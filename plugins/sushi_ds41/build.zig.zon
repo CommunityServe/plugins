@@ -1,0 +1,8 @@
+.{
+    .name = .sushi_ds41,
+    .version = "0.0.0",
+    .fingerprint = 0x43f9079ebb85f44a,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{ .mlx_serve_kit = .{ .path = "../../.kit/kit" } },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "scripts", "LICENSE", "NOTICE" },
+}

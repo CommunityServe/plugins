@@ -1,0 +1,1093 @@
+// Manual FFI bindings for mlx-c.
+// We declare only the functions we need rather than @cImport to avoid
+// potential issues with C++ headers and keep the dependency surface explicit.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const log = @import("log.zig");
+pub const kernel_keys = @import("mlx_kernel_keys.zig");
+
+// ── Opaque handle types ──
+pub const mlx_array = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_stream = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_device = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_string = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_map_string_to_array = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_map_string_to_string = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_map_string_to_array_iterator = extern struct { ctx: ?*anyopaque = null, map_ctx: ?*anyopaque = null };
+pub const mlx_vector_array = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_closure = extern struct { ctx: ?*anyopaque = null };
+
+// ── Enums ──
+pub const mlx_dtype = enum(c_int) {
+    bool_ = 0,
+    uint8 = 1,
+    uint16 = 2,
+    uint32 = 3,
+    uint64 = 4,
+    int8 = 5,
+    int16 = 6,
+    int32 = 7,
+    int64 = 8,
+    float16 = 9,
+    float32 = 10,
+    float64 = 11,
+    bfloat16 = 12,
+    complex64 = 13,
+};
+
+pub const mlx_device_type = enum(c_int) { cpu = 0, gpu = 1 };
+
+// ── Optional types ──
+pub const mlx_optional_int = extern struct {
+    value: c_int = 0,
+    has_value: bool = false,
+
+    pub fn none() mlx_optional_int {
+        return .{ .value = 0, .has_value = false };
+    }
+    pub fn some(v: c_int) mlx_optional_int {
+        return .{ .value = v, .has_value = true };
+    }
+};
+
+pub const mlx_optional_float = extern struct {
+    value: f32 = 0,
+    has_value: bool = false,
+
+    pub fn none() mlx_optional_float {
+        return .{ .value = 0, .has_value = false };
+    }
+    pub fn some(v: f32) mlx_optional_float {
+        return .{ .value = v, .has_value = true };
+    }
+};
+
+// ── Extern declarations ──
+pub extern "c" fn mlx_version(str: *mlx_string) c_int;
+
+// String
+pub extern "c" fn mlx_string_new() mlx_string;
+pub extern "c" fn mlx_string_data(str: mlx_string) [*:0]const u8;
+pub extern "c" fn mlx_string_free(str: mlx_string) c_int;
+
+// Device
+pub extern "c" fn mlx_device_new() mlx_device;
+pub extern "c" fn mlx_device_new_type(dtype: mlx_device_type, index: c_int) mlx_device;
+pub extern "c" fn mlx_device_free(dev: mlx_device) c_int;
+pub extern "c" fn mlx_get_default_device(dev: *mlx_device) c_int;
+pub extern "c" fn mlx_set_default_device(dev: mlx_device) c_int;
+
+// Stream
+pub extern "c" fn mlx_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_set(stream: *mlx_stream, src: mlx_stream) c_int;
+pub extern "c" fn mlx_stream_equal(lhs: mlx_stream, rhs: mlx_stream) bool;
+pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
+pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
+pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;
+pub extern "c" fn mlx_default_gpu_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_get_device(dev: *mlx_device, stream: mlx_stream) c_int;
+pub extern "c" fn mlx_device_get_type(dtype: *mlx_device_type, dev: mlx_device) c_int;
+
+/// True when the stream targets the GPU (custom Metal kernels require it).
+pub fn streamIsGpu(s: mlx_stream) bool {
+    var dev = mlx_device{ .ctx = null };
+    if (mlx_stream_get_device(&dev, s) != 0) return false;
+    defer _ = mlx_device_free(dev);
+    var dt: mlx_device_type = .cpu;
+    if (mlx_device_get_type(&dt, dev) != 0) return false;
+    return dt == .gpu;
+}
+pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
+
+// Metal
+pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
+pub extern "c" fn _mlx_array_is_available(res: *bool, arr: mlx_array) c_int;
+
+// Array creation
+pub extern "c" fn mlx_array_new() mlx_array;
+pub extern "c" fn mlx_array_new_int(val: c_int) mlx_array;
+pub extern "c" fn mlx_array_new_float(val: f32) mlx_array;
+pub extern "c" fn mlx_array_new_bool(val: bool) mlx_array;
+pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array;
+pub extern "c" fn mlx_array_new_data_managed(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
+pub extern "c" fn mlx_array_new_data_managed_payload(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
+pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
+pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
+
+// Array info
+pub extern "c" fn mlx_array_tostring(str: *mlx_string, arr: mlx_array) c_int;
+pub extern "c" fn mlx_array_ndim(arr: mlx_array) usize;
+pub extern "c" fn mlx_array_shape(arr: mlx_array) [*]const c_int;
+pub extern "c" fn mlx_array_strides(arr: mlx_array) [*]const usize;
+pub extern "c" fn mlx_array_size(arr: mlx_array) usize;
+pub extern "c" fn mlx_array_dtype(arr: mlx_array) mlx_dtype;
+pub extern "c" fn mlx_array_eval(arr: mlx_array) c_int;
+pub extern "c" fn mlx_array_itemsize(arr: mlx_array) usize;
+
+// Scalar access
+pub extern "c" fn mlx_array_item_float32(res: *f32, arr: mlx_array) c_int;
+pub extern "c" fn mlx_array_item_int32(res: *i32, arr: mlx_array) c_int;
+
+// Data access
+pub extern "c" fn mlx_array_data_bool(arr: mlx_array) ?[*]const bool;
+pub extern "c" fn mlx_array_data_float32(arr: mlx_array) ?[*]const f32;
+pub extern "c" fn mlx_array_data_float16(arr: mlx_array) ?[*]const f16;
+pub extern "c" fn mlx_array_data_bfloat16(arr: mlx_array) ?[*]const u16;
+pub extern "c" fn mlx_array_data_int32(arr: mlx_array) ?[*]const i32;
+pub extern "c" fn mlx_array_data_uint16(arr: mlx_array) ?[*]const u16;
+pub extern "c" fn mlx_array_data_uint32(arr: mlx_array) ?[*]const u32;
+pub extern "c" fn mlx_array_data_uint8(arr: mlx_array) ?[*]const u8;
+
+// Vector array
+pub extern "c" fn mlx_vector_array_new() mlx_vector_array;
+pub extern "c" fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usize) mlx_vector_array;
+pub extern "c" fn mlx_vector_array_free(vec: mlx_vector_array) c_int;
+pub extern "c" fn mlx_vector_array_size(vec: mlx_vector_array) usize;
+pub extern "c" fn mlx_vector_array_get(res: *mlx_array, vec: mlx_vector_array, idx: usize) c_int;
+pub extern "c" fn mlx_vector_array_new_value(val: mlx_array) mlx_vector_array;
+pub extern "c" fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int;
+
+// Graph utils (diagnostics)
+pub const mlx_node_namer = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_node_namer_new() mlx_node_namer;
+pub extern "c" fn mlx_node_namer_free(namer: mlx_node_namer) c_int;
+pub extern "c" fn mlx_print_graph(os: *std.c.FILE, namer: mlx_node_namer, outputs: mlx_vector_array) c_int;
+
+// Closure + compile
+pub extern "c" fn mlx_closure_new_func_payload(
+    fun: *const fn (*mlx_vector_array, mlx_vector_array, ?*anyopaque) callconv(.c) c_int,
+    payload: ?*anyopaque,
+    dtor: ?*const fn (?*anyopaque) callconv(.c) void,
+) mlx_closure;
+pub extern "c" fn mlx_closure_free(cls: mlx_closure) c_int;
+pub extern "c" fn mlx_closure_apply(res: *mlx_vector_array, cls: mlx_closure, input: mlx_vector_array) c_int;
+pub extern "c" fn mlx_compile(res: *mlx_closure, fun: mlx_closure, shapeless: bool) c_int;
+pub extern "c" fn mlx_detail_compile_clear_cache() c_int;
+
+// Map string -> array
+pub extern "c" fn mlx_map_string_to_array_new() mlx_map_string_to_array;
+pub extern "c" fn mlx_map_string_to_array_free(map: mlx_map_string_to_array) c_int;
+pub extern "c" fn mlx_map_string_to_array_get(value: *mlx_array, map: mlx_map_string_to_array, key: [*:0]const u8) c_int;
+pub extern "c" fn mlx_map_string_to_array_insert(map: mlx_map_string_to_array, key: [*:0]const u8, value: mlx_array) c_int;
+
+// Map iterator
+pub extern "c" fn mlx_map_string_to_array_iterator_new(map: mlx_map_string_to_array) mlx_map_string_to_array_iterator;
+pub extern "c" fn mlx_map_string_to_array_iterator_free(it: mlx_map_string_to_array_iterator) c_int;
+pub extern "c" fn mlx_map_string_to_array_iterator_next(key: *?[*:0]const u8, value: *mlx_array, it: mlx_map_string_to_array_iterator) c_int;
+
+// Map string -> string
+pub extern "c" fn mlx_map_string_to_string_new() mlx_map_string_to_string;
+pub extern "c" fn mlx_map_string_to_string_free(map: mlx_map_string_to_string) c_int;
+pub extern "c" fn mlx_map_string_to_string_insert(map: mlx_map_string_to_string, key: [*:0]const u8, value: [*:0]const u8) c_int;
+pub extern "c" fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: mlx_map_string_to_string, key: [*:0]const u8) c_int;
+
+// IO
+pub extern "c" fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int;
+pub extern "c" fn mlx_save_safetensors(file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) c_int;
+
+// ── Ops ──
+pub extern "c" fn mlx_add(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_subtract(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_multiply(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_floor_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_negative(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_maximum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+// Kokoro's SineGen takes the fractional part of a phase ramp (`x - floor(x)`).
+pub extern "c" fn mlx_floor(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_ceil(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_log2(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_round(res: *mlx_array, a: mlx_array, decimals: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sign(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+// Complex plumbing for Kokoro's iSTFTNet head. mlx-c has NO "build a complex
+// array from two real ones" op, so the spectrum is assembled as `re + im·i`
+// using a complex SCALAR from `mlx_array_new_complex` (float ⊕ complex
+// promotes to complex).
+pub extern "c" fn mlx_real(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_imag(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_arctan2(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_new_complex(real_val: f32, imag_val: f32) mlx_array;
+pub extern "c" fn mlx_minimum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_block_masked_mm(res: *mlx_array, a: mlx_array, b: mlx_array, block_size: c_int, mask_out: mlx_array, mask_lhs: mlx_array, mask_rhs: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_square(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_rsqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_exp(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_log(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_abs(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_tanh(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_cos(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sin(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_erf(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_reshape(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_transpose(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_transpose_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_expand_dims(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_squeeze(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_broadcast_to(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_take(res: *mlx_array, a: mlx_array, indices: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_take_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_concatenate_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_pad(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, low_pad: [*]const c_int, low_pad_num: usize, high_pad: [*]const c_int, high_pad_num: usize, pad_value: mlx_array, mode: [*:0]const u8, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_softmax_axis(res: *mlx_array, a: mlx_array, axis: c_int, precise: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_argmax_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_copy(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_view(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_argsort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_topk(res: *mlx_array, a: mlx_array, k: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_topk_axis(res: *mlx_array, a: mlx_array, k: c_int, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_cumsum(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_mean_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+// Variance along one axis — the InstanceNorm1d half of Kokoro's AdaIN1d
+// (`src/kokoro.zig`). `ddof` 0 = biased/population variance, which is what
+// torch's normalization layers use.
+pub extern "c" fn mlx_var_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_equal(res: *mlx_array, a: mlx_array, b: mlx_array, equal_nan: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_remainder(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_where(res: *mlx_array, condition: mlx_array, x: mlx_array, y: mlx_array, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_arange(res: *mlx_array, start: f64, stop: f64, step: f64, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_full(res: *mlx_array, shape: [*]const c_int, shape_num: usize, val: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_zeros(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_ones(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_slice(res: *mlx_array, a: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_slice_update(res: *mlx_array, src: mlx_array, update: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_scatter_single(res: *mlx_array, a: mlx_array, indices: mlx_array, updates: mlx_array, axis: c_int, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_triu(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_tril(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_power(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_less(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_greater(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_greater_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_less_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+
+// Quantized matmul
+pub extern "c" fn mlx_quantized_matmul(res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, s: mlx_stream) c_int;
+
+// Gathered quantized matmul (for MoE expert dispatch)
+pub extern "c" fn mlx_gather_qmm(res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, sorted_indices: bool, s: mlx_stream) c_int;
+// Dense gathered matmul — the unquantized analog of gather_qmm, used for bf16
+// MoE expert dispatch. No transpose flag: `b` must already be [..., in, out].
+pub extern "c" fn mlx_gather_mm(res: *mlx_array, a: mlx_array, b: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, sorted_indices: bool, s: mlx_stream) c_int;
+
+// Dequantize (fallback)
+pub extern "c" fn mlx_dequantize(res: *mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, dtype: mlx_optional_dtype, s: mlx_stream) c_int;
+
+// Quantize (affine group-wise). Returns a vector_array of [q, scales, biases].
+// Used by the KV cache quantization path; see src/kv_quant.zig.
+pub extern "c" fn mlx_quantize(res: *mlx_vector_array, w: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, s: mlx_stream) c_int;
+
+// Additional ops for MoE / GatedDeltaNet
+pub extern "c" fn mlx_sigmoid(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sum_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_max_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sum(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, groups: c_int, s: mlx_stream) c_int;
+// FFT — real-input forward transform for the TTS speaker-encoder mel/STFT.
+// `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
+pub const mlx_fft_norm = c_int;
+pub const MLX_FFT_NORM_BACKWARD: mlx_fft_norm = 0;
+pub extern "c" fn mlx_fft_rfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
+// Real-output inverse transform — the iSTFT head of Kokoro's iSTFTNet generator
+// (`src/kokoro.zig`). `n` is the OUTPUT length in samples, so the caller states
+// the frame size (20) rather than inferring it from the 11-bin input.
+pub extern "c" fn mlx_fft_irfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
+// 2D/3D conv + transposed conv for the media-generation decoders (VAE/vocoder).
+// MLX layout: input NHWC / NDHWC, weight OHWI / ODHWI (out-channels first, in-channels last).
+pub extern "c" fn mlx_conv2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv_transpose1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, output_padding: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv_transpose2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, output_padding_0: c_int, output_padding_1: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv_transpose3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, output_padding_0: c_int, output_padding_1: c_int, output_padding_2: c_int, groups: c_int, s: mlx_stream) c_int;
+// Seed-exact noise for diffusion latents (FLUX): pair with mlx_random_key(seed).
+pub extern "c" fn mlx_random_normal(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, loc: f32, scale: f32, key: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_argpartition_axis(res: *mlx_array, a: mlx_array, kth: c_int, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_take_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_put_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, values: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logical_and(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logical_or(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_repeat_axis(res: *mlx_array, arr: mlx_array, repeats: c_int, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_tile(res: *mlx_array, arr: mlx_array, reps: [*]const c_int, reps_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_log1p(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logaddexp(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_stack_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_split(res: *mlx_vector_array, a: mlx_array, num_splits: c_int, axis: c_int, s: mlx_stream) c_int;
+
+pub const mlx_optional_dtype = extern struct {
+    value: mlx_dtype = .float32,
+    has_value: bool = false,
+};
+
+// ── Fast ops ──
+pub extern "c" fn mlx_fast_rms_norm(res: *mlx_array, x: mlx_array, weight: mlx_array, eps: f32, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_layer_norm(res: *mlx_array, x: mlx_array, weight: mlx_array, bias: mlx_array, eps: f32, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_rope(res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: c_int, freqs: mlx_array, s: mlx_stream) c_int;
+// `mlx_fast_rope_dynamic` accepts a per-row offset array (shape [B], int32) so a single
+// kernel launch handles N requests at different KV positions during batched decode.
+pub extern "c" fn mlx_fast_rope_dynamic(res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: mlx_array, freqs: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_scaled_dot_product_attention(res: *mlx_array, queries: mlx_array, keys: mlx_array, values: mlx_array, scale: f32, mask_mode: [*:0]const u8, mask_arr: mlx_array, sinks: mlx_array, force_fused: bool, s: mlx_stream) c_int;
+
+// ── Vector of strings (for custom metal kernels) ──
+pub const mlx_vector_string = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_vector_string_new() mlx_vector_string;
+pub extern "c" fn mlx_vector_string_new_data(data: [*]const [*:0]const u8, size: usize) mlx_vector_string;
+pub extern "c" fn mlx_vector_string_free(vec: mlx_vector_string) c_int;
+
+// ── Custom Metal kernels ──
+pub const mlx_fast_metal_kernel_config = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_fast_metal_kernel_config_new() mlx_fast_metal_kernel_config;
+pub fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int {
+    kernel_keys.configFree(cls);
+    return raw_kernel.mlx_fast_metal_kernel_config_free(cls);
+}
+pub fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int {
+    kernel_keys.configNote(cls, " ->{t}", .{dtype});
+    return raw_kernel.mlx_fast_metal_kernel_config_add_output_arg(cls, shape, size, dtype);
+}
+pub extern "c" fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
+pub fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int {
+    kernel_keys.configNote(cls, " {s}={t}", .{ name, dtype });
+    return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_dtype(cls, name, dtype);
+}
+pub extern "c" fn mlx_any_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
+pub fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int {
+    kernel_keys.configNote(cls, " {s}={d}", .{ name, value });
+    return raw_kernel.mlx_fast_metal_kernel_config_add_template_arg_int(cls, name, value);
+}
+pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
+
+pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
+pub fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel {
+    const k = raw_kernel.mlx_fast_metal_kernel_new(name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
+    kernel_keys.kernelNew(k, name, source, header, ensure_row_contiguous, atomic_outputs);
+    return k;
+}
+pub fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int {
+    kernel_keys.kernelFree(cls);
+    return raw_kernel.mlx_fast_metal_kernel_free(cls);
+}
+pub fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int {
+    kernel_keys.apply(cls, inputs, config);
+    return raw_kernel.mlx_fast_metal_kernel_apply(outputs, cls, inputs, config, s);
+}
+
+/// The custom-kernel entry points under the wrappers above, which note each kernel's library key.
+const raw_kernel = struct {
+    extern "c" fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int;
+    extern "c" fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
+    extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
+    extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+    extern "c" fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel;
+    extern "c" fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int;
+    extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int;
+};
+
+// ── Random ──
+pub extern "c" fn mlx_random_categorical(res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
+// Uniform noise — Kokoro's SineGen draws a random initial phase per harmonic.
+// Bounds are ARRAYS, unlike mlx_random_normal's scalar loc/scale.
+pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_random_seed(seed: u64) c_int;
+pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
+// Uniform random integers in [low, high) — DiffusionGemma canvas init/renoise.
+pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
+
+// ── Diffusion sampler ops ──
+pub extern "c" fn mlx_cummax(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logsumexp_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_all(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_isfinite(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_clip(res: *mlx_array, a: mlx_array, a_min: mlx_array, a_max: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_contiguous(res: *mlx_array, a: mlx_array, allow_col_major: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_mean(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_mean_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_std(res: *mlx_array, a: mlx_array, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_std_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_max(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int;
+
+// ── Batch eval ──
+pub extern "c" fn mlx_eval(outputs: mlx_vector_array) c_int;
+pub extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
+
+// ── Memory management ──
+pub extern "c" fn mlx_clear_cache() c_int;
+pub extern "c" fn mlx_set_memory_limit(res: *usize, limit: usize) c_int;
+pub extern "c" fn mlx_set_cache_limit(res: *usize, limit: usize) c_int;
+pub extern "c" fn mlx_set_wired_limit(res: *usize, limit: usize) c_int;
+pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;
+pub extern "c" fn mlx_get_cache_memory(res: *usize) c_int;
+pub extern "c" fn mlx_get_peak_memory(res: *usize) c_int;
+pub extern "c" fn mlx_reset_peak_memory() c_int;
+
+// ── Device info ──
+pub const mlx_device_info = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_device_info_new() mlx_device_info;
+pub extern "c" fn mlx_device_info_get(info: *mlx_device_info, dev: mlx_device) c_int;
+pub extern "c" fn mlx_device_info_free(info: mlx_device_info) c_int;
+pub extern "c" fn mlx_device_info_get_size(res: *usize, info: mlx_device_info, key: [*:0]const u8) c_int;
+pub extern "c" fn mlx_device_info_get_string(res: *[*:0]const u8, info: mlx_device_info, key: [*:0]const u8) c_int;
+
+// ── Error handler ──
+pub const mlx_error_handler_func = ?*const fn ([*:0]const u8, ?*anyopaque) callconv(.c) void;
+pub extern "c" fn mlx_set_error_handler(handler: mlx_error_handler_func, data: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) void;
+
+// ── Zig helper wrappers ──
+
+/// Get the default compute stream. Normally the GPU (Metal) stream. When MLX
+/// was built without a Metal backend (e.g. the iOS Simulator slice, where MLX's
+/// Metal device can't be constructed), there is no GPU stream — fall back to the
+/// CPU stream so the engine runs on the Accelerate backend. The check is cached;
+/// on real hardware Metal is always available, so this is the GPU stream as
+/// before with no measurable overhead.
+var no_gpu_backend_cache: ?bool = null;
+
+/// True when MLX has no Metal/GPU backend (e.g. the iOS Simulator slice built
+/// with MLX_BUILD_METAL=OFF). Callers use this to take CPU-only paths and skip
+/// GPU-only work (kernel-fusion JIT compilation). Always false on real hardware.
+pub fn noGpuBackend() bool {
+    if (no_gpu_backend_cache == null) {
+        var avail: bool = false;
+        _ = mlx_metal_is_available(&avail);
+        no_gpu_backend_cache = !avail;
+    }
+    return no_gpu_backend_cache.?;
+}
+
+var test_error_handler_installed = std.atomic.Value(bool).init(false);
+
+/// A test reaches the GPU through this stream, so it latches MLX's errors like `main()` does instead of mlx-c's
+/// exiting the process: a retry that reads a refusal must not depend on which test ran first.
+pub fn gpuStream() mlx_stream {
+    if (builtin.is_test and !test_error_handler_installed.swap(true, .acq_rel)) installErrorHandler();
+    return if (noGpuBackend()) mlx_default_cpu_stream_new() else mlx_default_gpu_stream_new();
+}
+
+/// Print an array for debugging
+pub fn printArray(label: []const u8, arr: mlx_array) void {
+    _ = mlx_array_eval(arr);
+    var str = mlx_string_new();
+    _ = mlx_array_tostring(&str, arr);
+    const data = mlx_string_data(str);
+    log.debug("{s}: {s}\n", .{ label, data });
+    _ = mlx_string_free(str);
+}
+
+/// Get array shape as a Zig slice
+pub fn getShape(arr: mlx_array) []const c_int {
+    const ndim = mlx_array_ndim(arr);
+    if (ndim == 0) return &.{};
+    return mlx_array_shape(arr)[0..ndim];
+}
+
+/// How a residual's dtype moved between two observation points.
+pub const DtypeStep = enum { quiet, widened, narrowed, changed };
+
+/// Bytes per element, for deciding whether a dtype change WIDENED the stream.
+/// Only the dtypes a residual can actually hold are named; anything else is
+/// reported as a plain change rather than guessed at.
+pub fn dtypeBytes(d: mlx_dtype) ?u8 {
+    return switch (d) {
+        .float16, .bfloat16 => 2,
+        .float32 => 4,
+        .float64 => 8,
+        else => null,
+    };
+}
+
+pub fn dtypeStep(prev: mlx_dtype, cur: mlx_dtype) DtypeStep {
+    if (prev == cur) return .quiet;
+    const pb = dtypeBytes(prev) orelse return .changed;
+    const cb = dtypeBytes(cur) orelse return .changed;
+    if (cb > pb) return .widened;
+    if (cb < pb) return .narrowed;
+    return .changed; // same width, different kernel selection (bf16 vs f16)
+}
+
+/// One-shot latches for `[dtype-trace]`, keyed by forward-path name. A vision
+/// tower and its text trunk are different paths and latch independently.
+var dtype_trace_seen: [12]?[]const u8 = @splat(null);
+
+/// True the FIRST time `path` is seen, false forever after. After the first
+/// forward the trace costs nothing — a per-layer FFI dtype read on every token
+/// would be a real (if small) tax, and identical repeated lines would bury the
+/// one line that matters.
+pub fn dtypeTraceArm(path: []const u8) bool {
+    for (&dtype_trace_seen) |*slot| {
+        if (slot.*) |seen| {
+            if (std.mem.eql(u8, seen, path)) return false;
+            continue;
+        }
+        slot.* = path;
+        return true;
+    }
+    return false; // table full — stop tracing rather than spam
+}
+
+pub fn resetDtypeTraceForTest() void {
+    dtype_trace_seen = @splat(null);
+}
+
+/// DIAGNOSTIC (`[dtype-trace]`): watch the residual stream's dtype across one
+/// forward pass.
+///
+/// A residual wider than the weights promotes EVERY projection's weight on
+/// read, so the cost lands as a UNIFORM multiple across attention, MLP and
+/// lm_head — which reads like a platform problem, not a bug. A YaRN
+/// mscale table (f32 constant multiplied into bf16 q/k) cost 3x and was
+/// invisible to op count, kernel choice, KV ablation and the CPU/GPU split.
+/// Endpoints alone say THAT it widened; per-layer lines on every layer are
+/// unreadable. So: log both endpoints, and in between log only where the dtype
+/// actually moves — one line that names the layer responsible.
+pub const DtypeTrace = struct {
+    path: []const u8,
+    on: bool,
+    last: mlx_dtype,
+
+    pub fn begin(path: []const u8, h: mlx_array, weight: ?mlx_array) DtypeTrace {
+        const on = dtypeTraceArm(path);
+        const d = mlx_array_dtype(h);
+        if (on) {
+            log.info("[dtype-trace] {s}: residual in = {s}, first weight = {s}\n", .{
+                path,
+                @tagName(d),
+                if (weight) |w| (if (w.ctx == null) "null" else @tagName(mlx_array_dtype(w))) else "n/a",
+            });
+        }
+        return .{ .path = path, .on = on, .last = d };
+    }
+
+    pub fn layer(self: *DtypeTrace, h: mlx_array, layer_idx: usize) void {
+        if (!self.on) return;
+        const d = mlx_array_dtype(h);
+        const step = dtypeStep(self.last, d);
+        if (step == .quiet) return;
+        log.info("[dtype-trace] {s}: residual {s} at layer {d}: {s} -> {s}\n", .{
+            self.path,
+            @tagName(step),
+            layer_idx,
+            @tagName(self.last),
+            @tagName(d),
+        });
+        self.last = d;
+    }
+
+    pub fn end(self: *DtypeTrace, h: mlx_array) void {
+        if (!self.on) return;
+        log.info("[dtype-trace] {s}: residual out = {s}\n", .{ self.path, @tagName(mlx_array_dtype(h)) });
+    }
+};
+
+/// Check if an mlx-c call succeeded (returns 0 on success)
+/// DIAGNOSTIC op counter. Every graph-building op funnels through `check`, so
+/// this counts ops ISSUED (not kernels dispatched — MLX fuses some). Only read
+/// by the decode forward probe; the increment is a single relaxed add on a
+/// path that already does an FFI call, so it does not move any benchmark.
+pub var op_count: std.atomic.Value(u64) = .init(0);
+
+/// TEST-ONLY fault injection at the ONE chokepoint every checked mlx-c call
+/// goes through: `fault.arm(k)` makes the k-th SUBSEQUENT call that would have
+/// SUCCEEDED report `error.MlxError` instead, so an ownership audit can walk
+/// every error path of a function without patching the function. Failing calls
+/// are not counted (they already take the error path on their own). The op
+/// itself has already executed when `check` sees its return code — the
+/// argument is evaluated first — so what is injected is a succeeding op
+/// REPORTING failure; the caller's `&out` handle is a valid, freeable array,
+/// which is exactly the state its cleanup must survive. Compiled only under
+/// `builtin.is_test`, so a release build carries neither the branch nor the
+/// symbols.
+pub const fault = struct {
+    var remaining: u64 = 0; // 0 = disarmed
+    var fired: bool = false;
+
+    /// Fail the k-th checked call from here (k >= 1). `arm(0)` is a no-op arm.
+    pub fn arm(k: u64) void {
+        remaining = k;
+        fired = false;
+    }
+    pub fn disarm() void {
+        remaining = 0;
+    }
+    /// Did the armed fault actually fire? False means the call under test
+    /// returned before reaching its k-th checked op — an assertion the test
+    /// needs, or the sweep silently stops covering anything.
+    pub fn didFire() bool {
+        return fired;
+    }
+    fn hit() bool {
+        if (remaining == 0) return false;
+        remaining -= 1;
+        if (remaining != 0) return false;
+        fired = true;
+        return true;
+    }
+};
+
+/// Test-only: like `fault`, but the injected failure also LATCHES the process-wide
+/// error — the state a real mlx-c raise leaves behind, which a best-effort caller
+/// must drop before returning.
+const LATCH_FAULT_MSG = "injected latching mlx-c raise (test only)";
+var latch_remaining: u64 = 0;
+var latch_fired = false;
+
+fn latchFaultHit() bool {
+    if (latch_remaining == 0) return false;
+    latch_remaining -= 1;
+    if (latch_remaining != 0) return false;
+    latch_fired = true;
+    return true;
+}
+
+pub fn armLatchingFaultForTest(k: u64) void {
+    latch_remaining = k;
+    latch_fired = false;
+}
+pub fn latchingFaultFiredForTest() bool {
+    return latch_fired;
+}
+
+pub fn check(ret: c_int) !void {
+    _ = op_count.fetchAdd(1, .monotonic);
+    if (ret != 0) return error.MlxError;
+    if (comptime builtin.is_test) {
+        if (fault.hit()) return error.MlxError;
+        if (latchFaultHit()) {
+            latchMlxError(LATCH_FAULT_MSG.ptr, null);
+            return error.MlxError;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wired-residency policy (mlxfast notes/47 class).
+//
+// MLX's Metal residency set has a capacity set by `mlx_set_wired_limit`. At
+// capacity 0 (MLX default) nothing is wired, and the driver re-establishes
+// residency for the whole RAM-resident model on every command buffer; the
+// policy wires up to `max_recommended_working_set_size`.
+
+pub fn maxRecommendedWorkingSet() usize {
+    var dev = mlx_device{ .ctx = null };
+    _ = mlx_get_default_device(&dev);
+    var info = mlx_device_info_new();
+    defer _ = mlx_device_info_free(info);
+    if (mlx_device_info_get(&info, dev) != 0) return 0;
+    var max_rec: usize = 0;
+    if (mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0) return 0;
+    return max_rec;
+}
+
+/// Apply the wired-residency policy. Call on the inference thread AFTER a
+/// model load or unload completes (and from the offline run path after load).
+/// Returns the limit set, or null when there is no GPU or the device query
+/// failed. The caller logs the result.
+pub fn applyWiredPolicy() ?usize {
+    if (noGpuBackend()) return null;
+    const max_rec = maxRecommendedWorkingSet();
+    if (max_rec == 0) return null;
+    var prev: usize = 0;
+    _ = mlx_set_wired_limit(&prev, max_rec);
+    return max_rec;
+}
+
+// mlx-c error latch. mlx-c's default error handler calls exit(-1) after the C boundary
+// already caught the exception, so a Metal working-set OOM killed the server (#353).
+// Our handler latches the message and returns; the engine raises a named error at its
+// next checkpoint and the process stays serviceable.
+var mlx_error_latched = std.atomic.Value(bool).init(false);
+var mlx_error_buf: [512]u8 = undefined;
+var mlx_error_len: usize = 0;
+/// pthread mutex: mlx-c calls the handler from whatever thread raised, none carry an `Io`.
+var mlx_error_mtx: std.c.pthread_mutex_t = .{};
+fn lockErrBuf() void {
+    _ = std.c.pthread_mutex_lock(&mlx_error_mtx);
+}
+fn unlockErrBuf() void {
+    _ = std.c.pthread_mutex_unlock(&mlx_error_mtx);
+}
+
+/// Memory-class latched messages become a memory 503 (`[METAL] ... Insufficient Memory`,
+/// `[malloc]`/`[metal::malloc]` failures, `Resource limit exceeded`).
+pub fn mlxErrorIsMemory(msg: []const u8) bool {
+    const needles = [_][]const u8{
+        "Insufficient Memory",
+        "insufficient memory",
+        "Unable to allocate",
+        "Resource limit",
+        "out of memory",
+        "Out of memory",
+        "maximum allowed buffer size",
+    };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, msg, n) != null) return true;
+    }
+    return false;
+}
+
+fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
+    _ = data;
+    const span = std.mem.span(msg);
+    lockErrBuf();
+    defer unlockErrBuf();
+    // First error wins: follow-on noise from a poisoned stream must not hide the cause.
+    if (!mlx_error_latched.load(.acquire)) {
+        const n = @min(span.len, mlx_error_buf.len);
+        @memcpy(mlx_error_buf[0..n], span[0..n]);
+        mlx_error_len = n;
+        mlx_error_latched.store(true, .release);
+    }
+    log.err("[mlx] {s}\n", .{span});
+}
+
+/// Install the latching handler (mlx-c's default exits the process). Called once from `main()`.
+pub fn installErrorHandler() void {
+    mlx_set_error_handler(latchMlxError, null, null);
+}
+
+/// True when an MLX call has failed since the last `takeError`.
+pub fn errorPending() bool {
+    return mlx_error_latched.load(.acquire);
+}
+
+/// Peek the latch without consuming it: the name of the error `checkError` would raise, or
+/// null. A slot finish must not answer 200 over a failed forward, yet must leave the latch
+/// for the decode-tick wrapper that fails the rest of a batched group.
+pub fn peekErrorName() ?[]const u8 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    return if (mlxErrorIsMemory(mlx_error_buf[0..mlx_error_len])) "OutOfMemory" else "MlxFailure";
+}
+
+/// Consume the latched message into `buf` (copied), clearing the latch.
+pub fn takeError(buf: []u8) ?[]const u8 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    const n = @min(mlx_error_len, buf.len);
+    @memcpy(buf[0..n], mlx_error_buf[0..n]);
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return buf[0..n];
+}
+
+/// The limit MLX names when it refuses a custom-kernel launch that asks for more threads per threadgroup than
+/// the compiled pipeline allows; it varies with the kernel's register and threadgroup-memory use.
+pub fn threadgroupLimit(msg: []const u8) ?u32 {
+    const marker = "maximum allowed threads per threadgroup (";
+    const at = std.mem.indexOf(u8, msg, marker) orelse return null;
+    const digits = msg[at + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, digits, ')') orelse return null;
+    return std.fmt.parseInt(u32, digits[0..end], 10) catch null;
+}
+
+/// Consume the latch and return its limit when it is a threadgroup-size refusal; any other error stays latched.
+pub fn takeThreadgroupLimit() ?u32 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    const limit = threadgroupLimit(mlx_error_buf[0..mlx_error_len]) orelse return null;
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return limit;
+}
+
+/// Consume the latch only when its message contains `needle`; any other error stays latched.
+pub fn takeErrorIf(needle: []const u8) bool {
+    if (!mlx_error_latched.load(.acquire)) return false;
+    lockErrBuf();
+    defer unlockErrBuf();
+    if (std.mem.indexOf(u8, mlx_error_buf[0..mlx_error_len], needle) == null) return false;
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return true;
+}
+
+/// Drop a latch a best-effort op raised and its caller already reported, so an
+/// optional write or a diagnostic can never become an unrelated request's
+/// `MlxFailure`. `had_error` is the caller's `errorPending()` from BEFORE the op:
+/// an error that was already latched belongs to someone else and stays.
+pub fn dropLatchedErrorUnless(had_error: bool) void {
+    if (!had_error and errorPending()) {
+        var buf: [512]u8 = undefined;
+        _ = takeError(&buf);
+    }
+}
+
+/// Release-build fault injection: `SUSHI_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal
+/// OOM at the n-th `checkError` of the process, then disarms (`tests/test_mlx_error_recovery.sh`).
+const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by SUSHI_MLX_FAULT_CHUNK). at transforms.cpp:15";
+const FAULT_STEP_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by SUSHI_MLX_FAULT_STEP). at transforms.cpp:15";
+
+/// One armed, self-disarming injector; prefill and decode checkpoints count separately.
+const FaultSite = struct {
+    env: [:0]const u8,
+    msg: [:0]const u8,
+    at: ?u64 = null,
+    seen: u64 = 0,
+
+    fn target(self: *FaultSite) u64 {
+        if (self.at) |v| return v;
+        var v: u64 = 0;
+        if (std.c.getenv(self.env.ptr)) |pz| {
+            v = std.fmt.parseInt(u64, std.mem.span(pz), 10) catch 0;
+        }
+        self.at = v;
+        if (v > 0) log.warn("[mlx] FAULT INJECTION armed: {s}=#{d}\n", .{ self.env, v });
+        return v;
+    }
+
+    fn maybeFire(self: *FaultSite) void {
+        const t = self.target();
+        if (t == 0) return;
+        self.seen += 1;
+        if (self.seen != t) return;
+        self.at = 0;
+        latchErrorForTest(self.msg);
+    }
+
+    fn reset(self: *FaultSite) void {
+        self.at = null;
+        self.seen = 0;
+    }
+};
+
+var fault_chunk = FaultSite{ .env = "SUSHI_MLX_FAULT_CHUNK", .msg = FAULT_CHUNK_MSG };
+var fault_step = FaultSite{ .env = "SUSHI_MLX_FAULT_STEP", .msg = FAULT_STEP_MSG };
+
+/// Consume a latched failure: `error.OutOfMemory` for the memory class, else `error.MlxFailure`.
+fn consumeLatch() !void {
+    if (!mlx_error_latched.load(.acquire)) return;
+    var buf: [512]u8 = undefined;
+    const msg = takeError(&buf) orelse return;
+    if (mlxErrorIsMemory(msg)) return error.OutOfMemory;
+    return error.MlxFailure;
+}
+
+/// The name a caught failure is reported under. `check` returns `MlxError` and leaves the mlx-c
+/// latch set; settling it here keeps the next request's first checkpoint from failing on it, and
+/// a Metal out-of-memory behind it is reported as the memory failure it is.
+pub fn settledErrorName(err: anyerror) []const u8 {
+    if (err != error.MlxError) return @errorName(err);
+    var buf: [512]u8 = undefined;
+    const msg = takeError(&buf) orelse return @errorName(err);
+    return if (mlxErrorIsMemory(msg)) "OutOfMemory" else @errorName(err);
+}
+
+/// Prefill checkpoint: once per chunk plus once after the last.
+pub fn checkError() !void {
+    fault_chunk.maybeFire();
+    return consumeLatch();
+}
+
+/// Decode checkpoint: once per decode tick, after the forward. Without it a failed decode
+/// forward finished 200 with garbage and handed the latch to the NEXT request's prefill.
+pub fn checkErrorDecode() !void {
+    fault_step.maybeFire();
+    return consumeLatch();
+}
+
+pub fn latchErrorForTest(msg: [:0]const u8) void {
+    latchMlxError(msg.ptr, null);
+}
+
+pub fn resetFaultChunkForTest() void {
+    fault_chunk.reset();
+    fault_step.reset();
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+}
+
+test "a threadgroup-size refusal names the pipeline limit and only it is consumed" {
+    const t = std.testing;
+    const refusal = "Thread group size (1024) is greater than  the maximum allowed threads per threadgroup (832).";
+    try t.expectEqual(@as(?u32, 832), threadgroupLimit(refusal));
+    try t.expectEqual(@as(?u32, null), threadgroupLimit("[slice_update] Invalid slice sizes."));
+    try t.expectEqual(@as(?u32, null), threadgroupLimit("maximum allowed threads per threadgroup (x)"));
+
+    // A refusal an earlier test left latched is that test's failure, not this one's.
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+    try t.expectEqual(@as(?u32, null), takeThreadgroupLimit());
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectEqual(@as(?u32, null), takeThreadgroupLimit());
+    try t.expect(errorPending());
+    _ = takeError(&buf);
+    latchErrorForTest(refusal);
+    try t.expectEqual(@as(?u32, 832), takeThreadgroupLimit());
+    try t.expect(!errorPending());
+}
+
+test "an MLX memory failure is classified as a memory error, an argument error is not" {
+    const t = std.testing;
+    try t.expect(mlxErrorIsMemory("[METAL] Command buffer execution failed: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory). at transforms.cpp:15"));
+    try t.expect(mlxErrorIsMemory("[malloc] Unable to allocate 8589934592 bytes."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Resource limit (128000) exceeded."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Attempting to allocate 99 bytes which is greater than the maximum allowed buffer size of 5 bytes."));
+    try t.expect(!mlxErrorIsMemory("[slice_update] Invalid slice sizes."));
+    try t.expect(!mlxErrorIsMemory("[matmul] Last dimension of first input must match."));
+}
+
+test "the latch turns an mlx-c error into a Zig error instead of exiting, once" {
+    const t = std.testing;
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expect(errorPending());
+    latchErrorForTest("[slice_update] Invalid slice sizes.");
+    try t.expectError(error.OutOfMemory, checkError());
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectError(error.MlxFailure, checkError());
+    try t.expect(!errorPending());
+}
+
+test "the injected MLX error costs ONE checkError and the engine keeps working after it" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try checkError();
+    try checkError();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkError());
+
+    try t.expect(!errorPending());
+    try checkError();
+    const s = gpuStream();
+    const shape = [_]c_int{2};
+    const data = [_]f32{ 1.5, 2.5 };
+    const a = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+    defer _ = mlx_array_free(a);
+    var sum = mlx_array_new();
+    defer _ = mlx_array_free(sum);
+    try t.expectEqual(@as(c_int, 0), mlx_sum(&sum, a, false, s));
+    _ = mlx_array_eval(sum);
+    var out: f32 = 0;
+    _ = mlx_array_item_float32(&out, sum);
+    try t.expectApproxEqAbs(@as(f32, 4.0), out, 1e-6);
+    try checkError();
+}
+
+test "peekErrorName names the class WITHOUT consuming the latch" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try t.expect(peekErrorName() == null);
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    try t.expect(errorPending());
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectEqualStrings("MlxFailure", peekErrorName().?);
+    try t.expectError(error.MlxFailure, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
+}
+
+test "a DECODE-time MLX failure is attributed to the decoding request, not the next one" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try checkError();
+    try checkErrorDecode();
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(!errorPending());
+    try checkError();
+
+    try checkError();
+    try checkError();
+    try checkErrorDecode();
+    try t.expect(!errorPending());
+}
+
+
+test "a failure caught as MlxError settles the latch, so the next request's first checkpoint is clean" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+    installErrorHandler();
+
+    // The real route: an mlx-c call raises, the handler latches, `check` returns MlxError.
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    const shape = [_]c_int{4};
+    const data = [_]f32{ 1, 2, 3, 4 };
+    const a = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+    defer _ = mlx_array_free(a);
+    const bad = [_]c_int{ 3, 3 };
+    var out = mlx_array_new();
+    defer _ = mlx_array_free(out);
+    try t.expectError(error.MlxError, check(mlx_reshape(&out, a, &bad, 2, s)));
+    try t.expect(errorPending());
+
+    try t.expectEqualStrings("MlxError", settledErrorName(error.MlxError));
+    try t.expect(!errorPending());
+    try checkError();
+}
+
+test "a Metal out-of-memory behind an MlxError is a memory failure and leaves no latch" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory). at transforms.cpp:73");
+    try t.expectEqualStrings("OutOfMemory", settledErrorName(error.MlxError));
+    try t.expect(!errorPending());
+    try checkError();
+    try checkErrorDecode();
+}
+
+test "settledErrorName leaves other errors and an unlatched MlxError alone" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try t.expectEqualStrings("MlxError", settledErrorName(error.MlxError));
+    try t.expectEqualStrings("Cancelled", settledErrorName(error.Cancelled));
+    // A latch that is not this failure's stays for its owner.
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectEqualStrings("Cancelled", settledErrorName(error.Cancelled));
+    try t.expect(errorPending());
+}
+
+test "takeErrorIf leaves unrelated errors latched" {
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+    defer _ = takeError(&buf);
+    latchErrorForTest("unrelated allocation failure");
+    try std.testing.expect(!takeErrorIf("maximum allowed threads per threadgroup"));
+    try std.testing.expectEqualStrings("unrelated allocation failure", takeError(&buf).?);
+    latchErrorForTest("exceeds maximum allowed threads per threadgroup");
+    try std.testing.expect(takeErrorIf("maximum allowed threads per threadgroup"));
+    try std.testing.expect(!errorPending());
+}

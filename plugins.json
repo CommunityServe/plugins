@@ -1,0 +1,16 @@
+{
+  "kit": "26.11.1",
+  "plugins": [
+    {
+      "name": "sushi_ds41",
+      "kind": "model",
+      "version": "0.1.0",
+      "summary": "DeepSeek-V4.1-Flash STQ packs on sushi's own model code: DSpark, prefix cache, images.",
+      "models": [
+        "deepseek_v41 with expert_quant.format stq (beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw)"
+      ],
+      "requires_mlx_serve": ">=26.11.1",
+      "fixture": "none"
+    }
+  ]
+}

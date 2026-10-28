@@ -1,0 +1,5 @@
+.zig-toolchain/
+.kit/
+.zig-cache/
+zig-out/
+*.dylib

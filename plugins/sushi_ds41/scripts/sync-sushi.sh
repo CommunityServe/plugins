@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Copies the DeepSeek-V4.1 slice of sushi into src/sushi/ unchanged. Usage: scripts/sync-sushi.sh <sushi checkout>
+# src/sushi/{model,transformer,status,scheduler,test_models,tokenizer}.zig are ours (the cut edges) and never overwritten.
+set -euo pipefail
+src="${1:?sushi checkout}/src"
+dst="$(cd "$(dirname "$0")/.." && pwd)/src/sushi"
+files="dsv41_borrow dsv41_config dsv41_engram dsv41_kernels dsv41_model dsv41_owned dsv41_qat dsv41_scope dsv41_source dsv41_stream dsv41_vision vision_common dspark_rows dflash_policy spec_cost_gate mtp_depth_bounds
+expert_bf16_kernels expert_io expert_quant expert_stream expert_usage io_util log mlx mlx_kernel_keys test_expect glm_stream_fixture"
+for f in $files; do cp "$src/$f.zig" "$dst/$f.zig"; done
+rm -rf "$dst/exl3"; mkdir "$dst/exl3"; cp "$src"/exl3/*.zig "$dst/exl3/"
+mkdir -p "$dst/../stb"; cp "${1}/lib/stb_image.h" "${1}/lib/stb_image_impl.c" "$dst/../stb/"
+mkdir -p "$dst/fixtures"; cp "$src/fixtures/dsv41_engram_token_map.bin" "$dst/fixtures/"
+# sushi's bill multiplies `@min(rows, span_rows)`, which Zig narrows to u9: the product overflows (wraps in a release build).
+cfg="$dst/dsv41_config.zig"
+grep -q 'const span = @min(rows, span_rows);' "$cfg"
+sed -i.bak 's/const span = @min(rows, span_rows);/const span: u64 = @min(rows, span_rows);/' "$cfg"; rm "$cfg.bak"
+echo "$(git -C "${1}" rev-parse HEAD)" > "$dst/SUSHI_COMMIT"

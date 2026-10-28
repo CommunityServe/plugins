@@ -1,0 +1,31 @@
+name: release
+
+on:
+  push:
+    tags: ["*-v[0-9]*.[0-9]*.[0-9]*"]
+
+jobs:
+  release:
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Plugin from the tag
+        id: tag
+        run: |
+          name="${GITHUB_REF_NAME%-v*}"
+          [ -d "plugins/$name" ] || { echo "no plugins/$name" >&2; exit 1; }
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - run: scripts/build.sh "${{ steps.tag.outputs.name }}"
+      - name: Hash
+        run: |
+          cd "plugins/${{ steps.tag.outputs.name }}/zig-out/lib"
+          shasum -a 256 *.dylib > "lib${{ steps.tag.outputs.name }}.dylib.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            plugins/${{ steps.tag.outputs.name }}/zig-out/lib/*.dylib
+            plugins/${{ steps.tag.outputs.name }}/zig-out/lib/*.sha256
+            plugins/${{ steps.tag.outputs.name }}/plugin.json
+          body: "Built from source at this tag. Compiling it yourself is preferred: scripts/install.sh ${{ steps.tag.outputs.name }}"

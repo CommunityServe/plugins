@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1" # weekly: a toolchain or kit change must not rot a plugin unseen
+
+jobs:
+  all-plugins-compile:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repo rules
+        run: scripts/lint.sh
+      - name: Index is current
+        run: |
+          scripts/gen-index.sh
+          git diff --exit-code plugins.json
+      - name: Pinned toolchain and kit
+        run: scripts/setup.sh
+      - name: Every plugin compiles and passes its tests
+        run: scripts/build.sh --all
