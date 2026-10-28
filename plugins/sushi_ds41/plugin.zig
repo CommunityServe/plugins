@@ -560,18 +560,23 @@ fn mediaPrepare(p: *const abi.Parsed, kind: abi.MediaKind, bytes: abi.Str, budge
     const src = decodeRgb(bytes.slice()) orelse return Verdict.refuse(.failed, "sushi_ds41: the image does not decode (JPEG, PNG, GIF or BMP)");
     defer gpa.free(src.rgb);
     const px = vis.preprocess(gpa, src.rgb, src.h, src.w, vis.Processor.of(v)) catch return Verdict.refuse(.failed, "sushi_ds41: the image's dimensions have no grid");
-    defer gpa.free(px.bytes);
-    const feat: c_int = @intCast(3 * v.patch * v.patch);
-    const n: c_int = @intCast(px.grid_h * px.grid_w);
+    // The host copies these float32 bytes on a connection thread (no MLX there) and calls `releasePixels`.
     out.* = .{
         .kind = .image,
         .rows = @intCast(vis.spanRows(px.grid_h, px.grid_w, v.downsample)),
         .grid = .{ 1, px.grid_h, px.grid_w },
-        .pixels = .{ .ctx = mlx.mlx_array_new_data(px.bytes.ptr, &[_]c_int{ n, feat }, 2, .float32).ctx },
+        .bytes = .of(px.bytes),
+        .free = &releasePixels,
     };
     return .ok;
 }
 
+fn releasePixels(item: *abi.MediaItem) callconv(.c) void {
+    gpa.free(item.bytes.slice());
+    item.bytes = .{};
+}
+
+/// The tower reads the host's pixels as a float32 `[grid_h * grid_w, feat]` array it makes on the inference thread.
 fn mediaTower(mp: *anyopaque, item: *const abi.MediaItem, out: *abi.Array) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     const t = &(m.tower orelse return Verdict.refuse(.unsupported, "sushi_ds41: this pack has no vision tower"));
@@ -609,7 +614,12 @@ fn roundEntry(m: *Model, f: *const abi.Forward, out: *const abi.ForwardOut) ?Ver
     if (out.size < @sizeOf(abi.ForwardOut)) return Verdict.refuse(.unsupported, "sushi_ds41: the host's ForwardOut has no round");
     if (m.mdl.dspark == null) return Verdict.refuse(.unsupported, "sushi_ds41: the DSpark stages are not loaded");
     if (f.tokens.len != 1) return Verdict.refuse(.unsupported, "sushi_ds41: a round starts from one committed token");
-    if (m.open != null) return Verdict.refuse(.failed, "sushi_ds41: a verify is still open");
+    // A verify the engine never finished (its accept failed) is discarded; the position check below then refuses a
+    // stale request.
+    if (m.open != null) {
+        m.open = null;
+        dsv.finishVerify(m.mdl, 0) catch {};
+    }
     const st = dsv.ensureState(m.mdl) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
     if (f.positions.len > 0 and st.n != f.positions.slice()[0]) return Verdict.refuse(.failed, "sushi_ds41: the position does not follow the model's state");
     if (st.n + max_verify_rows > m.billed_context + generation_rows) return Verdict.refuse(.failed, "sushi_ds41: the request is longer than the context the expert cache was sized for (raise ctx_size)");
