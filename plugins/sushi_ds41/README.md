@@ -6,6 +6,7 @@ DeepSeek-V4.1-Flash on sushi's own model code, as an outside plugin for mlx-serv
     scripts/build.sh sushi_ds41             # from the repo root: tests, then ReleaseFast
     scripts/install.sh sushi_ds41           # compile and install into mlx-serve
     scripts/sync-sushi.sh <sushi checkout>  # refresh src/sushi/ from sushi
+    scripts/sync-sushi.sh --check <sushi checkout> <tag>  # does a sushi release touch this slice? exit 0 = keep the pin
 
 Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`, `finish`) and outside-plugin image hooks (ddalcu/mlx-serve#1002).
 
