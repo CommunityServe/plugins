@@ -13,6 +13,8 @@ Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`
 (ddalcu/mlx-serve#1002), host-decoded media (`MediaInput`, ddalcu/mlx-serve#1003) and the array-based aux snapshot hooks
 (ddalcu/mlx-serve#1000).
 
+The numbers below were measured on the slice of sushi 3fc47d8a; the slice is now sushi cc1981df (NOTICE).
+
 Measured on M4 Max 128 GB, Sushi-STQ-1.75bpw, greedy:
 
 | | decode tok/s | prefill tok/s |
@@ -41,10 +43,16 @@ simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2
 - DSpark: greedy and sampled requests (the engine accepts a sampled block; the plugin drafts and keeps what it accepts). `{"mtp": false}` in the model settings keeps the stages off.
 - Prefix cache: a restore point at the prompt's last token, images included: it is keyed by its ids and a hash of the
   image rows they cover (`src/vision_key.zig`), so two images, whose placeholder ids are the same, never share one.
-- Images: one frame, decoded by mlx-serve (`MediaInput`); the plugin lays it out as the release's processor does.
+- Images: one frame, decoded by mlx-serve (`MediaInput`); the plugin lays it out as the release's processor does. The
+  bf16 tower is requantized to affine 8-bit (group 128) at load, as sushi does.
+- Token embedding: an affine-quantized embedding stays in its shard and a forward reads its rows from SSD, as sushi does;
+  the bytes it frees go to the expert cache.
+- Memory: sushi runs each forward under an MLX transient cap that needs its patched MLX; mlx-serve's MLX has none, so
+  the plugin keeps its own buffer-pool caps and bills the prefill pool in the expert room.
 - Attention: on an M5 GPU (`applegpu_g17` or later, macOS 26.2 or later) a prompt's wide spans run on the matrix
-  units through Metal 4 tensor ops (`src/attn_nax.zig`), within 3e-5 of the simdgroup kernel; other GPUs keep that
-  kernel. The edit to the slice that calls it is `patches/attn-nax.patch`.
+  units through Metal 4 tensor ops (`src/attn_nax.zig`), within 3e-5 of the simdgroup kernel, with the picked
+  compressed rows read packed from the store as sushi's kernel reads them; other GPUs keep that kernel. The edit to the
+  slice that calls it is `patches/attn-nax.patch` (`fusedHeads`).
 - Prefill: the whole prompt in one host call (`whole_prompt_prefill`), chunked here at `prefill_width` as sushi does; a
   long prompt is one uncancellable call.
 - Not supported: Thunderbolt pair, other quant formats, snapshot serialization (no SSD tier).

@@ -1,6 +1,6 @@
 const std = @import("std");
 const io_mod = @import("expert_io.zig");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("dsv41/expert_usage.zig");
 pub const expert_exl3 = @import("sushi_exl3").format;
 
 /// The per-expert rate and offset table a rate-grouped layer keeps beside its stored banks. A group's gate trellis
@@ -1799,7 +1799,7 @@ test "layout resolution is qwen4_exp only: the same index declares nothing for a
         \\{"weight_map":{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.weight":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.scales":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.biases":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.weight":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.scales":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.biases":"a"}}
     ;
     try t.expect(isExpertStreamingArch("qwen4_exp"));
-    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "llama", "" }) |mt| {
+    for ([_][]const u8{ "qwen4_exp_text", "mimo_v2_text", "not_a_served_arch", "" }) |mt| {
         try t.expect(!isExpertStreamingArch(mt));
         try t.expect(layoutFromIndexJson(t.allocator, mt, split, 1) == null);
         try t.expect(layoutFromIndexJson(t.allocator, mt, fused, 1) == null);
@@ -2061,7 +2061,7 @@ test "mimo_v2 is the only additional expert streaming architecture" {
     try t.expect(isExpertStreamingArch("qwen4_exp"));
     try t.expect(isExpertStreamingArch("mimo_v2"));
     try t.expect(!isExpertStreamingArch("mimo_v2_text"));
-    try t.expect(!isExpertStreamingArch("qwen3_5_moe"));
+    try t.expect(!isExpertStreamingArch("not_a_served_arch"));
 }
 
 test "real quantized pack resolves nine regions per layer and the per expert bill" {
@@ -2192,7 +2192,7 @@ test "GLM BF16 individual index recognizes separate gate up down experts" {
 
 test "GLM BF16 individual source preserves shard bytes and leaves dense prefix and MTP unopened" {
     const t = std.testing;
-    const fixture = @import("glm_stream_fixture.zig");
+    const fixture = @import("glm5/glm_stream_fixture.zig");
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     try fixture.write(t.allocator, tmp.dir, .none);
@@ -2225,7 +2225,7 @@ test "GLM BF16 individual source preserves shard bytes and leaves dense prefix a
 
 test "GLM FP8 individual source resolves its layout and keeps e4m3 codes and block scales as stored" {
     const t = std.testing;
-    const fixture = @import("glm_stream_fixture.zig");
+    const fixture = @import("glm5/glm_stream_fixture.zig");
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     try fixture.writeStorage(t.allocator, tmp.dir, .none, 128, 128, .fp8);
@@ -2260,7 +2260,7 @@ test "GLM FP8 individual source resolves its layout and keeps e4m3 codes and blo
 
 test "GLM BF16 individual source rejects incomplete quantized or malformed banks" {
     const t = std.testing;
-    const fixture = @import("glm_stream_fixture.zig");
+    const fixture = @import("glm5/glm_stream_fixture.zig");
     for ([_]fixture.Fault{ .missing, .fp16, .wrong_shape, .truncated, .dense_prefix, .mixed, .fp8_scale }) |fault| {
         var tmp = t.tmpDir(.{});
         defer tmp.cleanup();

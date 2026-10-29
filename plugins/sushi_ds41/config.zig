@@ -4,7 +4,7 @@
 const std = @import("std");
 const kit = @import("mlx_serve");
 const abi = kit.abi.plugin;
-const sc = @import("src/sushi/dsv41_config.zig");
+const sc = @import("src/sushi/dsv41/dsv41_config.zig");
 const exl3 = @import("sushi_exl3");
 
 pub const model_types = [_][]const u8{"deepseek_v41"};
@@ -173,7 +173,7 @@ test "sushi_ds41 parses the STQ pack's geometry" {
     // The bill's arithmetic runs unchecked in a release build: Debug traps an overflow.
     const c = of(&p);
     for ([_]u64{ 1, 256, 2048, 8192 }) |chunk| {
-        for ([_]u64{ 1, 4096, 131072, 1 << 20 }) |seq| try testing.expect(c.transientBytes(chunk, seq) > 0 and c.decodeTransientBytes(chunk, seq) > 0);
+        for ([_]u64{ 1, 4096, 131072, 1 << 20 }) |seq| try testing.expect(c.chunkCap(chunk, seq) > 0 and c.forwardCap(chunk, seq) > 0);
     }
     // The mini pack names no stage tensors in its (absent) index: no native drafter.
     try testing.expectEqual(@as(u32, 0), p.spec.native_stages);

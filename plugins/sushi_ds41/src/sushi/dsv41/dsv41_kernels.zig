@@ -3,7 +3,7 @@
 //! Ported from mlx-serve's `deepseek_v41.zig` (MIT) and adapted to the original checkpoint layout: routed
 //! experts are `mxfp4` banks with separate gate and up, the shared expert and the trunk are `mxfp8`.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("../mlx.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 
@@ -431,7 +431,8 @@ var topk_merge_def = Def{ .name = "dsv41_topk_merge", .ins = &.{ "x", "ids", "kk
 var dense_f32x_def = Def{ .name = "dsv41_dense_f32x", .ins = &.{ "x", "w" }, .outs = &.{"out"}, .source = DENSE_F32X_SOURCE };
 
 const gate_sgs = 8;
-const topk_tg = 1024;
+/// Threads a top-k threadgroup runs; `probeTopk` halves it where the GPU caps the kernel lower.
+pub var topk_tg: usize = 1024;
 const dense_f32x_rps = 4;
 
 /// `x` `[L, D]` times the router rows `w` `[E, D]` in f32 (`D` a multiple of 8).
@@ -461,7 +462,7 @@ pub fn route(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32) !
 }
 
 /// Chunks a row of `n` scores splits into for its top-k. Past these sizes one threadgroup a row leaves the GPU idle;
-/// below them, or at a wide k, the merge costs what the split saves (`dsv41 topk split timing`).
+/// below them, or at a wide k, the merge costs what the split saves (`sushi-ubench run dsv41.topk`).
 pub fn topkSplits(rows: usize, n: usize, k: usize) usize {
     if (rows > topk_split_rows or k > topk_split_max_k) return 1;
     return if (n >= (if (rows == 1) topk_split_min_n_one_row else topk_split_min_n)) topk_splits else 1;
@@ -482,7 +483,7 @@ pub fn topkIndices(sc: *Scope, x: A, k: usize) !A {
 pub fn topkIndicesSplit(sc: *Scope, x: A, k: usize, splits: usize) !A {
     const L = dim(x, 0);
     var o: [1]A = undefined;
-    const tmpl: []const Tmpl = &.{.{ .name = "TG", .v = topk_tg }};
+    const tmpl: []const Tmpl = &.{.{ .name = "TG", .v = ci(topk_tg) }};
     const spec: []const OutSpec = &.{.{ .shape = &.{ ci(L), ci(k) }, .dt = .int32 }};
     // k rides in a buffer: as a template arg every index width up to index_topk was its own Metal compile.
     if (splits <= 1) {
@@ -922,7 +923,7 @@ pub fn attnWide(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, 
 /// the output. The softmax is online in f32, seeded by the sink (max = sink, sum = 1, zero value), so rows with
 /// no key leave 0. P reaches the bf16 matrix unit as a high and a low part, which keeps ~16 bits of it.
 /// meta = {wp, window, K, nc}.
-const ATTN_FUSED_SOURCE =
+const ATTN_FUSED_HEAD =
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int l = threadgroup_position_in_grid.y, h0 = threadgroup_position_in_grid.x * HB;
     \\const int wp = meta[0], window = meta[1], K = meta[2], nc = meta[3];
@@ -962,6 +963,10 @@ const ATTN_FUSED_SOURCE =
     \\  bool any = false;
     \\  for (int j = 0; j < KT; ++j) any = any || rsrc[j] != -1;
     \\  if (!any) continue;
+;
+
+/// The picked rows' tile load: `comp` holds them as bf16 rows, `topk` indexing its first `nc`.
+pub const ATTN_FUSED_LOAD_ROWS =
     \\  for (int i = int(tid); i < KT * (D / 8); i += NT) {
     \\    const int j = i / (D / 8), cc = i % (D / 8), src = rsrc[j];
     \\    metal::uint4 v = metal::uint4(0);
@@ -969,6 +974,33 @@ const ATTN_FUSED_SOURCE =
     \\    else if (src != -1) v = ((const device metal::uint4*)(comp + size_t(-2 - src) * D))[cc];
     \\    ((threadgroup metal::uint4*)kt)[i] = v;
     \\  }
+;
+
+/// The same tile load from the compressed store as it is kept (`ccodes` `[rows, D / 2]`, `cscales` `[rows, D / G]`,
+/// `qat_mod.packFp4`'s form): a picked row is decoded as `qat_mod.unpackFp4` does and lands in the tile as T.
+pub const ATTN_FUSED_LOAD_FP4 =
+    \\  for (int i = int(tid); i < KT * (D / 8); i += NT) {
+    \\    const int j = i / (D / 8), cc = i % (D / 8), src = rsrc[j];
+    \\    if (src < -1) {
+    \\      const size_t row = size_t(-2 - src);
+    \\      const device uchar* cp = ccodes + row * (D / 2) + cc * 4;
+    \\      const float s = scale_of(uint(cscales[row * (D / G) + cc * 8 / G]), MODE);
+    \\      #pragma clang loop unroll(full)
+    \\      for (int e = 0; e < 8; ++e) {
+    \\        const uint byte = uint(cp[e / 2]);
+    \\        const uint code = (e & 1) ? byte >> 4 : byte & 15u;
+    \\        const float v = E2M1[code & 7u] * s;
+    \\        kt[j * D + cc * 8 + e] = static_cast<T>((code & 8u) ? -v : v);
+    \\      }
+    \\    } else {
+    \\      metal::uint4 v = metal::uint4(0);
+    \\      if (src >= 0) v = ((const device metal::uint4*)(keys + size_t(src) * D))[cc];
+    \\      ((threadgroup metal::uint4*)kt)[i] = v;
+    \\    }
+    \\  }
+;
+
+const ATTN_FUSED_TAIL =
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  metal::simdgroup_matrix<float, 8, 8> s[RT][KC];
     \\  #pragma clang loop unroll(full)
@@ -1062,7 +1094,11 @@ const ATTN_FUSED_SOURCE =
     \\}
 ;
 
+const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
+const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
+
 var attn_fused_def = Def{ .name = "dsv41_attn_fused", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal" }, .outs = &.{"out"}, .source = ATTN_FUSED_SOURCE };
+var attn_fused_fp4_def = Def{ .name = "dsv41_attn_fused_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal" }, .outs = &.{"out"}, .source = ATTN_FUSED_FP4_SOURCE, .header = qat_mod.PACK_HEADER };
 
 const fused_hb = 16;
 const fused_nsg = 8;
@@ -1077,20 +1113,46 @@ pub fn attnFusedFits(h: usize, d: usize) bool {
 /// against the window rows `keys_w` (query i sees rows (wp + i - window, wp + i]) and the compressed rows
 /// `comp_rows` it picked (`topk` `[L, K]`), f32 throughout past the bf16 operands.
 pub fn attnFused(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, comp_rows: A, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
+    const dt = mlx.mlx_array_dtype(q);
+    const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
+    const keys = try sc.astype(keys_w, dt);
+    const comp = if (K > 0) try sc.astype(comp_rows, dt) else keys;
+    const picks = if (K > 0) try sc.astype(topk, .int32) else sc_mod.none;
+    return attnFusedLaunch(sc, &attn_fused_def, sink, q, keys, &.{comp}, wp, window, K, if (K > 0) dim(comp_rows, 0) else 0, picks, scale, out_dt, &.{});
+}
+
+/// `attnFused` with the picked rows read where the compressed store keeps them: `codes` `[rows, D / 2]` and
+/// `scales` `[rows, D / group]` (`qat_mod.packFp4`'s form), `topk` the ids into them. Each row is decoded as
+/// `qat_mod.unpackFp4` does, so the heads are the bytes `attnFused` gives for the unpacked rows.
+pub fn attnFusedPacked(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, codes: A, scales: A, mode: qat_mod.Qat, group: usize, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
+    std.debug.assert(group % 8 == 0 and dim(codes, 1) * 2 == dim(q, 2));
+    const keys = try sc.astype(keys_w, mlx.mlx_array_dtype(q));
+    const extra = [_]Tmpl{ .{ .name = "G", .v = ci(group) }, .{ .name = "MODE", .v = qat_mod.packMode(mode) } };
+    return attnFusedLaunch(sc, &attn_fused_fp4_def, sink, q, keys, &.{ codes, scales }, wp, window, dim(topk, 1), dim(codes, 0), try sc.astype(topk, .int32), scale, out_dt, &extra);
+}
+
+/// `comp`: the picked rows' arrays, as `def` takes them; `picks`: `topk` as int32, none without picks.
+fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const A, wp: usize, window: usize, K: usize, nc: usize, picks: A, scale: f32, out_dt: mlx.mlx_dtype, extra: []const Tmpl) !A {
     const L = dim(q, 0);
     const H = dim(q, 1);
     const D = dim(q, 2);
-    const dt = mlx.mlx_array_dtype(q);
-    const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
-    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), if (K > 0) ci(dim(comp_rows, 0)) else 0 };
+    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), ci(nc) };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
-    const keys = try sc.astype(keys_w, dt);
-    const comp = if (K > 0) try sc.astype(comp_rows, dt) else keys;
-    const picks = if (K > 0) try sc.astype(topk, .int32) else meta;
+    var ins: [8]A = undefined;
+    ins[0] = q;
+    ins[1] = keys;
+    @memcpy(ins[2..][0..comp.len], comp);
+    var n = 2 + comp.len;
+    for ([_]A{ if (picks.ctx != null) picks else meta, sink, meta, try f32Const(sc, &.{scale}) }) |a| {
+        ins[n] = a;
+        n += 1;
+    }
+    var tmpl: [6]Tmpl = undefined;
+    const base = [_]Tmpl{ .{ .name = "D", .v = ci(D) }, .{ .name = "HB", .v = fused_hb }, .{ .name = "NSG", .v = fused_nsg }, .{ .name = "KT", .v = fused_kt } };
+    @memcpy(tmpl[0..base.len], &base);
+    @memcpy(tmpl[base.len..][0..extra.len], extra);
     var o: [1]A = undefined;
-    try launch(sc, &attn_fused_def, &.{ q, keys, comp, picks, sink, meta, try f32Const(sc, &.{scale}) }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = out_dt }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, &.{
-        .{ .name = "D", .v = ci(D) }, .{ .name = "HB", .v = fused_hb }, .{ .name = "NSG", .v = fused_nsg }, .{ .name = "KT", .v = fused_kt },
-    }, &.{ .{ .name = "T", .dt = dt }, .{ .name = "OT", .dt = out_dt } }, &o);
+    try launch(sc, def, ins[0..n], &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = out_dt }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, tmpl[0 .. base.len + extra.len], &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(q) }, .{ .name = "OT", .dt = out_dt } }, &o);
     return o[0];
 }
 
@@ -1712,8 +1774,71 @@ pub fn hcNorm(sc: *Scope, z: A, x: A, cpre: A, norm_w: A, iters: usize, eps: A) 
     return .{ .sp = .{ .pre = o[0], .post = o[1], .comb = o[2] }, .h = o[3] };
 }
 
+/// Whether `hcExpandFused` reproduces this GPU's `hcExpandOps` byte for byte; set by `probeHc`.
+var hc_expand_tf32 = false;
+
+pub fn hcExpandProbed() bool {
+    return hc_expand_tf32;
+}
+
+pub fn hcExpandServes(x: A) bool {
+    return hc_expand_tf32 and dim(x, 1) == 4;
+}
+
+/// `hcExpand`'s op chain as one pass: `out[k] = post[k] * y + sum_j comb[j, k] * x[j]`. The chain's f32 matmul is
+/// TF32-class on a NAX GPU: both operands keep their top 10 mantissa bits (truncated), the four products are exact, and
+/// the sum is `(p0 + p1) + (p2 + p3)`; a GPU whose matmul is true f32 fails the probe and keeps the chain.
+const HC_EXPAND_SOURCE =
+    \\#pragma clang fp contract(off)
+    \\const int d = int(thread_position_in_grid.x), l = int(thread_position_in_grid.y);
+    \\const int D = x_shape[2];
+    \\if (d >= D) return;
+    \\const size_t xo = size_t(l) * HC * D + d;
+    \\float xv[HC];
+    \\for (int j = 0; j < HC; ++j) xv[j] = as_type<float>(as_type<uint>(float(x[xo + size_t(j) * D])) & 0xFFFFE000u);
+    \\const float yv = float(y[size_t(l) * D + d]);
+    \\for (int k = 0; k < HC; ++k) {
+    \\  float p[HC];
+    \\  for (int j = 0; j < HC; ++j) p[j] = as_type<float>(as_type<uint>(comb[l * HC * HC + j * HC + k]) & 0xFFFFE000u) * xv[j];
+    \\  out[xo + size_t(k) * D] = T(post[l * HC + k] * yv + ((p[0] + p[1]) + (p[2] + p[3])));
+    \\}
+;
+
+var hc_expand_def = Def{ .name = "dsv41_hc_expand", .ins = &.{ "x", "y", "post", "comb" }, .outs = &.{"out"}, .source = HC_EXPAND_SOURCE };
+
+/// `hcExpand` of four copies in one kernel, in `x`'s dtype; valid only where `hcExpandServes`.
+pub fn hcExpandFused(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
+    const L = dim(x, 0);
+    const D = dim(x, 2);
+    const dt = mlx.mlx_array_dtype(x);
+    var o: [1]A = undefined;
+    try launch(sc, &hc_expand_def, &.{ x, y, post, comb }, &.{.{ .shape = mlx.getShape(x), .dt = dt }}, .{ (D + 255) / 256 * 256, L, 1 }, .{ 256, 1, 1 }, &.{.{ .name = "HC", .v = 4 }}, &.{.{ .name = "T", .dt = dt }}, &o);
+    return o[0];
+}
+
+/// Launches the top-k kernels (one threadgroup a row, and chunked) at `topk_tg` threads, halving it until they run.
+pub fn probeTopk(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
+    while (true) {
+        probeTopkOnce(gpa, s) catch |e| {
+            if (e != error.MlxError or topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
+            topk_tg /= 2;
+            continue;
+        };
+        return;
+    }
+}
+
+fn probeTopkOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
+    var sc = Scope.init(gpa, s);
+    defer sc.deinit();
+    const x = try sc.zeros(&.{ 1, 64 }, .float32);
+    const one = try topkIndicesSplit(&sc, x, 4, 1);
+    const split = try topkIndicesSplit(&sc, x, 4, 2);
+    try sc_mod.evalAll(&.{ one, split });
+}
+
 /// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1, M2): launches every hyper-connection
-/// kernel once at `hc_tg` threads and halves it until they run.
+/// kernel once at `hc_tg` threads and halves it until they run, then checks `hcExpandFused` against the chain.
 pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, iters: usize) !void {
     while (true) {
         probeHcOnce(gpa, s, hc, D, iters) catch |e| {
@@ -1721,8 +1846,34 @@ pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
             hc_tg /= 2;
             continue;
         };
-        return;
+        break;
     }
+    hc_expand_tf32 = hc == 4 and probeHcExpand(gpa, s, D);
+}
+
+/// The fused expand against the chain on random streams of both dtypes at a wide and a narrow row count.
+fn probeHcExpand(gpa: std.mem.Allocator, s: mlx.mlx_stream, D: usize) bool {
+    var sc = Scope.init(gpa, s);
+    defer sc.deinit();
+    return probeHcExpandIn(&sc, D) catch blk: {
+        var buf: [512]u8 = undefined;
+        _ = mlx.takeError(&buf);
+        break :blk false;
+    };
+}
+
+fn probeHcExpandIn(sc: *Scope, D: usize) !bool {
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 5, 48 }) |L| {
+        const d: c_int = ci(D);
+        const x = try sc.astype(try randn(sc, &.{ L, 4, d }, .float32, 171, 1.5), dt);
+        const y = try sc.astype(try randn(sc, &.{ L, d }, .float32, 172, 1.0), dt);
+        const post = try randn(sc, &.{ L, 4 }, .float32, 173, 0.7);
+        const comb = try randn(sc, &.{ L, 4, 4 }, .float32, 174, 0.5);
+        const want = try sc_mod.hostF32(try sc.astype(try model.hcExpandOps(sc, x, y, post, comb), .float32));
+        const got = try sc_mod.hostF32(try sc.astype(try hcExpandFused(sc, x, y, post, comb), .float32));
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) return false;
+    };
+    return true;
 }
 
 fn probeHcOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, iters: usize) !void {
@@ -1837,7 +1988,7 @@ const testing = std.testing;
 const model = @import("dsv41_model.zig");
 const Config = @import("dsv41_config.zig").Config;
 
-fn randn(sc: *Scope, shape: []const c_int, dt: mlx.mlx_dtype, seed: u64, std_dev: f32) !A {
+pub fn randn(sc: *Scope, shape: []const c_int, dt: mlx.mlx_dtype, seed: u64, std_dev: f32) !A {
     var key = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_random_key(&key, seed));
     _ = try sc.keep(key);
@@ -1886,6 +2037,14 @@ fn expectLe(label: []const u8, got: f64, bound: f64) !void {
     if (got <= bound) return;
     std.debug.print("{s}: {e} > {e}\n", .{ label, got, bound });
     return error.KernelOutsideBar;
+}
+
+const F32_ULP: f64 = 0x1p-23;
+const NO_WORSE_ULPS = 16;
+
+/// `got` is no worse than `reference` plus the rounding noise of two f32 results, both relative to the peak.
+fn expectNoWorse(label: []const u8, got: f64, reference: f64) !void {
+    return expectLe(label, got, reference + NO_WORSE_ULPS * F32_ULP);
 }
 
 fn relErrF(got: []const f32, want: []const f32) f64 {
@@ -1972,7 +2131,7 @@ fn composedFfn(sc: *Scope, f: *const FfnData, dt: mlx.mlx_dtype) !A {
     const u = try (model.Lin{ .w = f.sh.up.w, .s = f.sh.up.s }).apply(sc, f.x);
     const sy = try (model.Lin{ .w = f.sh.down.w, .s = f.sh.down.s }).apply(sc, try sc.astype(try model.clampedSwiglu(sc, g, u, f.c.limit), dt));
     const y = try sc.astype(try sc.add(routed, try sc.astype(sy, .float32)), dt);
-    return model.hcExpand(sc, f.res, y, f.post, f.comb);
+    return model.hcExpandOps(sc, f.res, y, f.post, f.comb);
 }
 
 /// The FFN in f64 from the exact dequantized weights and the same inputs, no rounding between stages.
@@ -2044,7 +2203,7 @@ fn kernelFfn(sc: *Scope, f: *const FfnData) !A {
 }
 
 test "dsv41 moe decode: the gate-up and down-expand kernels are no further from the f64 truth than the composed chain, f32 sums in another order" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const f = try ffnData(&sc, .{}, .float32);
@@ -2056,11 +2215,11 @@ test "dsv41 moe decode: the gate-up and down-expand kernels are no further from 
     const err_kernel = relErr(try hostOf(&sc, got), truth);
     const err_composed = relErr(try hostOf(&sc, want), truth);
     try expectLe("kernel vs truth", err_kernel, 1e-5);
-    try expectLe("kernel vs composed's error", err_kernel, @max(err_composed, 2e-6));
+    try expectNoWorse("kernel vs composed's error", err_kernel, err_composed);
 }
 
 test "dsv41 moe decode: in bf16 the kernels give the composed chain's stream to a few bf16 ulps" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const f = try ffnData(&sc, .{}, .bfloat16);
@@ -2070,7 +2229,7 @@ test "dsv41 moe decode: in bf16 the kernels give the composed chain's stream to 
 }
 
 test "dsv41 gate: the router logits are no further from the f64 truth than the f32 matmul" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const E = 384;
@@ -2089,7 +2248,7 @@ test "dsv41 gate: the router logits are no further from the f64 truth than the f
             for (0..D) |k| s += @as(f64, xh[l * D + k]) * wh[e * D + k];
             truth[l * E + e] = s;
         };
-        try expectLe("kernel vs truth", relErr(got, truth), @max(relErr(comp, truth), 2e-6));
+        try expectNoWorse("kernel vs truth", relErr(got, truth), relErr(comp, truth));
     }
 }
 
@@ -2102,7 +2261,7 @@ fn composedRoute(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f3
 }
 
 test "dsv41 route: the experts are the composed chain's, their weights its scores to f32 rounding, with and without normalizing" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const E = 384;
@@ -2128,7 +2287,7 @@ test "dsv41 route: the experts are the composed chain's, their weights its score
 }
 
 test "dsv41 topk: the picks are the k largest in index order, ties to the lower index" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const n = 1500;
@@ -2150,8 +2309,27 @@ test "dsv41 topk: the picks are the k largest in index order, ties to the lower 
     try testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3, 4, 5, n - 4, n - 3, n - 2, n - 1 }, t[0..10]);
 }
 
+test "dsv41 topk: the picks do not depend on the threadgroup width" {
+    try mlx.requireGpu();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    try probeTopk(sc.a, sc.s);
+    const widest = topk_tg;
+    defer topk_tg = widest;
+    const k = 100;
+    const x = try randn(&sc, &.{ 3, 5000 }, .float32, 52, 1.0);
+    const want = try testing.allocator.dupe(i32, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 1)));
+    defer testing.allocator.free(want);
+    for ([_]usize{ 256, 512, 1024 }) |w| {
+        if (w > widest) continue;
+        topk_tg = w;
+        try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 1)));
+        try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 4)));
+    }
+}
+
 test "dsv41 topk split: the chunked picks are the one-threadgroup picks on long rows, ties and -inf included" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const k = 512;
@@ -2179,60 +2357,8 @@ test "dsv41 topk split: the chunked picks are the one-threadgroup picks on long 
     }
 }
 
-// Decode top-k at the release shapes by split count, arms interleaved per rep; best and median of 15 evals, and eight
-// independent rows of work in one eval (a decode token's eight index sources). Prints only under SUSHI_DSV41_TOPK_UBENCH.
-test "dsv41 topk split timing by context (SUSHI_DSV41_TOPK_UBENCH=1)" {
-    if (!@import("transformer.zig").diagEnvOn("SUSHI_DSV41_TOPK_UBENCH")) return error.SkipZigTest;
-    const gpu = mlx.gpuStream();
-    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var sc = Scope.init(testing.allocator, gpu);
-    defer sc.deinit();
-    const Shape = struct { n: usize, k: usize };
-    const splits = [_]usize{ 1, 2, 4, 8, 16, 32 };
-    for ([_]usize{ 65536, 262144, 524288 }) |ctx| {
-        // Index scores at ratio 2 and ratio 1, the candidate source's block maxima, a later source's gathered keys.
-        for ([_]Shape{ .{ .n = ctx / 2, .k = 512 }, .{ .n = ctx, .k = 512 }, .{ .n = ctx / 8, .k = 2048 }, .{ .n = 16384, .k = 512 } }) |sh| {
-            for ([_]usize{ 1, 4, 16 }) |L| {
-                var xs: [8]A = undefined;
-                for (&xs, 0..) |*x, i| x.* = try sc.add(try randn(&sc, &.{ @intCast(L), @intCast(sh.n) }, .float32, 90 + i, 1.0), try sc.f(@floatFromInt(i)));
-                try sc_mod.evalAll(&xs);
-                var tm: [splits.len][2][16]f64 = undefined;
-                var skip: [splits.len]bool = undefined;
-                for (splits, 0..) |g, gi| skip[gi] = sh.n / g < sh.k;
-                for (0..16) |rep| {
-                    for (splits, 0..) |g, gi| {
-                        if (skip[gi]) continue;
-                        var t = Scope.init(testing.allocator, gpu);
-                        defer t.deinit();
-                        var t0 = std.Io.Timestamp.now(io, .boot);
-                        const one = try topkIndicesSplit(&t, xs[0], sh.k, g);
-                        try sc_mod.evalAll(&.{one});
-                        tm[gi][0][rep] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
-                        var outs: [8]A = undefined;
-                        t0 = std.Io.Timestamp.now(io, .boot);
-                        for (&outs, xs) |*o, x| o.* = try topkIndicesSplit(&t, x, sh.k, g);
-                        try sc_mod.evalAll(&outs);
-                        tm[gi][1][rep] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
-                    }
-                }
-                for (splits, 0..) |g, gi| {
-                    if (skip[gi]) continue;
-                    var line: [2][2]f64 = undefined;
-                    for (0..2) |w| {
-                        const v = tm[gi][w][1..];
-                        std.mem.sort(f64, v, {}, std.sort.asc(f64));
-                        line[w] = .{ v[0], v[v.len / 2] };
-                    }
-                    std.debug.print("dsv41-topk ctx {d} n {d} k {d} L {d} splits {d}: one eval best {d:.3} med {d:.3} ms; x8 per row-of-work best {d:.3} med {d:.3} ms\n", .{ ctx, sh.n, sh.k, L, g, line[0][0], line[0][1], line[1][0] / 8, line[1][1] / 8 });
-                }
-            }
-        }
-    }
-}
-
 test "dsv41 dense f32x: the product is no further from the f64 truth than the widened f32 matmul" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const N = 1024;
@@ -2251,7 +2377,7 @@ test "dsv41 dense f32x: the product is no further from the f64 truth than the wi
             for (0..K) |k| s += @as(f64, xh[l * K + k]) * wh[n * K + k];
             truth[l * N + n] = s;
         };
-        try expectLe("kernel vs truth", relErr(got, truth), @max(relErr(comp, truth), 2e-6));
+        try expectNoWorse("kernel vs truth", relErr(got, truth), relErr(comp, truth));
     }
 }
 
@@ -2266,7 +2392,7 @@ fn expectBitEqual(label: []const u8, got: []const f32, want: []const f32) !void 
 }
 
 test "dsv41 moe act: the clamped SwiGLU times the routing weight is the composed chain's, bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const n = 61;
@@ -2282,7 +2408,7 @@ test "dsv41 moe act: the clamped SwiGLU times the routing weight is the composed
 }
 
 test "dsv41 moe combine: unsort, the f32 sum over the slots and the shared add are the composed chain's, bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const L = 37;
@@ -2322,7 +2448,7 @@ fn positions(sc: *Scope, first: i32, n: usize, step: i32) !A {
 }
 
 test "dsv41 rope tail: the rotation and the activation round trip are the composed chain's, bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
@@ -2350,7 +2476,7 @@ test "dsv41 rope tail: the rotation and the activation round trip are the compos
 }
 
 test "dsv41 kv row: the rms norm, rotation and fp8 round trip are the composed chain's, bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
@@ -2451,7 +2577,7 @@ fn truthAttn(sc: *Scope, a: *const AttnData, out: []f64) !void {
 }
 
 test "dsv41 decode attention: every split count is no further from the f64 truth than the composed core" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const a = try attnData(&sc, .{}, .float32);
@@ -2468,12 +2594,12 @@ test "dsv41 decode attention: every split count is no further from the f64 truth
     const err_comp = relErr(comp, truth);
     for ([_]usize{ 1, 2, 4, 5 }) |splits| {
         const got = try hostOf(&sc, try attnDecodeSplit(&sc, decodeArgs(&a, .float32, null), splits));
-        try expectLe("attn decode vs truth", relErr(got, truth), @max(err_comp, 2e-6));
+        try expectNoWorse("attn decode vs truth", relErr(got, truth), err_comp);
     }
 }
 
 test "dsv41 decode attention: the folded inverse rotation is the rotation of the heads, bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
@@ -2487,7 +2613,7 @@ test "dsv41 decode attention: the folded inverse rotation is the rotation of the
 }
 
 test "dsv41 decode attention: the folded fp8 round trip is the round trip of the heads, bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
@@ -2503,7 +2629,7 @@ test "dsv41 decode attention: the folded fp8 round trip is the round trip of the
 }
 
 test "dsv41 decode attention: a block of rows is the rows of single-row blocks, bit for bit, over a ring with slack" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const freqs = try ropeFreqs(&sc);
@@ -2529,7 +2655,7 @@ test "dsv41 decode attention: a block of rows is the rows of single-row blocks, 
 }
 
 test "dsv41 wide attention: the f16 core gives the f32 chain's heads at the release's span shape" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const L = 256;
@@ -2571,7 +2697,7 @@ fn composedIndexScores(sc: *Scope, q: A, keys: A, w: A, wscale: f32, p0: usize, 
 }
 
 test "dsv41 index scores: the scalar and the matrix kernels are no further from the f64 truth than the composed chain, -inf past the groups seen" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const IH = 64;
@@ -2613,12 +2739,12 @@ test "dsv41 index scores: the scalar and the matrix kernels are no further from 
             try cv.append(testing.allocator, comp[i]);
             try tv.append(testing.allocator, s);
         };
-        try expectLe("index scores vs truth", relErr(gv.items, tv.items), @max(relErr(cv.items, tv.items), 2e-6));
+        try expectNoWorse("index scores vs truth", relErr(gv.items, tv.items), relErr(cv.items, tv.items));
     }
 }
 
 test "dsv41 index scores: key slices scored at their offset are the whole list's columns bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const IH = 32;
@@ -2645,7 +2771,7 @@ test "dsv41 index scores: key slices scored at their offset are the whole list's
 }
 
 test "dsv41 index scores: the scalar kernel over packed keys gives the unpacked keys' scores bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const ratio = 1;
@@ -2734,7 +2860,7 @@ fn truthHc(sc: *Scope, d: *const HcData, x: A, z: []f64, h: []f64) !void {
 }
 
 test "dsv41 hc stage: the mixes and the normed collapse are no further from the f64 truth than the chain, the expanded stream too" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const d = try hcData(&sc, 1, .float32);
@@ -2745,10 +2871,10 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
     const ref = try composedHc(&sc, &d, d.x);
     try truthHc(&sc, &d, d.x, z_truth, h_truth);
     const st = try hcStage(&sc, d.x, null, d.cpre, d.w, d.hw, d.eps);
-    try expectLe("stage z", relErr(try hostOf(&sc, st.z), z_truth), @max(relErr(try hostOf(&sc, ref.z), z_truth), 2e-6));
-    try expectLe("stage h", relErr(try hostOf(&sc, st.h), h_truth), @max(relErr(try hostOf(&sc, ref.h), h_truth), 2e-6));
+    try expectNoWorse("stage z", relErr(try hostOf(&sc, st.z), z_truth), relErr(try hostOf(&sc, ref.z), z_truth));
+    try expectNoWorse("stage h", relErr(try hostOf(&sc, st.h), h_truth), relErr(try hostOf(&sc, ref.h), h_truth));
     // the expanded stream: the chain's `hcExpand`, then the same two outputs of its mixes
-    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.prev.post, d.prev.comb);
+    const x1_ref = try model.hcExpandOps(&sc, d.x, d.y, d.prev.post, d.prev.comb);
     const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
     const xh = try hostOf(&sc, d.x);
     const yh = try hostOf(&sc, d.y);
@@ -2761,19 +2887,19 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
         for (0..d.hc) |j| acc += @as(f64, ch[j * d.hc + i]) * xh[j * d.d + c];
         x1_truth[i * d.d + c] = acc;
     };
-    try expectLe("expanded stream", relErr(try hostOf(&sc, sx.x1), x1_truth), @max(relErr(try hostOf(&sc, x1_ref), x1_truth), 2e-6));
+    try expectNoWorse("expanded stream", relErr(try hostOf(&sc, sx.x1), x1_truth), relErr(try hostOf(&sc, x1_ref), x1_truth));
     const ref1 = try composedHc(&sc, &d, x1_ref);
     try truthHc(&sc, &d, sx.x1, z_truth, h_truth);
-    try expectLe("expand stage z", relErr(try hostOf(&sc, sx.z), z_truth), @max(relErr(try hostOf(&sc, ref1.z), z_truth), 2e-6));
-    try expectLe("expand stage h", relErr(try hostOf(&sc, sx.h), h_truth), @max(relErr(try hostOf(&sc, ref1.h), h_truth), 2e-6));
+    try expectNoWorse("expand stage z", relErr(try hostOf(&sc, sx.z), z_truth), relErr(try hostOf(&sc, ref1.z), z_truth));
+    try expectNoWorse("expand stage h", relErr(try hostOf(&sc, sx.h), h_truth), relErr(try hostOf(&sc, ref1.h), h_truth));
 }
 
 test "dsv41 hc stage: in bf16 the stage gives the chain's normed collapse and expanded stream to bf16 ulps" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const d = try hcData(&sc, 1, .bfloat16);
-    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.prev.post, d.prev.comb);
+    const x1_ref = try model.hcExpandOps(&sc, d.x, d.y, d.prev.post, d.prev.comb);
     const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
     try expectLe("bf16 expanded stream", relErrF(try hostOf(&sc, sx.x1), try hostOf(&sc, x1_ref)), 1.0 / 128.0);
     const ref = try composedHc(&sc, &d, x1_ref);
@@ -2781,7 +2907,7 @@ test "dsv41 hc stage: in bf16 the stage gives the chain's normed collapse and ex
 }
 
 test "dsv41 hc stage: a stage that splits its previous mixes gives the split kernel's and the array stage's bytes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const iters = 20;
@@ -2798,7 +2924,7 @@ test "dsv41 hc stage: a stage that splits its previous mixes gives the split ker
 }
 
 test "dsv41 hc split: the lane-per-element split gives the thread-per-row split of the mixes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const mixes = try randn(&sc, &.{ 37, 24 }, .float32, 141, 3.0);
@@ -2819,7 +2945,7 @@ test "dsv41 hc split: the lane-per-element split gives the thread-per-row split 
 }
 
 test "dsv41 hc wide: the mix and norm kernels give the decode stage's mixes, split and normed collapse, bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
@@ -2836,8 +2962,44 @@ test "dsv41 hc wide: the mix and norm kernels give the decode stage's mixes, spl
     }
 }
 
+test "dsv41 hc expand: the kernel gives the op chain's stream, bit for bit" {
+    try mlx.requireGpu();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    try probeHc(sc.a, sc.s, 4, 5120, 20);
+    // The kernel reproduces a TF32-class matmul; where the GPU's is true f32 (relative error under 1e-5 of a stream
+    // element) the load keeps the chain and there is nothing to compare.
+    const tf32_class = blk: {
+        const x = try sc.astype(try randn(&sc, &.{ 1, 4, 64 }, .float32, 185, 1.5), .float32);
+        const comb = try randn(&sc, &.{ 1, 4, 4 }, .float32, 186, 0.5);
+        const got = try hostOf(&sc, try model.hcExpandOps(&sc, x, try sc.zeros(&.{ 1, 64 }, .float32), try sc.zeros(&.{ 1, 4 }, .float32), comb));
+        const xs = try hostOf(&sc, x);
+        const cs = try hostOf(&sc, comb);
+        var worst: f64 = 0;
+        for (0..4) |k| for (0..64) |c| {
+            var t: f64 = 0;
+            for (0..4) |j| t += @as(f64, cs[j * 4 + k]) * xs[j * 64 + c];
+            worst = @max(worst, @abs(got[k * 64 + c] - t) / @max(@abs(t), 1e-3));
+        };
+        break :blk worst > 1e-5;
+    };
+    if (!tf32_class) return;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]c_int{ 5120, 4096, 1000, 40 }) |D| for ([_]c_int{ 1, 3, 16, 17, 33, 100, 1000, 2048, 4096 }) |L| {
+        var cs = Scope.init(testing.allocator, mlx.gpuStream());
+        defer cs.deinit();
+        const x = try cs.astype(try randn(&cs, &.{ L, 4, D }, .float32, 181, 1.5), dt);
+        const y = try cs.astype(try randn(&cs, &.{ L, D }, .float32, 182, 1.0), dt);
+        const post = try randn(&cs, &.{ L, 4 }, .float32, 183, 0.7);
+        const comb = try randn(&cs, &.{ L, 4, 4 }, .float32, 184, 0.5);
+        const want = try hostOf(&cs, try model.hcExpandOps(&cs, x, y, post, comb));
+        const got = try hostOf(&cs, try hcExpandFused(&cs, x, y, post, comb));
+        try expectBitEqual("hc expand", got, want);
+    };
+    try testing.expect(hc_expand_tf32);
+}
+
 test "dsv41 engram: the gate kernel writes the op chain's stream, bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var cfg = Config{};
@@ -2859,7 +3021,7 @@ test "dsv41 engram: the gate kernel writes the op chain's stream, bit for bit" {
 }
 
 test "dsv41 kernels: a new row count, pick count, split count or context width compiles no new Metal library" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const keys = mlx.kernel_keys;

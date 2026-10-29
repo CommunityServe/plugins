@@ -11,17 +11,18 @@ pub const config = @import("config.zig");
 pub const mlx = @import("src/sushi/mlx.zig");
 pub const log = @import("src/sushi/log.zig");
 pub const io_util = @import("src/sushi/io_util.zig");
-const dsv = @import("src/sushi/dsv41_model.zig");
-const dstream = @import("src/sushi/dsv41_stream.zig");
-const source = @import("src/sushi/dsv41_source.zig");
-const engram = @import("src/sushi/dsv41_engram.zig");
+const dsv = @import("src/sushi/dsv41/dsv41_model.zig");
+const dstream = @import("src/sushi/dsv41/dsv41_stream.zig");
+const source = @import("src/sushi/dsv41/dsv41_source.zig");
+const engram = @import("src/sushi/dsv41/dsv41_engram.zig");
 const stream = @import("src/sushi/expert_stream.zig");
 const smodel = @import("src/sushi/model.zig");
-const sc = @import("src/sushi/dsv41_config.zig");
-const vis = @import("src/sushi/dsv41_vision.zig");
-const rows_policy = @import("src/sushi/dspark_rows.zig");
-const borrow = @import("src/sushi/dsv41_borrow.zig");
+const sc = @import("src/sushi/dsv41/dsv41_config.zig");
+const vis = @import("src/sushi/dsv41/dsv41_vision.zig");
+const rows_policy = @import("src/sushi/dsv41/dspark_rows.zig");
+const borrow = @import("src/sushi/dsv41/dsv41_borrow.zig");
 const depth_bounds = @import("src/sushi/mtp_depth_bounds.zig");
+const vision_common = @import("src/sushi/vision_common.zig");
 const attn_nax = @import("src/attn_nax.zig");
 const vision_key = @import("src/vision_key.zig");
 
@@ -93,7 +94,7 @@ fn attnKeys(p: *const abi.Parsed, seq: u64) callconv(.c) u64 {
 fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u64) callconv(.c) u64 {
     _ = kv_bits;
     _ = warm;
-    return config.of(p).transientBytes(chunk, seq);
+    return config.of(p).chunkCap(chunk, seq);
 }
 
 /// Window layers keep a ring; a compressed layer reads the last KV source at or above it.
@@ -131,7 +132,7 @@ fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.St
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = model_dir.slice();
     const trunk = source.residentBytes(io, gpa, dir) catch |e| return Verdict.named(.failed, @errorName(e));
-    const tower = if (config.of(p).vision != null) source.visionBytes(io, gpa, dir) catch |e| return Verdict.named(.failed, @errorName(e)) else 0;
+    const tower = if (config.of(p).vision != null) source.visionBytes(io, gpa, dir, vision_common.vision_bf16) catch |e| return Verdict.named(.failed, @errorName(e)) else 0;
     const stages = if (config.private(p).dspark) source.dsparkBytes(io, gpa, dir) catch |e| return Verdict.named(.failed, @errorName(e)) else 0;
     out.* = trunk + tower + stages;
     return .ok;
@@ -229,8 +230,9 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
 
 /// MLX's freed-buffer pool during decode, which the ledger bills.
 const pool_bytes: u64 = 1 << 30;
-/// The pool a prefill chunk of `sc.prefill_width` rows parks (sushi's `dsv41_prefill_pool_bytes` and its RAM-wide cap on
-/// a 128 GB+ box). At `pool_bytes` a 2048-row chunk frees and remakes its buffers op after op, which halves prefill.
+/// The pool a prefill chunk of `sc.prefill_width` rows parks. At `pool_bytes` a 2048-row chunk frees and remakes its
+/// buffers op after op, which halves prefill. sushi bounds a wide forward's pool with its MLX transient cap, which the
+/// host's MLX does not have, so here the pool keeps a cap of its own and the expert room bills it.
 const prefill_pool_bytes: u64 = 8 << 30;
 /// The prompt positions the expert cache leaves room for when the model sets no `ctx_size`.
 const default_context: u64 = 131072;
@@ -250,7 +252,7 @@ fn gb(b: u64) f64 {
 /// process overhead and one request of `context` positions (its state and one prefill chunk's working set).
 fn expertRoom(ctx: *const abi.LoadCtx, c: *const sc.Config, context: u64) !u64 {
     const ceiling = if (kit.host.Host.of(ctx.host)) |h| h.memoryCeiling() else |_| mlx.maxRecommendedWorkingSet();
-    const request = c.transientBytes(host_chunk, context) +| (context +| generation_rows) *| c.stateBytesPerToken() +| c.stateFixedBytes(false) +|
+    const request = c.chunkCap(host_chunk, context) +| (context +| generation_rows) *| c.stateBytesPerToken() +| c.stateFixedBytes(false) +|
         (prefill_pool_bytes - pool_bytes);
     return ceiling -| ctx.wired_margin_bytes -| host_bytes -| request;
 }
@@ -369,10 +371,10 @@ fn forwardRows(m: *Model, rows: []const u32, want: dsv.Want, ahead: []const u32,
 }
 
 /// Moves MLX's buffer-pool cap to the one a pass of `rows` parks, as sushi's server does per forward
-/// (`dsv41_borrow.enterForward`): the decode cap up to a verify block, growing to the prefill cap at a full chunk. A
-/// lower cap trims lazily, so the clear makes the parked pool what the expert room billed.
+/// (`dsv41_borrow.enterForward`): the decode cap up to a verify block, the prefill cap above it. A lower cap trims
+/// lazily, so the clear makes the parked pool what the expert room billed.
 fn poolForRows(m: *Model, rows: usize) void {
-    const want = borrow.poolCap(rows, pool_bytes, prefill_pool_bytes, prefill_pool_bytes);
+    const want = borrow.poolCap(rows, pool_bytes, prefill_pool_bytes);
     if (want == m.pool_now) return;
     var prev: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev, @intCast(want));

@@ -1,10 +1,12 @@
-//! The Metal test of `attn_nax.zig`: `attnFusedNax` against the slice's `attnFused` at the release's attention shape.
+//! The Metal test of `attn_nax.zig`: `attnFusedNax` against the slice's `attnFused`, and `attnFusedNaxPacked` against
+//! `attnFusedPacked`, at the release's attention shape.
 //! The root of `zig build gpu-test -Dmlx-lib=<dir>` only (it links that MLX and sets SUSHI_DS41_GPU_TEST); skipped
 //! without an M5. It also runs `vision_key.zig`'s test, which needs MLX but no M5.
 const std = @import("std");
 const mlx = @import("sushi/mlx.zig");
-const sc_mod = @import("sushi/dsv41_scope.zig");
-const kernels = @import("sushi/dsv41_kernels.zig");
+const sc_mod = @import("sushi/dsv41/dsv41_scope.zig");
+const kernels = @import("sushi/dsv41/dsv41_kernels.zig");
+const dsv = @import("sushi/dsv41/dsv41_model.zig");
 const nax = @import("attn_nax.zig");
 
 const A = sc_mod.A;
@@ -90,5 +92,45 @@ test "sushi_ds41 gpu: attnFusedNax gives attnFused's heads at the release shapes
         const g = maxDiff(got_r, want_r);
         const mant: i32 = if (c.dt == .float16) 10 else 7;
         try testing.expect(g.err <= std.math.ldexp(@as(f64, 1.0), std.math.frexp(g.peak).exponent - 1 - mant));
+    }
+}
+
+/// One ulp of `peak` at `mant` mantissa bits.
+fn ulpOf(peak: f64, mant: i32) f64 {
+    return std.math.ldexp(@as(f64, 1.0), std.math.frexp(peak).exponent - 1 - mant);
+}
+
+test "sushi_ds41 gpu: attnFusedNaxPacked reads the packed store as attnFusedNax reads its unpacked picks, and stays within attnFusedPacked's heads" {
+    if (std.c.getenv("SUSHI_DS41_GPU_TEST") == null) return error.SkipZigTest;
+    if (!nax.naxAvailable()) return error.SkipZigTest;
+    const testing = std.testing;
+    // sushi's own packed-picks cases at the release's heads (dsv41_model.zig): release spans, a short span and a few picks.
+    const cases = [_]dsv.AttnCase{
+        .{ .L = 256, .wp = 127, .K = 512, .nc = 700 },
+        .{ .L = 256, .wp = 127, .K = 512, .nc = 4096, .holes = false },
+        .{ .L = 100, .wp = 63, .K = 512, .nc = 40 },
+        .{ .L = 17, .wp = 5, .K = 512, .nc = 9 },
+    };
+    for (cases, 0..) |c, ci_| {
+        var sc = Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const d = try dsv.attnCaseData(&sc, c, 0xb11 + ci_);
+        var rows = try dsv.packedStore(&sc, d.comp);
+        defer rows.deinit();
+        const pk = rows.pack.?;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
+        const unpacked = try dsv.packedPicks(&sc, &rows, d.topk, false);
+        try testing.expect(unpacked.store == null);
+        for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |out_dt| {
+            const got = try sc_mod.hostF32(try sc.astype(try nax.attnFusedNaxPacked(&sc, d.sink, d.q, d.keys, c.wp, c.window, rows.buf, rows.sbuf, pk.mode, pk.group, d.topk, scale, out_dt), .float32));
+            // Byte for byte the heads of the unpacked and gathered picks, as sushi holds attnFusedPacked to attnFused.
+            const rows_path = try sc_mod.hostF32(try sc.astype(try nax.attnFusedNax(&sc, d.sink, d.q, d.keys, c.wp, c.window, unpacked.comp_rows, unpacked.topk, scale, out_dt), .float32));
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(rows_path), std.mem.sliceAsBytes(got));
+            // Within the bounds the first test holds attnFusedNax to attnFused.
+            const want = try sc_mod.hostF32(try sc.astype(try kernels.attnFusedPacked(&sc, d.sink, d.q, d.keys, c.wp, c.window, rows.buf, rows.sbuf, pk.mode, pk.group, d.topk, scale, out_dt), .float32));
+            const f = maxDiff(got, want);
+            errdefer std.debug.print("case {d} {s}: err {e} peak {e}\n", .{ ci_, @tagName(out_dt), f.err, f.peak });
+            if (out_dt == .float32) try testing.expect(f.err <= 3e-5 * f.peak) else try testing.expect(f.err <= ulpOf(f.peak, 7));
+        }
     }
 }
