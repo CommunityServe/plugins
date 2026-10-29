@@ -54,7 +54,11 @@ simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2
   compressed rows read packed from the store as sushi's kernel reads them; other GPUs keep that kernel. The edit to the
   slice that calls it is `patches/attn-nax.patch` (`fusedHeads`).
 - Prefill: the whole prompt in one host call (`whole_prompt_prefill`), chunked here at `prefill_width` as sushi does; a
-  long prompt is one uncancellable call.
+  long prompt is one uncancellable call. A chunk that another chunk follows skips its CED decoder tail
+  (`patches/ced-state.patch`, `extendState`): it runs the layers below the split and the split layer's compressor, since
+  the next chunk's tail overwrites the 128-row rings that tail would fill. Prefill 8k / 32k / 64k 2466 / 2758 / 2729 to
+  2562 / 3079 / 3063 tok/s on the M5 Ultra; text and logprobs are byte-identical on 8k to 64k prompts, a merged tail, an
+  image and a prefix-cache restore.
 - Not supported: Thunderbolt pair, other quant formats, snapshot serialization (no SSD tier).
 
 `plugin check` needs a conformance fixture pack, which an STQ pack cannot provide small; the plugin is checked by serving.

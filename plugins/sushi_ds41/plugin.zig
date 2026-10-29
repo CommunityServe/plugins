@@ -350,7 +350,10 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows) !mlx
         var end = @min(at + sc.prefill_width, prefix);
         if (end < prefix and prefix - end < sc.tail_merge_rows) end = prefix;
         const next = if (end < prefix) @min(end + sc.prefill_width, prefix) else ids.len;
-        _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
+        // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
+        // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
+        // its decoder (`extendState`).
+        if (end < prefix and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
         if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
         at = end;
     }
@@ -371,6 +374,15 @@ fn forwardRows(m: *Model, rows: []const u32, want: dsv.Want, ahead: []const u32,
     m.engine.finishForward(rows.len);
     try m.ids.appendSlice(gpa, rows);
     return logits;
+}
+
+/// `forwardRows` for a chunk that leaves only state behind (`dsv.extendState`).
+fn stateRows(m: *Model, rows: []const u32, ahead: []const u32, media: ?dsv.VisionRows) !void {
+    poolForRows(m, rows.len);
+    m.engine.beginForward();
+    try dsv.extendState(m.mdl, rows, dsv.SPAN, media, ahead);
+    m.engine.finishForward(rows.len);
+    try m.ids.appendSlice(gpa, rows);
 }
 
 /// Moves MLX's buffer-pool cap to the one a pass of `rows` parks, as sushi's server does per forward
