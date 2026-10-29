@@ -16,11 +16,14 @@
 #   - in the kernel contract's registry (sdk/testing/kernel_contract/registry.zig), its `areas` cut to REGISTRY_AREAS:
 #     the areas whose kernels this plugin ships, which its GPU tests (`zig build gpu-test`) hold to the contract.
 # MODULES are directories mlx-serve builds as modules of their own (Sushi's EXL3 decode, `sushi_exl3`): their Zig files
-# and kernels are copied whole (their test fixtures are not), with no edit but the `copied_from` line. The kernel
-# contract's planted controls (`controls/*.metal`) come with its `controls.zig`.
+# are copied whole (their test fixtures are not), with no edit but the `copied_from` line, but for MODULE_STAND_INS,
+# and of their other files only the kernels a copied Zig file of theirs names. The kernel contract's planted controls
+# (`controls/*.metal`) come with its `controls.zig`.
 # Files in EDGES are this plugin's own, at the paths of the mlx-serve files they stand in for, and never overwritten.
 # Every other file a copy imports gets a stand-in: an empty file, so the import resolves while nothing of it is used
-# (a use is a compile error, never a silent difference).
+# (a use is a compile error, never a silent difference). Zig loads every file a file imports, used or not, so a file
+# the plugin's builds reach no code of is a stand-in rather than a copy: slice.txt leaves it out, MODULE_STAND_INS
+# names it inside a module.
 # scripts/sync-mlx-serve.sh --check <mlx-serve checkout> <ref>: does <ref> change the slice (or a cut edge's mlx-serve
 # file, which is then reviewed by hand) since MLX_SERVE_COMMIT? Exit 0 when the pin holds, 1 with the changed files.
 set -euo pipefail
@@ -36,6 +39,9 @@ sdk/quant/gguf/format.zig engines/mlx/admission/bills.zig sdk/util/shared.zig en
 engines/mlx/spec/mtp_head_ref.zig sdk/ane/offload.zig"
 
 MODULES="sdk/quant/exl3/sushi"
+# A module's files the plugin's builds reach no code of (its root imports them).
+MODULE_STAND_INS="sdk/quant/exl3/sushi/glm_group2.zig sdk/quant/exl3/sushi/glm_prefill_grid.zig
+sdk/quant/exl3/sushi/layout.zig sdk/quant/exl3/sushi/rate_groups.zig"
 
 # The kernel contract's areas this plugin keeps (the registry's paths), in the registry's order.
 REGISTRY_AREAS="controls.zig ../../blocks/hc/contract.zig ../../blocks/gdn/contract.zig ../../../engines/mlx/spec/contract.zig
@@ -54,7 +60,7 @@ fi
 repo="${1:?mlx-serve checkout}"
 sha="$(git -C "$repo" rev-parse HEAD)"
 for e in $EDGES; do [ -f "$dst/$e" ] || { echo "the cut edge $e is missing" >&2; exit 1; }; done
-REGISTRY_AREAS="$(echo $REGISTRY_AREAS)" python3 - "$repo" "$sha" "$dst" "$here/scripts/slice.txt" "$MODULES" $EDGES <<'P'
+REGISTRY_AREAS="$(echo $REGISTRY_AREAS)" MODULE_STAND_INS="$(echo $MODULE_STAND_INS)" python3 - "$repo" "$sha" "$dst" "$here/scripts/slice.txt" "$MODULES" $EDGES <<'P'
 import os, pathlib, re, sys
 repo, sha, dst, slice_file, edges = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3]), sys.argv[4], set(sys.argv[6:])
 modules = sys.argv[5].split()
@@ -162,14 +168,23 @@ for s in stand_ins:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(f"//! stand_in: src/{s}@{sha}: the copies import it, this plugin uses nothing of it.\n")
 module_files = set()
+module_stand_ins = set(os.environ["MODULE_STAND_INS"].split())
 for mdir in modules:
-    for q in sorted((repo / "src" / mdir).rglob("*")):
+    srcs = [q for q in sorted((repo / "src" / mdir).rglob("*")) if q.is_file() and "/fixtures/" not in str(q.relative_to(repo / "src"))]
+    missing = sorted(m for m in module_stand_ins if m.startswith(mdir + "/") and not (repo / "src" / m).is_file())
+    if missing:
+        sys.exit(f"MODULE_STAND_INS names files {mdir} does not have: {missing}")
+    # What the module's copied Zig files say: a kernel only they name comes along.
+    named = "".join(q.read_text() for q in srcs if q.suffix == ".zig" and str(q.relative_to(repo / "src")) not in module_stand_ins)
+    for q in srcs:
         rel = str(q.relative_to(repo / "src"))
-        if not q.is_file() or "/fixtures/" in rel:
+        if q.suffix != ".zig" and f'"{q.relative_to(repo / "src" / mdir)}"' not in named:
             continue
         out = dst / rel
         out.parent.mkdir(parents=True, exist_ok=True)
-        if q.suffix == ".zig":
+        if rel in module_stand_ins:
+            out.write_text(f"//! stand_in: src/{rel}@{sha}: the module's root imports it, this plugin uses nothing of it.\n")
+        elif q.suffix == ".zig":
             out.write_text(f"//! copied_from: src/{rel}@{sha}\n" + q.read_text())
         else:
             out.write_bytes(q.read_bytes())

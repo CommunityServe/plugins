@@ -1,4 +1,6 @@
-# The mlx-serve files this plugin copies, as paths under mlx-serve's src/ (scripts/sync-mlx-serve.sh).
+# The mlx-serve files this plugin copies, as paths under mlx-serve's src/ (scripts/sync-mlx-serve.sh): each one holds
+# code the plugin's builds reach. A file a copy imports with no code reached is left out, and the script writes it as
+# a stand-in.
 engines/mlx/batched/layered.zig
 engines/mlx/batched/row_axis_verify.zig
 engines/mlx/cache/kv_quant.zig
@@ -8,7 +10,6 @@ engines/mlx/eval_cadence.zig
 engines/mlx/forward_ctx.zig
 engines/mlx/kv/cache.zig
 engines/mlx/kv/cache_ops.zig
-engines/mlx/kv/sliding.zig
 engines/mlx/layer_weights.zig
 engines/mlx/load/exl3_bank.zig
 engines/mlx/load/layers_layered.zig
@@ -49,14 +50,12 @@ plugins/qwen4_exp/contract_merges.zig
 plugins/qwen4_exp/contract_qsa_attn.zig
 plugins/qwen4_exp/contract_qsa_gather.zig
 plugins/qwen4_exp/cost_profile.zig
-plugins/qwen4_exp/fixture.zig
 plugins/qwen4_exp/forward.zig
 plugins/qwen4_exp/hc.zig
 plugins/qwen4_exp/hc_fused.zig
 plugins/qwen4_exp/load.zig
 plugins/qwen4_exp/model_config.zig
 plugins/qwen4_exp/mtp.zig
-plugins/qwen4_exp/mtp_generate.zig
 plugins/qwen4_exp/ple.zig
 plugins/qwen4_exp/ple_gpu.zig
 plugins/qwen4_exp/ple_table.zig
@@ -93,9 +92,7 @@ plugins/qwen4_exp/trunk_load.zig
 plugins/qwen4_exp/wave.zig
 plugins/qwen4_exp/weights.zig
 sdk/bases/block.zig
-sdk/bases/blocks/linear.zig
 sdk/bases/blocks/row_exact.zig
-sdk/bases/blocks/sliding.zig
 sdk/bases/run.zig
 sdk/blocks/attention/attn256.zig
 sdk/blocks/attention/batched.zig
@@ -104,7 +101,6 @@ sdk/blocks/attention/gates.zig
 sdk/blocks/attention/kv_quant.zig
 sdk/blocks/attention/kv_quant_attn.zig
 sdk/blocks/attention/kv_view.zig
-sdk/blocks/attention/lane_attn.zig
 sdk/blocks/attention/nax_attention.zig
 sdk/blocks/attention/row_attn.zig
 sdk/blocks/attention/sdpa.zig
@@ -135,11 +131,9 @@ sdk/blocks/hc/hc_decode2_test.zig
 sdk/blocks/hc/hc_prefill.zig
 sdk/blocks/hc/hc_prefill_cuda.zig
 sdk/blocks/hc/hc_prefill_nax.zig
-sdk/blocks/kda/gate.zig
 sdk/blocks/linear/fused_rows.zig
 sdk/blocks/linear/prefill_dq_gemm.zig
 sdk/blocks/linear/qmatmul.zig
-sdk/blocks/linear/qmv_rows.zig
 sdk/blocks/linear/verify_projection.zig
 sdk/blocks/linear/verify_qmm.zig
 sdk/blocks/linear/verify_qmm_nax.zig
@@ -162,7 +156,6 @@ sdk/blocks/moe/router_kernel.zig
 sdk/blocks/moe/routing.zig
 sdk/blocks/moe/verify_kernels.zig
 sdk/blocks/moe/weights.zig
-sdk/blocks/norms/add_norm.zig
 sdk/blocks/norms/residual_norm.zig
 sdk/blocks/qmm/lane_qmm.zig
 sdk/blocks/qmm/mxfp8_qmv.zig
@@ -170,15 +163,12 @@ sdk/blocks/qmm/qmm_int8.zig
 sdk/blocks/qmm/qmv2.zig
 sdk/blocks/qmm/qmv_cuda.zig
 sdk/blocks/qmm/qmv_nax2.zig
-sdk/blocks/qmm/rowqmv.zig
 sdk/blocks/qmm/simd_qmm.zig
 sdk/blocks/rope/mrope.zig
 sdk/blocks/rope/qk_norm_rope.zig
 sdk/blocks/rope/rope.zig
 sdk/blocks/rope/yarn.zig
 sdk/blocks/ssm/mamba2_decode.zig
-sdk/config/generation.zig
-sdk/config/merge.zig
 sdk/config/model.zig
 sdk/diag/standin.zig
 sdk/kv/cache.zig
@@ -213,15 +203,12 @@ sdk/testing/kernel_contract/root.zig
 sdk/testing/kernel_contract/set.zig
 sdk/testing/kernel_contract/spec.zig
 sdk/util/crt.zig
-sdk/util/err_name.zig
 sdk/util/io_util.zig
-sdk/util/state_rows.zig
 sdk/util/system.zig
 sdk/vision/mrope.zig
 sdk/vision/splice.zig
 sdk/weights/load.zig
 sdk/weights/nocache_reader.zig
 sdk/weights/resident.zig
-sdk/weights/routed.zig
 sdk/weights/shard.zig
 sdk/weights/streamed.zig

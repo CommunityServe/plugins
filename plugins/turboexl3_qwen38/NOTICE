@@ -8,14 +8,17 @@ Copyright (c) 2026 David Dalcu
 Licensed under the MIT License.
 
 src/mlx_serve/ holds the slice of mlx-serve's src/ this plugin runs (scripts/slice.txt), at the paths it has there, from
-the commit in src/mlx_serve/MLX_SERVE_COMMIT (the head of ddalcu/mlx-serve#1005), with the Metal kernels it embeds.
-The script's edits: each file's `copied_from` line; the imports of what the kit ships, pointed at the kit; mlx-c handles
-default-initialised with their one field; `pub` on six functions of plugins/qwen4_exp/plugin.zig and on its model's `ownSlot`; and abi/quant.zig
-with the declarations the kit's quant ABI has unchanged re-exported from the kit; and the kernel contract's registry
+the commit in src/mlx_serve/MLX_SERVE_COMMIT (the head of ddalcu/mlx-serve#1005), with the Metal kernels it embeds. The
+slice is the files that hold code the plugin's builds compile (the dylib, `zig build test`, mlx-free-test and gpu-test),
+found from those builds' symbols and the compiler's errors. The script's edits: each file's `copied_from` line; the
+imports of what the kit ships, pointed at the kit; mlx-c handles default-initialised with their one field; `pub` on six
+functions of plugins/qwen4_exp/plugin.zig and on its model's `ownSlot`; and abi/quant.zig with the declarations the
+kit's quant ABI has unchanged re-exported from the kit; and the kernel contract's registry
 (sdk/testing/kernel_contract/registry.zig) with its `areas` cut to those whose kernels this plugin ships. A `stand_in`
-file is an empty one for an import nothing uses. The script's cut edges (its EDGES list) are this plugin's own code, not copies; one of them,
-engines/mlx/generate/generator.zig, declares the fields of mlx-serve's Generator that the copied MTP round policy
-(engines/mlx/spec/mtp/) reads, with their types and defaults, and names the copies' own methods.
+file is an empty one for an import whose code no build compiles: Zig loads every file a file imports. The script's cut
+edges (its EDGES list) are this plugin's own code, not copies; one of them, engines/mlx/generate/generator.zig, declares
+the fields of mlx-serve's Generator that the copied MTP round policy (engines/mlx/spec/mtp/) reads, with their types and
+defaults, and names the copies' own methods.
 
 --------------------------------------------------------------------------------
 Sushi
@@ -25,8 +28,9 @@ Copyright (c) 2026 David Dalcu
 Licensed under the MIT License.
 
 src/mlx_serve/sdk/quant/exl3/sushi/ is mlx-serve's copy of Sushi v1.3.0's `src/exl3` (commit 8e4c0af1), as mlx-serve
-ships it (its NOTICE has the details), without its test fixtures. It re-implements turboderp/exllamav3's EXL3 format
-(MIT); no exllamav3 code is shipped.
+ships it (its NOTICE has the details), without its test fixtures, with the four files no build compiles code of as
+stand-ins (scripts/sync-mlx-serve.sh's MODULE_STAND_INS) and only the kernels its other files name. It re-implements
+turboderp/exllamav3's EXL3 format (MIT); no exllamav3 code is shipped.
 
 --------------------------------------------------------------------------------
 MLX
