@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Copies the DeepSeek-V4.1 slice of sushi into src/sushi/ unchanged. Usage: scripts/sync-sushi.sh <sushi checkout>
+# Copies the DeepSeek-V4.1 slice of sushi into src/sushi/, then applies this repo's edits to it (patches/*.patch and
+# the bill fix below). Usage: scripts/sync-sushi.sh <sushi checkout>
 # src/sushi/{model,transformer,status,scheduler,test_models,tokenizer}.zig are ours (the cut edges) and never overwritten.
 # scripts/sync-sushi.sh --check <sushi checkout> <ref>: does <ref> (a release tag or commit) change the slice since
 # SUSHI_COMMIT? Exit 0 when the pin holds, 1 with the changed files when a sync is due.
 set -euo pipefail
-dst="$(cd "$(dirname "$0")/.." && pwd)/src/sushi"
+plugin="$(cd "$(dirname "$0")/.." && pwd -P)"
+dst="$plugin/src/sushi"
 files="dsv41_borrow dsv41_config dsv41_engram dsv41_kernels dsv41_model dsv41_owned dsv41_qat dsv41_scope dsv41_source dsv41_stream dsv41_vision vision_common dspark_rows dflash_policy spec_cost_gate mtp_depth_bounds
 expert_bf16_kernels expert_io expert_quant expert_stream expert_usage io_util log mlx mlx_kernel_keys test_expect glm_stream_fixture"
 
@@ -27,4 +29,10 @@ mkdir -p "$dst/fixtures"; cp "$src/fixtures/dsv41_engram_token_map.bin" "$dst/fi
 cfg="$dst/dsv41_config.zig"
 grep -q 'const span = @min(rows, span_rows);' "$cfg"
 sed -i.bak 's/const span = @min(rows, span_rows);/const span: u64 = @min(rows, span_rows);/' "$cfg"; rm "$cfg.bak"
+# patches/*.patch, in name order (paths relative to the plugin). `git apply` is all or nothing: a patch that no longer
+# applies to the new slice stops the sync with the files it names.
+top="$(git -C "$plugin" rev-parse --show-toplevel)"
+for p in "$plugin"/patches/*.patch; do
+  git -C "$top" apply --directory="${plugin#"$top"/}" "$p" || { echo "sync-sushi: $(basename "$p") does not apply; redo it on the new slice" >&2; exit 1; }
+done
 echo "$(git -C "${1}" rev-parse HEAD)" > "$dst/SUSHI_COMMIT"

@@ -19,7 +19,7 @@ const TDtype = struct { name: [*:0]const u8, dt: mlx.mlx_dtype };
 const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
 
 /// A kernel's source and signature; the pipeline is built on first use.
-const Def = struct {
+pub const Def = struct {
     name: [*:0]const u8,
     ins: []const [*:0]const u8,
     outs: []const [*:0]const u8,
@@ -30,7 +30,7 @@ const Def = struct {
 
 const Grid = [3]usize;
 
-fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid: Grid, tg: Grid, ints: []const Tmpl, dts: []const TDtype, result: []A) !void {
+pub fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid: Grid, tg: Grid, ints: []const Tmpl, dts: []const TDtype, result: []A) !void {
     const k = try qat_mod.kernelNew(&def.built, def.name, def.ins, def.outs, def.source, def.header);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -42,7 +42,7 @@ fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid:
     try qat_mod.applyKernel(sc, k, inputs, cfg, result);
 }
 
-fn f32Const(sc: *Scope, vals: []const f32) !A {
+pub fn f32Const(sc: *Scope, vals: []const f32) !A {
     return sc.floats(vals, &.{ci(vals.len)});
 }
 

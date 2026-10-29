@@ -22,6 +22,7 @@ const vis = @import("src/sushi/dsv41_vision.zig");
 const rows_policy = @import("src/sushi/dspark_rows.zig");
 const borrow = @import("src/sushi/dsv41_borrow.zig");
 const depth_bounds = @import("src/sushi/mtp_depth_bounds.zig");
+const attn_nax = @import("src/attn_nax.zig");
 const stb = @import("stb");
 
 /// Shown at install and in Settings.
@@ -191,6 +192,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.engine.warmCache() catch |e| log.warn("[sushi_ds41] expert cache warm failed: {s}\n", .{@errorName(e)});
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
+    const nax = attn_nax.fits(c.heads, c.head_dim, .bfloat16);
+    log.info("[sushi_ds41] wide-span attention: {s}\n", .{if (nax) "matmul2d (the M5's matrix units)" else "attnFused (simdgroup matrices)"});
     // As sushi's server does: a synced per-stage `[dsv41-prof]` line per wide chunk, and with the verify profile per
     // decode-width chunk too.
     const verify_profile = std.c.getenv("SUSHI_DSV41_VERIFY_PROFILE") != null;
@@ -389,6 +392,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 
 test {
     _ = config;
+    _ = attn_nax;
 }
 
 // ── prefix cache ──

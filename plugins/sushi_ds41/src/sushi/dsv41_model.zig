@@ -12,6 +12,7 @@ const cfg_mod = @import("dsv41_config.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
+const attn_nax = @import("../attn_nax.zig");
 const engram = @import("dsv41_engram.zig");
 const source = @import("dsv41_source.zig");
 const owned_mod = @import("dsv41_owned.zig");
@@ -1799,7 +1800,9 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             try p.mark(.indexer, got[0..if (picks.comp_rows.ctx != null) 3 else 1]);
         }
         const K = if (picks.comp_rows.ctx != null) dim(picks.topk, 1) else 0;
-        const head = if (fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and kernels.attnFusedFits(H, hd))
+        const head = if (fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and attn_nax.fits(H, hd, .bfloat16))
+            try attn_nax.attnFusedNax(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks.comp_rows, picks.topk, scale, m.act)
+        else if (fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and kernels.attnFusedFits(H, hd))
             try kernels.attnFused(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks.comp_rows, picks.topk, scale, m.act)
         else if (m.attn_f16 and fus and (m.act == .bfloat16 or m.act == .float16) and wk + K <= kernels.attn_softmax_max_cols)
             try kernels.attnWide(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks.comp_rows, picks.topk, scale, m.act)
