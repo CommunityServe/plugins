@@ -11,7 +11,7 @@ expert_bf16_kernels expert_io expert_quant expert_stream expert_usage io_util lo
 if [ "${1:-}" = "--check" ]; then
   repo="${2:?sushi checkout}"; ref="${3:?release tag or commit}"
   pin="$(tr -d '[:space:]' < "$dst/SUSHI_COMMIT")"
-  paths=(src/exl3 lib/stb_image.h lib/stb_image_impl.c src/fixtures/dsv41_engram_token_map.bin)
+  paths=(src/exl3 src/fixtures/dsv41_engram_token_map.bin)
   for f in $files; do paths+=("src/$f.zig"); done
   changed="$(git -C "$repo" diff --name-only "$pin" "$ref" -- "${paths[@]}")"
   if [ -z "$changed" ]; then echo "pin holds: $ref changes nothing in the slice since ${pin:0:8}"; exit 0; fi
@@ -21,7 +21,6 @@ fi
 src="${1:?sushi checkout}/src"
 for f in $files; do cp "$src/$f.zig" "$dst/$f.zig"; done
 rm -rf "$dst/exl3"; mkdir "$dst/exl3"; cp "$src"/exl3/*.zig "$dst/exl3/"
-mkdir -p "$dst/../stb"; cp "${1}/lib/stb_image.h" "${1}/lib/stb_image_impl.c" "$dst/../stb/"
 mkdir -p "$dst/fixtures"; cp "$src/fixtures/dsv41_engram_token_map.bin" "$dst/fixtures/"
 # sushi's bill multiplies `@min(rows, span_rows)`, which Zig narrows to u9: the product overflows (wraps in a release build).
 cfg="$dst/dsv41_config.zig"

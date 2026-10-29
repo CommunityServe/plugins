@@ -1,3 +1,3 @@
 sushi-ds41 vendors a slice of sushi (MIT, Theinruj Toranavikrai and David Dalcu) in src/sushi/, copied unchanged by
 scripts/sync-sushi.sh from commit 3fc47d8a460970b1e86b24de1cab3b0f2067bc72. The files model.zig, transformer.zig, status.zig,
-scheduler.zig, test_models.zig and tokenizer.zig there are this repo's own cut edges. src/stb/ is stb_image (Sean Barrett, public domain / MIT). It is built against the mlx-serve plugin kit.
+scheduler.zig, test_models.zig and tokenizer.zig there are this repo's own cut edges. It is built against the mlx-serve plugin kit.
