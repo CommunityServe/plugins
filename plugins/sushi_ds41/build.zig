@@ -31,5 +31,5 @@ pub fn build(b: *std.Build) void {
     gpu.addRPath(.{ .cwd_relative = mlx_lib });
     const gpu_run = b.addRunArtifact(b.addTest(.{ .root_module = gpu, .filters = &.{"sushi_ds41 gpu"} }));
     gpu_run.setEnvironmentVariable("SUSHI_DS41_GPU_TEST", "1");
-    b.step("gpu-test", "Run the Metal test (needs -Dmlx-lib; skips without an M5)").dependOn(&gpu_run.step);
+    b.step("gpu-test", "Run the Metal tests (needs -Dmlx-lib; the matmul2d ones skip without an M5)").dependOn(&gpu_run.step);
 }
