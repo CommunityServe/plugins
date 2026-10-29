@@ -11,11 +11,6 @@ const log = @import("../util/log.zig");
 const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
 const DenseKVView = @import("../blocks/attention/kv_view.zig").DenseKVView;
 
-pub fn arrayBytes(arr: mlx.mlx_array) u64 {
-    if (arr.ctx == null) return 0;
-    return @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
-}
-
 // ── KV Cache (standard attention) ──
 
 pub const KVCacheEntry = struct {
@@ -76,14 +71,6 @@ pub fn newEmptyKVEntry() KVCacheEntry {
     };
 }
 
-/// Reset a cache entry to the empty state, freeing all storage + view
-/// handles. Mirror of the per-entry reset in `KVCache.restore`; used by the
-/// disk tier (kv_disk_cache.zig) when installing restored buffers.
-pub fn resetKVEntry(e: *KVCacheEntry) void {
-    freeKVEntry(e);
-    e.* = newEmptyKVEntry();
-}
-
 pub fn freeKVEntry(e: *KVCacheEntry) void {
     _ = mlx.mlx_array_free(e.keys);
     _ = mlx.mlx_array_free(e.values);
@@ -127,33 +114,6 @@ pub const KVCache = struct {
             freeKVEntry(e);
         }
         self.allocator.free(self.entries);
-    }
-
-    /// Swap this cache for a freshly-built one under `config`. BUILD FIRST,
-    /// then free: `initWithConfig` is fallible, and a caller that reached it
-    /// through `cache.deinit(); cache = try init(...)` left a FREED cache
-    /// installed on the Transformer on the error path, whose own `deinit`
-    /// then freed every handle a second time. The class is "a fallible
-    /// re-init behind a deinit"; keeping the order inside ONE helper is what
-    /// stops it recurring, so the call sites are scan-pinned to use it.
-    pub fn reinit(self: *KVCache, num_layers: u32, config: KVQuantConfig) !void {
-        const fresh = try initWithConfig(self.allocator, num_layers, config);
-        self.deinit();
-        self.* = fresh;
-    }
-
-    /// Capture cache state for speculative-decoding rollback (PLD/drafter).
-    /// GPU bytes of the buffers this cache owns. A restored share is billed to
-    /// the hot-cache entry that owns its buffer.
-    pub fn residentBytes(self: *const KVCache) u64 {
-        var total: u64 = 0;
-        for (self.entries) |e| {
-            if (!e.initialized or e.shared_view) continue;
-            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
-                total += arrayBytes(arr);
-            }
-        }
-        return total;
     }
 
     /// Snapshots own array handles that share the underlying buffer with the
@@ -248,19 +208,6 @@ pub const KVCache = struct {
         return n_chunks * chunk_step;
     }
 
-    /// Tokens of capacity a request reserves: prompt + allowed generation + one chunk of slack.
-    /// The one definition; `server.reservedCacheTokens` delegates here.
-    pub fn reservedTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
-        // Short prompts keep the proportional policy: reserving costs them `max_tokens` of KV they may never use.
-        if (seq < RESERVE_MIN_TOKENS) return 0;
-        // An omitted `max_tokens` is maxInt(u32)/4 (~26 TB of KV), so bound by the context AND
-        // by the generation headroom: reserving `ctx - prompt` billed 13 GB at 383k on a
-        // 1M-context qwen4_exp. `ctx == 0` = unknown, no clamp.
-        const want: u64 = @min(max_tokens, RESERVE_GEN_HEADROOM);
-        const head_room: u64 = if (ctx > seq) @min(want, ctx - seq) else if (ctx > 0) 0 else want;
-        return seq +| head_room +| @max(chunk, 1);
-    }
-
     /// Tokens of generation the reservation pre-buys. Past it a decode grow takes the ordinary
     /// +25% policy, which happens between decode steps, never inside a chunk's lazy graph.
     /// 8192 covers essentially every real request at ~100 MB of KV on qwen4_exp at 8-bit.
@@ -272,11 +219,6 @@ pub const KVCache = struct {
 
     /// How many times a KV capacity buffer actually grew (the moments a second copy of the whole cache exists).
     pub var kv_cap_buf_grows: usize = 0;
-
-    /// Ask this cache to hold `tokens` up front. Idempotent and monotone.
-    pub fn reserve(self: *KVCache, tokens: usize) void {
-        if (tokens > self.reserve_tokens) self.reserve_tokens = tokens;
-    }
 
     /// The capacity a grow takes: the proportional policy, raised to the reservation when there is one.
     pub fn nextCapacityReserved(self: *const KVCache, current_cap: usize, needed: usize) usize {
@@ -543,17 +485,6 @@ pub const KVCache = struct {
         try buildSliceView(s, &entry.value_biases_view, entry.values_biases, total, view_start);
     }
 
-    /// `update` for a layer that attends only its last `window` keys: the buffer keeps the newest
-    /// `keep` rows (>= window) and drops the rest on its next grow, so it stays near keep + one
-    /// chunk however long the sequence runs. Positions stay absolute (`offset`, `step`).
-    pub fn updateSliding(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32, window: u32, keep: u32) !DenseKVView {
-        std.debug.assert(keep >= window and max_seq <= keep + @as(u32, @intCast(mlx.getShape(new_k)[2])));
-        const e = &self.entries[layer];
-        e.keep = keep;
-        e.window = window;
-        return self.update(layer, new_k, new_v, s, max_seq);
-    }
-
     /// A grow: the capacity to allocate, and which of the current rows move into it.
     const Grow = struct { cap: c_int, drop: usize, kept: usize };
 
@@ -723,28 +654,7 @@ pub const KVCache = struct {
         cap: usize = std.math.maxInt(usize),
         seen: usize = 0,
 
-        /// `null` = this layer holds no buffer (a linear layer, or a cold cache).
-        pub fn add(self: *CapacityFold, entry_cap: ?usize) void {
-            const v = entry_cap orelse return;
-            self.seen += 1;
-            self.cap = @min(self.cap, v);
-        }
-
-        pub fn result(self: CapacityFold) usize {
-            return if (self.seen == 0) 0 else self.cap;
-        }
     };
-
-    /// Tokens of capacity every caching layer's buffer already holds: the warm bill's one
-    /// gate. Restored rows are free only while the buffer is reused in place; past this
-    /// capacity a grow allocates a whole new buffer beside the old one. The MINIMUM across
-    /// layers, since the credit must be provable for every buffer the prefill writes.
-    pub fn residentCapacityTokens(self: *const KVCache) usize {
-        var fold = CapacityFold{};
-        // A sliding ring is billed as a fixed per-slot term, never by its capacity.
-        for (self.entries) |*e| fold.add(if (e.initialized and e.keep == 0) bufferCapacity(e.keys) else null);
-        return fold.result();
-    }
 
     /// Buffer-grow / slice-update / view-build, parameterized over the
     /// buffer's last dim and dtype: six calls per `updateAffine` (3 buffers ×
@@ -810,84 +720,6 @@ pub const KVCache = struct {
             const v_stop = [_]c_int{ cur_shape[0], cur_shape[1], total, cur_shape[3] };
             const v_strides = [_]c_int{ 1, 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(view, buf, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
-        }
-    }
-
-    pub fn seqLen(self: *const KVCache, layer: u32) usize {
-        const entry = &self.entries[layer];
-        if (!entry.initialized) return 0;
-        return entry.offset;
-    }
-
-    pub fn appendEvalArrays(self: *const KVCache, vec: mlx.mlx_vector_array) void {
-        const affine = self.config.scheme != .off;
-        for (self.entries) |*entry| {
-            if (!entry.initialized) continue;
-            _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-            _ = mlx.mlx_vector_array_append_value(vec, entry.values);
-            if (affine) {
-                _ = mlx.mlx_vector_array_append_value(vec, entry.keys_scales);
-                _ = mlx.mlx_vector_array_append_value(vec, entry.keys_biases);
-                _ = mlx.mlx_vector_array_append_value(vec, entry.values_scales);
-                _ = mlx.mlx_vector_array_append_value(vec, entry.values_biases);
-            }
-        }
-    }
-
-    /// Evaluate all KV cache entries to materialize them on GPU.
-    /// Called after prefill to ensure the cache is in optimal memory layout for decode.
-    pub fn evalState(self: *KVCache) void {
-        // Collect all initialized entries into a vector and batch-eval them.
-        // This matches mlx_lm's `mx.eval([c.state for c in cache])` pattern.
-        const vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(vec);
-        self.appendEvalArrays(vec);
-        if (mlx.mlx_vector_array_size(vec) > 0) {
-            _ = mlx.mlx_eval(vec);
-        }
-    }
-
-    /// The sequence length of the attention state this cache holds. `step` is maintained by
-    /// `update` on layer 0 only: the absolute position on an attention-first trunk, a
-    /// permanent zero on a linear-layer-0 trunk (GDN, Mamba2, gated-conv, KDA), where the
-    /// first initialized entry's `offset` is the KV length. Attention-first trunks keep `step`.
-    pub fn kvLenForBatching(self: *const KVCache) usize {
-        if (self.entries.len > 0 and self.entries[0].initialized) return self.step;
-        for (self.entries) |*e| {
-            if (e.initialized) return e.offset;
-        }
-        return self.step;
-    }
-
-    /// Truncate the KV cache to keep only the first `len` tokens on the sequence axis.
-    /// A draft tree's accepted path: window rows `rows` (written at base + row)
-    /// move to base + 1, base + 2, ... in order; the caller truncates after.
-    pub fn compactRows(self: *KVCache, base: usize, rows: []const u32, s: mlx.mlx_stream) !void {
-        if (rows.len == 0) return;
-        var idx_buf: [64]i32 = undefined;
-        if (rows.len > idx_buf.len) return error.SpecTreeUnsupported;
-        for (self.entries) |*entry| {
-            if (!entry.initialized) continue;
-            // Row indices are absolute; a sliding ring's buffer starts at `base`.
-            for (rows, 0..) |r, i| idx_buf[i] = @intCast(base + r - entry.base);
-            const idx = mlx.mlx_array_new_data(&idx_buf, &[_]c_int{@intCast(rows.len)}, 1, .int32);
-            defer _ = mlx.mlx_array_free(idx);
-            // A quantized row's scales and biases move with it (groups run along head_dim).
-            const bufs = [_]*mlx.mlx_array{ &entry.keys, &entry.values, &entry.keys_scales, &entry.keys_biases, &entry.values_scales, &entry.values_biases };
-            for (bufs[0..if (self.config.scheme == .off) 2 else bufs.len]) |buf| {
-                const sh = mlx.getShape(buf.*);
-                var picked = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(picked);
-                try mlx.check(mlx.mlx_take_axis(&picked, buf.*, idx, 2, s));
-                const lo: c_int = @intCast(base + 1 - entry.base);
-                const hi: c_int = lo + @as(c_int, @intCast(rows.len));
-                var moved = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_slice_update(&moved, buf.*, picked, &[_]c_int{ 0, 0, lo, 0 }, 4, &[_]c_int{ sh[0], sh[1], hi, sh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
-                _ = mlx.mlx_array_free(buf.*);
-                buf.* = moved;
-            }
-            // The rows now live in this cache's own buffer, not a restored share.
-            entry.shared_view = false;
         }
     }
 
@@ -990,30 +822,6 @@ pub const KVCacheSnapshot = struct {
             freeKVEntry(e);
         }
         self.allocator.free(self.entries);
-    }
-
-    /// Shortest length this snapshot restores to: a sliding ring must still hold the window
-    /// behind it. 0 when no ring has dropped a row.
-    pub fn ringFloor(self: *const KVCacheSnapshot) usize {
-        var floor: usize = 0;
-        for (self.entries) |e| {
-            if (e.initialized and e.base > 0) floor = @max(floor, e.base + e.window);
-        }
-        return floor;
-    }
-
-    /// Give up every array handle this snapshot holds, leaving it empty but deinit-able. The
-    /// second half of restore by move: `KVCache.restore` binds through `mlx_array_set`, so the
-    /// snapshot's second reference made `is_donatable()` fail and the first `writeAtOffset`
-    /// privatised the whole prefix (5.13 GB / ~110 ms at 393k, 45% of the warm TTFT). Called
-    /// only from `donateCheckout`, right before the slot's first write, so a request refused
-    /// before then still hands back an intact entry.
-    pub fn releaseHandles(self: *KVCacheSnapshot) void {
-        for (self.entries) |*e| {
-            freeKVEntry(e);
-            e.* = newEmptyKVEntry();
-        }
-        self.step = 0;
     }
 
     /// Issue #330: a materialized copy of the first `len` tokens (sequence

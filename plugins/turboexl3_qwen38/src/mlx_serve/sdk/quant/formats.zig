@@ -13,12 +13,6 @@ const gguf = @import("gguf/format.zig");
 
 pub const tables = [_]*const abi.QuantTable{ &native.affine, &native.fp8, &native.mxfp8, &native.nvfp4, &hadamard.table, &exl3.table, &gguf.table };
 
-/// The table serving `block_json` of `config_json`; null when no built-in claims it.
-pub fn claimant(block_json: []const u8, config_json: []const u8) error{Ambiguous}!?*const abi.QuantTable {
-    const i = try block.claimant(block_json, config_json) orelse return null;
-    return tables[i];
-}
-
 /// `claimant` with a model's own tables `extra` weighed against the built-ins (qwen4_exp's trunk formats: turboexl3's
 /// table, linked in): an extra table named as a built-in replaces it; otherwise one claiming above every built-in wins, a
 /// built-in wins a tie, and extra tables tied at the top leave the block to the built-ins.
@@ -54,19 +48,6 @@ const testing = std.testing;
 const sdk = @import("mlx_serve").sdk;
 const conformance = @import("../testing/conformance.zig");
 const fixture = @import("mlx_serve").sdk.fixture;
-
-fn claimsAtMarker(block_json: abi.Str, _: abi.Str) callconv(.c) abi.Claim {
-    return if (std.mem.indexOf(u8, block_json.slice(), "\"exl3\"") != null) .by_marker else .no;
-}
-
-fn claimsAtType(block_json: abi.Str, _: abi.Str) callconv(.c) abi.Claim {
-    return if (std.mem.indexOf(u8, block_json.slice(), "\"exl3\"") != null) .by_type else .no;
-}
-
-/// An extra table as the claimant reads it: its name and its claim.
-fn extraTable(comptime name: []const u8, claims: block.ClaimsFn) abi.QuantTable {
-    return .{ .name = abi.Str.of(name), .claims = claims, .validate = undefined, .bill = undefined, .open = undefined, .close = undefined, .load_tensor = undefined, .load_bank = undefined, .release = undefined, .matmul = undefined, .moe = undefined };
-}
 
 /// A built-in format as the conformance suite reads a quant plugin.
 fn Builtin(comptime i: usize, comptime block_json: []const u8, comptime config_json: []const u8) type {

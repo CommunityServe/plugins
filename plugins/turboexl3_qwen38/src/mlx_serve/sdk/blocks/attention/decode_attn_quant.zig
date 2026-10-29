@@ -66,38 +66,9 @@ pub inline fn cli() *CliState {
     return cli_shared.get();
 }
 
-/// Whether the user EXPLICITLY asked for --decode-attn-quant (CLI flag, app
-/// toggle) as opposed to riding the silent default. Archs whose
-/// characterization showed ANSWER MOVEMENT under the requant gate on this
-/// form (dsv4 comp_in: one duplicated paragraph on 1/7 greedy prompts,
-/// ); laguna's clean characterization keeps the plain default.
-pub fn decodeAttnQuantExplicit() bool {
-    if (decode_attn_quant_override) |v| return v; // test seam counts as explicit
-    return cli().decode_attn_quant_flag orelse false;
-}
-
 pub fn decodeAttnQuantEnabled() bool {
     if (decode_attn_quant_override) |v| return v;
     return cli().decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
-}
-
-/// Whether `--decode-attn-quant` has anything to requantize: a text-trunk attention
-/// projection shipped dense. Fully quantized packs decode exactly as without it.
-pub fn weightsHaveDenseAttnProj(weights: *const Weights) bool {
-    const projs = [_][]const u8{ ".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".o_proj.weight", ".q_k_v_proj.weight", ".wq_du.weight", ".wk_dv.weight", ".wv_dv.weight", ".wo_ud.weight", ".wr_du.weight" };
-    var it = weights.map.iterator();
-    while (it.next()) |e| {
-        const name = e.key_ptr.*;
-        if (std.mem.indexOf(u8, name, "attn") == null) continue;
-        if (std.mem.indexOf(u8, name, "vision") != null or std.mem.indexOf(u8, name, "visual") != null or std.mem.indexOf(u8, name, "audio") != null) continue;
-        for (projs) |suffix| {
-            if (!std.mem.endsWith(u8, name, suffix)) continue;
-            var buf: [512]u8 = undefined;
-            const scales = std.fmt.bufPrint(&buf, "{s}.scales", .{name[0 .. name.len - ".weight".len]}) catch break;
-            if (decodeAttnQuantEligible(mlx.getShape(e.value_ptr.*), mlx.mlx_array_dtype(e.value_ptr.*), weights.map.contains(scales))) return true;
-        }
-    }
-    return false;
 }
 
 /// Whether a loaded dense projection weight (pre-transposed [in, out]) can

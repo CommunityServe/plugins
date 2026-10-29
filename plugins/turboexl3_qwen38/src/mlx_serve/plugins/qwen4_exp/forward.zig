@@ -335,18 +335,6 @@ pub fn forwardQwen4VerifyRows(
     mtp.mtp_verify_moe_group_last_ops = group_ops;
 }
 
-/// Qwen3.8-Flash-Next forward: embeddings tiled into `hc` residual
-/// streams; every block reads a gated mix of the streams and writes back
-/// through per-stream scalar gates; the n-gram PLE adds to the streams
-/// before its layer; the final mixer replaces model.norm.
-/// A later pipeline rank's forward: its layers over the `[B, L, hc*hidden]`
-/// stream the previous rank handed over, returning the stream for the next one.
-pub fn forwardQwen4Stream(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array) !mlx.mlx_array {
-    ctx.stream_in = stream;
-    defer ctx.stream_in = null;
-    return self.forwardQwen4With(ctx, .{ .ctx = null });
-}
-
 pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
     // A wide prefill chunk in reordered numerics runs as the wavefront's two halves (`wave.zig`).
     if (wave.pfWavePlanFor(self, ctx, token_ids)) |halves| return wave.forwardQwen4Wave(self, ctx, token_ids, halves);
@@ -581,47 +569,7 @@ pub const Qwen4TestSlot = struct {
     /// verify left it where the solo round did.
     head: Trunk.Qwen4MtpState,
 
-    pub fn init(alloc: std.mem.Allocator, n_layers: u32) !*Qwen4TestSlot {
-        const sl = try alloc.create(Qwen4TestSlot);
-        const cache = try KVCache.init(alloc, n_layers);
-        const head_cache = try KVCache.init(alloc, 1);
-        sl.* = .{
-            .cache = cache,
-            .entries = try alloc.alloc(SSMCacheEntry, n_layers),
-            .head = .{
-                .cache = head_cache,
-                .entry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
-            },
-        };
-        for (sl.entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-        sl.ctx = .{ .cache = &sl.cache, .moe_seq_offset = &sl.off, .ssm_entries = sl.entries, .ssm_member_gen = nextSsmMemberGen(), .capture_hidden = null, .vision_embeddings = null };
-        return sl;
-    }
-    pub fn deinit(sl: *Qwen4TestSlot, alloc: std.mem.Allocator) void {
-        for (sl.entries) |*e| {
-            ssmFreeSpecCapture(e);
-            _ = mlx.mlx_array_free(e.conv_state);
-            _ = mlx.mlx_array_free(e.ssm_state);
-            ssmFreeQsaState(e);
-        }
-        alloc.free(sl.entries);
-        _ = mlx.mlx_array_free(sl.head.entry.conv_state);
-        _ = mlx.mlx_array_free(sl.head.entry.ssm_state);
-        sl.head.cache.deinit();
-        sl.cache.deinit();
-        alloc.destroy(sl);
-    }
-    pub fn forward(sl: *Qwen4TestSlot, xfm: anytype, ids: []const i32) !mlx.mlx_array {
-        const shape = [_]c_int{ 1, @intCast(ids.len) };
-        const arr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(arr);
-        return xfm.forwardWith(&sl.ctx, arr);
-    }
 };
-
-fn qwen4Rows(arr: mlx.mlx_array) c_int {
-    return if (arr.ctx != null) mlx.getShape(arr)[1] else -1;
-}
 
 /// A decode-width `forwardQwen4With` over dense synthetic weights with every block a stand-in: the graph is the
 /// embedding, one host-gathered PLE layer, the final mixer and the lm_head. Ladder strides start at the shipped
@@ -642,129 +590,8 @@ const Qwen4LadderRig = struct {
         entries: [LAYERS]SSMCacheEntry,
         off: usize,
 
-        fn init() Slot {
-            var s: Slot = .{ .entries = undefined, .off = 0 };
-            for (&s.entries) |*e| e.* = pleArmEntry();
-            return s;
-        }
-
-        fn deinit(self: *Slot) void {
-            for (&self.entries) |*e| ssmFreeQsaState(e);
-        }
     };
 
     const Step = struct { logits: []f32, pending: bool };
 
-    fn init(self: *Qwen4LadderRig) !void {
-        try self.fx.init(null);
-        self.n = 0;
-        try self.fx.arm(false);
-        const x = self.fx.xfm();
-        const st = x.qwen4.?;
-        const emb_dim: c_int = @intCast(st.table.dim * st.hash.n_heads);
-        x.config = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .hidden_size = HIDDEN, .hc_count = HC, .num_hidden_layers = LAYERS, .vocab_size = VOCAB };
-        var prng = std.Random.DefaultPrng.init(59);
-        const r = prng.random();
-        x.emb_w = try self.weight(r, &.{ VOCAB, HIDDEN });
-        x.lm_head_w = try self.weight(r, &.{ VOCAB, HIDDEN });
-        var ones = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{HIDDEN}, 1, .bfloat16, x.s));
-        self.keep(ones);
-        x.ones_hidden = ones;
-        const none: mlx.mlx_array = .{ .ctx = null };
-        x.qwen4_mixer = .{
-            .norm_w = try self.weight(r, &.{ HC, HIDDEN }),
-            .down_w = try self.weight(r, &.{ HC * HIDDEN, RANK }),
-            .down_s = none,
-            .down_b = none,
-            .up_w = try self.weight(r, &.{ RANK, HC * HIDDEN }),
-            .up_s = none,
-            .up_b = none,
-        };
-        self.layer_bytes = @splat(0);
-        const layers: [*]MoeLayerWeights = @ptrCast(&self.layer_bytes);
-        for (layers[0..LAYERS]) |*lw| {
-            lw.hc_attn = null;
-            lw.hc_mlp = null;
-            lw.ple = null;
-        }
-        layers[0].ple = .{
-            .key_w = try self.weight(r, &.{ emb_dim, HC * HIDDEN }),
-            .key_s = none,
-            .key_b = none,
-            .value_w = try self.weight(r, &.{ emb_dim, HIDDEN }),
-            .value_s = none,
-            .value_b = none,
-            .norm_key = try self.weight(r, &.{ HC, HIDDEN }),
-            .norm_query = try self.weight(r, &.{ HC, HIDDEN }),
-            .norm_conv = try self.weight(r, &.{ HC, HIDDEN }),
-            .conv_w = try self.weight(r, &.{ HC * HIDDEN, @intCast(x.config.ple_conv_kernel), 1 }),
-        };
-        x.moe_layers = layers[0..LAYERS];
-        x.decode_async_ladder = 0;
-        x.decode_async_ladder_qwen4 = QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
-    }
-
-    fn deinit(self: *Qwen4LadderRig) void {
-        for (self.arrs[0..self.n]) |a| _ = mlx.mlx_array_free(a);
-        self.fx.deinit();
-    }
-
-    fn keep(self: *Qwen4LadderRig, a: mlx.mlx_array) void {
-        self.arrs[self.n] = a;
-        self.n += 1;
-    }
-
-    fn weight(self: *Qwen4LadderRig, r: std.Random, shape: []const c_int) !mlx.mlx_array {
-        const a = try attn256RandBf16(r, shape, self.fx.xfm().s);
-        self.keep(a);
-        return a;
-    }
-
-    /// One serial decode step on a deferred PLE leaf at serial ladder stride `ladder`; reports whether the leaf was
-    /// still pending when the build returned, then fills it and reads the logits.
-    fn step(self: *Qwen4LadderRig, slot: *Slot, ids: mlx.mlx_array, ladder: u32) !Step {
-        const x = self.fx.xfm();
-        x.decode_async_ladder = ladder;
-        defer x.decode_async_ladder = 0;
-        var ctx: ForwardCtx = .{ .cache = @ptrCast(&self.fx.cache_bytes), .moe_seq_offset = &slot.off, .ssm_entries = &slot.entries, .capture_hidden = null, .vision_embeddings = null, .ple_defer = true };
-        const logits = try x.forwardQwen4With(&ctx, ids);
-        defer _ = mlx.mlx_array_free(logits);
-        const pending = ctx.ple_pending != null;
-        try x.flushDeferredPle(&ctx);
-        return .{ .logits = try qwen4ReadF32(testing.allocator, logits, x.s), .pending = pending };
-    }
-
-    fn prefill(self: *Qwen4LadderRig, sl: *Qwen4TestSlot, ids: []const i32) !void {
-        const shape = [_]c_int{ 1, @intCast(ids.len) };
-        const arr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(arr);
-        const logits = try self.fx.xfm().forwardQwen4With(&sl.ctx, arr);
-        defer _ = mlx.mlx_array_free(logits);
-        try mlx.check(mlx.mlx_array_eval(logits));
-    }
-
-    /// One batched decode step over `slots` at batched ladder stride `ladder`, filling (or discarding) the leaf.
-    fn batchedStep(self: *Qwen4LadderRig, slots: []const *Qwen4TestSlot, ids: []const i32, ladder: u32, fill: bool) !Step {
-        const x = self.fx.xfm();
-        x.decode_async_ladder_qwen4 = ladder;
-        defer x.decode_async_ladder_qwen4 = QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
-        const run = try qwen4BatchedPleForward(x, slots, ids, 1, false, true, fill);
-        defer _ = mlx.mlx_array_free(run.logits);
-        return .{ .logits = try qwen4ReadF32(testing.allocator, run.logits, x.s), .pending = run.pending };
-    }
 };
-
-fn expectLogitBitsEqual(want: []const f32, got: []const f32) !void {
-    try testing.expectEqual(want.len, got.len);
-    if (std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) return;
-    var n: usize = 0;
-    var max: f32 = 0;
-    for (want, got) |a, b| {
-        if (@as(u32, @bitCast(a)) == @as(u32, @bitCast(b))) continue;
-        n += 1;
-        max = @max(max, @abs(a - b));
-    }
-    std.debug.print("logits differ in {d}/{d} entries, max |diff| {d}\n", .{ n, want.len, max });
-    return error.TestExpectedEqual;
-}

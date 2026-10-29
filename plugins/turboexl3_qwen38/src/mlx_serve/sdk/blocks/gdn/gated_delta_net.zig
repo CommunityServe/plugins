@@ -66,10 +66,6 @@ pub const LinearAttnWeights = struct {
     /// bf16 in_proj_a / in_proj_b joined at load (qwen4_exp `trunk/gdn_ab.zig`): `a_w` / `b_w` are views of it.
     ab: GdnAb = .{},
 
-    /// The ANE GDN program projects one joined qkv and a full-rank z.
-    pub fn aneGdnServes(la: *const LinearAttnWeights) bool {
-        return !la.combined_proj and la.qkv_w.ctx != null;
-    }
 };
 
 /// A GDN layer's joined bf16 a / b: `w` the transposed view [hidden, n] of the row-major buffer [a | 0 | b] (null-ctx:

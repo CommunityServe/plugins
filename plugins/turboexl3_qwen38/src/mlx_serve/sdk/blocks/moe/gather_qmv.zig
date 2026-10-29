@@ -450,23 +450,3 @@ pub fn gatherQmvAct(
 pub var gqmv_gateup_override: ?bool = null;
 
 // ── tests ──
-
-/// Max |a - ref| as f32, for the gatherQmv no-worse-than-reference parity tests.
-fn gqmvMaxAbsErr(a: mlx.mlx_array, ref: mlx.mlx_array, str: mlx.mlx_stream) !f32 {
-    var a32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a32);
-    try mlx.check(mlx.mlx_astype(&a32, a, .float32, str));
-    var d = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(d);
-    try mlx.check(mlx.mlx_subtract(&d, a32, ref, str));
-    var ad = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ad);
-    try mlx.check(mlx.mlx_abs(&ad, d, str));
-    var mx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mx);
-    try mlx.check(mlx.mlx_max(&mx, ad, false, str));
-    try mlx.check(mlx.mlx_array_eval(mx));
-    var out: f32 = 0;
-    try mlx.check(mlx.mlx_array_item_float32(&out, mx));
-    return out;
-}

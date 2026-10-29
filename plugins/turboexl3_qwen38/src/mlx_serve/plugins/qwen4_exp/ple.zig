@@ -409,13 +409,6 @@ pub fn settleDeferredPle(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !void
     releasePlePending(p);
 }
 
-/// True when the pending record is the GPU arm's: the embedding is already in the graph
-/// and only the history is owed, by `settleDeferredPle` or `flushDeferredPle`.
-pub fn deferredPleOnGpu(ctx: *const ForwardCtx) bool {
-    const p = ctx.ple_pending orelse return false;
-    return p.gpu;
-}
-
 pub fn releasePlePending(p: PlePending) void {
     if (p.emb.ctx != null) _ = mlx.mlx_array_free(p.emb);
     _ = mlx.mlx_array_free(p.token_ids);
@@ -463,22 +456,6 @@ pub fn pleKickOff(self: *Trunk) !void {
 }
 
 var ple_kick_said = false;
-
-/// A prefill of `prompt_ids` is about to start on `ctx`: the table reads the prompt's PLE rows ahead of each chunk's
-/// gather (`NgramTable.prefetchBegin`). Nothing on the GPU arm (its kernel reads the table in place) or without a PLE
-/// layer.
-pub fn plePrefetchBegin(self: *Trunk, ctx: *const ForwardCtx, prompt_ids: []const u32) void {
-    const st = self.qwen4 orelse return;
-    if (st.gpu != null) return;
-    const entries = ctx.ssm_entries orelse return;
-    for (self.moe_layers, 0..) |*lw, l| {
-        if (lw.ple == null) continue;
-        if (l >= entries.len) return;
-        const prev = plePrevOf(&entries[l], st.hash.eos);
-        st.table.prefetchBegin(&st.hash, prev[0 .. st.hash.ngram_size - 1], prompt_ids, ctx.moe_seq_offset.*);
-        return;
-    }
-}
 
 /// Ends the prefill's prefetch session (`plePrefetchBegin`), on every exit of the prefill.
 pub fn plePrefetchEnd(self: *Trunk) void {
@@ -1020,68 +997,6 @@ const Qwen4BatchedPleRun = struct {
     pending: bool,
 };
 
-pub fn qwen4BatchedPleForward(
-    xfm: *Trunk,
-    slots: []const *Qwen4TestSlot,
-    ids: []const i32,
-    seq_len: c_int,
-    capture: bool,
-    defer_ple: bool,
-    do_flush: bool,
-) !Qwen4BatchedPleRun {
-    const N = slots.len;
-    const ctxs = try xfm.allocator.alloc(*ForwardCtx, N);
-    defer xfm.allocator.free(ctxs);
-    var off_buf = try xfm.allocator.alloc(i32, N);
-    defer xfm.allocator.free(off_buf);
-    for (slots, 0..) |sl, i| {
-        ctxs[i] = &sl.ctx;
-        off_buf[i] = @intCast(sl.off);
-    }
-    const ml = xfm.moe_layers;
-    const merged = try xfm.allocator.alloc(SSMCacheEntry, ml.len);
-    defer xfm.allocator.free(merged);
-    for (merged) |*m| m.* = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
-    defer for (merged) |*m| {
-        if (m.conv_state.ctx != null) _ = mlx.mlx_array_free(m.conv_state);
-        if (m.ssm_state.ctx != null) _ = mlx.mlx_array_free(m.ssm_state);
-        if (m.aux_state.ctx != null) _ = mlx.mlx_array_free(m.aux_state);
-        ssmFreeSpecCapture(m);
-    };
-    for (ml, 0..) |*lw, l| {
-        if (!lw.is_linear and lw.ple == null) continue;
-        merged[l] = try xfm.mergeSsmAcrossSlots(ctxs, l);
-    }
-    const off_shape = [_]c_int{@intCast(N)};
-    const rope_offset_arr = mlx.mlx_array_new_data(off_buf.ptr, &off_shape, 1, .int32);
-    defer _ = mlx.mlx_array_free(rope_offset_arr);
-    var scratch_offset: usize = @intCast(off_buf[0]);
-    var bctx: ForwardCtx = .{
-        .cache = ctxs[0].cache,
-        .moe_seq_offset = &scratch_offset,
-        .ssm_entries = merged,
-        .capture_hidden = null,
-        .capture_ssm_seq = capture,
-        .vision_embeddings = null,
-        .batch_slots = ctxs,
-        .batch_rope_offsets = rope_offset_arr,
-        .ple_defer = defer_ple,
-    };
-    const tshape = [_]c_int{ @intCast(N), seq_len };
-    const tarr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &tshape, 2, .int32);
-    defer _ = mlx.mlx_array_free(tarr);
-    const logits = try xfm.forwardQwen4With(&bctx, tarr);
-    errdefer _ = mlx.mlx_array_free(logits);
-    const pending = bctx.ple_pending != null;
-    if (do_flush) try xfm.flushDeferredPle(&bctx) else if (bctx.ple_pending != null) xfm.discardDeferredPle(&bctx);
-    for (merged, 0..) |*m, li| {
-        if (!ml[li].is_linear and ml[li].ple == null) continue;
-        try xfm.splitSsmToSlots(m, ctxs, li);
-    }
-    for (slots) |sl| sl.off += @intCast(seq_len);
-    return .{ .logits = logits, .pending = pending };
-}
-
 // ── qwen4 PLE: the GPU arm against the host gather (synthetic table, no model) ──
 
 /// A zeroed Trunk carrying only what `pleEmbedding` reads, over a synthetic 4-bit table.
@@ -1097,70 +1012,8 @@ pub const PleArmFixture = struct {
     cache_bytes: [@sizeOf(KVCache)]u8 align(@alignOf(KVCache)),
     off: usize,
 
-    pub fn init(self: *PleArmFixture, gate: ?bool) !void {
-        const hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 1234, 0, 999);
-        self.fx = try ple_gpu.writeFixture(4, hash.total_rows, 64, 32, 21);
-        self.gpu = if (gate) |on| ple_gpu.load(&self.fx.table, on, 0) else try ple_gpu.wrap(&self.fx.table);
-        self.st = .{ .hash = hash, .table = self.fx.table, .gpu = self.gpu };
-        self.xfm_bytes = @splat(0);
-        self.cache_bytes = @splat(0);
-        self.off = 0;
-        const x = self.xfm();
-        x.allocator = testing.allocator;
-        x.s = mlx.gpuStream();
-        x.qwen4 = &self.st;
-    }
-
-    pub fn deinit(self: *PleArmFixture) void {
-        self.st.gpu = self.gpu;
-        self.st.deinit();
-        self.fx.td.cleanup();
-    }
-
-    pub fn xfm(self: *PleArmFixture) *Trunk {
-        return @ptrCast(&self.xfm_bytes);
-    }
-
     fn ctx(self: *PleArmFixture) ForwardCtx {
         return .{ .cache = @ptrCast(&self.cache_bytes), .moe_seq_offset = &self.off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
     }
 
-    pub fn arm(self: *PleArmFixture, on_gpu: bool) !void {
-        if (on_gpu and self.gpu == null) return error.NoGpuArm;
-        self.st.gpu = if (on_gpu) self.gpu else null;
-    }
 };
-
-pub fn pleArmEntry() SSMCacheEntry {
-    return .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
-}
-
-pub fn pleArmIds(ids: []const u32, batch: c_int) mlx.mlx_array {
-    var buf: [64]i32 = undefined;
-    for (ids, 0..) |v, i| buf[i] = @intCast(v);
-    const shape = [_]c_int{ batch, @divExact(@as(c_int, @intCast(ids.len)), batch) };
-    return mlx.mlx_array_new_data(&buf, &shape, 2, .int32);
-}
-
-fn pleArmRead(emb: mlx.mlx_array) ![]u16 {
-    try mlx.check(mlx.mlx_array_eval(emb));
-    const d = mlx.mlx_array_data_bfloat16(emb) orelse return error.MlxArrayDataNull;
-    return testing.allocator.dupe(u16, d[0..mlx.mlx_array_size(emb)]);
-}
-
-/// One serial PLE embedding on the chosen arm, read back as bf16 bits.
-fn pleArmEmbed(fx: *PleArmFixture, ctx: *ForwardCtx, entry: *SSMCacheEntry, ids: []const u32, on_gpu: bool) ![]u16 {
-    try fx.arm(on_gpu);
-    const arr = pleArmIds(ids, 1);
-    defer _ = mlx.mlx_array_free(arr);
-    const emb = try fx.xfm().pleEmbedding(ctx, arr, entry, 0, @intCast(ids.len));
-    defer _ = mlx.mlx_array_free(emb);
-    return pleArmRead(emb);
-}
-
-pub fn expectPleHistoryEqual(want: *const SSMCacheEntry, got: *const SSMCacheEntry) !void {
-    try testing.expectEqual(want.ple_prev_valid, got.ple_prev_valid);
-    try testing.expectEqualSlices(u32, &want.ple_prev, &got.ple_prev);
-    try testing.expectEqual(want.spec_ple_len, got.spec_ple_len);
-    try testing.expectEqualSlices(u32, want.spec_ple_tokens[0..want.spec_ple_len], got.spec_ple_tokens[0..got.spec_ple_len]);
-}

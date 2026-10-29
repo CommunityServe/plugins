@@ -68,55 +68,6 @@ pub fn launch(p: Gemv, n: c_int) Launch {
     return .{ .grid = .{ 32, groups * p.rg * p.ks, 1 }, .tg = .{ 32, p.rg * p.ks, 1 } };
 }
 
-/// The kernels' e4m3 decode: (code & 127) << 7 with the sign at bit 15, read as a half (the code's value / 256).
-pub fn decodeHalf(code: u8) f32 {
-    const bits: u16 = (@as(u16, code & 0x7F) << 7) | (@as(u16, code & 0x80) << 8);
-    return @floatCast(@as(f16, @bitCast(bits)));
-}
-
-/// The GEMV's weight: f32 code x scale, one rounding, as the kernel forms it.
-pub fn weight32(code: u8, scale: f32) f32 {
-    return decodeHalf(code) * (scale * 256);
-}
-
-pub fn bf16ToF32(b: u16) f32 {
-    return @bitCast(@as(u32, b) << 16);
-}
-
-/// Round to nearest even (no NaN reaches here).
-pub fn f32ToBf16(v: f32) u16 {
-    const r: u32 = @bitCast(v);
-    return @truncate((r +% 0x7fff +% ((r >> 16) & 1)) >> 16);
-}
-
-/// One output of the GEMV in the kernel's order over weight row `w` (`weight32`) and BF16 input row `xr`: per lane, fma
-/// over steps then codes; the xor butterfly; the K partitions in order. The f32 sum the kernel rounds to BF16 once.
-pub fn hostDot(p: Gemv, xr: []const u16, w: []const f32) f32 {
-    const ks: usize = @intCast(p.ks);
-    const kp = xr.len / ks;
-    var total: f32 = 0;
-    for (0..ks) |part| {
-        var lanes: [32]f32 = undefined;
-        for (0..32) |l| {
-            var acc: f32 = 0;
-            const k0 = part * kp + kv * l;
-            var st: usize = 0;
-            while (st < kp / step) : (st += 1) {
-                const kk = k0 + st * step;
-                for (0..kv) |i| acc = @mulAdd(f32, bf16ToF32(xr[kk + i]), w[kk + i], acc);
-            }
-            lanes[l] = acc;
-        }
-        for ([_]usize{ 16, 8, 4, 2, 1 }) |off| {
-            var next: [32]f32 = undefined;
-            for (0..32) |l| next[l] = lanes[l] + lanes[l ^ off];
-            lanes = next;
-        }
-        total = if (part == 0) lanes[0] else total + lanes[0];
-    }
-    return total;
-}
-
 // ── tests ──
 
 const testing = std.testing;

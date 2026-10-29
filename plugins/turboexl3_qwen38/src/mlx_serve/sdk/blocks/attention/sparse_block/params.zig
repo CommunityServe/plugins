@@ -24,19 +24,6 @@ pub const Blocks = struct {
         return @divTrunc(pos, @as(c_int, @intCast(b.size))) + 1;
     }
 
-    /// Whether block `blk` is a pick of every query at `pos` that can see it, whatever its score.
-    pub fn forced(b: Blocks, blk: c_int, pos: c_int) bool {
-        if (blk < 0) return false;
-        if (blk < b.init) return true;
-        const own = @divTrunc(pos, @as(c_int, @intCast(b.size)));
-        return blk <= own and blk + @as(c_int, @intCast(b.local)) > own;
-    }
-
-    /// Whether every row from `row0` on has all `nb` scored blocks as candidates.
-    pub fn allSee(b: Blocks, row0: c_int, nb: c_int) bool {
-        return b.bound(row0) >= nb;
-    }
-
     /// Per row `r` (cache position `row0 + r`), the candidate bound clamped to the `nb` scored blocks; `all_vis`
     /// claims every row sees all `nb`, and is honored verbatim.
     pub fn selectBounds(b: Blocks, out: []i32, row0: c_int, nb: c_int, all_vis: bool) void {
@@ -61,21 +48,6 @@ pub const Params = struct {
     /// The attention layers that are sparse; null = every one.
     layers: ?[]const bool = null,
 
-    pub fn validate(p: Params) error{InvalidSparseBlockParams}!void {
-        const b = p.blocks;
-        if (b.size == 0 or b.top_k == 0 or p.index_heads == 0 or p.index_dim == 0) return error.InvalidSparseBlockParams;
-        if (@as(u64, b.init) + b.local > b.top_k) return error.InvalidSparseBlockParams;
-    }
-
-    pub fn sparseAt(p: Params, layer: usize) bool {
-        const l = p.layers orelse return true;
-        return layer < l.len and l[layer];
-    }
-
-    /// Pick lists per query row: one, or one per index head.
-    pub fn listsPerQuery(p: Params) u32 {
-        return if (p.score == .key_max) p.index_heads else 1;
-    }
 };
 
 const testing = std.testing;

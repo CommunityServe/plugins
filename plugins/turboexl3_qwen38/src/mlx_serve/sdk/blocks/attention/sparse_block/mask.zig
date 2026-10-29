@@ -114,21 +114,6 @@ pub fn qsaMaskFromBlockSel(s: mlx.mlx_stream, blk_sel: mlx.mlx_array, offset: c_
     return mask;
 }
 
-/// The key mask of picks `[1, lists * rows, K]` for the last `rows` queries of a `kv`-key cache: each list's blocks
-/// and the rows' tails, `[1, 1, rows, kv]` with one list, else `[1, heads, rows, kv]` with q head h reading list
-/// h / (heads / lists).
-pub fn picksMask(a: std.mem.Allocator, s: mlx.mlx_stream, b: Blocks, picks: mlx.mlx_array, rows: c_int, kv: c_int, heads: c_int) !mlx.mlx_array {
-    var g = Graph.init(a, s);
-    defer g.deinit();
-    const ps = ops.shape(picks);
-    const lists = @divExact(ps[1], rows);
-    const m = try g.adopt(try qsaMaskFromBlocks(s, try g.reshape(picks, &.{ lists, rows, ps[2] }), kv, @intCast(b.size)));
-    if (lists == 1) return g.escape(m);
-    const per = @divExact(heads, lists);
-    const wide = try g.broadcast(try g.reshape(m, &.{ 1, lists, 1, rows, kv }), &.{ 1, lists, per, rows, kv });
-    return g.escape(try g.reshape(wide, &.{ 1, heads, rows, kv }));
-}
-
 /// The dense-mask arm: the fused masked kernel, the split vector sdpa, then stock sdpa.
 pub fn qsaMaskArm(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, mask: mlx.mlx_array) !mlx.mlx_array {
     if (try fusedSdpa256Masked(s, q, k, v, scale, mask)) |o| return o;

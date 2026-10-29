@@ -21,9 +21,6 @@ pub const SpecTree = struct {
     parents: mlx.mlx_array,
     attn: row_attn.Tree,
 
-    pub fn deinit(self: *const SpecTree) void {
-        for ([_]mlx.mlx_array{ self.parents, self.attn.depth, self.attn.path }) |a| _ = mlx.mlx_array_free(a);
-    }
 };
 
 // ── Forward context ──

@@ -384,10 +384,6 @@ fn arraysEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
     return same;
 }
 
-fn expectBitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
-    try std.testing.expect(try arraysEqual(a, b, s));
-}
-
 fn canaryMapped(key: CanaryKey, paired: bool, s: mlx.mlx_stream) !bool {
     const rows: c_int = 340;
     const tokens: c_int = 97;
@@ -525,71 +521,6 @@ pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, 
     return out;
 }
 
-fn requireNax() !void {
-    mlx.installErrorHandler();
-    if (mlx.noGpuBackend() or !@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
-}
-
-/// A kernel failure is its test's: name it and drop its latch, or the next test inherits it.
-fn dropOwnLatch() void {
-    var buf: [512]u8 = undefined;
-    if (mlx.takeError(&buf)) |msg| std.debug.print("[gather-nax] mlx: {s}\n", .{msg});
-}
-
-/// A top-k routing's sorted expert runs: 1 in 16 experts empty, 1 in 64 eight
-/// times the mean, the rest flat; the remainder lands on the last expert.
-fn skewedRouting(ids: []u32, experts: usize) void {
-    var weight_sum: usize = 0;
-    for (0..experts) |e| weight_sum += if (e % 16 == 5) 0 else if (e % 64 == 0) 8 else 1;
-    var pos: usize = 0;
-    for (0..experts) |e| {
-        const weight: usize = if (e % 16 == 5) 0 else if (e % 64 == 0) 8 else 1;
-        for (0..@min(ids.len * weight / weight_sum, ids.len - pos)) |_| {
-            ids[pos] = @intCast(e);
-            pos += 1;
-        }
-    }
-    while (pos < ids.len) : (pos += 1) ids[pos] = @intCast(experts - 1);
-}
-
-fn testCase(rows: c_int, experts: c_int, n: c_int, k: c_int, bits: u32, group: u32, mx: bool, s: mlx.mlx_stream) !void {
-    errdefer dropOwnLatch();
-    const alloc = std.testing.allocator;
-    const ids_data = try alloc.alloc(u32, @intCast(rows));
-    defer alloc.free(ids_data);
-    if (rows == 81920) {
-        var pos: usize = 0;
-        for (0..@intCast(experts)) |expert| {
-            const count: usize = if (expert < 16) 0 else if (expert < 32) 320 else if (expert < 272) 150 else 170;
-            for (0..@min(count, ids_data.len - pos)) |_| {
-                ids_data[pos] = @intCast(expert);
-                pos += 1;
-            }
-        }
-        while (pos < ids_data.len) : (pos += 1) ids_data[pos] = @intCast(experts - 1);
-    } else skewedRouting(ids_data, @intCast(experts));
-    const ids_shape = [_]c_int{rows};
-    const ids = mlx.mlx_array_new_data(ids_data.ptr, &ids_shape, 1, .uint32);
-    defer _ = mlx.mlx_array_free(ids);
-    const bank = try randomBank(experts, n, k, bits, group, mx, 0x2267, s);
-    defer bank.deinit();
-    const x_shape = [_]c_int{ rows, 1, k };
-    var x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x);
-    try mlx.check(mlx.mlx_random_normal(&x, &x_shape, 3, .bfloat16, 0, 0.5, bank.key, s));
-    const got = (try sortedGather(x, bank.w, bank.sc, bank.bi, ids, bits, group, mx, true, s)) orelse return error.KernelDeclinedTestShape;
-    defer _ = mlx.mlx_array_free(got);
-    if (@rem(k, 64) != 0) {
-        // Pinned stock NAX has the K-tail bug, so this arm uses fp32 dequantized matmul.
-        try std.testing.expect(try floatReferenceClose(got, x, bank.w, bank.sc, bank.bi, ids, bits, group, mx, s));
-        return;
-    }
-    // This pin includes MLX's sorted-row offset fix, so >32768 rows can use stock.
-    const ref = try stockGather(x, bank.w, bank.sc, bank.bi, ids, bits, group, mx, s);
-    defer _ = mlx.mlx_array_free(ref);
-    try expectBitEqual(got, ref, s);
-}
-
 const Bank = struct {
     w: mlx.mlx_array,
     sc: mlx.mlx_array,
@@ -604,100 +535,5 @@ const Bank = struct {
     }
 };
 
-/// Quantized [experts, n, k] expert rows from a seeded normal draw; `key` is the draw's.
-fn randomBank(experts: c_int, n: c_int, k: c_int, bits: u32, group: u32, mx: bool, seed: u64, s: mlx.mlx_stream) !Bank {
-    var key = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_key(&key, seed));
-    var wf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wf);
-    try mlx.check(mlx.mlx_random_normal(&wf, &[_]c_int{ experts, n, k }, 3, .bfloat16, 0, 0.05, key, s));
-    var q = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(q);
-    try mlx.check(mlx.mlx_quantize(&q, wf, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), modeName(mx, group), .{}, s));
-    const w = try outputAt(q, 0);
-    errdefer _ = mlx.mlx_array_free(w);
-    const sc = try outputAt(q, 1);
-    errdefer _ = mlx.mlx_array_free(sc);
-    const bi: mlx.mlx_array = if (mx) .{ .ctx = null } else try outputAt(q, 2);
-    for ([_]mlx.mlx_array{ w, sc, bi }) |a| if (a.ctx != null) try mlx.check(mlx.mlx_array_eval(a));
-    return .{ .w = w, .sc = sc, .bi = bi, .key = key };
-}
-
-/// `a` and `b` interleaved per rep after one warm run each: per-arm medians of the wall
-/// time of the build plus the eval of what it returns.
-fn abMedianMs(reps: comptime_int, ctx: BenchArm, a: BenchBuild, b: BenchBuild) ![2]f64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var laps: [2][reps]u64 = undefined;
-    for (0..reps + 1) |i| {
-        for ([_]BenchBuild{ a, b }, 0..) |build, arm| {
-            const mark = std.Io.Timestamp.now(io, .boot);
-            const out = try build(ctx);
-            defer _ = mlx.mlx_array_free(out);
-            try mlx.check(mlx.mlx_array_eval(out));
-            if (i > 0) laps[arm][i - 1] = @intCast(mark.untilNow(io, .boot).nanoseconds);
-        }
-    }
-    var out: [2]f64 = undefined;
-    for (&laps, &out) |*l, *o| {
-        std.mem.sort(u64, l, {}, std.sort.asc(u64));
-        o.* = @as(f64, @floatFromInt(l[reps / 2])) / 1e6;
-    }
-    return out;
-}
-
 const BenchBuild = *const fn (BenchArm) anyerror!mlx.mlx_array;
 const BenchArm = struct { x: mlx.mlx_array, bank: Bank, up: ?Bank = null, row_map: mlx.mlx_array = .{ .ctx = null }, sigtab: mlx.mlx_array = .{ .ctx = null }, ids: mlx.mlx_array, plan: Plan, bits: u32, group: u32, mx: bool, s: mlx.mlx_stream };
-
-fn benchStock(c: BenchArm) anyerror!mlx.mlx_array {
-    return stockGather(c.x, c.bank.w, c.bank.sc, c.bank.bi, c.ids, c.bits, c.group, c.mx, c.s);
-}
-
-fn benchPort(c: BenchArm) anyerror!mlx.mlx_array {
-    return launch(c.x, c.bank.w, c.bank.sc, c.bank.bi, c.ids, c.bits, c.group, c.mx, c.plan, c.s);
-}
-
-/// The live gate/up call as stock runs it: gather the token rows, two projections, the SwiGLU.
-fn benchStockGateUp(c: BenchArm) anyerror!mlx.mlx_array {
-    var x_rep = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_rep);
-    try mlx.check(mlx.mlx_take_axis(&x_rep, c.x, c.row_map, 0, c.s));
-    const g = try stockGather(x_rep, c.bank.w, c.bank.sc, c.bank.bi, c.ids, c.bits, c.group, c.mx, c.s);
-    defer _ = mlx.mlx_array_free(g);
-    const u = try stockGather(x_rep, c.up.?.w, c.up.?.sc, c.up.?.bi, c.ids, c.bits, c.group, c.mx, c.s);
-    defer _ = mlx.mlx_array_free(u);
-    var sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sig);
-    var act = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(act);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_sigmoid(&sig, g, c.s));
-    try mlx.check(mlx.mlx_multiply(&act, g, sig, c.s));
-    try mlx.check(mlx.mlx_multiply(&out, act, u, c.s));
-    return out;
-}
-
-fn benchPortGateUp(c: BenchArm) anyerror!mlx.mlx_array {
-    return launchMapped(c.x, c.row_map, c.bank.w, c.bank.sc, c.bank.bi, c.ids, .{ .w = c.up.?.w, .sc = c.up.?.sc, .bi = c.up.?.bi, .sigtab = c.sigtab }, c.bits, c.group, c.mx, c.plan, c.s);
-}
-
-/// `=sweep` times every tile configuration instead of the planner's.
-fn benchPlans(buf: *[32]Plan, rows: c_int, experts: c_int, k: c_int, n: c_int, paired: bool) []const Plan {
-    const raw = env.get(.GQMM_UBENCH) orelse return buf[0..0];
-    if (!std.mem.eql(u8, std.mem.sliceTo(raw, 0), "sweep")) {
-        buf[0] = plan(rows, experts, k, n, paired);
-        return buf[0..1];
-    }
-    var count: usize = 0;
-    for ([_]c_int{ 64, 96, 128 }) |bm| for ([_]c_int{ 0, 32 }) |gx| {
-        buf[count] = .{ .sched = .db, .bm = bm, .bk = 64, .gx = gx, .pad = 0 };
-        count += 1;
-        for ([_]c_int{ 64, 128 }) |bk| for ([_]c_int{ 0, 8192 }) |pad| {
-            if (pad != 0 and bm != 128) continue;
-            buf[count] = .{ .sched = .seg, .bm = bm, .bk = bk, .gx = gx, .pad = pad };
-            count += 1;
-        };
-    };
-    return buf[0..count];
-}

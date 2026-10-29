@@ -326,10 +326,3 @@ pub fn forwardRowAxisVerify(
         n_rollback = 0;
     }
 }
-
-/// The joined verify block of the last grouped verify, handed to the caller (null when it projected per row).
-pub fn takeJoinedVerifyLogits(self: *Trunk) mlx.mlx_array {
-    const out = self.verify_joined_logits;
-    self.verify_joined_logits = .{ .ctx = null };
-    return out;
-}

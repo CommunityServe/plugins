@@ -208,11 +208,6 @@ pub fn mtpRegimeObserve(r: *MtpRegime, two_chunk: bool, m_lo: u32, round_ms: f32
 /// cross; the M4 base loss it exists for is 21%.
 pub const MTP_REGIME_MARGIN: f32 = 0.05;
 
-/// Null until BOTH shapes have been measured at the same base depth.
-pub fn mtpRegimeTwoChunkWorse(r: MtpRegime) ?bool {
-    return mtpRegimeVerdict(r, null);
-}
-
 /// Verdict with HYSTERESIS: a standing "worse" only flips to "better"
 /// once two-chunk is at or below single, not merely inside the margin.
 /// The majority shape's first observed round after a trial block is

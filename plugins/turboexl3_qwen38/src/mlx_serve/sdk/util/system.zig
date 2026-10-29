@@ -107,50 +107,7 @@ var prev_ticks: [4]u64 = @splat(0);
 
 // ── Public metric helpers ──
 
-pub fn getAppRssMb() u32 {
-    if (comptime !builtin.os.tag.isDarwin())
-        return @intCast(linuxProcStatusKib("VmRSS:") / 1024);
-    var info = std.mem.zeroes(TaskBasicInfo);
-    var count: u32 = @sizeOf(TaskBasicInfo) / @sizeOf(i32);
-    if (task_info(mach_task_self_, 20, @ptrCast(&info), &count) != 0) return 0;
-    return @intCast(info.resident_size / (1024 * 1024));
-}
-
-/// Process physical memory footprint in MB (TASK_VM_INFO flavor 22). Unlike
-/// resident_size, this includes MLX's Metal/IOKit + compressed memory — the
-/// only figure that reflects a loaded model's true footprint on Apple Silicon.
-/// On Linux the honest analog is VmRSS (unified-memory footprint has no
-/// equivalent); swap-paged-out pages are invisible to it.
-pub fn getAppMemFootprintMb() u32 {
-    if (comptime !builtin.os.tag.isDarwin())
-        return @intCast(linuxProcStatusKib("VmRSS:") / 1024);
-    var info = std.mem.zeroes(TaskVmInfo);
-    var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 38 = TASK_VM_INFO_REV1_COUNT
-    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
-    return @intCast(info.phys_footprint / (1024 * 1024));
-}
-
-/// Bytes the OS will grant a new wiring: free (less speculative — free_count
-/// already contains them and `external` carries them back) plus file-backed plus
-/// purgeable (anonymous caches macOS drops before it compresses anything), capped
-/// by the RAM outside wired + compressor. 0 on a failed query.
-fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, purgeable_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
-    if (total_mem == 0) return 0;
-    const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages +| purgeable_pages;
-    const outside: u64 = total_mem -| (wire_pages +| compressor_pages) *| page;
-    return @min(reclaimable *| page, outside);
-}
-
 extern "c" fn os_proc_available_memory() usize;
-
-/// Per-process memory headroom before jetsam (iOS only — the entitlement-
-/// aware figure that actually governs whether a big allocation survives).
-/// Returns 0 on macOS, where the concept doesn't apply; the symbol is only
-/// referenced on iOS builds so macOS links are unaffected.
-pub fn getProcAvailableMemBytes() u64 {
-    if (comptime builtin.os.tag != .ios) return 0;
-    return @intCast(os_proc_available_memory());
-}
 
 /// Where weights live in device memory (`mlx.weightsInDeviceMemory`: CUDA on Windows, WSL) the
 /// GPU's memory is what every gate bills, as unified memory is on a Mac; elsewhere the host's.
@@ -160,24 +117,6 @@ pub fn memoryPool(device_weights: bool, device: u64, host: u64) u64 {
 
 pub fn getTotalMemBytes() u64 {
     return memoryPool(mlx.weightsInDeviceMemory(), mlx.maxRecommendedWorkingSet(), hostTotalMemBytes());
-}
-
-pub fn getAvailableMemBytes() u64 {
-    return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), hostAvailableMemBytes());
-}
-
-/// The kernel's memory-pressure level: 1 normal, 2 warning, 4 critical; 0 where the OS has no such reading.
-pub fn memoryPressureLevel() u32 {
-    if (comptime !builtin.os.tag.isDarwin()) return 0;
-    var level: c_int = 0;
-    var len: usize = @sizeOf(c_int);
-    if (sysctlbyname("kern.memorystatus_vm_pressure_level", @ptrCast(&level), &len, null, 0) != 0) return 0;
-    return if (level > 0) @intCast(level) else 0;
-}
-
-/// Warning or worse: the OS is already compressing and swapping to make room.
-pub fn underMemoryPressure(level: u32) bool {
-    return level >= 2;
 }
 
 /// Total physical RAM (hw.memsize on Darwin; /proc/meminfo on Linux). 0 on failure.
@@ -190,42 +129,8 @@ fn hostTotalMemBytes() u64 {
     return total_mem;
 }
 
-/// Free RAM the plan never touches. MLX wires what it allocates, so planning down to the last
-/// free page leaves the OS nothing to reclaim: a 16 GB Mac died on wired memory (15.4 GB wired,
-/// 14 MB free) with every request admitted.
-/// `device_pool`: the memory is a GPU's own (`mlx.weightsInDeviceMemory`), whose free reading
-/// already counts every process, so no OS share is held back.
-pub fn osReserveBytes(total_ram: u64, device_pool: bool) u64 {
-    if (os_reserve_override) |v| return v;
-    if (device_pool) return 0;
-    return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
-}
-
 /// `--os-reserve-gib N` in bytes; 0 turns the reserve off. Null = the automatic eighth.
 pub var os_reserve_override: ?u64 = null;
-
-pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
-    const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOsReserve;
-    if (n > 64) return error.InvalidOsReserve;
-    return @as(u64, n) << 30;
-}
-
-fn hostAvailableMemBytes() u64 {
-    if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullAvailPhys;
-    if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
-    var total_mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
-
-    var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
-
-    var vm = std.mem.zeroes(VmStats64);
-    var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
-
-    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.purgeable_count, vm.wire_count, vm.compressor_page_count, page);
-}
 
 const MemoryStatusEx = extern struct {
     dwLength: u32 = @sizeOf(MemoryStatusEx),
@@ -262,20 +167,6 @@ fn linuxMemInfoKib(key: []const u8) u64 {
     return 0;
 }
 
-/// One `/proc/self/status` field in KiB ("VmRSS:", "VmHWM:", …). 0 unknown.
-fn linuxProcStatusKib(key: []const u8) u64 {
-    var buf: [8192]u8 = undefined;
-    const n = readProcFile("/proc/self/status", &buf) orelse return 0;
-    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
-    while (it.next()) |line| {
-        if (!std.mem.startsWith(u8, line, key)) continue;
-        const val = std.mem.trim(u8, line[key.len..], " \t");
-        const end = std.mem.indexOf(u8, val, " kB") orelse val.len;
-        return std.fmt.parseInt(u64, std.mem.trim(u8, val[0..end], " \t"), 10) catch 0;
-    }
-    return 0;
-}
-
 /// Whole-file read of a small procfs file. Returns null when missing/unreadable.
 fn readProcFile(path: []const u8, buf: []u8) ?usize {
     if (path.len >= std.fs.max_path_bytes) return null;
@@ -290,132 +181,4 @@ fn readProcFile(path: []const u8, buf: []u8) ?usize {
     return @intCast(n);
 }
 
-pub fn getSysMemPct() u32 {
-    if (comptime !builtin.os.tag.isDarwin()) {
-        // (total - available) / total, from the kernel's MemAvailable.
-        const total = linuxMemInfoKib("MemTotal:");
-        if (total == 0) return 0;
-        const avail = linuxMemInfoKib("MemAvailable:");
-        return @intCast((total -| avail) * 100 / total);
-    }
-    var total_mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
-
-    var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
-
-    var vm = std.mem.zeroes(VmStats64);
-    var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
-
-    const used: u64 = (@as(u64, vm.active_count) + vm.wire_count + vm.compressor_page_count) * page;
-    if (total_mem == 0) return 0;
-    return @intCast(used * 100 / total_mem);
-}
-
-pub fn getCpuPct() u32 {
-    if (comptime !builtin.os.tag.isDarwin()) {
-        // /proc/stat aggregate line: "cpu  user nice system idle iowait irq
-        // softirq steal ...". Delta over the calls, idle = nice-adjusted idle
-        // columns, mirroring the Mach ticks loop below.
-        var buf: [512]u8 = undefined;
-        const n = readProcFile("/proc/stat", &buf) orelse return 0;
-        const line_end = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse n;
-        var it = std.mem.tokenizeAny(u8, buf[0..line_end], " \t");
-        _ = it.next(); // "cpu"
-        var ticks: [4]u64 = @splat(0);
-        var all: [10]u64 = @splat(0);
-        var i: usize = 0;
-        while (it.next()) |tok| : (i += 1) {
-            if (i >= 10) break;
-            all[i] = std.fmt.parseInt(u64, tok, 10) catch 0;
-        }
-        ticks[0] = all[0] + all[1] + all[2]; // user+nice+system
-        ticks[1] = 0;
-        ticks[2] = 0;
-        ticks[3] = all[3] + all[4]; // idle + iowait
-        var total: u64 = 0;
-        var idle: u64 = 0;
-        for (0..4) |j| {
-            const delta = ticks[j] -| prev_ticks[j];
-            total += delta;
-            if (j == 3) idle = delta;
-            prev_ticks[j] = ticks[j];
-        }
-        if (total == 0) return 0;
-        return @intCast((total - idle) * 100 / total);
-    }
-    var info = std.mem.zeroes(CpuLoadInfo);
-    var count: u32 = 4;
-    if (host_statistics(mach_host_self(), 3, @ptrCast(&info), &count) != 0) return 0;
-
-    var total: u64 = 0;
-    var idle: u64 = 0;
-    for (0..4) |i| {
-        const cur: u64 = info.ticks[i];
-        const delta = cur -| prev_ticks[i];
-        total += delta;
-        if (i == 2) idle = delta;
-        prev_ticks[i] = cur;
-    }
-    if (total == 0) return 0;
-    return @intCast((total - idle) * 100 / total);
-}
-
-pub fn getGpuPct() u32 {
-    // IOKit's IOServiceMatching/AGXAccelerator path is macOS-only; the symbols
-    // aren't in the public iOS SDK (and apps are sandboxed from the GPU service
-    // registry anyway). On iOS we report 0 — the value is only a log-line stat.
-    if (comptime !is_macos) return 0;
-    const matching = IOServiceMatching("AGXAccelerator") orelse return 0;
-    var iter: u32 = 0;
-    if (IOServiceGetMatchingServices(0, matching, &iter) != 0) return 0;
-    defer _ = IOObjectRelease(iter);
-
-    const entry = IOIteratorNext(iter);
-    if (entry == 0) return 0;
-    defer _ = IOObjectRelease(entry);
-
-    var props: ?*anyopaque = null;
-    if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) return 0;
-    defer if (props) |p| CFRelease(p);
-
-    const perf = cfDictGet(props, "PerformanceStatistics") orelse return 0;
-    const util = cfDictGet(perf, "Device Utilization %") orelse return 0;
-
-    var value: i64 = 0;
-    _ = CFNumberGetValue(util, 4, @ptrCast(&value));
-    return if (value >= 0 and value <= 100) @intCast(value) else 0;
-}
-
 var gpu_cores: ?u32 = null;
-
-/// GPU core count (AGXAccelerator `gpu-core-count`), 0 when unknown. Read once.
-pub fn gpuCoreCount() u32 {
-    if (gpu_cores) |n| return n;
-    gpu_cores = blk: {
-        if (comptime !is_macos) break :blk 0;
-        const matching = IOServiceMatching("AGXAccelerator") orelse break :blk 0;
-        var iter: u32 = 0;
-        if (IOServiceGetMatchingServices(0, matching, &iter) != 0) break :blk 0;
-        defer _ = IOObjectRelease(iter);
-        const entry = IOIteratorNext(iter);
-        if (entry == 0) break :blk 0;
-        defer _ = IOObjectRelease(entry);
-        var props: ?*anyopaque = null;
-        if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) break :blk 0;
-        defer if (props) |p| CFRelease(p);
-        const v = cfDictGet(props, "gpu-core-count") orelse break :blk 0;
-        var n: i64 = 0;
-        _ = CFNumberGetValue(v, 4, @ptrCast(&n));
-        break :blk if (n > 0 and n < 1 << 16) @intCast(n) else 0;
-    };
-    return gpu_cores.?;
-}
-
-fn cfDictGet(dict: ?*const anyopaque, key_name: [*:0]const u8) ?*const anyopaque {
-    const key = CFStringCreateWithCString(null, key_name, 0x08000100) orelse return null;
-    defer CFRelease(key);
-    return CFDictionaryGetValue(dict, key);
-}

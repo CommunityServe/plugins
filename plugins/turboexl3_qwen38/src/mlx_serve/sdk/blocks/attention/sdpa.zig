@@ -210,34 +210,3 @@ pub fn splitMaskedSdpa256(
     }
     return out;
 }
-
-/// q [1, H, S, hd] over k/v [1, KVH, L, hd] whose last S rows are the
-/// window's: row r takes the one-query sdpa over keys [0, L - S + r].
-pub fn rowByRowSdpa(out: *mlx.mlx_array, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, seq: c_int, s: mlx.mlx_stream) !void {
-    const qs = mlx.getShape(q);
-    const ks = mlx.getShape(k);
-    const vs = mlx.getShape(v);
-    const none_mask = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(none_mask);
-    const rows = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(rows);
-    const st4 = [_]c_int{ 1, 1, 1, 1 };
-    var r: c_int = 0;
-    while (r < seq) : (r += 1) {
-        const keys = ks[2] - seq + r + 1;
-        var qr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(qr);
-        try mlx.check(mlx.mlx_slice(&qr, q, &[_]c_int{ 0, 0, r, 0 }, 4, &[_]c_int{ qs[0], qs[1], r + 1, qs[3] }, 4, &st4, 4, s));
-        var kr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kr);
-        try mlx.check(mlx.mlx_slice(&kr, k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ ks[0], ks[1], keys, ks[3] }, 4, &st4, 4, s));
-        var vr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(vr);
-        try mlx.check(mlx.mlx_slice(&vr, v, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ vs[0], vs[1], keys, vs[3] }, 4, &st4, 4, s));
-        var o = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(o);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, qr, kr, vr, scale, "", none_mask, .{ .ctx = null }, false, s));
-        _ = mlx.mlx_vector_array_append_value(rows, o);
-    }
-    try mlx.check(mlx.mlx_concatenate_axis(out, rows, 2, s));
-}

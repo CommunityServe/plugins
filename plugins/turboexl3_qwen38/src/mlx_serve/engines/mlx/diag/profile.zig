@@ -7,15 +7,6 @@ const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 
-pub fn debugTraceHead(label: []const u8, arr: mlx.mlx_array, s: mlx.mlx_stream) void {
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    mlx.check(mlx.mlx_astype(&f, arr, .float32, s)) catch return;
-    mlx.check(mlx.mlx_array_eval(f)) catch return;
-    const d = mlx.mlx_array_data_float32(f) orelse return;
-    std.debug.print("{s}: {any}\n", .{ label, d[0..8] });
-}
-
 // ── Decode sub-block profiler (diag decode-profile) ──
 // Serializes the S=1 decode forward with per-sub-block evals to attribute the
 // per-token GPU cost across embed / attn / mlp / lm_head. DIAGNOSTIC ONLY: the
@@ -94,24 +85,4 @@ pub fn dispatchProbeCount() usize {
     const n: usize = if (raw) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0 else 0;
     dispatch_probe_cached = n;
     return n;
-}
-
-pub fn decodeProfReport() void {
-    const n = profileState().decode_prof.calls;
-    if (n == 0) return;
-    const per = struct {
-        fn ms(ns: u64, calls: u64) f64 {
-            return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(calls)) / 1.0e6;
-        }
-    };
-    const e = per.ms(profileState().decode_prof.embed_ns, n);
-    const a = per.ms(profileState().decode_prof.attn_ns, n);
-    const g = per.ms(profileState().decode_prof.gdn_ns, n);
-    const m = per.ms(profileState().decode_prof.mlp_ns, n);
-    const l = per.ms(profileState().decode_prof.lmhead_ns, n);
-    const mr = per.ms(profileState().decode_prof.moe_router_ns, n);
-    const mx_ = per.ms(profileState().decode_prof.moe_experts_ns, n);
-    const ms_ = per.ms(profileState().decode_prof.moe_shared_ns, n);
-    log.info("[decode-prof] n={d} serial/tok={d:.2}ms  embed={d:.2} attn={d:.2} gdn={d:.2} mlp={d:.2} lmhead={d:.2} ms | moe: router={d:.2} experts={d:.2} shared={d:.2} ms\n", .{ n, e + a + g + m + l, e, a, g, m, l, mr, mx_, ms_ });
-    profileState().decode_prof = .{};
 }

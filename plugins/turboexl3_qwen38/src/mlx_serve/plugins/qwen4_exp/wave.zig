@@ -444,22 +444,4 @@ const WaveTestRun = struct {
         r.arrays.deinit(testing.allocator);
     }
 
-    fn keep(r: *WaveTestRun, x: mlx.mlx_array, s: mlx.mlx_stream) !void {
-        const v = if (x.ctx == null) try testing.allocator.alloc(f32, 0) else try qwen4ReadF32(testing.allocator, x, s);
-        errdefer testing.allocator.free(v);
-        try r.arrays.append(testing.allocator, v);
-    }
 };
-
-/// rms(got - want) / rms(want) (the plain rms against a zero `want`), and false on a value that is not finite.
-fn waveTestRel(want: []const f32, got: []const f32) ?f64 {
-    var num: f64 = 0;
-    var den: f64 = 0;
-    for (want, got) |w, g| {
-        if (!std.math.isFinite(w) or !std.math.isFinite(g)) return null;
-        const d = @as(f64, g) - w;
-        num += d * d;
-        den += @as(f64, w) * w;
-    }
-    return if (den == 0) @sqrt(num) else @sqrt(num / den);
-}

@@ -79,12 +79,6 @@ const QkFusedCfgKey = struct { hq: c_int, hk: c_int, rd: c_int, scaled: bool, dt
 var qk_fused_cfgs: [2]struct { cfg: ?mlx.mlx_fast_metal_kernel_config = null, key: QkFusedCfgKey = std.mem.zeroes(QkFusedCfgKey) } = .{ .{}, .{} };
 var qk_fused_next: usize = 0;
 
-/// True when the fused QK-norm+RoPE kernel is on — exported so an out-of-file
-/// caller (tts.zig's talker) can skip building the angles row when it is not.
-pub fn qkNormRopeFusedWanted() bool {
-    return qkNormRopeFusedEnabled();
-}
-
 /// One fused dispatch: per-head RMSNorm + RoPE (+ optional mscale) for q AND
 /// k, emitting the transposed [1,H,1,128] layout attention consumes (at L==1
 /// that is the flat buffer relabeled, so the transposes vanish too).
@@ -154,22 +148,6 @@ pub fn fusedQkNormRope(
         log.info("[attn] fused QK-norm+RoPE engaged: hq={d} hk={d} rd={d} scaled={}\n", .{ hq, hk, rd, ms != null });
     }
     return .{ oq, ok };
-}
-
-/// Extract the exact cos|sin row the stock RoPE kernel computes at `offset`:
-/// a [1,1,1,rd] f32 probe with ones in the first half rotates to
-/// [cos(theta_p) | sin(theta_p)] — the same floats, not a re-derivation (the
-/// angle math inside `mlx_fast_rope` is float regardless of the tensor
-/// dtype, so the f32 probe reads it out exactly).
-pub fn ropeAngleRow(
-    s: mlx.mlx_stream,
-    rd: c_int,
-    base: mlx.mlx_optional_float,
-    freqs: mlx.mlx_array,
-    offset: c_int,
-    allocator: std.mem.Allocator,
-) !mlx.mlx_array {
-    return ropeAngleRows(s, rd, base, freqs, offset, 1, allocator, 1.0, 1.0);
 }
 
 /// Multi-position variant: [rows * rd] f32, row p = the cos|sin row at
@@ -363,40 +341,3 @@ pub fn fusedQkNormRope256(
 }
 
 // ── tests ──
-
-/// Composed reference for the fused QK-norm+RoPE tests: the EXACT shipped
-/// chain (reshape → fast_rms_norm → transpose → fast_rope → optional bf16
-/// mscale multiply), returning [1, H, 1, 128].
-fn qkComposedRef(
-    s: mlx.mlx_stream,
-    flat: mlx.mlx_array,
-    norm_w: mlx.mlx_array,
-    ms: ?mlx.mlx_array,
-    h: c_int,
-    rd: c_int,
-    base: mlx.mlx_optional_float,
-    freqs: mlx.mlx_array,
-    offset: c_int,
-    eps: f32,
-) !mlx.mlx_array {
-    const shape4 = [_]c_int{ 1, 1, h, 128 };
-    var r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(r);
-    try mlx.check(mlx.mlx_reshape(&r, flat, &shape4, 4, s));
-    var normed = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(normed);
-    try mlx.check(mlx.mlx_fast_rms_norm(&normed, r, norm_w, eps, s));
-    const perm = [_]c_int{ 0, 2, 1, 3 };
-    var t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(t);
-    try mlx.check(mlx.mlx_transpose_axes(&t, normed, &perm, 4, s));
-    var roped = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_fast_rope(&roped, t, rd, false, base, 1.0, offset, freqs, s));
-    if (ms) |m| {
-        var scaled = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&scaled, roped, m, s));
-        _ = mlx.mlx_array_free(roped);
-        return scaled;
-    }
-    return roped;
-}

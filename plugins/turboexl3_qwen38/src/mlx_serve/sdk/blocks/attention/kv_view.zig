@@ -52,12 +52,6 @@ pub const DenseKVView = struct {
         // Triple fields are non-owning borrows — never free.
     }
 
-    pub fn kTriple(self: DenseKVView) kv_quant.BorrowedTriple {
-        return .{ .q = self.k_triple_q, .scales = self.k_triple_scales, .biases = self.k_triple_biases };
-    }
-    pub fn vTriple(self: DenseKVView) kv_quant.BorrowedTriple {
-        return .{ .q = self.v_triple_q, .scales = self.v_triple_scales, .biases = self.v_triple_biases };
-    }
 };
 
 /// What a sliding layer's K/V view looks like for THIS forward: the `max_kv`

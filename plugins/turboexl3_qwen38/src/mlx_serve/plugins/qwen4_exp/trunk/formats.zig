@@ -111,72 +111,6 @@ pub fn reordered(self: *const Trunk) bool {
     return self.formats.numerics == .reordered;
 }
 
-fn gib(b: u64) f64 {
-    return @as(f64, @floatFromInt(b)) / (1024.0 * 1024.0 * 1024.0);
-}
-
-/// The MTP head's linears' `.weight` arrays (0 where absent): fc_embedding, fc_hidden, its attention's q, k, v, o and
-/// indexer, its shared expert's gate, up and down.
-fn mtpLinears(self: *const Trunk) [10]usize {
-    var keys: [10]usize = @splat(0);
-    const m = if (self.qwen4_mtp) |*h| h else return keys;
-    keys[0] = @intFromPtr(m.fc_emb_w.ctx);
-    keys[1] = @intFromPtr(m.fc_hid_w.ctx);
-    switch (m.layer.attn) {
-        .full => |*fa| for ([_]mlx.mlx_array{ fa.q_w, fa.k_w, fa.v_w, fa.o_w, fa.idx_qk_w }, keys[2..7]) |w, *k| {
-            k.* = @intFromPtr(w.ctx);
-        },
-        .linear => {},
-    }
-    switch (m.layer.mlp) {
-        .moe => |*mw| for ([_]mlx.mlx_array{ mw.shared_gate_w, mw.shared_up_w, mw.shared_down_w }, keys[7..10]) |w, *k| {
-            k.* = @intFromPtr(w.ctx);
-        },
-        .dense => {},
-    }
-    return keys;
-}
-
-/// Whether the resident set takes the linear whose `.weight` is `w`: one the trunk format loaded, not the lm_head (one row
-/// per prefill), not the MTP head's on a load that serves no head.
-fn residentAdmits(self: *const Trunk, w: mlx.mlx_array, head: *const [10]usize, mtp_head: bool) bool {
-    if (w.ctx == null or w.ctx == self.lm_head_w.ctx or self.formats.linearOf(w) == null) return false;
-    return mtp_head or std.mem.indexOfScalar(usize, head, @intFromPtr(w.ctx)) == null;
-}
-
-/// The resident trunk's arm, from the engine's load once everything the load keeps is resident and before the warm-ups
-/// and the hot-cache plan, which then bill it: the trunk format keeps every linear `residentAdmits`, within `room` bytes
-/// (the GPU ceiling less the active bytes, the context's KV and a prefill chunk's reserve); `mtp_head` whether the head
-/// serves this load. A decline keeps the per-call decode.
-pub fn armTrunkResident(self: *Trunk, room: u64, mtp_head: bool) void {
-    const f = &self.formats;
-    const t = f.trunk orelse return;
-    const keep = t.resident orelse {
-        log.info("[trunk-resident] declined: {s} keeps no decoded matrices; each call decodes its own\n", .{t.name.slice()});
-        return;
-    };
-    var ws: std.ArrayList(abi.Weight) = .empty;
-    defer ws.deinit(self.allocator);
-    const head = mtpLinears(self);
-    var it = f.linears.iterator();
-    while (it.next()) |e| {
-        if (!residentAdmits(self, .{ .ctx = @ptrFromInt(e.key_ptr.*) }, &head, mtp_head)) continue;
-        ws.append(self.allocator, e.value_ptr.*) catch {
-            log.info("[trunk-resident] declined: no host memory for the list\n", .{});
-            return;
-        };
-    }
-    if (ws.items.len == 0) return;
-    var bytes: u64 = 0;
-    const v = keep(.of(ws.items), room, .{ .ctx = self.s.ctx }, &bytes);
-    if (!v.isOk()) {
-        log.info("[trunk-resident] declined: {d} linears, {d:.2} GB, in {d:.2} GB of room ({s}); each call decodes its own\n", .{ ws.items.len, gib(bytes), gib(room), v.why.slice() });
-        return;
-    }
-    f.resident_bytes = bytes;
-    log.info("[trunk-resident] engaged: {d} linears, {d:.2} GB, each decoded matrix kept at its first prefill call\n", .{ ws.items.len, gib(bytes) });
-}
-
 /// One load's formats while they are open: `begin` claims and opens them and loads the trunk's linears, `banks` loads
 /// one MoE layer's routed banks, `end` closes them (the weights outlive it, in `formats`). Stays at its address while
 /// open: the load contexts point into it.
@@ -391,12 +325,6 @@ const Marker = struct {
     const table: abi.QuantTable = .{ .name = abi.Str.of("marker"), .claims = &claims, .validate = undefined, .bill = undefined, .open = undefined, .close = undefined, .load_tensor = undefined, .load_bank = undefined, .release = undefined, .matmul = undefined, .moe = undefined };
 };
 
-fn putZeros(w: *model.Weights, name: []const u8, dt: mlx.mlx_dtype, shape: []const c_int) !void {
-    var a = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, mlx.mlx_default_cpu_stream_new()));
-    try w.put(name, a);
-}
-
 /// `Fake` with the resident entries: each weight takes `per` bytes.
 const Keep = struct {
     const per: u64 = 1024;
@@ -416,18 +344,3 @@ const Keep = struct {
         break :blk t;
     };
 };
-
-fn keepTrunk(w: *model.Weights, s: mlx.mlx_stream) !Trunk {
-    const config: model.ModelConfig = .{ .trunk_format = true };
-    var ld: Loading = undefined;
-    try ld.begin(testing.allocator, &config, w, .{ .trunk_quant = "{\"format\":\"fake\"}" }, s);
-    ld.end();
-    var t: Trunk = undefined;
-    t.formats = ld.formats;
-    t.allocator = testing.allocator;
-    t.s = s;
-    t.lm_head_w = w.get("lm_head.weight").?;
-    t.qwen4_mtp = null;
-    t.moe_layers = &.{};
-    return t;
-}

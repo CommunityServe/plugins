@@ -9,8 +9,3 @@ pub const Pending = struct { f: ?*const fn () callconv(.c) u64 = null };
 
 /// Process-wide under `-Dunits` (`sdk/util/shared.zig`).
 pub const pending = @import("../util/shared.zig").Shared(Pending, "quant_resident_pending", .{});
-
-pub fn bytes() u64 {
-    const f = pending.get().f orelse return 0;
-    return f();
-}

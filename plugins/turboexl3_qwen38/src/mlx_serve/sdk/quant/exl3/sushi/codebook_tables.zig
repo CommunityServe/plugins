@@ -47,12 +47,6 @@ pub const Table = struct {
     /// stamped with one is refused as a legacy config.
     superseded: []const []const u8 = &.{},
 
-    pub fn row(self: *const Table, rate: format.Rate) ?Row {
-        if (rate.n % 2 != 0 or rate.n < self.n_lo) return null;
-        const i = (rate.n - self.n_lo) / 2;
-        return if (i < self.rows.len) self.rows[i] else null;
-    }
-
     pub fn rateOf(self: *const Table, i: usize) format.Rate {
         return .{ .n = self.n_lo + 2 * @as(u32, @intCast(i)) };
     }
@@ -220,47 +214,13 @@ const test_only = [_]Table{
 
 pub const tables = shipped ++ if (builtin.is_test) test_only else [0]Table{};
 
-pub fn indexOf(comptime name: []const u8) u8 {
-    return comptime for (tables, 0..) |t, i| {
-        if (std.mem.eql(u8, t.name, name)) break @intCast(i);
-    } else @compileError("no codebook table " ++ name);
-}
-
 pub fn index(t: *const Table) u8 {
     return @intCast(t - &tables[0]);
-}
-
-/// The SPEC1 pair a bank at `rate` decodes with under table `which`; null where the table has no row.
-pub fn tabledPair(which: u8, rate: format.Rate) ?format.HashMask {
-    const r = tables[which].row(rate) orelse return null;
-    return .{ .mult = r[0], .mask = r[1] };
 }
 
 pub fn lookup(name: []const u8) ?*const Table {
     for (&tables) |*t| if (std.mem.eql(u8, t.name, name)) return t;
     return null;
-}
-
-/// First 8 hex digits of sha256 over one line per row, ascending n: `<n decimal>,<each field as 8 lowercase hex
-/// digits, comma separated>\n`.
-pub fn digestOf(fields: usize, ns: []const u32, rows: []const Row) [8]u8 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
-    for (ns, rows) |n, r| {
-        var line: [64]u8 = undefined;
-        var len = (std.fmt.bufPrint(&line, "{d}", .{n}) catch unreachable).len;
-        for (r[0..fields]) |v| len += (std.fmt.bufPrint(line[len..], ",{x:0>8}", .{v}) catch unreachable).len;
-        line[len] = '\n';
-        h.update(line[0 .. len + 1]);
-    }
-    var out: [32]u8 = undefined;
-    h.final(&out);
-    return std.fmt.bytesToHex(out[0..4].*, .lower);
-}
-
-pub fn digestOfTable(t: *const Table) [8]u8 {
-    var ns: [(format.Rate.max_n - format.Rate.min_n) / 2 + 1]u32 = undefined;
-    for (ns[0..t.rows.len], 0..) |*n, i| n.* = t.rateOf(i).n;
-    return digestOf(t.fields, ns[0..t.rows.len], t.rows);
 }
 
 /// The table `block` names for `codebook` at `window`, refusing by name. Only std1, spec1 and pair1 have tables.
@@ -277,11 +237,4 @@ pub fn resolve(block: std.json.ObjectMap, codebook: format.Codebook, window: for
     if (!table.admits(window)) return error.Exl3CodebookTableWindowMismatch;
     if (!table.decodable()) return error.Exl3CodebookTableUndecodable;
     return table;
-}
-
-fn resolveText(raw: []const u8, codebook: format.Codebook, window: format.Window) Refusal!*const Table {
-    const t = std.testing;
-    const parsed = std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{}) catch unreachable;
-    defer parsed.deinit();
-    return resolve(parsed.value.object, codebook, window);
 }

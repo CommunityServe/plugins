@@ -1,0 +1,144 @@
+# The functions scripts/sync-mlx-serve.sh leaves out of a copy, as `<file>: <function> ...` (a method as
+# Container.method): none of them is compiled by any build of the plugin (the dylib, `zig build test`,
+# mlx-free-test, gpu-test), as those builds' symbols and the compiler show. A name the copy lacks stops the sync.
+engines/mlx/batched/layered.zig: forwardBatchedDecode forwardMoeBatchedDecode forwardMoeBatchedVerify
+engines/mlx/batched/row_axis_verify.zig: L10VerifySlots.init expectRowsByteEqual expectSlotStateEqual forwardRowAxisVerify logicalSsmCapture rollbackRowToAccepted takeJoinedVerifyLogits verifyLaps verifyRollbackEvalStorage verifyRollbackKvCase verifyRollbackStorageAddress verifyRollbackValidPrefixEqual
+engines/mlx/compiled.zig: clearCompiledClosures compileGeglu compileGelu gegluClosureCallback geluClosureCallback
+engines/mlx/diag/profile.zig: debugTraceHead decodeProfReport
+engines/mlx/eval_cadence.zig: ladderStep
+engines/mlx/forward_ctx.zig: SpecTree.deinit
+engines/mlx/kv/cache.zig: kvAppendDummyAttn kvAppendOperandsEqual kvAppendPacked kvAppendPrefill ringViewsEqual testKV testKVWide
+engines/mlx/kv/cache_ops.zig: ab freeEntries mx newEntries
+engines/mlx/load/weights.zig: addOne depthwiseConvNeedsTranspose expertLeaf f32Table getLayerScaleOrEmptyOpt getLayerWeightAt getLayerWeightAtOpt getWeightAt getWeightAtOpt layerBase loadQW maybeTransposeDepthwiseConv transposeBf16WeightPub
+engines/mlx/methods/mrope.zig: applyMrope beginMropeChunk buildMropeCosSin mropeCosSinAt
+engines/mlx/methods/yarn.zig: yarnActive yarnScaleQK yarnScaleRotated
+engines/mlx/sampling/spec_sampling.zig: argmaxStepProposal filteredProbsBlock filteredProbsRows groupProbsBlock groupProbsRow lazyOneHotRow logitsStepProposal pldOneHotRow probAt probsAllPositions probsAtLastPos proposalTestRead sampleFromProbs sampleResidual scatterShortlistQ selectorQRow shortlistProposal shortlistProposalRows shortlistStepProposal sliceProbRow verifyRows2d
+engines/mlx/spec/dflash/dflash.zig: DflashConfig.captureIds DflashConfig.deinit DflashConfig.isDflash2 DflashConfig.isDspark DflashCtx.absLen DflashCtx.appendEvalArrays DflashCtx.deinit DflashCtx.init DflashLayer.appendEval DflashLayer.deinit DflashLinear.appendEval DflashLinear.apply DflashLinear.deinit DflashLinear.isQuantized DflashModel.bind DflashModel.bindWithDraftBits DflashModel.buildDraftHead DflashModel.deinit DflashModel.draftLogits DflashModel.tileLaneWeights DraftTree.deinit DynConv.appendEval DynConv.deinit Lattice.deinit LayerType.fromString MarkovHead.appendEval MarkovHead.deinit MarkovHead.stepLogits OwnHeadFix.write SelectedPath.deinit Selector.appendEval Selector.deinit TinyFix.bf16Arr TinyFix.bf16ArrShaped TinyFix.capArr TinyFix.normArr TinyFix.put TinyFix.putNorm TinyFix.putQuantW TinyFix.putV1AssistantWeights TinyFix.putW TinyFix.readF32 TinyFix.val TinyFix.writeAssistant TinyFix.writeAssistant2 TinyFix.writeAssistantAs TinyFix.writeAssistantOpts TinyFix.writeTrunk appendContext applyLogitTransforms baseKernelHalf bestFirstTree blockCapForMachine buildBlockMask checkCodebook contractFloat convFinish convPrepare ctxBytesPerToken defaultQuantBits encodeContext fixtureArr fixtureCaptures fixtureF32Slice forwardBlock jsonFloat jsonU32 lattice loadDflash loadDflashQuant loadDynConv loadLinear loadOwnHead ownWeight ownWeightEither paritySlices parityVs parseConfig parseConfigFromJson preorder probeIsDflash projectHeads projectHeadsNoNorm quantGroupFor quantizeDense readConfigFile resolveBlockSize resolveInDirDrafter scalarAs selectPath servesAsDrafter sidecarQuantBits softmaxShare swiglu tinyBlockHidden toDrafterDtype validateTargetLayers wideVerifyLaneAvailable
+engines/mlx/spec/mtp/adaptive.zig: MtpAdaptive.declineReentry mtpHeadDriftNow mtpHeadPositionDrift mtpMaybeReleaseModuleHead mtpModuleHeadReleased mtpReleasePending stickyReleaseNow
+engines/mlx/spec/mtp/chain.zig: LazyRig.load LazyRig.prompt LazyRig.run MtpChainTestSlot.begin MtpChainTestSlot.equal MtpChainTestSlot.init MtpPreDraft.frontFor MtpPreDraft.setEnNext acceptGraphFor acceptPrefixFor concatIds mtpChainInit mtpCommittedHistoryLen mtpCommittedLen mtpCoupledDrafts mtpLazyGate mtpLazyKeeps mtpLazyPreDraft mtpLazyPredraftAllowedFor mtpLazyPredraftEnabled mtpLazyVerdict mtpLookupChain mtpMropeContext mtpPaddedAppend mtpPaddedHeadEnabled mtpPaddedHistory mtpPaddedHistoryAppend mtpPreDraftResolve mtpRoundOff0 mtpSamplingDraw verifySerialSamples verifySerialSamplesAt
+engines/mlx/spec/mtp/depth.zig: mtpDraftGreedyAt mtpDraftGreedyFor mtpDraftSampling mtpDraftSamplingFor mtpDraftTempFor mtpHeadGreedySampling specAcceptProb
+engines/mlx/spec/mtp/ev_fix.zig: measuredTable
+engines/mlx/spec/mtp/ev_plan.zig: mtpBoundsPlanFixture mtpDepthCapFor mtpDepthCapForProfileChip mtpEvPlanFor mtpEvPlanForAt mtpEvRoundCost mtpEvTestGenerator persistRoundCost resolveMtpDepthCap
+engines/mlx/spec/mtp/planner.zig: mtpGroupPlan mtpPlannerMode mtpPlannerObserve mtpRoundPlan mtpRoundPlanTraced mtpTraceRoundEnd planMs
+engines/mlx/spec/mtp/regime.zig: mtpRegimeTwoChunkWorse
+engines/mlx/spec/mtp/serial.zig: invalidateRoundClock invalidateSerialClock mtpApplyStash mtpDetachHead mtpGroupPreDraft mtpMaybePreDraft mtpPreDraftOpen mtpPreDraftOpenAllows mtpResumeAfterForced mtpSerialCaptureReady mtpSerialCaptureTick mtpSerialGiveUp mtpSerialMayResume mtpSerialOneToken mtpSerialTick
+engines/mlx/spec/mtp_depth_bounds.zig: parseClamped parseDepth plannerWidth validate
+engines/mlx/spec/mtp_group_planner.zig: History.expected History.observe Recovery.observe action entry execution healthy probeWidth shouldProbe
+engines/mlx/spec/mtp_lookup.zig: Index.agreement Index.matchBest
+engines/mlx/spec/mtp_nax_profile.zig: mtpNaxBf16EmbeddingMatches mtpNaxBf16EmbeddingMatchesFrom mtpNaxProfileEnabled mtpNaxProfileEnabledForTrunk mtpNaxProfileEnabledFrom mtpNaxQ4Gs64ProfileEnabled mtpNaxQ6Gs64ProfileEnabled mtpNaxQ8Gs64ProfileEnabled mtpNaxTestConfig mtpOqeNaxProfileEnabled trunkFlags
+engines/mlx/spec/mtp_test.zig: RerankFixture.initDense
+engines/mlx/spec/round_cost.zig: Table.dropImplausibleCells Table.foldedCells Table.foldedSerialCells Table.roundBeatsSerial Table.widerImplausible bucketFor buildIdReadsExe cacheKey cachePath engineBuildId exePath feed feedLookup fileExists fileFingerprint homeDir loadCached migrateLegacy mixExeBytes mixFileStamp mixMlxArtifacts mlxDylibPath parse persistDiagArmed persistDiagArmedFrom persistEnabled persistEnabledFrom qwen4ProfileArmed readCached serialize storeCached storeShouldWrite storeVersion totalFolded
+engines/mlx/ssm/checkpoint.zig: checkpointPosOf positionDropIndex positionDropIndexLowAnchored positionDropIndexUsize qsaHistoryBytesHeld spanPreservingDropIndex ssmCheckpointDropIndex ssmCheckpointDropIndexLowAnchored u32PosOf usizePosOf
+engines/mlx/ssm/entry.zig: qsaRawKeyBytes ssmChainCaptured ssmCommitTreePath ssmEntryBytes
+engines/mlx/ssm/group.zig: SsmTickSlot.bind SsmTickSlot.init mergeSsmAcrossSlots splitSsmToSlots ssmBindBatched ssmBumpMemberGen ssmDetachFromGroup ssmGroupDrop ssmGroupRelease ssmTickBind ssmTickBindXfm ssmTickBumpArr ssmTickBumpMerged ssmTickBumpSlots ssmTickCompareRow ssmTickDummyArr ssmTickKinds ssmTickResetLikePrefixCache ssmTickStubXfm
+mlx/ops.zig: Graph.abs Graph.addScalar Graph.arange Graph.argmax Graph.argpartition Graph.broadcast Graph.concat Graph.contiguous Graph.conv1d Graph.conv2d Graph.convTranspose1d Graph.cos Graph.div Graph.drop Graph.equal Graph.erf Graph.escape Graph.exp Graph.fromSlice Graph.full Graph.greater Graph.keep Graph.layerNorm Graph.less Graph.linear Graph.log Graph.max Graph.maximum Graph.mergeHeads Graph.minimum Graph.mulScalar Graph.neg Graph.padAxis Graph.qmm Graph.repeat Graph.rope Graph.rsqrt Graph.scalarLike Graph.scope Graph.sdpa Graph.silu Graph.sin Graph.sliceUpdate Graph.softmax Graph.splitHeads Graph.splitKey Graph.sqrt Graph.square Graph.sub Graph.takeAlong Graph.tanh Graph.transpose Graph.where Owned.remove bytesOf chain cpu dtype eval evalMany expectBitEqual expectSameAs liveForTest randn
+plugins/qwen4_exp/cost_profile.zig: qwen4G17CostProfile
+plugins/qwen4_exp/forward.zig: Qwen4LadderRig.Slot.deinit Qwen4LadderRig.Slot.init Qwen4LadderRig.batchedStep Qwen4LadderRig.deinit Qwen4LadderRig.init Qwen4LadderRig.keep Qwen4LadderRig.prefill Qwen4LadderRig.step Qwen4LadderRig.weight Qwen4TestSlot.deinit Qwen4TestSlot.forward Qwen4TestSlot.init expectLogitBitsEqual forwardQwen4Stream qwen4Rows
+plugins/qwen4_exp/hc.zig: tOwned
+plugins/qwen4_exp/hc_fused.zig: hcFusedReadParity
+plugins/qwen4_exp/model_config.zig: expectEngineParse
+plugins/qwen4_exp/mtp.zig: Qwen4HeadRig.history Qwen4HeadRig.ids Qwen4HeadRig.load Qwen4HeadRig.paddedHistory Qwen4HeadRig.placedDrafts Qwen4MtpOutBuf.abandon mtpHeadForceBatched mtpMoeRows mtpPadSeq qwen4DraftSelectBatched qwen4DraftShortlist qwen4DraftShortlistsBatched qwen4MtpAdopt qwen4MtpApplyKvQuant qwen4MtpForwardBatched qwen4MtpForwardPlaced qwen4MtpForwardPlacedOn qwen4MtpMarkQsaLeftover qwen4MtpMarks qwen4MtpReset qwen4MtpResetOwned qwen4MtpTruncateOn singleVerifyTestRound
+plugins/qwen4_exp/ple.zig: PleArmFixture.arm PleArmFixture.deinit PleArmFixture.init PleArmFixture.xfm deferredPleOnGpu expectPleHistoryEqual pleArmEmbed pleArmEntry pleArmIds pleArmRead plePrefetchBegin qwen4BatchedPleForward
+plugins/qwen4_exp/ple_gpu.zig: expectArmsEqual gpuRows openEmbeddedFixture randIds testHash
+plugins/qwen4_exp/ple_table.zig: writeAffineFixture writeNvfp4Fixture writeNvfp4FixtureGroups
+plugins/qwen4_exp/plugin.zig: conformanceFixture
+plugins/qwen4_exp/qsa/checkpoint.zig: applyQsaHistoryAt attachQsaHistoryOnHandoff checkpointHasQsaHistory checkpointListHasQsaPooled checkpointQsaAuxRows checkpointQsaCoversPos checkpointQsaLeftoverRows entriesHaveQsaHistory handoffQsaHistoryToLatest qsaCoverTestCp qsaRestoreSatisfiesForward qsaSourceHoldsRowsAt sliceQsaHistoryOntoCheckpoint
+plugins/qwen4_exp/qsa/gather.zig: QsaBlockFixture.build QsaBlockFixture.deinit attn256QsaMask qsaBatchedGatherFloor qsaBatchedGatherOn qsaBoostLastTileK qsaNaxAssertNoWorseThanStock qsaNaxKernelBuilds qsaNaxProbeReset
+plugins/qwen4_exp/qsa/history.zig: QsaHeadMarkSet.bytes QsaHeadMarkSet.dropAt QsaHeadMarkSet.put markPosOf qsaRingTail qsaTestAppendPool qsaTestMeanBlocks reserveQsaHistory reserveQsaHistoryWithHead
+plugins/qwen4_exp/qsa/indexer.zig: qsaRandScoresF32
+plugins/qwen4_exp/qsa/merges.zig: testIdxFacts
+plugins/qwen4_exp/qsa/pooled.zig: qsaIdxBitMismatches qsaIdxCancelKeys qsaIdxRopeCase qsaIdxRopeTestXfm qsaIdxTestKeys qsaPoolRopePipelineCount resetQsaPooledRope
+plugins/qwen4_exp/qsa/sparse_attn.zig: qsaAttnCacheFixture qsaAttnCfgBuilds
+plugins/qwen4_exp/qsa/verify_gather.zig: QsaSlotPlan.deinit QsaVerifyPlan.deinit qsaBatchedPlanHost qsaDecodeGatherIdsHost qsaVerifyBlocksHost qsaVerifyDenseHost qsaVerifyPlanHost
+plugins/qwen4_exp/qwen4_exp.zig: AheadTestPlay.next aheadTestHistory aheadTestSettle aheadTestStats ngramTestImage ngramTestParse trellisBias trellisFixture trellisRowRef writeTrellisFile
+plugins/qwen4_exp/side_stream.zig: randBf16 sameBits
+plugins/qwen4_exp/trunk.zig: Trunk.forwardWithCapture Trunk.init Trunk.useCurrentThreadStream
+plugins/qwen4_exp/trunk/attn.zig: gatedFullAttnWith ropeAtPositions
+plugins/qwen4_exp/trunk/batched.zig: mergeSsmAcrossSlots splitSsmToSlots
+plugins/qwen4_exp/trunk/formats.zig: armTrunkResident gib keepTrunk mtpLinears putZeros residentAdmits
+plugins/qwen4_exp/trunk/fusion.zig: testFacts
+plugins/qwen4_exp/trunk/gdn_core.zig: RecurIn.deinit RecurIn.init preworkCase sameBits
+plugins/qwen4_exp/trunk/linear.zig: mtpProjectionRows
+plugins/qwen4_exp/trunk/moe.zig: moeExpertsRouted
+plugins/qwen4_exp/trunk/verify.zig: takeJoinedVerifyLogits
+plugins/qwen4_exp/wave.zig: WaveTestRun.keep waveTestRel
+sdk/bases/block.zig: Ctx.cache Ctx.cacheOps Ctx.castOnce Ctx.offloadGdn Ctx.offloadMlp Ctx.offset Ctx.recall Ctx.remember Ctx.stream Ctx.wide Shared.deinit Shared.init allBatch
+sdk/bases/blocks/row_exact.zig: attend attendFixed experts fits groupServes linear qmm reluSqUp router
+sdk/bases/run.zig: Run.cadence Run.capture Run.ctx Run.finish Run.input Run.splice declares failed idCount mropeHalf run tableForward tokenIds
+sdk/blocks/attention/attn256.zig: attn256Cosine attn256MaxAbs attn256Reference attn256SliceLastDim attn256UlpBar fusedSinkAttnPrefill
+sdk/blocks/attention/decode_attn_quant.zig: decodeAttnQuantExplicit weightsHaveDenseAttnProj
+sdk/blocks/attention/gates.zig: fusedSigmoidGateMul
+sdk/blocks/attention/kv_quant.zig: KVQuantConfig.fromJsonValue KVQuantConfig.wireName buildSmoothBHTD buildSmoothBf16 gqaParityCase gqaParityCaseD quantAttention readF32Flat
+sdk/blocks/attention/kv_view.zig: DenseKVView.kTriple DenseKVView.vTriple
+sdk/blocks/attention/nax_attention.zig: attention dispatch getKernel hostBf16 maxAbsDiff passEdges quantHash quantPinInput randBf16 relRms tieBlocks truth
+sdk/blocks/attention/row_attn.zig: fits kernel randBf16 sdpa slice4
+sdk/blocks/attention/sdpa.zig: rowByRowSdpa
+sdk/blocks/attention/sparse_block/decode.zig: hostF32 randomBf16
+sdk/blocks/attention/sparse_block/decode_cuda.zig: hostF32 randomBf16
+sdk/blocks/attention/sparse_block/mask.zig: picksMask
+sdk/blocks/attention/sparse_block/one_shot.zig: OneShotBits.reset
+sdk/blocks/attention/sparse_block/params.zig: Blocks.allSee Blocks.forced Params.listsPerQuery Params.sparseAt Params.validate
+sdk/blocks/attention/sparse_block/score.zig: keyMaxScores qsaScoreFusedProbeFailed qsaScoreFusedProbeReset qsaScoreKernelBuilds qsaScoreKernelBuilt qsaScoreRowsPerChunk
+sdk/blocks/attention/sparse_block/select.zig: qsaExactTopHost qsaExpectMatchesHost qsaIdsBitEqual qsaSelectCfgBuilds qsaSelectMakeSheet qsaSelectSplitCfgBuilds qsaVisSheetForTest selectPicks
+sdk/blocks/dit/int8_attn.zig: attention attentionHeads attnError bf16 launch newKernel prepK prepQ randn simdGrid
+sdk/blocks/gdn/decode_fused_test.zig: Qwen4GdnRig.deinit Qwen4GdnRig.init Qwen4GdnRig.run gdnDecodeFoldParityCase gdnDecodeParityCase gdnDecodeRowsCase gdnDecodeSeqParityCase gdnDecodeTreeCase
+sdk/blocks/gdn/gated_delta_net.zig: LinearAttnWeights.aneGdnServes
+sdk/blocks/gdn/kernels.zig: bf16Trunc gdnBlockedParityCase gdnChunkContinuity gdnHostRef gdnTestRun gdnTestRunSeqAt
+sdk/blocks/hc/hc_cuda.zig: Bag.free Bag.keep chain expectClose randArr rmsDiff
+sdk/blocks/hc/hc_decode2_test.zig: expectClose parityRows
+sdk/blocks/hc/hc_prefill_nax.zig: TestWeights.init bitEqual freeTables injBlock tGate tOp tSilu testTables
+sdk/blocks/linear/fused_rows.zig: joinableCols
+sdk/blocks/linear/qmatmul.zig: rowExactQmm
+sdk/blocks/linear/verify_projection.zig: mtpCoarsePairs mtpHeadRowsFit verifySharedCapable
+sdk/blocks/linear/verify_qmm_nax.zig: naxMinM verifyQmmNaxEnabled verifyQmmNaxEnabledForM
+sdk/blocks/mlp/activations.zig: gptOssSwiGLU reluSquaredOp
+sdk/blocks/mlp/fused_activations.zig: fusedClampedSwiGLU fusedGeluErfMul geluErfChain geluErfTable
+sdk/blocks/moe/down_reduce.zig: moeDownReduceParityCase
+sdk/blocks/moe/gather_qmm_nax.zig: abMedianMs benchPlans benchPort benchPortGateUp benchStock benchStockGateUp dropOwnLatch expectBitEqual randomBank requireNax skewedRouting testCase
+sdk/blocks/moe/gather_qmv.zig: gqmvMaxAbsErr
+sdk/blocks/moe/gather_qmv_rows.zig: moeRowsAffineBank moeRowsFusedCase moeRowsSliceRow
+sdk/blocks/moe/moe_affine4.zig: freeBank quant randBf16 readF32 ungatedFoldCase
+sdk/blocks/moe/moe_cuda.zig: Bag.free Bag.keep chain rand
+sdk/blocks/moe/moe_fp4.zig: decodeBanks fp4DecodeCase quant randBf16 row scaleVec scaledBank truthRow
+sdk/blocks/moe/moe_gather_ubench.zig: Bank.bytesPerCall Bank.deinit affineBank allFinite bench benchChain benchRows call chainBatch evalAll randUniformBf16 rowsCall stockDownReduce stockGateUp timeBatches timeRowsBatches
+sdk/blocks/moe/moe_prefill_cuda.zig: sortedIds
+sdk/blocks/moe/router_kernel.zig: routerRefRow
+sdk/blocks/norms/residual_norm.zig: fusedAddRmsNorm fusedResidualNorm getResidualNormKernel
+sdk/blocks/qmm/lane_qmm.zig: bitEqual dataKey dropPacked fits fp32Truth hold meanSquare mlxTakesNax overwrite packedFor qmm quantized quantizedBits randBf16 relErr rowContiguous rowsOf shapeRegistered tileInPlace
+sdk/blocks/qmm/mxfp8_qmv.zig: mxfp8Case randBf16
+sdk/blocks/qmm/qmm_int8.zig: Cache.deinit Quantized.deinit configFor derivedCached dropMemo dropOwnLatch errVsTruth expectWithinBar kernel qmm qmmImpl qmmRotated quantConfig quantKernel quantizeRows quantizedFor requireNax retained retainedQ rotateQuantizeRows transposed
+sdk/blocks/qmm/qmv2.zig: deviceMmaVerifiesWide errVsTruth mmaVerifiesWide
+sdk/blocks/qmm/qmv_nax2.zig: errVsTruth parityAgainstStock skipWithoutNax
+sdk/blocks/qmm/simd_qmm.zig: expectSame randBf16 rowsOf
+sdk/blocks/rope/qk_norm_rope.zig: qkComposedRef qkNormRopeFusedWanted ropeAngleRow
+sdk/blocks/ssm/mamba2_decode.zig: buildStepConfig groupNorm makeKernel rowBucket step stepFits stepThreadgroupBytes tmplInt
+sdk/config/model.zig: ModelConfig.addEosToken ModelConfig.applyDsv4ReferenceSampling ModelConfig.applyFamilySamplingDefaults ModelConfig.applyGenerationDefaults ModelConfig.applyTokenizer ModelConfig.attnScale ModelConfig.cacheLayoutNamespace ModelConfig.defaultEnableThinking ModelConfig.draftVocab ModelConfig.effectivePooling ModelConfig.ensureGemmaTerminators ModelConfig.ensureGptOssTerminators ModelConfig.ensureHy3Terminators ModelConfig.ensureMuseTerminators ModelConfig.eosTokenSlice ModelConfig.getKVSourceLayer ModelConfig.hasEmbeddingCapability ModelConfig.hasSsmLayers ModelConfig.isEosToken ModelConfig.kdaUsesBoundedGate ModelConfig.kvBytesPerToken ModelConfig.layerKvRowBytes ModelConfig.layerRopeDims ModelConfig.layerSkipsRope ModelConfig.mergeEosTokens ModelConfig.mlaHasQLora ModelConfig.mtpAcceptance ModelConfig.mtpDepth ModelConfig.needsSsmEntries ModelConfig.perRequestPrefillChunk ModelConfig.populateLfm2ImageTokens ModelConfig.populateMiniCpmImageTokens ModelConfig.postNormEps ModelConfig.prefillAttnKeys ModelConfig.prefillChunkMax ModelConfig.rowExactDecode ModelConfig.slidingKeepRows ModelConfig.slidingRing ModelConfig.slidingRowBytes ModelConfig.speech ModelConfig.ssdFirstCapable ModelConfig.supportsBatchedGdnDecode PoolingMode.fromString addQwen4NormTestArray declaresExpertStreaming gdnStateF32Enabled getConfigOverrides jsonField jsonFloat jsonFloat64 jsonSsmBound jsonU32 jsonValue narrowHadamardPackTables parseConfig parseConfigFromJson parseConfigLegacy parseConfigWith parseDsv41Fields parseEmbeddingGemma2Geometry parseForcedAligner parseGenerationDefaultsFromJson parseLlama3Rope parseMaxSliceNumsFromJson parseMiniCpmVision parsePoolingSidecar parseQvGeometry parseQwen4FullExl3 parseQwenAudioConfig parseQwenVisionFields parseSoftTokenBudgetsFromJson parseSushiExperts parseVisionProcessorDefaultsFromJson parseYarnRopeParameters poolingFromDirName positiveJsonU32 prismHadamardBlock qwen4CaseJson qwen4ConfigU32 qwen4ConfigU64 qwenAsrThinker refuseUnconvertedMimo setConfigOverrides validSoftTokenBudget validateQwen4Config yarnMscale
+sdk/kv/cache.zig: KVCache.CapacityFold.add KVCache.CapacityFold.result KVCache.appendEvalArrays KVCache.compactRows KVCache.evalState KVCache.kvLenForBatching KVCache.reinit KVCache.reserve KVCache.reservedTokens KVCache.residentBytes KVCache.residentCapacityTokens KVCache.seqLen KVCache.updateSliding KVCacheSnapshot.releaseHandles KVCacheSnapshot.ringFloor arrayBytes resetKVEntry
+sdk/quant/block.zig: claimant
+sdk/quant/block_test.zig: expectClaimant
+sdk/quant/exl3/format.zig: decode putBank routed
+sdk/quant/exl3/sushi/codebook_tables.zig: Table.row digestOf digestOfTable indexOf resolveText tabledPair
+sdk/quant/exl3/sushi/expert_exl3.zig: Codebook.pair Decode.hashMask Decode.tabled Rate.bitEnd Rate.freshBits Rate.fromK Rate.halfwords Rate.isInteger Rate.kText Rate.totalBits Rate.words asU16 decodeCodeword decodeHashMask decodeMcg decodeMul1 decodePackedFixture decodePair decodeTile f16BitsToF32 f32ToF16Bits finishOutput firstPair1PairMismatch firstPair1TileMismatch hadamard128 hadamardEntry halfSumScaled innerGemv packedHalfwords packedWords parseSafetensors prepareInput project reconstructInner reconstructPublic tensorCorePerm unpackTile wordU32
+sdk/quant/exl3/sushi/expert_exl3_kernels.zig: Exl3GemmParity.elemCeiling FallbackEnv.force FallbackEnv.restore Group2Support.makeKernel MimoMoeFixture.deinit PrefillGridSupport.available PrefillGridSupport.makeKernel activeDecode applyUnary bf16Bytes bf16TruthCase bf16TruthCaseAnyArm clampedGpuWindowBytes clampedMiddleDownCase clampedSortedReference clampedWindowBytes dequantStacked downFinishReduceGatedShared downFinishReduceShared downLaneArm downLaneCase downPreparedBytesMatch evalF16 exl3GemmParityVerdict exl3SwigluF32 expectInnerGemmParity expectRelRms f32Bits f32Bytes finishIndexed foldBytesMatch funnelLayoutBytesMatch fusedChainMatchesHost fusedDispatchCount gemmArmCounts gemvConfig gemvOutBytes getFinishKernel getGemvKernel getPrepareKernel glmLaneChainBytesMatch glmLaneFoldMatch glmLaneFoldMatchAt hostWeight indexedGemvMatchesFixtureInner indexedParity indexedParityStats innerGemmSorted innerGemmSortedWin innerGemmSortedWinAlign innerGemvF16 laneChainNs lanePairCase lanePairChain layerUbench measureInnerGemmParity measureInnerGemmParityOn metalInnerGemvFixture mimoArmMatchesF32 mimoArmsAgree mimoChainBytesMatch mimoDecodeArm mimoMoeFixture mimoPrefillArm mimoPrefillMatchesHost mimoRouting mimoWindowCapacityCase moeSwigluClamped moeSwigluFused moeSwigluHost moeSwigluIndexed mutatedDecode n40Bf16Truth n40NaxReaderExact n40PrefillBf16Truth n40WeightReaderExact n48FunnelCase naxBodyBytesMatch oneRowChain pairPreparedBytesMatch perRate prefillDecodeGatherMm prepareFromTokens prepareIndexed projectIndexed projectSortedWithRuns repeatRows reportGemmParity resetFusedDispatchCount rowsOfShape setPairSplitsForTest sortedGemmParity sortedGemmParityShape sortedGemmParityStats sortedGemmSmallShape syntheticArmCounts t1ChainNs t1Routes tokenReduce unionUnique usesPrefillArm verifyRowsMatchDecodeTicks weightReaderExact weightReaderExactAt windowStats withGemmWindow
+sdk/quant/exl3/sushi/root.zig: moeGroups moeRagged moeWithGatedShared moeWithShared shardStampAgrees specFromConfigJson validationZeros
+sdk/quant/exl3/sushi_pack.zig: Stored.elements allEqual cpuStream e4m3 headerResidentBytes pastTrunk putNew residentBytes
+sdk/quant/formats.zig: claimant claimsAtMarker claimsAtType extraTable
+sdk/quant/fp8_block128.zig: bf16Of codesOf evalBf16
+sdk/quant/fp8_block128_gemv.zig: bf16ToF32 decodeHalf f32ToBf16 hostDot weight32
+sdk/quant/hadamard/rht.zig: Registry.alias Registry.applyIn Registry.conflictingWidths Registry.count Registry.deinit Registry.dropMemo Registry.get Registry.init Registry.register Registry.seed Registry.signsFor expectTransformMatches identity normRotate refHadamard retained signsF32 signsHash
+sdk/quant/native.zig: addQuantized expectParity putTriple quantized randW rowScaledFp8
+sdk/quant/params.zig: quantParamsFromGeometry quantParamsOrDense
+sdk/quant/resident.zig: bytes
+sdk/quant/ternary.zig: firstRowExactMiss
+sdk/spec/mtp/draft_fuse.zig: bitEqual16 chainExact chainRerank expectPickEqual freeRescore gpuOn hostArr idValue named quantRows refFront tAstype tRandn tReshape tTake
+sdk/spec/mtp/mtp.zig: HeadLoadLeakProbe.build HeadLoadLeakProbe.expectNoLeak MtpModel.bind MtpModel.buildDraftHead MtpModel.canRerankDrafts MtpModel.draftFallbackArgmax MtpModel.draftSelect MtpModel.draftSelectBatched MtpModel.draftShortlist MtpModel.draftShortlistsBatched MtpModel.m5NaxCostProfile MtpModel.m5NaxHeadFingerprint MtpModel.makeCache MtpModel.maybeBuildDraftRerank appendHistory appendHistoryWithMrope appendKvOnly arrayMeanF32 backChain castOwned embedTargetTokens exactShortlistsBatched fcConcat fcMatchesHidden foldNormPlusOne foldNormPlusOne_ifDelta forward forwardLanes forwardWithMrope fpSidecarCase frontChain headQuantBits inferBits inferGroupSize loadHy3Mtp loadLinear loadMoeTriple loadMtp loadMtpWeightsFromCheckpoint loadQwenMtp loadQwenMtpMlp loadTrunkLinear m5NaxCostProfileForFingerprint m5NaxDenseSidecarMatches m5NaxDraftHeadMatches m5NaxNormMatches m5NaxProfileFor m5NaxQLinearMatches maxAbsDiff mtpBackboneAnchorMean mtpCtxWithinLimit mtpKeyPrefix mtpKvOnlyEnabled mtpNormNeedsRepair mtpNormsAreDeltaEnc1D mtpNormsAreDeltaEncoded negFraction ownAndTranspose2D ownHeadNormWithRepair ownNorm ownWeight ownWeightOpt qLinearFwd rerankCoarseRows rerankSelectBatched rerankShortlistsBatched sidecarQuantMode stepArr stepArrWithMrope targetLmHead writeFakeSidecar
+sdk/spec/mtp/source.zig: dirAdvertisesMtp hasMtpHead indexJsonHasMtpHead indexJsonHasQwen4Mtp isMtpHeadKey mtpShardsFromIndexJson readDirFileAlloc resolveMtpSidecarInDir resolveMtpSource safetensorsHeaderHasMtpHead
+sdk/spec/mtp_acceptance.zig: exactPrefix fromName name parse specAcceptProb tokenV3Deferred tokenV3Prefix tokenV3Target typicalAccept typicalPrefix typicalThreshold
+sdk/testing/kernel_contract/host.zig: Affine.row fwht ints intsInto silu sumAbs
+sdk/util/crt.zig: exportHomeDefault monotonicMs sleepMs
+sdk/util/io_util.zig: MonotonicClock.nowMs local nowMs nowMsMonotonic nowSecs nowUsMonotonic
+sdk/util/system.zig: cfDictGet computeAvailableBytes getAppMemFootprintMb getAppRssMb getAvailableMemBytes getCpuPct getGpuPct getProcAvailableMemBytes getSysMemPct gpuCoreCount hostAvailableMemBytes linuxProcStatusKib memoryPressureLevel osReserveBytes parseOsReserveGib underMemoryPressure
+sdk/weights/load.zig: loadWeights loadWeightsSingleFile loadWeightsWithVision writeF16Shard
+sdk/weights/resident.zig: Resident.adopt Resident.source Weights.dropBlock Weights.dropPrefix Weights.remove loadWeightsFile
+sdk/weights/shard.zig: Shard.slice
+sdk/weights/streamed.zig: Setting.of Setting.parse Setting.slotRows Streamed.bankBytes Streamed.close Streamed.layerOf Streamed.open Streamed.openPack Streamed.packBytes Streamed.routedSource exl3Routed glm5nRouted

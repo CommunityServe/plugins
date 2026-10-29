@@ -30,18 +30,6 @@ const verifyQmmTile = @import("verify_qmm_nax.zig").verifyQmmTile;
 
 // ── Core ops ──
 
-/// A row-exact 4/6/8-bit matmul: Nemotron-H's thin MoE trunk streams faster
-/// through `rowqmv`'s per-row matvecs, the dense Qwen3.8 through `simd_qmm`,
-/// whose multi-row MMA reads each weight once (`rowqmv_only` = the Nemotron-H trunk). Null outside both.
-pub fn rowExactQmm(rowqmv_only: bool, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!rowqmv_only) {
-        // The pick follows the weight and the GPU, never the row count: serial and verify rows share a kernel.
-        if (naxAvailable()) if (try lane_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
-        if (try simd_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
-    }
-    return rowqmv.qmv(x, w, sc, bi, bits, group_size, s);
-}
-
 /// The verify lanes cover 2..7 rows everywhere and take 8+ only with a NAX or shader tile,
 /// so simd_qmm starts at 8 rows where there is no tile and stays off where there is.
 pub fn simdQmmDecodeMinRows(tile: VqmmTile) c_int {

@@ -146,18 +146,6 @@ pub fn planFor(gen: u32, phone: bool, dt: mlx.mlx_dtype, m: c_int, n: c_int, k: 
     };
 }
 
-/// Whether generation `gen` verifies an 8-row window of a 2-bit ternary
-/// weight on the MMA lane, where it costs about what 5 rows do.
-pub fn mmaVerifiesWide(gen: u32, phone: bool) bool {
-    return planFor(gen, phone, .float16, 8, 17408, 5120) == .mma;
-}
-
-/// `mmaVerifiesWide` on this device.
-pub fn deviceMmaVerifiesWide() bool {
-    const g = deviceGen();
-    return mmaVerifiesWide(g.gen, g.phone);
-}
-
 var gen_logged = false;
 
 fn deviceGen() struct { gen: u32, phone: bool } {
@@ -362,25 +350,3 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
 }
 
 pub const RmsMax = struct { rms: f32, max: f32 };
-
-/// Per-row RMS and worst error of `got` against the f32 `truth` [m, n].
-pub fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx.mlx_stream) ![]RmsMax {
-    var g32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g32);
-    try mlx.check(mlx.mlx_astype(&g32, got, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(g32));
-    const g = mlx.mlx_array_data_float32(g32).?;
-    const out = try std.testing.allocator.alloc(RmsMax, m);
-    for (0..m) |r| {
-        var ss: f64 = 0;
-        var mx: f32 = 0;
-        for (0..n) |c| {
-            const d = g[r * n + c] - truth[r * n + c];
-            try std.testing.expect(std.math.isFinite(g[r * n + c]));
-            ss += d * d;
-            mx = @max(mx, @abs(d));
-        }
-        out[r] = .{ .rms = @floatCast(@sqrt(ss / @as(f64, @floatFromInt(n)))), .max = mx };
-    }
-    return out;
-}

@@ -267,12 +267,6 @@ pub fn moeTensorParallel(self: *Trunk, tp: *distributed_mod.Peer, x: mlx.mlx_arr
     return out;
 }
 
-/// The worker's half of `moeTensorParallel`: its expert slices under rank 0's routing.
-pub fn moeExpertsRouted(self: *Trunk, x: mlx.mlx_array, layer: u32, logits: mlx.mlx_array) !mlx.mlx_array {
-    const mw = &self.moe_layers[layer].mlp.moe;
-    return self.moeMLP2WithRouter(x, x, mw, logits, false);
-}
-
 pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx.mlx_array, mw: *const MoeMlpWeights, router_override: ?mlx.mlx_array, skip_shared: bool) !mlx.mlx_array {
     const cfg = &self.config;
     // DIAGNOSTIC (diag dispatch-probe=N): inject N extra small

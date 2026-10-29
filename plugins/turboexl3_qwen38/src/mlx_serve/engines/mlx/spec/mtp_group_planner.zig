@@ -12,31 +12,6 @@ pub const History = struct {
     accepted: [MAX_DEPTH]u16 = @splat(0),
     rounds: u32 = 0,
 
-    pub fn observe(self: *History, drafted: u32, retained_drafts: u32) void {
-        const count = @min(drafted, MAX_DEPTH);
-        if (count == 0) return;
-        const retained = @min(retained_drafts, count);
-        for (0..count) |j| {
-            if (self.trials[j] >= 64) {
-                self.trials[j] /= 2;
-                self.accepted[j] /= 2;
-            }
-            self.trials[j] += 1;
-            if (j < retained) self.accepted[j] += 1;
-        }
-        self.rounds +|= 1;
-    }
-
-    pub fn expected(self: *const History, depth: u8) f32 {
-        var result: f32 = 1;
-        var survival: f32 = 1;
-        for (0..@min(depth, MAX_DEPTH)) |j| {
-            const probability = (@as(f32, @floatFromInt(self.accepted[j])) + 0.5) / (@as(f32, @floatFromInt(self.trials[j])) + 1);
-            survival = @min(survival, probability);
-            result += survival;
-        }
-        return result;
-    }
 };
 
 pub const Row = struct {
@@ -171,29 +146,7 @@ const Fixture = struct {
     }
 };
 
-fn healthy() History {
-    var history: History = .{};
-    for (0..100) |_| history.observe(4, 4);
-    return history;
-}
-
 pub const Action = enum { plain, prime, speculate };
-
-pub fn action(width: u8, hidden_stale: bool) Action {
-    return if (width == 0) .plain else if (hidden_stale) .prime else .speculate;
-}
-
-pub fn probeWidth(rounds: u8, remaining: u32, cap: u8) ?u8 {
-    if (remaining < 96 or rounds >= 16) return null;
-    const width: u8 = if (rounds < 4) 1 else if (rounds < 12) 2 else 4;
-    return if (width <= cap) width else null;
-}
-
-pub fn shouldProbe(decision: Decision, rounds: u8) bool {
-    if (rounds < 12) return true;
-    for (decision.widths[0..decision.n]) |width| if (width > 0) return false;
-    return true;
-}
 
 pub const Recovery = struct {
     last_spec_tokens: u32 = 0,
@@ -206,12 +159,6 @@ pub const Recovery = struct {
         return @min(2, cap);
     }
 
-    pub fn observe(self: *Recovery, completed: u32, recovering: bool) void {
-        self.last_spec_tokens = completed;
-        if (recovering) self.rounds +|= 1;
-        // Four rounds leave three recurring observations after the transition.
-        self.burst = if (recovering) (self.burst + 1) % 4 else 0;
-    }
 };
 
 pub const DEFAULT_ENABLED = true;
@@ -233,28 +180,4 @@ pub const Execution = struct {
     capture: [MAX_ROWS]bool = @splat(false),
 };
 
-pub fn execution(widths: []const u8, stale: []const bool) Execution {
-    if (widths.len == 0 or widths.len > MAX_ROWS or stale.len != widths.len) return .{};
-    var result = Execution{ .n = widths.len };
-    for (widths, stale) |width, hidden_stale| {
-        if (width > MAX_DEPTH) return .{};
-        result.prime = result.prime or action(width, hidden_stale) == .prime;
-    }
-    for (widths, 0..) |width, row| {
-        if (result.prime or width == 0) {
-            result.plain[result.plain_n] = row;
-            result.plain_n += 1;
-            result.capture[row] = result.prime and width > 0;
-        } else {
-            result.speculative[result.speculative_n] = row;
-            result.speculative_n += 1;
-        }
-    }
-    return result;
-}
-
 pub const Entry = enum { wait_predraft, drain, choose };
-
-pub fn entry(pending_pipeline: bool, pending_draft: bool) Entry {
-    return if (pending_draft) .wait_predraft else if (pending_pipeline) .drain else .choose;
-}

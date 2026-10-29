@@ -32,93 +32,6 @@ const mtpRegimeForce = @import("regime.zig").mtpRegimeForce;
 const mtpTraceEnabled = @import("trace.zig").mtpTraceEnabled;
 
 
-/// One debug line per planned round with every input the planner read.
-pub fn mtpPlannerMode(self: *const Generator) u8 {
-    if (self.mtp == null) return 0;
-    const sharp = self.mtpDraftSampling(0).temperature > 0.01;
-    return group_cost.GroupShape.samplingMode(self.mtpRerankDrafts(), false, sharp, self.sampling.temperature > 0.01);
-}
-
-pub fn mtpPlannerObserve(self: *Generator, observed: u32, accepted: u32) void {
-    if (!group_planner.enabled() or !self.mtp_planner_owned) return;
-    self.mtp_planner_history.observe(observed, @min(observed, accepted));
-    self.mtp_planner_spec_rounds += 1;
-    self.mtp_hidden_stale = false;
-    self.mtp_planner_recovery.observe(self.completion_tokens, self.mtp_planner_recovering);
-    if (self.mtp_planner_probe and !self.mtp_planner_recovering) self.mtp_planner_probes +|= 1;
-}
-
-pub fn mtpRoundPlan(self: *Generator) MtpRoundPlan {
-    if (group_planner.enabled()) if (self.mtp_planner_width) |width| {
-        return .{ .m_lo = width, .m_hi = width, .tau_ln = 0 };
-    };
-    const plan = self.mtpRoundPlanTraced();
-    if (self.mtp_group_cap > 0) {
-        const cap = @min(depth_bounds.lookupCap(self.mtp_group_cap, depth_bounds.active), if (self.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
-        return mtpPlanInBounds(mtpGroupPlan(plan, cap, self.mtp_group_fill and mtpPinnedDepth() == null), depth_bounds.floorFor(depth_bounds.active, cap), cap);
-    }
-    return plan;
-}
-
-/// A lane's plan inside a batched verify. The group pays for its widest lane's rows,
-/// so where those rows are one fixed tile (`fill`) every lane drafts to the cap.
-pub fn mtpGroupPlan(solo: MtpRoundPlan, cap: u32, fill: bool) MtpRoundPlan {
-    if (fill) return .{ .m_lo = cap, .m_hi = cap, .tau_ln = 0 };
-    var plan = solo;
-    plan.m_lo = @min(plan.m_lo, cap);
-    plan.m_hi = @min(plan.m_hi, cap);
-    return plan;
-}
-
-/// Round time the plan prices depth `m` at, in ms.
-pub fn planMs(src: MtpCostSource, m: u32) f32 {
-    return src.roundCost(m, false) / src.scale;
-}
-
-pub fn mtpRoundPlanTraced(self: *Generator) MtpRoundPlan {
-    if (!log.isDebug()) return self.mtpRoundPlanInner();
-    const disabled_before = self.spec_disabled_runtime;
-    const serial_left_before = self.mtp_serial_left;
-    const plan = self.mtpRoundPlanInner();
-    const kv_len = self.mtpKvLen();
-    const t = &self.xfm.round_cost;
-    const b = self.mtpAdaptiveBucket(kv_len);
-    const src = MtpCostSource.init(self.mtp_ev_costs, kv_len, t);
-    const serial_step: []const u8 = if (!disabled_before and self.spec_disabled_runtime)
-        "switch"
-    else if (self.mtp_serial_left > serial_left_before)
-        "probe"
-    else
-        "none";
-    var cells: [256]u8 = undefined;
-    const a = self.mtp_ev_accept;
-    const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
-    const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), if (self.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
-    const target = mtpWidthTrialTarget(t, kv_len, plan, cap_free, self.mtp_m_lo_streak >= 2);
-    log.debug(
-        "  [mtp-plan] r={d} kv={d} bucket={s} m_lo={d} m_hi={d} tau={d:.3} a=[{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2}] src={s} trial={s}{d} serial_step={s} streak={d} serial_left={d} drops=t{d}/c{d}/b{d} cap={d}/{d} solo={} rte={d} wt={d}/{d} tgt={?d} cells={s}\n",
-        .{
-            self.mtp_ev_rounds,                        kv_len,
-            round_cost.bucketName(t.layout, b),        plan.m_lo,
-            plan.m_hi,                                 plan.tau_ln,
-            a[0],                                      a[1],
-            a[2],                                      a[3],
-            a[4],                                      a[5],
-            if (src.fromTable()) "table" else "prior", if (plan.width_trial) "w" else "-",
-            if (plan.width_trial) plan.m_lo else 0,    serial_step,
-            self.mtp_m_lo_streak,                      self.mtp_serial_left,
-            t.dropped_transition,                      t.dropped_contended,
-            t.dropped_bad,                             cap_row,
-            cap_free,                                  self.spec_cost_solo,
-            self.mtp_regime.trial_end,                 self.mtp_width_trial.next_trial,
-            self.mtp_width_trial.trial_end,            target,
-            t.formatBucket(b, &cells),
-        },
-    );
-    if (src.fromTable()) log.debug("  [mtp-plan-ms] w1..6=[{d:.1},{d:.1},{d:.1},{d:.1},{d:.1},{d:.1}]\n", .{ planMs(src, 1), planMs(src, 2), planMs(src, 3), planMs(src, 4), planMs(src, 5), planMs(src, 6) });
-    return plan;
-}
-
 pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
     if (mtpPinnedDepth()) |pinned| {
         const d = @min(pinned, self.mtp_depth);
@@ -353,42 +266,6 @@ pub fn updateMtpEvRound(self: *Generator, drafted: u32, accepted: u32) void {
         self.spec_disabled_runtime = true;
         self.spec_disable_reason = .acceptance;
     }
-}
-
-/// Close one traced round; emits + resets the summary at the cadence.
-pub fn mtpTraceRoundEnd(self: *Generator, m: u32, accepted: u32, m_lo: u32) void {
-    if (!mtpTraceEnabled()) return;
-    if (!self.mtp_trace.endRound(m, accepted, m > m_lo)) return;
-    const t = &self.mtp_trace;
-    var acc_buf: [64]u8 = undefined;
-    log.info(
-        MtpTrace.LINE_FMT,
-        .{
-            t.rounds,
-            t.avgMs(.draft),
-            t.avgMs(.sync),
-            t.avgMs(.ext),
-            t.avgMs(.verify),
-            t.avgMs(.corr),
-            t.avgMs(.eval),
-            t.avgMs(.hist),
-            t.avgMs(.commit),
-            t.avgMs(.predraft),
-            t.avgMs(.gap),
-            t.totalAvgMs(),
-            @as(f64, @floatFromInt(t.drafted)) / @as(f64, @floatFromInt(t.rounds)),
-            @as(f64, @floatFromInt(t.accepted)) / @as(f64, @floatFromInt(t.rounds)),
-            @as(f64, @floatFromInt(t.extended)) / @as(f64, @floatFromInt(t.rounds)),
-            t.accIdxStr(&acc_buf),
-            t.subAvgMs(.build),
-            t.subAvgMs(.ple),
-            t.subAvgMs(.ple_sync),
-            t.subAvgMs(.dispatch),
-            t.subAvgMs(.wait),
-            t.subAvgMs(.chain),
-        },
-    );
-    t.reset();
 }
 
 // ── tests ──

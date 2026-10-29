@@ -91,15 +91,6 @@ pub const SSMCacheEntry = struct {
 
 pub const arrayBytes = @import("../../../sdk/kv/cache.zig").arrayBytes;
 
-pub fn qsaRawKeyBytes(e: *const SSMCacheEntry) u64 {
-    return arrayBytes(if (e.qsa_key_buf.ctx != null) e.qsa_key_buf else e.aux_state);
-}
-
-/// A live request's recurrent state: the hybrid's counterpart of its KV.
-pub fn ssmEntryBytes(e: *const SSMCacheEntry) u64 {
-    return arrayBytes(e.conv_state) + arrayBytes(e.ssm_state) + qsaRawKeyBytes(e);
-}
-
 /// SSM snapshot value. Holds clones of conv_state and ssm_state via refcount —
 /// the underlying buffer is shared with the source entry, but the snapshot
 /// owns its own array handles and frees them on deinit. Used for
@@ -294,12 +285,6 @@ pub fn ssmFreeSpecCapture(entry: *SSMCacheEntry) void {
     entry.spec_ple_len = 0;
 }
 
-/// Whether a chain verify left this entry a rollback capture: the per-step states (`spec_state_seq`), or the replay's
-/// round input state and rows' recurrence inputs (`spec_replay`), which `ssmRollbackFromCapture` replays.
-pub fn ssmChainCaptured(entry: *const SSMCacheEntry) bool {
-    return entry.spec_state_seq.ctx != null or entry.spec_replay;
-}
-
 /// A chain's accepted prefix as `gdn_decode.replay` walks it (verify rows 0..accepted, oldest first) and the conv window
 /// `ssmRollbackFromCapture` slices (conv-input rows 1 + accepted .. 3 + accepted); `buf` holds accepted + 1.
 pub fn gdnReplayPlan(accepted: u32, buf: []i32) struct { path: []const i32, conv_rows: [3]i32 } {
@@ -338,63 +323,6 @@ pub fn splitSpecCaptures(s: mlx.mlx_stream, m: *const SSMCacheEntry, e: *SSMCach
         const own = try ssmAxisView(s, m.spec_ple_input, 0, i);
         if (e.spec_ple_input.ctx != null) _ = mlx.mlx_array_free(e.spec_ple_input);
         e.spec_ple_input = own;
-    }
-}
-
-/// PLD partial-accept rollback for a GatedDeltaNet layer, using the
-/// per-position capture from the verify forward instead of a re-forward.
-/// Sets `conv_state` + `ssm_state` to the state AFTER processing the first
-/// `1 + accepted` verify tokens (t1 + accepted accepted drafts).
-///
-/// Numerically identical to a fresh forward over `[t1, draft[0..accepted-1]]`:
-/// the GDN recurrence is sequential, so the state captured at position
-/// `accepted` of a length-(1+m) verify run is the exact same float32→bf16
-/// value a length-(1+accepted) run would store as its final state. Likewise
-/// `conv_state` is the same windowed slice of the same conv input. So this
-/// preserves PLD's byte-equivalence guarantee (pinned by
-/// `tests/test_pld_equivalence.sh`).
-///
-/// No-op when the entry holds no capture (non-GDN hybrid layer); the caller
-/// only takes the fast path when capture succeeded.
-/// `verify_len` is the number of positions the verify forward ran (T). A
-/// GatedDeltaNet layer records it implicitly in `spec_state_seq`, but a
-/// CONV-ONLY layer (LFM2's gated conv — no recurrent ssm_state at all) has
-/// only `spec_conv_input`, whose leading `kernel-1` rows cannot be told from
-/// verify positions without it. Passing it explicitly is what lets one helper
-/// roll back both shapes.
-/// A draft tree's accepted path: the recurrent state after window row
-/// `state_row` (every row's state is captured in tree mode) and the conv
-/// state from the capture's conv-input rows `conv_rows` (0..2 the pre-verify
-/// conv state, 3 + r window row r).
-pub fn ssmCommitTreePath(entry: *SSMCacheEntry, path: []const i32, conv_rows: [3]i32, s: mlx.mlx_stream) !void {
-    if (entry.spec_prework.k.ctx != null) {
-        const sh = mlx.getShape(entry.spec_state_in); // [B, Hv, Dv, Dk]
-        const g = gdn_decode.Geometry{ .hk = mlx.getShape(entry.spec_prework.k)[1], .hv = sh[1], .dk = sh[3], .dv = sh[2] };
-        const c = (try gdn_decode.replay(g, entry.spec_state_in, entry.spec_prework, path, entry.spec_conv_input, conv_rows, s)) orelse return error.SpecTreeUnsupported;
-        _ = mlx.mlx_array_free(entry.ssm_state);
-        entry.ssm_state = c.ssm_state;
-        _ = mlx.mlx_array_free(entry.conv_state);
-        entry.conv_state = c.conv_state;
-        return;
-    } else if (entry.spec_state_seq.ctx != null) {
-        const state_row: u32 = @intCast(path[path.len - 1]);
-        const sh = mlx.getShape(entry.spec_state_seq); // [T, B, Hv, Dv, Dk]
-        const r: c_int = @intCast(state_row);
-        var row = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(row);
-        try mlx.check(mlx.mlx_slice(&row, entry.spec_state_seq, &[_]c_int{ r, 0, 0, 0, 0 }, 5, &[_]c_int{ r + 1, sh[1], sh[2], sh[3], sh[4] }, 5, &[_]c_int{ 1, 1, 1, 1, 1 }, 5, s));
-        var st = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&st, row, &[_]c_int{ sh[1], sh[2], sh[3], sh[4] }, 4, s));
-        _ = mlx.mlx_array_free(entry.ssm_state);
-        entry.ssm_state = st;
-    }
-    if (entry.spec_conv_input.ctx != null) {
-        const idx = mlx.mlx_array_new_data(&conv_rows, &[_]c_int{3}, 1, .int32);
-        defer _ = mlx.mlx_array_free(idx);
-        var conv = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_take_axis(&conv, entry.spec_conv_input, idx, 1, s));
-        _ = mlx.mlx_array_free(entry.conv_state);
-        entry.conv_state = conv;
     }
 }
 

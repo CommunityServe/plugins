@@ -31,11 +31,6 @@ pub fn parse(root: std.json.ObjectMap, topk: u32) !Spec {
     return spec;
 }
 
-/// What a dispatch decodes with: an STQ table rides along (a table-keyed codebook without it is refused).
-pub fn decode(spec: Spec) Decode {
-    return .{ .codebook = spec.codebook, .window = spec.window, .table = spec.table };
-}
-
 /// One projection's bank at load: its suh/svh present, a trellis the kernels decode at the pack's rate, and a rate
 /// the pack's codebook table has a row for.
 pub fn admit(p: Proj, experts: u32, in_dim: u32, out_dim: u32, spec: Spec) !void {
@@ -51,15 +46,6 @@ pub const Routed = struct {
     limit: c_int = 0,
     verify_rows: bool = false,
 };
-
-/// Routed SwiGLU of `x` [B, S, D] through `bank`'s experts `inds` [B, S, K], weighted by `scores`.
-pub fn routed(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, spec: Spec, opts: Routed) !mlx.mlx_array {
-    const dec = decode(spec);
-    return if (opts.limit > 0)
-        sushi.moeClamped(s, x, bank, inds, scores, dec, opts.limit)
-    else
-        sushi.moe(s, x, bank, inds, scores, dec, opts.verify_rows);
-}
 
 // ── the quant table ──
 
@@ -216,21 +202,6 @@ const D: c_int = 128;
 const I: c_int = 128;
 const E: c_int = 4;
 const K: c_int = 2;
-
-/// One projection's random bank under `<base>.{trellis,suh,svh}` in `w`, at `n` halfwords per tile.
-fn putBank(w: *resident.Weights, rnd: std.Random, base: []const u8, in: c_int, out: c_int, n: c_int) !void {
-    const words = try testing.allocator.alloc(u16, @intCast(E * @divExact(in, 16) * @divExact(out, 16) * n));
-    defer testing.allocator.free(words);
-    for (words) |*v| v.* = rnd.int(u16);
-    var nb: [128]u8 = undefined;
-    try w.put(try std.fmt.bufPrint(&nb, "{s}.trellis", .{base}), mlx.mlx_array_new_data(words.ptr, &[_]c_int{ E, @divExact(in, 16), @divExact(out, 16), n }, 4, .uint16));
-    for ([_]struct { leaf: []const u8, dim: c_int }{ .{ .leaf = "suh", .dim = in }, .{ .leaf = "svh", .dim = out } }) |side| {
-        const h = try testing.allocator.alloc(u16, @intCast(E * side.dim));
-        defer testing.allocator.free(h);
-        for (h) |*v| v.* = sushi.format.f32ToF16Bits(if (rnd.boolean()) 0.125 else -0.125);
-        try w.put(try std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, side.leaf }), mlx.mlx_array_new_data(h.ptr, &[_]c_int{ E, side.dim }, 2, .float16));
-    }
-}
 
 const projs = [_][]const u8{ "l.gate_proj", "l.up_proj", "l.down_proj" };
 

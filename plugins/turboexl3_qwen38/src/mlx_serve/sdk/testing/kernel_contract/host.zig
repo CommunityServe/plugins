@@ -37,18 +37,6 @@ pub fn uniformInto(rng: std.Random, out: []f64, lo: f64, hi: f64, dt: mlx.mlx_dt
     for (out) |*v| v.* = rt(dt, lo + (hi - lo) * rng.float(f64));
 }
 
-/// `n` integers uniform in [lo, hi] (exact in every float dtype for small ranges).
-pub fn ints(a: std.mem.Allocator, rng: std.Random, n: usize, lo: i32, hi: i32) ![]f64 {
-    const out = try a.alloc(f64, n);
-    intsInto(rng, out, lo, hi);
-    return out;
-}
-
-/// `ints` into `out`.
-pub fn intsInto(rng: std.Random, out: []f64, lo: i32, hi: i32) void {
-    for (out) |*v| v.* = @floatFromInt(rng.intRangeAtMost(i32, lo, hi));
-}
-
 /// Gate 1's pattern over `rows` rows of `width`: NaN in row 0, +Inf in row 1, -Inf in row 2, both infinities in
 /// row 3 (rows past the buffer are skipped).
 pub fn plant(x: []f64, rows: usize, width: usize) void {
@@ -93,15 +81,6 @@ pub fn sigmoid(x: Val) Val {
     const sig = 1 / (1 + e);
     if (!std.math.isFinite(x.v)) return .{ .v = sig };
     return .{ .v = sig, .e = sig * (1 - sig) * x.e + sig * (fastExp(x.v) * e * sig + U + 2.5 * 0x1p-23) };
-}
-
-/// x / (1 + exp(-x)) as Metal computes it in f32 (fast exp, a fast divide), unrounded; `x` carries its own error.
-pub fn silu(x: Val) Val {
-    const e = @exp(-x.v);
-    const sig = 1 / (1 + e);
-    const v = x.v * sig;
-    if (!std.math.isFinite(x.v)) return .{ .v = v };
-    return .{ .v = v, .e = @abs(sig * (1 + x.v * (1 - sig))) * x.e + @abs(v) * (fastExp(x.v) * e * sig + U + 2.5 * 0x1p-23) };
 }
 
 /// One ulp of `dt` relative to the value, at its widest.
@@ -166,13 +145,6 @@ pub fn sum(t: []const f64) f64 {
     return s;
 }
 
-/// The terms' magnitude: the bound's `mag`.
-pub fn sumAbs(t: []const f64) f64 {
-    var s: f64 = 0;
-    for (t) |v| s += @abs(v);
-    return s;
-}
-
 /// The sum of x[i] * w[i] and of its terms' magnitudes, in float64 (vectorized: references run in Debug builds).
 pub fn dot(x: []const f64, w: []const f64) [2]f64 {
     const V = @Vector(8, f64);
@@ -190,20 +162,6 @@ pub fn dot(x: []const f64, w: []const f64) [2]f64 {
         out[1] += @abs(x[i] * w[i]);
     }
     return out;
-}
-
-/// The Walsh-Hadamard transform of `v` in place (Sylvester order, unscaled), in float64.
-pub fn fwht(v: []f64) void {
-    var h: usize = 1;
-    while (h < v.len) : (h <<= 1) {
-        var i: usize = 0;
-        while (i < v.len) : (i += 2 * h) for (i..i + h) |j| {
-            const a = v[j];
-            const b = v[j + h];
-            v[j] = a + b;
-            v[j + h] = a - b;
-        };
-    }
 }
 
 /// An affine-quantized [rows, cols] weight as MLX packs it: `bits`-bit codes little-endian in u32 words (a dense
@@ -334,17 +292,6 @@ pub const Affine = struct {
         self.words = try packAffine(a, self.codes, n, k, self.bits);
     }
 
-    /// Row `r` dequantized (q * s + b) into `w`, and each value's magnitude through the dequant (|q s| + |b|).
-    pub fn row(self: *const Affine, r: usize, w: []f64, m: []f64) void {
-        for (w, m, 0..) |*o, *g, i| {
-            const at = r * self.k + i;
-            const s = self.scales[at / self.gs];
-            const b = self.biases[at / self.gs];
-            const q: f64 = @floatFromInt(self.codes[at]);
-            o.* = q * s + b;
-            g.* = @abs(q * s) + @abs(b);
-        }
-    }
 };
 
 /// `codes` (4-bit) packed eight to a uint32, value i at bit 4 * i.

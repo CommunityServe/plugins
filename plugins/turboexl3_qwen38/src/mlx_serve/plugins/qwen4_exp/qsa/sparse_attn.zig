@@ -736,40 +736,4 @@ fn qsaPrefillGatherProfiled(s: mlx.mlx_stream, q_rope: mlx.mlx_array, k: mlx.mlx
 
 // ── tests ──
 
-pub fn qsaAttnCfgBuilds() usize {
-    return qsa_attn_cfgs.builds;
-}
-
 // ── Fused sparse attention at verify widths and batched decode (msv_attn_qsa256_q) ──
-
-/// Build a KVCache whose view is a strided slice of a larger capacity buffer (the shape the serving path hands the kernel).
-pub fn qsaAttnCacheFixture(
-    alloc: std.mem.Allocator,
-    s: mlx.mlx_stream,
-    k_dense: mlx.mlx_array,
-    v_dense: mlx.mlx_array,
-    kv: c_int,
-    split: c_int,
-    cfg: kv_quant.KVQuantConfig,
-    cache: *KVCache,
-) !DenseKVView {
-    _ = alloc;
-    const st = [_]c_int{ 1, 1, 1, 1 };
-    var k0 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k0);
-    var v0 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v0);
-    const ks = mlx.getShape(k_dense);
-    try mlx.check(mlx.mlx_slice(&k0, k_dense, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ ks[0], ks[1], split, ks[3] }, 4, &st, 4, s));
-    try mlx.check(mlx.mlx_slice(&v0, v_dense, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ ks[0], ks[1], split, ks[3] }, 4, &st, 4, s));
-    var first = try cache.update(0, k0, v0, s, 0);
-    first.deinit();
-    var k1 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k1);
-    var v1 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v1);
-    try mlx.check(mlx.mlx_slice(&k1, k_dense, &[_]c_int{ 0, 0, split, 0 }, 4, &[_]c_int{ ks[0], ks[1], kv, ks[3] }, 4, &st, 4, s));
-    try mlx.check(mlx.mlx_slice(&v1, v_dense, &[_]c_int{ 0, 0, split, 0 }, 4, &[_]c_int{ ks[0], ks[1], kv, ks[3] }, 4, &st, 4, s));
-    _ = cfg;
-    return try cache.update(0, k1, v1, s, 0);
-}

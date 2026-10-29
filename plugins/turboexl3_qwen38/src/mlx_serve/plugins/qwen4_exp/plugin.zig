@@ -584,11 +584,6 @@ fn mtpSetting(settings_json: []const u8) ?bool {
     return parsed.value.mtp;
 }
 
-/// The tiny pack the conformance suite runs: four layers (GDN and QSA attention), the PLE, bf16 weights.
-pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
-    return .{ .files = try fixture.files(a, 7, .bf16) };
-}
-
 // ── tests ──
 
 test {

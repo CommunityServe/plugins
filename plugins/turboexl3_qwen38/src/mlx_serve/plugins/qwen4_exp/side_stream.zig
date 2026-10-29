@@ -146,29 +146,3 @@ pub fn addGatedShared(t: *Trunk, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_ar
 // ── tests ──
 
 const testing = std.testing;
-
-/// `shape` of bf16 values uniform in [-scale, scale), evaluated.
-fn randBf16(rnd: std.Random, shape: []const c_int, scale: f32, s: mlx.mlx_stream) !mlx.mlx_array {
-    var n: usize = 1;
-    for (shape) |d| n *= @intCast(d);
-    const buf = try testing.allocator.alloc(f32, n);
-    defer testing.allocator.free(buf);
-    for (buf) |*v| v.* = (rnd.float(f32) * 2 - 1) * scale;
-    const f = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
-    defer _ = mlx.mlx_array_free(f);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
-    try mlx.check(mlx.mlx_array_eval(out));
-    return out;
-}
-
-fn sameBits(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
-    var eq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eq);
-    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
-    try mlx.check(mlx.mlx_array_eval(eq));
-    var same = false;
-    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
-    return same;
-}

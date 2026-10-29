@@ -53,10 +53,6 @@ pub fn naxMinMForBits(bits: u32) c_int {
     return if (bits == 8) 7 else 8;
 }
 
-fn naxMinM() c_int {
-    return naxMinMForBits(4);
-}
-
 /// Exact NAX-dispatch predicate, pure over the runtime gates and shape. Keep
 /// controller policy behind this seam so a takeover-width tweak or ineligible
 /// projection geometry can never advertise a NAX cost profile while verifyQmm
@@ -70,18 +66,6 @@ pub fn verifyQmmNaxEnabledForMFrom(
     min_m: c_int,
 ) bool {
     return verify_on and vqmmLaneFor(m, K, N, available, min_m) == .nax;
-}
-
-/// Runtime form of verifyQmmNaxEnabledForMFrom.
-pub fn verifyQmmNaxEnabledForM(m: c_int, K: c_int, N: c_int) bool {
-    return verifyQmmNaxEnabledForMFrom(
-        m,
-        K,
-        N,
-        verifyQmmEnabled(),
-        verifyQmmNaxAvailable(),
-        naxMinM(),
-    );
 }
 
 pub const VQMM_NAX_HEADER: [:0]const u8 = kernelSource("kernels/linear/vqmm_nax_header.metal");
@@ -244,10 +228,4 @@ pub fn runVerifyQmmNax(
 pub var vqmm_nax_probe_override: ?bool = null;
 
 // ── tests ──
-
-/// Family-wide NAX readiness: the verify family is on and the hardware probe passes. This intentionally says nothing about a specific
-/// M/K/N dispatch; controller decisions use verifyQmmNaxEnabledForM instead.
-pub fn verifyQmmNaxEnabled() bool {
-    return verifyQmmEnabled() and verifyQmmNaxAvailable();
-}
 

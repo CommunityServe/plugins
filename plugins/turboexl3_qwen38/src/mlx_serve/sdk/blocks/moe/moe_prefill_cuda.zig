@@ -245,16 +245,3 @@ pub fn weightedSum(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_arra
 }
 
 const testing = std.testing;
-
-/// Sorted expert ids for `rows` rows over `experts`: uneven, with empty experts and ones past a tile.
-fn sortedIds(a: std.mem.Allocator, rows: usize, experts: u32, seed: u64) ![]u32 {
-    const ids = try a.alloc(u32, rows);
-    var prng = std.Random.DefaultPrng.init(seed);
-    for (ids) |*v| {
-        const r = prng.random();
-        // A quarter of the rows crowd into four experts, so some take several BM-row tiles.
-        v.* = if (r.intRangeLessThan(u32, 0, 4) == 0) r.intRangeLessThan(u32, 0, 4) * (experts / 4) else r.intRangeLessThan(u32, 0, experts / 2) * 2;
-    }
-    std.mem.sort(u32, ids, {}, std.sort.asc(u32));
-    return ids;
-}

@@ -26,16 +26,6 @@ pub const Shared = struct {
     post_eps: f32,
     post_eps_arr: Array,
 
-    pub fn init(eps: f32, post_eps: f32) Shared {
-        const mlx = @import("../../mlx/ffi.zig");
-        return .{ .eps = eps, .eps_arr = mlx.mlx_array_new_float(eps), .post_eps = post_eps, .post_eps_arr = mlx.mlx_array_new_float(post_eps) };
-    }
-
-    pub fn deinit(self: *Shared) void {
-        const mlx = @import("../../mlx/ffi.zig");
-        _ = mlx.mlx_array_free(self.eps_arr);
-        _ = mlx.mlx_array_free(self.post_eps_arr);
-    }
 };
 
 /// What one forward builds once and its layers share (masks, angle rows, casts): the same bits as building each per
@@ -90,60 +80,6 @@ pub const Ctx = struct {
     /// A verify whose rows form a draft tree (`Forward.tree`); null = a chain.
     tree: ?Tree = null,
 
-    pub fn stream(c: *const Ctx) ops.Stream {
-        return c.g.s;
-    }
-    /// The solo slot's first position.
-    pub fn offset(c: *const Ctx) u32 {
-        return c.positions[0];
-    }
-    /// More than one row per slot: prompt chunks and verify rows (the legacy `is_prefill`).
-    pub fn wide(c: *const Ctx) bool {
-        return c.rows > 1;
-    }
-    pub fn cache(c: *const Ctx) abi.Handle {
-        return c.caches[0];
-    }
-    pub fn cacheOps(c: *const Ctx) !*const abi.CacheOps {
-        return c.cache_ops orelse error.NoCacheOps;
-    }
-    /// `key`'s array if this forward built it already.
-    pub fn recall(c: *const Ctx, key: Memo.Key) ?Array {
-        const m = c.memo orelse return null;
-        for (m.keys[0..m.n], m.vals[0..m.n]) |k, v| if (std.meta.eql(k, key)) return v;
-        return null;
-    }
-    /// `x`, built for `key`, kept for the rest of the forward.
-    pub fn remember(c: *const Ctx, key: Memo.Key, x: Array) !Array {
-        const m = c.memo orelse return x;
-        if (m.n == Memo.cap) return x;
-        const kept = try m.g.keep(x);
-        m.keys[m.n] = key;
-        m.vals[m.n] = kept;
-        m.n += 1;
-        return kept;
-    }
-    /// This layer's dense MLP of `x` as the engine's offload computed it, owned by `g`; null = the block computes it.
-    pub fn offloadMlp(c: *const Ctx, x: Array) !?Array {
-        const o = c.offload orelse return null;
-        var y: abi.Array = .{};
-        if (!o.mlp(o.ctx, c.layer, .{ .ctx = x.ctx }, &y)) return null;
-        return try c.g.adopt(.{ .ctx = y.ctx });
-    }
-    /// This layer's GatedDeltaNet q|k|v and z projections of `x` as the engine's offload computed them, owned by `g`.
-    pub fn offloadGdn(c: *const Ctx, x: Array) !?[2]Array {
-        const o = c.offload orelse return null;
-        var qkv: abi.Array = .{};
-        var z: abi.Array = .{};
-        if (!o.gdn_proj(o.ctx, c.layer, .{ .ctx = x.ctx }, &qkv, &z)) return null;
-        return .{ try c.g.adopt(.{ .ctx = qkv.ctx }), try c.g.adopt(.{ .ctx = z.ctx }) };
-    }
-    /// `x` as `dt`, cast once per forward.
-    pub fn castOnce(c: *const Ctx, x: Array, dt: ops.Dtype) !Array {
-        const key: Memo.Key = .{ .what = .cast, .n = .{ @intCast(@intFromPtr(x.ctx)), @intFromEnum(dt), 0, 0, 0, 0, 0 } };
-        if (c.recall(key)) |m| return m;
-        return c.remember(key, try c.g.astype(x, dt));
-    }
 };
 
 /// A seam's middle: the new residual and the next block's normed input.
@@ -187,12 +123,6 @@ pub fn reason(comptime B: type, comptime kinds: []const Kind) ?[]const u8 {
 /// Fails the build, naming the block and the reason, unless `B` is a block of one of `kinds`.
 pub fn check(comptime B: type, comptime kinds: []const Kind) void {
     if (comptime reason(B, kinds)) |why| @compileError(@typeName(B) ++ " " ++ why);
-}
-
-/// Whether every block in `blocks` (a tuple of types) serves `batched_rows`.
-pub fn allBatch(comptime blocks: anytype) bool {
-    inline for (blocks) |B| if (!B.supports_batched_rows) return false;
-    return true;
 }
 
 /// One of two blocks per layer (a mixer or an MLP each): a switch, never an indirect call. Nest for more kinds.

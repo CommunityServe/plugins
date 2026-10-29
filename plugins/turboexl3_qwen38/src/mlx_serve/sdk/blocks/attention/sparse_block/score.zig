@@ -329,26 +329,6 @@ pub fn qsaScoreSheet(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array,
     return qsaScoreSheetComposed(s, q, k32t);
 }
 
-/// `key_max` scores `[1, heads * rows, nb]` f32 (head-major) of index queries `q` `[1, heads, rows, d]` at cache
-/// positions `row0..` over index keys `keys` `[1, 1, kv, d]`: per block (`nb` = kv / size, rounded up) the max of
-/// q . k over its keys at or before the row, -inf where it has none.
-pub fn keyMaxScores(a: std.mem.Allocator, s: mlx.mlx_stream, b: Blocks, q: mlx.mlx_array, keys: mlx.mlx_array, row0: c_int) !mlx.mlx_array {
-    var g = Graph.init(a, s);
-    defer g.deinit();
-    const qs = ops.shape(q);
-    const kv = ops.shape(keys)[2];
-    const size: c_int = @intCast(b.size);
-    const nb = @divTrunc(kv + size - 1, size);
-    const dots = try g.matmul(try g.astype(q, .float32), try g.transpose(try g.astype(keys, .float32), &.{ 0, 1, 3, 2 }));
-    const col = try g.reshape(try g.arange(0, @floatFromInt(kv), 1, .int32), &.{ 1, 1, 1, kv });
-    const pos = try g.reshape(try g.arange(@floatFromInt(row0), @floatFromInt(row0 + qs[2]), 1, .int32), &.{ 1, 1, qs[2], 1 });
-    const neg = try g.scalar(-std.math.inf(f32), .float32);
-    const seen = try g.where(try g.call(mlx.mlx_less_equal, .{ col, pos }), dots, neg);
-    const padded = try g.call(mlx.mlx_pad, .{ seen, &[_]c_int{3}, 1, &[_]c_int{0}, 1, &[_]c_int{nb * size - kv}, 1, neg, "constant" });
-    const per_block = try g.max(try g.reshape(padded, &.{ 1, qs[1], qs[2], nb, size }), 4, false);
-    return g.escape(try g.reshape(per_block, &.{ 1, qs[1] * qs[2], nb }));
-}
-
 /// Bound on the per-chunk [n_idx, rows, nb] f32 indexer score sheet: the
 /// prefill selection runs in row chunks so 4096 rows x 64k blocks x 4 heads
 /// (4.3 GB at 256k) never materializes at once.
@@ -395,23 +375,3 @@ pub fn qsaPrefillTransientBytes(n_idx: u64, fwd: u64, kv: u64, ratio: u64, idx_h
 }
 
 // ── tests ──
-
-pub fn qsaScoreKernelBuilt() bool {
-    return qsa_score_kernel_cached != null;
-}
-
-pub fn qsaScoreKernelBuilds() usize {
-    return qsa_score_kernel_builds;
-}
-
-pub fn qsaScoreFusedProbeFailed() bool {
-    return qsa_score_probe_state.load(.acquire) == 1;
-}
-
-pub fn qsaScoreFusedProbeReset() void {
-    qsa_score_probe_state.store(0, .release);
-}
-
-pub fn qsaScoreRowsPerChunk(n_idx: u64, nb: u64, rows: u64, idx_hd: u64) u64 {
-    return qsaScoreRowsPerChunkFused(n_idx, nb, rows, qsaScoreFusedActiveFor(1, @intCast(n_idx), @intCast(idx_hd)));
-}

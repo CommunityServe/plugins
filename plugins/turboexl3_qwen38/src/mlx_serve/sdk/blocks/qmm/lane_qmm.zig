@@ -115,12 +115,6 @@ var tiled: std.AutoHashMapUnmanaged(TiledKey, Tiled) = .{};
 const TiledShape = struct { n: c_int, kw: c_int };
 var tiled_shapes: std.AutoHashMapUnmanaged(TiledShape, u32) = .{};
 
-fn shapeRegistered(key: TiledKey) !void {
-    const gop = try tiled_shapes.getOrPut(std.heap.c_allocator, .{ .n = key.n, .kw = key.kw });
-    if (!gop.found_existing) gop.value_ptr.* = 0;
-    gop.value_ptr.* += 1;
-}
-
 fn shapeReleased(key: TiledKey) void {
     const count = tiled_shapes.getPtr(.{ .n = key.n, .kw = key.kw }) orelse return;
     count.* -= 1;
@@ -149,62 +143,6 @@ pub fn release(owner: usize) void {
     };
 }
 
-fn dataKey(a: mlx.mlx_array, b: ?mlx.mlx_array) !DerivedKey {
-    // Loaded weights are evaluated already (a no-op); a data read needs it.
-    try mlx.check(mlx.mlx_array_eval(a));
-    const shape = mlx.getShape(a);
-    const ap: usize = switch (mlx.mlx_array_dtype(a)) {
-        .uint32 => @intFromPtr(mlx.mlx_array_data_uint32(a) orelse return error.UnreadableWeight),
-        else => @intFromPtr(mlx.mlx_array_data_bfloat16(a) orelse return error.UnreadableWeight),
-    };
-    var bp: usize = 0;
-    if (b) |bb| {
-        try mlx.check(mlx.mlx_array_eval(bb));
-        bp = @intFromPtr(mlx.mlx_array_data_bfloat16(bb) orelse return error.UnreadableWeight);
-    }
-    return .{ .a = ap, .b = bp, .n = shape[0], .w = shape[1] };
-}
-
-fn hold(a: mlx.mlx_array) !mlx.mlx_array {
-    var h = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(h);
-    try mlx.check(mlx.mlx_array_set(&h, a));
-    return h;
-}
-
-fn packedFor(sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const key = try dataKey(sc, bi);
-    if (packed_scales.get(key)) |e| return e.out;
-    var st = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(st);
-    try mlx.check(mlx.mlx_transpose(&st, sc, s));
-    var bt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(bt);
-    try mlx.check(mlx.mlx_transpose(&bt, bi, s));
-    const pair = [_]mlx.mlx_array{ st, bt };
-    const vec = mlx.mlx_vector_array_new_data(&pair, 2);
-    defer _ = mlx.mlx_vector_array_free(vec);
-    var stacked = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(stacked);
-    try mlx.check(mlx.mlx_stack_axis(&stacked, vec, -1, s));
-    var sbt = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(sbt);
-    try mlx.check(mlx.mlx_contiguous(&sbt, stacked, false, s));
-    const held_a = try hold(sc);
-    errdefer _ = mlx.mlx_array_free(held_a);
-    const held_b = try hold(bi);
-    errdefer _ = mlx.mlx_array_free(held_b);
-    try packed_scales.put(std.heap.c_allocator, key, .{ .src_a = held_a, .src_b = held_b, .out = sbt });
-    return sbt;
-}
-
-fn dropPacked(sc: mlx.mlx_array, bi: mlx.mlx_array) void {
-    const key = dataKey(sc, bi) catch return;
-    if (packed_scales.fetchRemove(key)) |kv| {
-        for ([_]mlx.mlx_array{ kv.value.src_a, kv.value.src_b, kv.value.out }) |h| _ = mlx.mlx_array_free(h);
-    }
-}
-
 fn tiledEntry(w: mlx.mlx_array) !?Tiled {
     if (tiled.count() == 0 or mlx.mlx_array_dtype(w) != .uint32) return null;
     const sh = mlx.getShape(w);
@@ -212,74 +150,6 @@ fn tiledEntry(w: mlx.mlx_array) !?Tiled {
     try mlx.check(mlx.mlx_array_eval(w));
     const p = @intFromPtr(mlx.mlx_array_data_uint32(w) orelse return null);
     return tiled.get(.{ .ptr = p, .n = sh[0], .kw = sh[1] });
-}
-
-/// Writes `bytes` of `a`'s evaluated contents from `offset` over `dst`'s buffer.
-fn overwrite(dst: mlx.mlx_array, a: mlx.mlx_array, offset: usize, bytes: usize) !void {
-    try mlx.check(mlx.mlx_array_eval(a));
-    const d: [*]u8 = switch (mlx.mlx_array_dtype(dst)) {
-        .uint32 => @ptrCast(@constCast(mlx.mlx_array_data_uint32(dst) orelse return error.UnreadableWeight)),
-        else => @ptrCast(@constCast(mlx.mlx_array_data_bfloat16(dst) orelse return error.UnreadableWeight)),
-    };
-    const src: [*]const u8 = switch (mlx.mlx_array_dtype(a)) {
-        .uint32 => @ptrCast(mlx.mlx_array_data_uint32(a) orelse return error.UnreadableWeight),
-        else => @ptrCast(mlx.mlx_array_data_bfloat16(a) orelse return error.UnreadableWeight),
-    };
-    @memcpy(d[0..bytes], src[offset .. offset + bytes]);
-}
-
-fn rowContiguous(a: mlx.mlx_array) bool {
-    const sh = mlx.getShape(a);
-    const st = mlx.mlx_array_strides(a);
-    return sh.len == 2 and st[1] == 1 and st[0] == @as(usize, @intCast(sh[1]));
-}
-
-/// Re-orders a 4-bit, group-64 weight in its own buffer into column tiles
-/// (64 wide where N allows, else 32) and its (scale, bias) pairs group-major
-/// over the two buffers (the first half of the groups in the scales'), then
-/// registers it and the row views `widths` splits it into (a joined
-/// weight's parts). From then on only this module reads it; the caller has
-/// synchronized the GPU. Returns the bytes re-ordered, 0 when it does not fit.
-pub fn tileInPlace(owner: usize, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, widths: []const c_int, s: mlx.mlx_stream) !u64 {
-    // Shapes alone cannot tell 4-bit g64 from 8-bit g32: the caller says which.
-    if (group_size != 64 or !fits(w, sc, bi, bits, 64)) return 0;
-    const ws = mlx.getShape(w);
-    const n = ws[0];
-    const kw = ws[1];
-    const wpg: c_int = @intCast(2 * bits); // words per column per group
-    const kg = mlx.getShape(sc)[1];
-    if (@rem(n, 32) != 0 or kg * wpg != kw or @rem(kg, 2) != 0) return 0;
-    if (!rowContiguous(w) or !rowContiguous(sc) or !rowContiguous(bi)) return 0;
-    if (try tiledEntry(w) != null) return 0;
-    const nt: c_int = if (bits == 4 and coopFor(n)) 64 else 32;
-    // [N, KW] -> [N/nt][K/64][nt columns x a group's words]
-    var r4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(r4);
-    try mlx.check(mlx.mlx_reshape(&r4, w, &[_]c_int{ @divExact(n, nt), nt, kg, wpg }, 4, s));
-    var tr = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(tr);
-    try mlx.check(mlx.mlx_transpose_axes(&tr, r4, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
-    var tw = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(tw);
-    try mlx.check(mlx.mlx_contiguous(&tw, tr, false, s));
-    const sbt = try packedFor(sc, bi, s);
-    const w_bytes: usize = @intCast(@as(i64, n) * kw * 4);
-    const s_bytes: usize = @intCast(@as(i64, n) * kg * 2);
-    try overwrite(w, tw, 0, w_bytes);
-    try overwrite(sc, sbt, 0, s_bytes);
-    try overwrite(bi, sbt, s_bytes, s_bytes);
-    dropPacked(sc, bi);
-    const base = @intFromPtr(mlx.mlx_array_data_uint32(w).?);
-    var r0: c_int = 0;
-    const views = [_]c_int{n};
-    for ([_][]const c_int{ &views, widths }, 0..) |list, li| for (list) |rows| {
-        const key = TiledKey{ .ptr = base + @as(usize, @intCast(r0)) * @as(usize, @intCast(kw)) * 4, .n = rows, .kw = kw };
-        const e = Tiled{ .owner = owner, .w = try hold(w), .st = try hold(sc), .bt = try hold(bi), .ntot = n, .r0 = r0, .nt = nt, .bits = @intCast(bits) };
-        try tiled.put(std.heap.c_allocator, key, e);
-        try shapeRegistered(key);
-        if (li == 1) r0 += rows;
-    };
-    return w_bytes + 2 * s_bytes;
 }
 
 fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
@@ -340,16 +210,6 @@ fn buildPlan(key: PlanKey) !mlx.mlx_fast_metal_kernel_config {
 /// MLX's block height: 32 rows when one block covers them all.
 fn prefillBm(rows: c_int) c_int {
     return if (rows <= 32) 32 else 64;
-}
-
-/// A 4-, 5-, 6- or 8-bit affine bf16 matrix [N, K * bits / 32] in groups of
-/// 64 or 32, K % 64 == 0, N % 4 == 0.
-pub fn fits(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32) bool {
-    if ((bits != 4 and bits != 5 and bits != 6 and bits != 8) or (group_size != 64 and group_size != 32) or bi.ctx == null) return false;
-    if (mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return false;
-    const ws = mlx.getShape(w);
-    const b: c_int = @intCast(bits);
-    return ws.len == 2 and @rem(ws[1] * 32, b * 64) == 0 and @rem(ws[0], 4) == 0;
 }
 
 fn mdimsFor(rows: c_int) !mlx.mlx_array {
@@ -424,124 +284,4 @@ pub fn tiledQmm(x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx
     return try run(key, rows, x, xs, &.{ t.w, t.st, t.bt }, s);
 }
 
-/// `x [..., K] @ w.T` for 1..MAX_ROWS rows on the tensor units (any row count
-/// for a tiled weight), or null outside the kernel (the caller's other
-/// row-exact kernels take it).
-pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (try tiledQmm(x, w, s)) |y| return y;
-    if (!mlx.streamIsGpu(s) or !fits(w, sc, bi, bits, group_size) or mlx.mlx_array_dtype(x) != .bfloat16) return null;
-    const xs = mlx.getShape(x);
-    if (xs.len == 0 or xs.len > 8) return null;
-    const ws = mlx.getShape(w);
-    const k = xs[xs.len - 1];
-    if (k * @as(c_int, @intCast(bits)) != ws[1] * 32) return null;
-    var rows: c_int = 1;
-    for (xs[0 .. xs.len - 1]) |d| rows *= d;
-    if (rows < 1 or rows > MAX_ROWS) return null;
-    const n = ws[0];
-    const gs: c_int = @intCast(group_size);
-    // Wider codes are widened per group into bytes, 32 columns at a time.
-    const coop = bits == 4 and coopFor(n);
-    const sbt = try packedFor(sc, bi, s);
-    return try run(.{ .kind = if (coop) .coop else .narrow, .tiled = false, .tmr = tmrFor(rows), .k = k, .n = n, .gs = gs, .sk = splitK(n, k), .bits = @intCast(bits) }, rows, x, xs, &.{ w, sbt }, s);
-}
-
 const testing = std.testing;
-
-fn randBf16(shape: []const c_int, scale: f32, seed: u64, s: mlx.mlx_stream) !mlx.mlx_array {
-    var key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_key(&key, seed));
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_random_normal(&f, shape.ptr, shape.len, .float32, 0.0, scale, key, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
-    return out;
-}
-
-fn quantized(n: c_int, k: c_int, seed: u64, s: mlx.mlx_stream) ![3]mlx.mlx_array {
-    return quantizedBits(n, k, 4, seed, s);
-}
-
-fn quantizedBits(n: c_int, k: c_int, bits: u32, seed: u64, s: mlx.mlx_stream) ![3]mlx.mlx_array {
-    const wf = try randBf16(&.{ n, k }, 0.02, seed, s);
-    defer _ = mlx.mlx_array_free(wf);
-    var triple = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(triple);
-    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
-    var out: [3]mlx.mlx_array = undefined;
-    for (&out, 0..) |*a, j| {
-        a.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(a, triple, j));
-        try mlx.check(mlx.mlx_array_eval(a.*));
-    }
-    return out;
-}
-
-/// MLX's own pick in `QuantizedMatmul::eval_gpu` / `qmm_splitk` (transposed,
-/// group 64): NAX qmm unless under 512 threadgroups of 32 x 32 leave a K split.
-fn mlxTakesNax(m: c_int, n: c_int, k: c_int) bool {
-    var split: c_int = @max(1, @divTrunc(512, @divTrunc(n + 31, 32) * @divTrunc(m + 31, 32)));
-    split = @min(split, @divTrunc(k, 64));
-    while (split > 1 and @rem(k, split * 64) != 0) split -= 1;
-    return split <= 1;
-}
-
-/// x times the dequantized weight in fp32, evaluated.
-fn fp32Truth(x: mlx.mlx_array, t: [3]mlx.mlx_array, bits: u32, s: mlx.mlx_stream) !mlx.mlx_array {
-    var wd = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wd);
-    try mlx.check(mlx.mlx_dequantize(&wd, t[0], t[1], t[2], mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
-    var xf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xf);
-    try mlx.check(mlx.mlx_astype(&xf, x, .float32, s));
-    var wt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wt);
-    try mlx.check(mlx.mlx_transpose(&wt, wd, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_matmul(&out, xf, wt, s));
-    try mlx.check(mlx.mlx_array_eval(out));
-    return out;
-}
-
-fn relErr(y: mlx.mlx_array, truth: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
-    var yf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(yf);
-    try mlx.check(mlx.mlx_astype(&yf, y, .float32, s));
-    var d = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(d);
-    try mlx.check(mlx.mlx_subtract(&d, yf, truth, s));
-    return @sqrt((try meanSquare(d, s)) / (try meanSquare(truth, s)));
-}
-
-fn rowsOf(a: mlx.mlx_array, r0: c_int, rows: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const cols = mlx.getShape(a)[1];
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&o, a, &[_]c_int{ r0, 0 }, 2, &[_]c_int{ r0 + rows, cols }, 2, &[_]c_int{ 1, 1 }, 2, s));
-    try mlx.check(mlx.mlx_array_eval(o));
-    return o;
-}
-
-fn meanSquare(a: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
-    var sq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sq);
-    try mlx.check(mlx.mlx_square(&sq, a, s));
-    var m = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(m);
-    try mlx.check(mlx.mlx_mean(&m, sq, false, s));
-    try mlx.check(mlx.mlx_array_eval(m));
-    var v: f32 = 0;
-    try mlx.check(mlx.mlx_array_item_float32(&v, m));
-    return v;
-}
-
-fn bitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
-    var e = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(e);
-    try mlx.check(mlx.mlx_array_equal(&e, a, b, false, s));
-    try mlx.check(mlx.mlx_array_eval(e));
-    var v: bool = false;
-    try mlx.check(mlx.mlx_array_item_bool(&v, e));
-    return v;
-}

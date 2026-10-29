@@ -395,7 +395,3 @@ fn ringDeclined(why: []const u8, ring: mlx.mlx_array, keys: mlx.mlx_array, held:
 // ── tests ──
 
 const testing = std.testing;
-
-fn testIdxFacts() IdxFacts {
-    return .{ .batch = 1, .rows = 1, .linear = true, .bf16 = true, .idx_hd = 128, .ratio = 4, .rope_dims = 64, .text_rope = true, .norms = true };
-}

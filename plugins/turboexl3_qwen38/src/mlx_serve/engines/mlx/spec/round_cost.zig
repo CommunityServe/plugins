@@ -106,11 +106,6 @@ pub fn bucketForLayout(kv_len: u32, layout: Layout) usize {
     return edges;
 }
 
-/// The long layout's grid. Anything reading a TABLE goes through `Table.bucketOf`.
-pub fn bucketFor(kv_len: u32) usize {
-    return bucketForLayout(kv_len, .long);
-}
-
 pub const Cell = struct {
     ms: f32 = 0,
     tok: f32 = 0,
@@ -182,26 +177,6 @@ pub const Table = struct {
     /// Persisted width cells dropped at load for failing the step bound.
     restored_dropped: u32 = 0,
 
-    /// Folded width cells; never counts the serial row.
-    pub fn foldedCells(self: *const Table) u32 {
-        var n: u32 = 0;
-        for (self.cells) |row| {
-            for (row) |c| {
-                if (c.n > 0) n += 1;
-            }
-        }
-        return n;
-    }
-
-    /// Folded serial cells.
-    pub fn foldedSerialCells(self: *const Table) u32 {
-        var n: u32 = 0;
-        for (self.serial) |c| {
-            if (c.n > 0) n += 1;
-        }
-        return n;
-    }
-
     /// Feed one realized round. `solo` = this was the only decoding stream
     /// (contention only ever ADDS time, so a busy server stops teaching the
     /// table rather than teaching it a lie); `transition` = the width
@@ -258,37 +233,6 @@ pub const Table = struct {
             return ms > below.ms * std.math.pow(f32, IMPLAUSIBLE_STEP, @floatFromInt(width - w));
         }
         return false;
-    }
-
-    /// `ms` at `width` exceeds IMPLAUSIBLE_WIDER over the nearest trusted wider cell. Sweep
-    /// only: at fold time a slower regime would have every narrower sample refused against a
-    /// stale wider cell, where the step bound alone still lets width 1 reseed the bucket.
-    fn widerImplausible(self: *const Table, width: u32, bucket: usize, ms: f32) bool {
-        var w = width;
-        while (w < MAX_WIDTH) {
-            w += 1;
-            const above = self.cells[w][bucket];
-            if (above.n < MIN_SAMPLES) continue;
-            return ms > above.ms * IMPLAUSIBLE_WIDER;
-        }
-        return false;
-    }
-
-    /// Clear every width cell that fails the step bound against its narrower neighbour or
-    /// the wider bound against its wider one (the persisted-table sweep); returns the count cleared.
-    fn dropImplausibleCells(self: *Table) u32 {
-        var dropped: u32 = 0;
-        for (0..N_BUCKETS) |b| {
-            var w: u32 = 1;
-            while (w <= MAX_WIDTH) : (w += 1) {
-                const c = self.cells[w][b];
-                if (c.n == 0) continue;
-                if (!self.stepImplausible(w, b, c.ms) and !self.widerImplausible(w, b, c.ms)) continue;
-                self.cells[w][b] = .{};
-                dropped += 1;
-            }
-        }
-        return dropped;
     }
 
     /// Feed one realized plain serial decode token into `serial[bucket]`. Same drop rules as
@@ -381,16 +325,6 @@ pub const Table = struct {
     pub fn serialMsPerTok(self: *const Table, bucket: usize) ?f32 {
         if (bucket >= N_BUCKETS or self.serial[bucket].n < MIN_SAMPLES) return null;
         return self.serial[bucket].msPerTok();
-    }
-
-    /// Whether a round at `width` is measured to emit tokens cheaper than a plain
-    /// step at this KV length: the width-0 cell (plain rounds) or the serial row
-    /// (MTP's probe ticks); null until both sides are trusted.
-    pub fn roundBeatsSerial(self: *const Table, width: u32, kv_len: u32) ?bool {
-        const b = self.bucketOf(kv_len);
-        const round = self.msPerTok(width, b) orelse return null;
-        const serial = self.msPerTok(0, b) orelse self.serialMsPerTok(b) orelse return null;
-        return round < serial;
     }
 
     /// The bucket resolver for anything holding a table: the layout is the table's.
@@ -688,344 +622,16 @@ pub const SWITCH_MARGIN: f32 = 0.05;
 /// are the file's only spelling of "which context", so a stale version is a quiet miss.
 pub const STORE_VERSION: u32 = 3;
 
-/// The store version a layout writes and reads. The legacy grid keeps `rc1`, the file 26.9.1
-/// shipped, so a sidecar pack boots warm. `rc2` is nobody's.
-pub fn storeVersion(layout: Layout) u32 {
-    return switch (layout) {
-        .legacy => 1,
-        .long => 3,
-    };
-}
-
-/// Samples folded into either row; the persistence trigger reads this.
-pub fn totalFolded(t: *const Table) u32 {
-    return t.folded +% t.serial_folded;
-}
-
-pub fn persistEnabledFrom(raw: ?[]const u8) bool {
-    const v = raw orelse return false;
-    return std.mem.eql(u8, v, "1");
-}
-
-pub fn persistEnabled() bool {
-    const raw = env.get(.MLX_SERVE_ROUND_COST_PERSIST);
-    return persistEnabledFrom(if (raw) |r| std.mem.span(r) else null);
-}
-
-pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
-    for (raws) |raw| {
-        if (env.onValue(raw)) return true;
-    }
-    return false;
-}
-
-fn qwen4ProfileArmed() bool {
-    return env.diagAny("qwen4-profile-");
-}
-
-pub fn persistDiagArmed() bool {
-    return qwen4ProfileArmed() or @import("mtp_depth_bounds.zig").active.pinned() != null or
-        persistDiagArmedFrom(&.{
-            env.get(.MTP_TRACE),
-        });
-}
-
-pub fn storeShouldWrite(persist_on: bool, diag_armed: bool, key_len: usize) bool {
-    return persist_on and !diag_armed and key_len != 0;
-}
-
 var build_id_buf: [64]u8 = undefined;
 var build_id_len: usize = 0;
 var build_id_mu: os_mutex.Mutex = .{};
 
-pub fn engineBuildId() []const u8 {
-    build_id_mu.lock();
-    defer build_id_mu.unlock();
-    if (build_id_len != 0) return build_id_buf[0..build_id_len];
-    var h = std.hash.Fnv1a_64.init();
-    if (buildIdReadsExe(build_options.git_sha)) mixExeBytes(&h) else h.update(build_options.git_sha);
-    h.update("\x00");
-    mixMlxArtifacts(&h);
-    const printed = std.fmt.bufPrint(&build_id_buf, "{x:0>16}", .{h.final()}) catch build_id_buf[0..0];
-    build_id_len = printed.len;
-    return printed;
-}
-
 // A release build's sha stands for its bytes (the packager owns that promise); a dev build
 // has no sha and hashes the executable so an edit-and-rebuild never shares a table.
-pub fn buildIdReadsExe(git_sha: []const u8) bool {
-    return git_sha.len == 0;
-}
-
-fn mixExeBytes(h: *std.hash.Fnv1a_64) void {
-    var path_buf: [4096]u8 = undefined;
-    const path = exePath(&path_buf) orelse return;
-    const fd = crt.openRead(path.ptr);
-    if (fd < 0) return;
-    defer crt.close(fd);
-    var buf: [65536]u8 = undefined;
-    while (true) {
-        const got = crt.read(fd, &buf);
-        if (got < 0) {
-            const e = std.c._errno().*;
-            if (e == @backingInt(std.c.E.INTR)) continue;
-            break;
-        }
-        if (got == 0) break;
-        h.update(buf[0..@intCast(got)]);
-    }
-}
-
-fn exePath(buf: []u8) ?[:0]const u8 {
-    switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => {
-            var n: u32 = @intCast(buf.len);
-            if (std.c._NSGetExecutablePath(buf.ptr, &n) != 0) return null;
-            return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(buf.ptr)), 0);
-        },
-        .linux => {
-            const got = std.c.readlink("/proc/self/exe", buf.ptr, buf.len - 1);
-            if (got <= 0 or got >= buf.len - 1) return null;
-            buf[@intCast(got)] = 0;
-            return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(buf.ptr)), 0);
-        },
-        else => return null,
-    }
-}
-
-fn mixMlxArtifacts(h: *std.hash.Fnv1a_64) void {
-    var dylib_buf: [4096]u8 = undefined;
-    const dylib = mlxDylibPath(&dylib_buf) orelse return;
-    mixFileStamp(h, dylib);
-    var metal_buf: [4096]u8 = undefined;
-    const dir = std.fs.path.dirname(dylib) orelse return;
-    const metal = std.fmt.bufPrint(&metal_buf, "{s}/mlx.metallib", .{dir}) catch return;
-    mixFileStamp(h, metal);
-}
-
-fn mlxDylibPath(buf: []u8) ?[]const u8 {
-    const lib_name = if (builtin.os.tag.isDarwin()) "libmlx.dylib" else "libmlx.so";
-    if (builtin.os.tag.isDarwin()) {
-        const n = std.c._dyld_image_count();
-        var i: u32 = 0;
-        while (i < n) : (i += 1) {
-            const name = std.mem.span(std.c._dyld_get_image_name(i));
-            if (std.mem.endsWith(u8, name, lib_name)) return name;
-        }
-    }
-    var exe_buf: [4096]u8 = undefined;
-    const exe = exePath(&exe_buf) orelse return null;
-    const dir = std.fs.path.dirname(exe) orelse return null;
-    for ([_][]const u8{ "../../lib/mlx/lib/", "../../../lib/mlx/lib/" }) |rel| {
-        const p = std.fmt.bufPrint(buf, "{s}/{s}{s}", .{ dir, rel, lib_name }) catch continue;
-        if (fileExists(p)) return p;
-    }
-    return null;
-}
-
-fn fileExists(path: []const u8) bool {
-    var pbuf: [4096]u8 = undefined;
-    if (path.len >= pbuf.len) return false;
-    @memcpy(pbuf[0..path.len], path);
-    pbuf[path.len] = 0;
-    const fd = crt.openRead(pbuf[0..path.len :0]);
-    if (fd < 0) return false;
-    crt.close(fd);
-    return true;
-}
-
-fn mixFileStamp(h: *std.hash.Fnv1a_64, path: []const u8) void {
-    const fp = fileFingerprint(path) orelse return;
-    h.update(std.mem.asBytes(&fp));
-}
 
 // Size plus six sampled 64 KiB windows: a byte-identical reinstall keeps its table (mtime is
 // not identity), a rebuilt dylib or metallib rotates it, and a 182 MB metallib costs 384 KiB.
-pub fn fileFingerprint(path: []const u8) ?u64 {
-    var pbuf: [4096]u8 = undefined;
-    if (path.len >= pbuf.len) return null;
-    @memcpy(pbuf[0..path.len], path);
-    pbuf[path.len] = 0;
-    const fd = crt.openRead(pbuf[0..path.len :0]);
-    if (fd < 0) return null;
-    defer crt.close(fd);
-    // Size via lseek-to-end: std.c.Stat/fstat are Darwin-only in 0.17, and
-    // this fingerprint runs on the Linux build too (libmlx.so gets mixed in).
-    const size: u64 = @intCast(@max(crt.seekEnd(fd), 0));
-    if (size == 0) return null;
-    var h = std.hash.Fnv1a_64.init();
-    h.update(std.mem.asBytes(&size));
-    const win: u64 = 65536;
-    var k: u64 = 0;
-    while (k < 6) : (k += 1) {
-        const off: u64 = if (size <= win) 0 else if (k == 5) size - win else (size - win) * k / 5;
-        var buf: [65536]u8 = undefined;
-        var done: usize = 0;
-        while (done < buf.len) {
-            const got = crt.pread(fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
-            if (got < 0) {
-                if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
-                return null;
-            }
-            if (got == 0) break;
-            done += @intCast(got);
-        }
-        h.update(buf[0..done]);
-        if (size <= win) break;
-    }
-    return h.final();
-}
-
-/// Same identity rule as the spec-cost probe's key: every field the cost
-/// depends on, hashed, so one machine's cliff is never served to another.
-pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []const u8, os_build: []const u8, layout: Layout, build_id: []const u8) []const u8 {
-    var h = std.hash.Fnv1a_64.init();
-    for ([_][]const u8{ chip, model_dir, quant, os_build, build_id }) |part| {
-        h.update(part);
-        h.update("\x00");
-    }
-    // The hash is layout-blind: only the version prefix moves.
-    return std.fmt.bufPrint(buf, "rc{d}-{x:0>16}", .{ storeVersion(layout), h.final() }) catch buf[0..0];
-}
-
-/// `rc3\n`, then one `width bucket ms tok n` line per folded width cell and one
-/// `s bucket ms tok n` line per folded serial cell.
-pub fn serialize(buf: []u8, t: *const Table) ![]const u8 {
-    var w = std.Io.Writer.fixed(buf);
-    try w.print("rc{d}\n", .{storeVersion(t.layout)});
-    for (t.cells, 0..) |row, wi| {
-        for (row, 0..) |c, b| {
-            if (c.n == 0) continue;
-            try w.print("{d} {d} {d:.4} {d:.4} {d}\n", .{ wi, b, c.ms, c.tok, c.n });
-        }
-    }
-    // The serial row is v3-only; an `s` line in an rc1 file would read as width `s` to an older build.
-    if (t.layout == .long) {
-        for (t.serial, 0..) |c, b| {
-            if (c.n == 0) continue;
-            try w.print("s {d} {d:.4} {d:.4} {d}\n", .{ b, c.ms, c.tok, c.n });
-        }
-    }
-    return w.buffered();
-}
-
-/// Null on any version or shape mismatch. Restored cells keep their sample
-/// counts (trust) but are marked STALE, so the first live sample of each
-/// blends at RESEED_WEIGHT — another boot is another thermal/OS state.
-pub fn parse(text: []const u8, layout: Layout) ?Table {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    const head = lines.next() orelse return null;
-    var hb: [16]u8 = undefined;
-    const want = std.fmt.bufPrint(&hb, "rc{d}", .{storeVersion(layout)}) catch return null;
-    if (!std.mem.eql(u8, std.mem.trim(u8, head, " \r"), want)) return null;
-    var t = Table{ .layout = layout };
-    while (lines.next()) |line| {
-        const l = std.mem.trim(u8, line, " \r");
-        if (l.len == 0) continue;
-        var f = std.mem.splitScalar(u8, l, ' ');
-        const head_field = f.next() orelse return null;
-        const is_serial = std.mem.eql(u8, head_field, "s");
-        const wi: u32 = if (is_serial) 0 else std.fmt.parseInt(u32, head_field, 10) catch return null;
-        const b = std.fmt.parseInt(usize, f.next() orelse return null, 10) catch return null;
-        const ms = std.fmt.parseFloat(f32, f.next() orelse return null) catch return null;
-        const tok = std.fmt.parseFloat(f32, f.next() orelse return null) catch return null;
-        const n = std.fmt.parseInt(u32, f.next() orelse return null, 10) catch return null;
-        // Range is the layout's, not the array's.
-        if (wi > MAX_WIDTH or b >= nBuckets(layout) or n == 0) return null;
-        if (is_serial and layout != .long) return null;
-        if (!std.math.isFinite(ms) or ms <= 0 or !(tok > 0)) return null;
-        const cell = Cell{ .ms = ms, .tok = tok, .n = n, .last_seen = 0 };
-        if (is_serial) t.serial[b] = cell else t.cells[wi][b] = cell;
-    }
-    t.restored_dropped = t.dropImplausibleCells();
-    t.seq = RESEED_GAP + 1;
-    t.serial_seq = RESEED_GAP + 1;
-    t.restored = t.foldedCells();
-    t.restored_serial = t.foldedSerialCells();
-    return t;
-}
-
-fn homeDir() []const u8 {
-    return std.mem.span(env.get(.HOME) orelse return "/tmp");
-}
-
-fn cachePath(buf: []u8, key: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "{s}/.mlx-serve/round-cost/{s}.txt", .{ homeDir(), key }) catch null;
-}
-
-/// Read one table file at `key`, parsed under `layout`. Null on anything at all.
-fn readCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, layout: Layout) ?Table {
-    if (key.len == 0) return null;
-    var path_buf: [512]u8 = undefined;
-    const path = cachePath(&path_buf, key) orelse return null;
-    const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
-    defer f.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = f.reader(io, &rb);
-    const text = rs.interface.allocRemaining(allocator, .limited(16384)) catch return null;
-    defer allocator.free(text);
-    return parse(text, layout);
-}
-
-/// Lift a legacy table onto the long grid: buckets 0..4 share their edges and carry over;
-/// the legacy `32k+` cell spans three long cells and is dropped.
-pub fn migrateLegacy(src: Table) Table {
-    var t = Table{ .layout = .long };
-    const shared = nBuckets(.legacy) - 1; // 0..4: identical edges
-    for (src.cells, 0..) |row, wi| {
-        for (row[0..shared], 0..) |c, b| t.cells[wi][b] = c;
-    }
-    t.seq = RESEED_GAP + 1;
-    t.serial_seq = RESEED_GAP + 1;
-    t.restored = t.foldedCells();
-    t.restored_serial = 0;
-    return t;
-}
-
-/// The table for `layout`, warm-started from the previous format when its own file is absent.
-pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, layout: Layout) ?Table {
-    if (!persistEnabled()) return null;
-    if (readCached(allocator, io, key, layout)) |t| return t;
-    if (layout != .long) return null;
-    // The legacy file for the same (chip, model, quant, OS build) differs only in the prefix.
-    if (key.len < 4) return null;
-    var legacy_key_buf: [64]u8 = undefined;
-    const legacy_key = std.fmt.bufPrint(&legacy_key_buf, "rc{d}-{s}", .{ storeVersion(.legacy), key[4..] }) catch return null;
-    const old = readCached(allocator, io, legacy_key, .legacy) orelse return null;
-    return migrateLegacy(old);
-}
-
-/// Best-effort: a machine that cannot write re-explores next boot.
-pub fn storeCached(io: std.Io, key: []const u8, t: *const Table) void {
-    if (!storeShouldWrite(persistEnabled(), persistDiagArmed(), key.len)) return;
-    var dir_buf: [512]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/.mlx-serve/round-cost", .{homeDir()}) catch return;
-    std.Io.Dir.cwd().createDirPath(io, dir) catch return;
-    var path_buf: [512]u8 = undefined;
-    const path = cachePath(&path_buf, key) orelse return;
-    var text: [8192]u8 = undefined;
-    const body = serialize(&text, t) catch return;
-    const f = std.Io.Dir.createFileAbsolute(io, path, .{}) catch return;
-    defer f.close(io);
-    var wb: [8192]u8 = undefined;
-    var fw = f.writer(io, &wb);
-    fw.interface.writeAll(body) catch return;
-    fw.interface.flush() catch {};
-}
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-/// Fold MIN_SAMPLES identical samples so the cell counts as measured.
-fn feed(t: *Table, width: u32, kv: u32, ms: f32, tok: f32) void {
-    var i: u32 = 0;
-    while (i < MIN_SAMPLES) : (i += 1) _ = t.observe(width, kv, ms, tok, true, false);
-}
-
-/// Past the compile sample, then MIN_SAMPLES folds.
-fn feedLookup(t: *Table, drafts: u32, kv: u32, ms: f32, tok: f32) void {
-    if (!t.lookup_compiled[drafts]) _ = t.observeLookup(drafts, kv, 500.0, tok, true);
-    var i: u32 = 0;
-    while (i < MIN_SAMPLES) : (i += 1) _ = t.observeLookup(drafts, kv, ms, tok, true);
-}

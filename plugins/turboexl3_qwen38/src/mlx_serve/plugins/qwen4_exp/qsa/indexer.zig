@@ -813,17 +813,3 @@ pub fn qsaSelectBlocks(self: *Trunk, q_rope: mlx.mlx_array, k32t: mlx.mlx_array,
 }
 
 // ── The QSA all-visible identity skip at the engagement boundary ──
-
-/// Random f32 score sheet (the reference's own dtype).
-fn qsaRandScoresF32(rnd: std.Random, shape: []const c_int) !mlx.mlx_array {
-    var n: usize = 1;
-    for (shape) |d| n *= @intCast(d);
-    const data = try std.testing.allocator.alloc(f32, n);
-    defer std.testing.allocator.free(data);
-    // relu output: many exact zeros.
-    for (data) |*x| {
-        const v = rnd.float(f32) - 0.35;
-        x.* = if (v > 0) v else 0.0;
-    }
-    return mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
-}

@@ -17,7 +17,9 @@
 #     the areas whose kernels this plugin ships, which its GPU tests (`zig build gpu-test`) hold to the contract;
 #   - every named test no build of the plugin runs taken out, with the comment lines right above it: a copy keeps the
 #     named tests of KIT_TESTS (the files whose tests `zig build test` runs) and those a gpu-test or mlx-free-test filter
-#     in build.zig picks, and every unnamed `test {}` block. A module's named tests go (no test build roots a module).
+#     in build.zig picks, and every unnamed `test {}` block. A module's named tests go (no test build roots a module);
+#   - the functions scripts/cut-functions.txt names taken out, with their `///` lines: functions no build of the plugin
+#     compiles (a method as Container.method). A name the copy lacks stops the sync.
 # MODULES are directories mlx-serve builds as modules of their own (Sushi's EXL3 decode, `sushi_exl3`): their Zig files
 # are copied whole (their test fixtures are not), with no edit but the `copied_from` line, but for MODULE_STAND_INS,
 # and of their other files only the kernels a copied Zig file of theirs names. The kernel contract's planted controls
@@ -139,6 +141,80 @@ def strip_tests(f, text, keep):
         i, n = j + 1, n + 1
     return "\n".join(out), n
 tests_out = 0
+# The functions no build compiles, per file (scripts/cut-functions.txt), and the scanner that finds them: top-level
+# functions and methods of named containers, by path; what sits inside a function body is that function's.
+cut_lists = {}
+for l in open(pathlib.Path(slice_file).parent / "cut-functions.txt"):
+    if l.strip() and not l.startswith("#"):
+        k, v = l.split(":", 1)
+        cut_lists[k.strip()] = set(v.split())
+fn_head = re.compile(r'^\s*(?:pub\s+)?(?:export\s+)?(inline\s+|noinline\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(')
+extern_head = re.compile(r'^\s*(?:pub\s+)?extern\b')
+container_head = re.compile(r'^\s*(?:pub\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]*)?=\s*(?:extern\s+|packed\s+)?'
+                            r'(?:struct|union|enum|opaque)\b[^{};]*\{\s*$')
+def fn_end(lines, i, col):
+    """The last line of the function whose parameter list opens at lines[i][col]. Braces count once that list has
+    closed (a parameter's type can hold a switch or a struct); a return type's braces close with the body's `{` still
+    to come on the line, and the function ends where the body's close."""
+    paren, brace, opened, j, k = 0, 0, False, i, col
+    while j < len(lines):
+        code = code_of(lines[j])
+        while k < len(code):
+            ch = code[k]
+            if ch == "(":
+                paren += 1
+            elif ch == ")":
+                paren -= 1
+                opened = opened or paren == 0
+            elif opened and paren == 0:
+                if ch == "{":
+                    brace += 1
+                elif ch == "}":
+                    brace -= 1
+                    if brace == 0 and "{" not in code[k + 1:]:
+                        return j
+                elif ch == ";" and brace == 0:
+                    return j
+            k += 1
+        j, k = j + 1, 0
+    sys.exit("a function has no end: the function cut needs updating")
+def functions(lines):
+    """[(path, first line, last line)] of each function the scanner sees."""
+    out, stack, depth, i = [], [], 0, 0
+    while i < len(lines):
+        m = fn_head.match(lines[i])
+        if m and not extern_head.match(lines[i]):
+            j = fn_end(lines, i, m.end() - 1)
+            out.append((".".join([c for c, _ in stack] + [m.group(2)]), i, j))
+            i = j + 1
+            continue
+        c = container_head.match(lines[i])
+        if c:
+            stack.append((c.group(1), depth))
+        code = code_of(lines[i])
+        depth += code.count("{") - code.count("}")
+        while stack and depth <= stack[-1][1] and not c:
+            stack.pop()
+        i += 1
+    return out
+def cut_functions(f, text):
+    paths = cut_lists.get(f)
+    if not paths:
+        return text, 0
+    lines = text.split("\n")
+    found = [fn for fn in functions(lines) if fn[0] in paths]
+    missing = sorted(paths - {fn[0] for fn in found})
+    if missing:
+        sys.exit(f"{f}: scripts/cut-functions.txt names functions it lacks: {missing}")
+    drop = set()
+    for _, a, b in found:
+        while a > 0 and lines[a - 1].lstrip().startswith("///"):
+            a -= 1
+        drop.update(range(a, b + 1))
+        if b + 1 < len(lines) and lines[b + 1] == "" and a > 0 and lines[a - 1] == "":
+            drop.add(b + 1)
+    return "\n".join(l for k, l in enumerate(lines) if k not in drop), len(found)
+fns_out = 0
 for f in files:
     text = (repo / "src" / f).read_text()
     def to_kit(m):
@@ -167,6 +243,8 @@ for f in files:
         text = text[:m.start(1)] + "".join(f'    @import("{a}"),\n' for a in rows if a in keep) + text[m.end(1):]
     text, n = strip_tests(f, text, (lambda name: True) if f in kit_tests else (lambda name: any(x in name for x in test_filters)))
     tests_out += n
+    text, n = cut_functions(f, text)
+    fns_out += n
     out = dst / f
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(f"//! copied_from: src/{f}@{sha}\n" + text)
@@ -246,6 +324,8 @@ for mdir in modules:
         if q.suffix == ".zig" and rel not in module_stand_ins:
             stripped[rel], n = strip_tests(rel, q.read_text(), lambda name: False)
             tests_out += n
+            stripped[rel], n = cut_functions(rel, stripped[rel])
+            fns_out += n
     named = "".join(stripped.values())
     for q in srcs:
         rel = str(q.relative_to(repo / "src"))
@@ -260,13 +340,16 @@ for mdir in modules:
         else:
             out.write_bytes(q.read_bytes())
         module_files.add(rel)
+unknown = sorted(set(cut_lists) - set(files) - module_files)
+if unknown:
+    sys.exit(f"scripts/cut-functions.txt names files that are not copies: {unknown}")
 known = set(files) | edges | set(stand_ins) | set(kernels) | module_files | {"MLX_SERVE_COMMIT", "abi/quant.zig"}
 for p in sorted(dst.rglob("*")):
     rel = str(p.relative_to(dst))
     if p.is_file() and rel not in known:
         p.unlink()
         print(f"removed {rel} (no longer in the slice)")
-print(f"synced {len(files)} files, {len(kernels)} kernels, {len(module_files)} module files, {len(stand_ins)} stand-ins from {sha[:8]}; {tests_out} named tests no build runs left out")
+print(f"synced {len(files)} files, {len(kernels)} kernels, {len(module_files)} module files, {len(stand_ins)} stand-ins from {sha[:8]}; {tests_out} named tests no build runs and {fns_out} functions none compiles left out")
 P
 find "$dst" -type d -empty -delete
 # No env levers: the copies reach the environment only through env.zig (ours), but for the variables mlx-serve's own

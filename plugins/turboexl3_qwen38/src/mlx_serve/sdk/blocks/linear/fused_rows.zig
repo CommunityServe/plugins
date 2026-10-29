@@ -189,41 +189,6 @@ pub fn sliceQkvPart(out: *mlx.mlx_array, qkv: mlx.mlx_array, start: c_int, width
     try mlx.check(mlx.mlx_slice(out, qkv, &lo, 3, &hi, 3, &st, 3, s));
 }
 
-/// A packed bank holds each expert's gate and up projections in one tensor
-/// `experts.gate_up_proj` of shape [E, 2*M, X], gate rows first (HF chunks
-/// the projected output in halves: gate = [..., :M], up = [..., M:]).
-/// Slicing axis 1 maps the packed layout onto MoeMlpWeights' separate
-/// switch_gate_*/switch_up_* fields with zero forward-pass changes; the same
-/// split serves the packed-u32 weight, its scales, and its biases (all share
-/// the [E, rows, X] expert-output layout — quant groups run along axis 2).
-/// Caller owns both returned arrays.
-/// Join N same-input-width projections into one by stacking their OUTPUT rows.
-/// Quantization survives the join untouched: affine groups run along the INPUT
-/// axis, so rows stay independent and the scales/biases concatenate on the same
-/// axis as the packed codes. Returns an owned array (caller records it in
-/// `owned_bf16`); a null-ctx member means "this triple is dense", which the
-/// caller resolves before calling.
-///
-/// Used by KDA, whose checkpoint ships q/k/v as three separate projections and
-/// three separate depthwise convs where the forward wants one of each — doing
-/// it at load keeps the recurrence's hot path identical to GatedDeltaNet's.
-/// Whether a set of same-role projections can be JOINED on the output-row
-/// axis. `cols` is each one's trailing dim — the PACKED width for a quantized
-/// weight, the input width for a dense one. They must all agree: mlx's
-/// concatenate needs identical trailing dims (a mismatch is an MLX-level
-/// error, which is uncatchable and takes the process with it), and a joined
-/// weight resolves ONE (bits, group_size) from its packed geometry, so a trio
-/// quantized at mixed widths would serve two thirds of its rows at the wrong
-/// scale even if the concatenate somehow succeeded. Pure so the predicate is
-/// testable without building arrays.
-pub fn joinableCols(cols: []const c_int) bool {
-    if (cols.len == 0) return false;
-    for (cols[1..]) |c| {
-        if (c != cols[0]) return false;
-    }
-    return true;
-}
-
 /// A projection triple (`scales`/`biases` null-ctx when dense). Borrowed handles.
 pub const QW = struct {
     w: mlx.mlx_array = .{ .ctx = null },

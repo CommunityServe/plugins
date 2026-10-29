@@ -322,59 +322,6 @@ pub fn qwen4MtpRelease(self: *Trunk, st: *Qwen4MtpState) void {
     self.qwen4_mtp_owner = null;
 }
 
-/// Reset the MTP head's per-request state (KV, indexer keys, position).
-pub fn qwen4MtpReset(self: *Trunk) !void {
-    const m = &(self.qwen4_mtp orelse return);
-    try m.cache.reinit(self.config.num_hidden_layers + 1, m.cache.config);
-    ssmFreeQsaState(&m.entry);
-    m.qsa_marks.deinit();
-    m.seq_offset = 0;
-    m.pos_base = -1;
-}
-
-pub fn qwen4MtpResetOwned(self: *Trunk, enable_mtp: bool) void {
-    if (enable_mtp) self.qwen4MtpReset() catch {};
-}
-
-/// Re-creates the head cache under `cfg` (the engine's choice for the head) with the HEAD's own geometry (layers +
-/// 1, its key head dim).
-pub fn qwen4MtpApplyKvQuant(self: *Trunk, cfg: KVQuantConfig) !void {
-    const m = &(self.qwen4_mtp orelse return);
-    const n_layers: u32 = self.config.num_hidden_layers + 1;
-    if (std.meta.eql(m.cache.config, cfg) and m.cache.entries.len == n_layers) return;
-    try m.cache.reinit(n_layers, cfg);
-}
-
-/// Record the head's QSA leftover at `row`, the trunk's checkpoint position in the head's
-/// own row space (absolute minus the head's base): a warm restore clamps the head to
-/// exactly that row, by then a whole generated tail below its ring. A head that is not at
-/// `row` — one whose history window skipped these chunks — marks nothing. Best effort; a
-/// missing mark is a blind head, never a wrong one.
-pub fn qwen4MtpMarkQsaLeftover(self: *Trunk, row: usize) !void {
-    const m = &(self.qwen4_mtp orelse return);
-    if (row != m.seq_offset) return;
-    const pos: c_int = @intCast(m.seq_offset);
-    const ratio = @max(m.entry.qsa_ratio, 1);
-    // An aligned position needs no rows at all: the pooled bank is the whole history there.
-    if (pos == 0 or @mod(pos, ratio) == 0 or m.entry.aux_state.ctx == null) return;
-    const rows = try qsaLeftoverAt(m.entry.aux_state, qsaHistoryRows(&m.entry), pos, ratio, self.s);
-    if (rows.ctx == null) return;
-    // The copy is lazy and its parent is the ring the next append rewrites.
-    {
-        const vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(vec);
-        _ = mlx.mlx_vector_array_append_value(vec, rows);
-        _ = mlx.mlx_eval(vec);
-    }
-    m.qsa_marks.put(pos, rows);
-}
-
-/// The marks a commit stores beside the head's QSA half.
-pub fn qwen4MtpMarks(self: *const Trunk) []const QsaHeadMark {
-    if (self.qwen4_mtp) |*m| return m.qsa_marks.slice();
-    return &.{};
-}
-
 /// MTP draft logits: `stream_prev` `[B,S,hc*H]` is the trunk's pre-mixer
 /// stream at positions p.., `token_ids` `[B,S]` the tokens at p+1.., and
 /// `pos_offset` = p+1 of the first row (the draft query's own position).
@@ -410,9 +357,6 @@ pub const Qwen4MtpOutBuf = struct {
         self.allocator.free(self.items);
     }
 
-    fn abandon(self: *Qwen4MtpOutBuf) []Qwen4MtpOut {
-        return self.items;
-    }
 };
 
 /// What `qwen4MtpForward` owes its caller past the head's own layer. The
@@ -441,11 +385,6 @@ pub const Qwen4MtpProject = enum {
 pub fn qwen4MtpTruncate(self: *Trunk, len: usize) !void {
     const m = &(self.qwen4_mtp orelse return);
     var live = qwen4MtpLiveModule(m);
-    try self.qwen4MtpTruncateLive(&live, len);
-}
-
-pub fn qwen4MtpTruncateOn(self: *Trunk, st: *Qwen4MtpState, len: usize) !void {
-    var live = qwen4MtpLiveState(st);
     try self.qwen4MtpTruncateLive(&live, len);
 }
 
@@ -515,43 +454,6 @@ pub fn qwen4MtpTruncateToMarkLive(self: *Trunk, live: *Qwen4MtpLive, keep: c_int
     try truncatePooled(&live.entry.qsa_pooled, keep, live.entry.qsa_ratio, self.s, true);
 }
 
-/// Adopt a committed head history from the prefix cache: the head's KV plus the QSA aux
-/// entry it is only valid with, trimmed to `want` rows. Any failure resets the head to blank.
-pub fn qwen4MtpAdopt(
-    self: *Trunk,
-    kv_snap: *const KVCacheSnapshot,
-    aux: *const SSMCacheEntrySnapshot,
-    marks: []const QsaHeadMark,
-    pos_base: c_int,
-    want: usize,
-) !void {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
-    if (kv_snap.step > 0 and pos_base < 0) return error.MtpHeadInvalidOrigin;
-    // The head's row count IS its cache's step (`qwen4MtpAdvance`).
-    if (m.cache.step != m.seq_offset) return error.MtpHeadStepGap;
-    // A history that is not exactly as long as the KV is not adoptable at any length.
-    if (aux.aux_state.ctx == null and aux.qsa_pooled.ctx == null) return error.MtpHeadNoQsaHistory;
-    const hist: c_int = if (aux.qsa_rows > 0) aux.qsa_rows else blk: {
-        if (aux.aux_state.ctx == null) break :blk 0;
-        const sh = mlx.getShape(aux.aux_state);
-        break :blk if (sh.len >= 2) sh[1] else 0;
-    };
-    if (hist != @as(c_int, @intCast(kv_snap.step))) return error.MtpHeadQsaHistoryGap;
-    errdefer self.qwen4MtpReset() catch {};
-    try m.cache.restore(kv_snap);
-    // `ssmRestore` replaces the aux state, so a stale history cannot survive.
-    try ssmRestore(&m.entry, aux);
-    // Same discipline for the marks: the clamp below reads the committed set, never a
-    // previous request's.
-    m.qsa_marks.deinit();
-    m.qsa_marks = QsaHeadMarkSet.share(marks);
-    m.seq_offset = kv_snap.step;
-    m.pos_base = pos_base;
-    // Unconditional clamp: a snapshot's buffer can be longer than the matched prefix.
-    try self.qwen4MtpTruncate(want);
-    if (m.seq_offset != want) return error.MtpHeadTrimGap;
-}
-
 /// Commit a forward's `seq_len` rows to the head's own bookkeeping: `KVCache.update`
 /// advances `step` only at layer 0, and the head's layer is `num_hidden_layers`. Without
 /// this the committed snapshot's step disagreed with its QSA history and every restore declined.
@@ -585,12 +487,6 @@ pub const HeadPlace = struct {
     dead_end: c_int,
 };
 
-pub fn qwen4MtpForwardPlaced(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
-    var live = qwen4MtpLiveModule(m);
-    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place, null);
-}
-
 /// `qwen4MtpForward` with the row's normalized embedding handed in (`front_en`: the previous draft step's fused pick,
 /// bit for bit `rmsNorm(embedding(token_ids_in), pre_norm_emb)`, `draft_fuse.zig`); null builds it here.
 pub fn qwen4MtpForwardFront(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject, front_en: ?mlx.mlx_array) !Qwen4MtpOut {
@@ -613,289 +509,6 @@ pub const Qwen4MtpBatchRow = struct {
     pos_offset: c_int,
     mrope_ctx: ?mrope.PositionContext = null,
 };
-
-pub fn mtpPadSeq(self: *Trunk, arr: mlx.mlx_array, want: c_int) !mlx.mlx_array {
-    const sh = mlx.getShape(arr);
-    if (sh[1] == want) {
-        var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&out, arr));
-        return out;
-    }
-    const high = [_]c_int{want - sh[1]};
-    const z = mlx.mlx_array_new_int(0);
-    defer _ = mlx.mlx_array_free(z);
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_pad(&out, arr, &[_]c_int{1}, 1, &[_]c_int{0}, 1, &high, 1, z, "constant", self.s));
-    return out;
-}
-
-pub fn mtpHeadForceBatched() bool {
-    return mtp_head_force_batched_override orelse false;
-}
-
-pub fn mtpMoeRows(self: *Trunk, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
-    // EXL3 head rows ride the decode chain only.
-    if (self.config.exl3 != null and exl3.kernels.usesPrefillArm(exl3.kernels.rowsOfShape(mlx.getShape(x))))
-        return error.Exl3MtpRowsExceedDecode;
-    if (mw.shared_ungated or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return self.moeMLP(x, mw);
-    var routed = mw.*;
-    routed.shared_expert_gate_w = null;
-    const expert_sum = try self.moeMLP(x, &routed);
-    defer _ = mlx.mlx_array_free(expert_sum);
-    const down = (try self.moeSharedDown(.mtp_rows, x, mw, &.{})).?;
-    defer _ = mlx.mlx_array_free(down);
-    const gate_logit = try self.mtpProjectionRows(x, mw.shared_expert_gate_w.?, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, false);
-    defer _ = mlx.mlx_array_free(gate_logit);
-    return self.moeSharedGateTail(expert_sum, gate_logit, down);
-}
-
-pub fn qwen4MtpForwardBatched(
-    self: *Trunk,
-    rows: []const Qwen4MtpBatchRow,
-    project: Qwen4MtpProject,
-    depth: u32,
-) ![]Qwen4MtpOut {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
-    if (rows.len == 0) return error.EmptyMtpBatch;
-    if (rows.len > MAX_BATCH_ROWS) return error.MtpBatchTooWide;
-    var any_mrope = false;
-    var widths: [MAX_BATCH_ROWS]c_int = undefined;
-    for (rows, 0..) |r, i| {
-        const shape = mlx.getShape(r.stream);
-        if (shape.len != 3) return error.MtpHeadStreamShape;
-        widths[i] = shape[1];
-        if (r.mrope_ctx != null) any_mrope = true;
-    }
-    const fits = mtpHeadRowsFit(widths[0..rows.len], self.config.hc_count);
-    const use_batch = fits and !any_mrope and (rows.len > 1 or mtpHeadForceBatched());
-    if (!use_batch) {
-        var buf = try Qwen4MtpOutBuf.init(self.allocator, rows.len);
-        errdefer buf.deinit();
-        for (rows, 0..) |r, i| {
-            buf.items[i] = try self.qwen4MtpForwardOn(r.st, r.stream, r.token_ids, r.pos_offset, r.mrope_ctx, project);
-            buf.built = i + 1;
-        }
-        return buf.abandon();
-    }
-
-    const Once = struct {
-        var logged: bool = false;
-    };
-    if (!Once.logged) {
-        Once.logged = true;
-        log.info("[batched] mtp head engaged (slots={d} depth={d})\n", .{ rows.len, depth });
-    }
-
-    qwen4_mtp_head_graphs += 1;
-    self.fwd_gen +%= 1;
-    const cfg = &self.config;
-    const hc: c_int = @intCast(cfg.hc_count);
-    const hidden: c_int = @intCast(cfg.hidden_size);
-    const N: c_int = @intCast(rows.len);
-    var seqs: [MAX_BATCH_ROWS]c_int = undefined;
-    var s_max: c_int = 0;
-    for (rows, 0..) |r, i| {
-        const sh = mlx.getShape(r.stream);
-        seqs[i] = sh[1];
-        if (seqs[i] > s_max) s_max = seqs[i];
-        if (r.st.seq_offset == 0) r.st.pos_base = r.pos_offset;
-        if (r.pos_offset != r.st.pos_base + @as(c_int, @intCast(r.st.seq_offset))) return error.MtpPositionGap;
-    }
-
-    var tok_parts: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-    var str_parts: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-    for (tok_parts[0..rows.len], 0..) |*p, i| {
-        p.* = .{ .ctx = null };
-        str_parts[i] = .{ .ctx = null };
-    }
-    defer for (tok_parts[0..rows.len], 0..) |p, i| {
-        if (p.ctx != null) _ = mlx.mlx_array_free(p);
-        if (str_parts[i].ctx != null) _ = mlx.mlx_array_free(str_parts[i]);
-    };
-    for (rows, 0..) |r, i| {
-        var tok2 = mlx.mlx_array_new();
-        errdefer if (tok2.ctx != null) {
-            _ = mlx.mlx_array_free(tok2);
-        };
-        try mlx.check(mlx.mlx_reshape(&tok2, r.token_ids, &[_]c_int{ 1, seqs[i] }, 2, self.s));
-        tok_parts[i] = try self.mtpPadSeq(tok2, s_max);
-        _ = mlx.mlx_array_free(tok2);
-        tok2 = .{ .ctx = null };
-        str_parts[i] = try self.mtpPadSeq(r.stream, s_max);
-    }
-    const token_ids = try concatAxis0(self.s, tok_parts[0..rows.len]);
-    defer _ = mlx.mlx_array_free(token_ids);
-    const stream_prev = try concatAxis0(self.s, str_parts[0..rows.len]);
-    defer _ = mlx.mlx_array_free(stream_prev);
-
-    const e = try self.embedding(token_ids);
-    defer _ = mlx.mlx_array_free(e);
-    const en = try self.rmsNorm(e, m.pre_norm_emb);
-    defer _ = mlx.mlx_array_free(en);
-    const ep = try self.mtpProjectionRows(en, m.fc_emb_w, m.fc_emb_s, m.fc_emb_b, false);
-    defer _ = mlx.mlx_array_free(ep);
-    const hn = try self.rmsNorm(stream_prev, m.pre_norm_hidden);
-    defer _ = mlx.mlx_array_free(hn);
-    var hn4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(hn4);
-    try mlx.check(mlx.mlx_reshape(&hn4, hn, &[_]c_int{ N, s_max, hc, hidden }, 4, self.s));
-    const hp = try self.mtpProjectionRows(hn4, m.fc_hid_w, m.fc_hid_s, m.fc_hid_b, false);
-    defer _ = mlx.mlx_array_free(hp);
-    var ep4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ep4);
-    try mlx.check(mlx.mlx_reshape(&ep4, ep, &[_]c_int{ N, s_max, 1, hidden }, 4, self.s));
-    var x4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x4);
-    try mlx.check(mlx.mlx_add(&x4, hp, ep4, self.s));
-    var h = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(h);
-    try mlx.check(mlx.mlx_reshape(&h, x4, &[_]c_int{ N, s_max, hc * hidden }, 3, self.s));
-
-    var slot_ctxs: [MAX_BATCH_ROWS]ForwardCtx = undefined;
-    var slot_ptrs: [MAX_BATCH_ROWS]*ForwardCtx = undefined;
-    for (rows, 0..) |r, i| {
-        slot_ctxs[i] = .{
-            .cache = &r.st.cache,
-            .moe_seq_offset = &r.st.seq_offset,
-            .ssm_entries = null,
-            .capture_hidden = null,
-            .vision_embeddings = null,
-            .qsa_entry = &r.st.entry,
-            .qsa_pos_base = r.st.pos_base,
-        };
-        slot_ptrs[i] = &slot_ctxs[i];
-    }
-
-    const li: u32 = cfg.num_hidden_layers;
-    const lw = &m.layer;
-    const fa = switch (lw.attn) {
-        .full => |w| w,
-        .linear => return error.MtpLayerNotAttention,
-    };
-
-    var h_parts: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-    var mlp_mix: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-    var mlp_inj: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-    for (h_parts[0..rows.len], 0..) |*p, i| {
-        p.* = .{ .ctx = null };
-        mlp_mix[i] = .{ .ctx = null };
-        mlp_inj[i] = .{ .ctx = null };
-    }
-    defer for (h_parts[0..rows.len], 0..) |p, i| {
-        if (p.ctx != null) _ = mlx.mlx_array_free(p);
-        if (mlp_mix[i].ctx != null) _ = mlx.mlx_array_free(mlp_mix[i]);
-        if (mlp_inj[i].ctx != null) _ = mlx.mlx_array_free(mlp_inj[i]);
-    };
-    {
-        const hsh = mlx.getShape(h);
-        for (rows, 0..) |r, i| {
-            const i_c: c_int = @intCast(i);
-            var h_i = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(h_i);
-            try mlx.check(mlx.mlx_slice(&h_i, h, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, seqs[i], hsh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            var pre = try self.hcRead(h_i, &lw.hc_attn.?, 1, seqs[i]);
-            defer pre.deinit();
-            const ao = try self.qwen4AttnWith(slot_ptrs[i], pre.mixed, &fa, &r.st.entry, li, @intCast(r.st.seq_offset), r.st.pos_base, 1, seqs[i], seqs[i] > 1);
-            defer _ = mlx.mlx_array_free(ao);
-            h_i = try self.hcWrite(h_i, ao, pre.inj, 1, seqs[i]);
-            const pre2 = try self.hcRead(h_i, &lw.hc_mlp.?, 1, seqs[i]);
-            mlp_mix[i] = pre2.mixed;
-            mlp_inj[i] = pre2.inj;
-            h_parts[i] = h_i;
-        }
-    }
-    _ = mlx.mlx_array_free(h);
-    h = .{ .ctx = null };
-    const mix_all = try concatAxis0(self.s, mlp_mix[0..rows.len]);
-    defer _ = mlx.mlx_array_free(mix_all);
-    const mo_all = switch (lw.mlp) {
-        .moe => |*mw| try self.mtpMoeRows(mix_all, mw),
-        .dense => |*dw| try self.denseMLP(mix_all, dw),
-    };
-    defer _ = mlx.mlx_array_free(mo_all);
-    const msh = mlx.getShape(mo_all);
-    for (0..rows.len) |i| {
-        const i_c: c_int = @intCast(i);
-        var mo_i = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(mo_i);
-        try mlx.check(mlx.mlx_slice(&mo_i, mo_all, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, seqs[i], msh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-        h_parts[i] = try self.hcWrite(h_parts[i], mo_i, mlp_inj[i], 1, seqs[i]);
-    }
-    for (rows, 0..) |r, i| {
-        qwen4MtpAdvance(&r.st.cache, &r.st.seq_offset, seqs[i]);
-    }
-
-    var buf = try Qwen4MtpOutBuf.init(self.allocator, rows.len);
-    errdefer buf.deinit();
-
-    if (project == .none) {
-        for (0..rows.len) |i| {
-            buf.items[i] = .{ .logits = .{ .ctx = null }, .stream = h_parts[i] };
-            h_parts[i] = .{ .ctx = null };
-            buf.built = i + 1;
-        }
-        return buf.abandon();
-    }
-
-    var last_parts: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-    for (last_parts[0..rows.len]) |*p| p.* = .{ .ctx = null };
-    defer for (last_parts[0..rows.len]) |p| {
-        if (p.ctx != null) _ = mlx.mlx_array_free(p);
-    };
-    for (0..rows.len) |i| {
-        var stream_i = h_parts[i];
-        h_parts[i] = .{ .ctx = null };
-        errdefer _ = mlx.mlx_array_free(stream_i);
-        const ssh = mlx.getShape(stream_i);
-        if ((project == .last_row or project == .mixed_last_row) and ssh[1] > 1) {
-            var last = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(last);
-            try mlx.check(mlx.mlx_slice(&last, stream_i, &[_]c_int{ 0, ssh[1] - 1, 0 }, 3, &[_]c_int{ 1, ssh[1], ssh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            _ = mlx.mlx_array_free(stream_i);
-            stream_i = last;
-        }
-        last_parts[i] = stream_i;
-    }
-    const last_h = try concatAxis0(self.s, last_parts[0..rows.len]);
-    defer _ = mlx.mlx_array_free(last_h);
-    for (last_parts[0..rows.len]) |*part| {
-        if (part.ctx != null) _ = mlx.mlx_array_free(part.*);
-        part.* = .{ .ctx = null };
-    }
-    const n_rows: c_int = @intCast(rows.len);
-    const mix = try self.hcRead(last_h, &m.mixer, n_rows, 1);
-    if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
-    defer if (mix.mixed.ctx != null) {
-        _ = mlx.mlx_array_free(mix.mixed);
-    };
-    var logits_all: mlx.mlx_array = .{ .ctx = null };
-    defer if (logits_all.ctx != null) {
-        _ = mlx.mlx_array_free(logits_all);
-    };
-    if (project != .mixed_last_row) {
-        logits_all = try self.mtpProjectionRows(mix.mixed, self.lm_head_w, self.lm_head_s, self.lm_head_b, true);
-    }
-    const lsh = if (logits_all.ctx != null) mlx.getShape(logits_all) else mlx.getShape(mix.mixed);
-    for (0..rows.len) |i| {
-        const i_c: c_int = @intCast(i);
-        var stream_i = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(stream_i);
-        try mlx.check(mlx.mlx_slice(&stream_i, last_h, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, mlx.getShape(last_h)[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-        if (project == .mixed_last_row) {
-            var mixed_i = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(mixed_i);
-            try mlx.check(mlx.mlx_slice(&mixed_i, mix.mixed, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, mlx.getShape(mix.mixed)[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            buf.items[i] = .{ .logits = .{ .ctx = null }, .stream = stream_i, .mixed = mixed_i };
-        } else {
-            var logits = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(logits);
-            try mlx.check(mlx.mlx_slice(&logits, logits_all, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, lsh[lsh.len - 1] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            buf.items[i] = .{ .logits = logits, .stream = stream_i };
-        }
-        buf.built = i + 1;
-    }
-    return buf.abandon();
-}
 
 var head_defer_said = false;
 
@@ -1197,31 +810,6 @@ fn draftFuseFront(self: *const Trunk, m: *const Qwen4Mtp) ?draft_fuse.Front {
     return f;
 }
 
-/// The exact re-scored top-32 shortlist for a SAMPLED draft. Null = the
-/// coarse head is unavailable and the caller falls back to a greedy draft.
-pub fn qwen4DraftShortlist(self: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
-    return mtp_mod.rerankShortlist(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask);
-}
-
-/// Per-row exact re-scored shortlists for a batched SAMPLED draft step.
-/// False = no coarse head; the caller drafts greedily instead.
-pub fn qwen4DraftShortlistsBatched(
-    self: *Trunk,
-    x: mlx.mlx_array,
-    suppress_mask: ?mlx.mlx_array,
-    out: []mtp_mod.Shortlist,
-) !bool {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
-    return mtp_mod.rerankShortlistsBatched(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask, out);
-}
-
-pub fn qwen4DraftSelectBatched(self: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
-    if (try mtp_mod.rerankSelectBatched(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
-    return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
-}
-
 /// Test hook: layer-0 intermediates of the qwen4 forward (fixture bisect).
 pub const Qwen4Trace = struct {
     mixed_attn: mlx.mlx_array = .{ .ctx = null },
@@ -1254,22 +842,6 @@ const Qwen4HeadRig = struct {
     weights: model_mod.Weights,
     xfm: Trunk,
 
-    fn load(alloc: std.mem.Allocator) !*Qwen4HeadRig {
-        const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-        if (mlx.noGpuBackend()) return error.SkipZigTest;
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const rig = try alloc.create(Qwen4HeadRig);
-        errdefer alloc.destroy(rig);
-        rig.config = try model_mod.parseConfig(io, alloc, std.mem.span(model_dir));
-        rig.weights = try model_mod.loadWeights(io, alloc, std.mem.span(model_dir));
-        model_mod.resolveWeightPrefix(&rig.config, &rig.weights);
-        rig.xfm = try Trunk.init(io, alloc, rig.config, &rig.weights);
-        rig.xfm.compileQwen4Hc();
-        rig.xfm.compileGdnGate();
-        rig.xfm.compileMoeRouting();
-        return rig;
-    }
-
     fn deinit(rig: *Qwen4HeadRig, alloc: std.mem.Allocator) void {
         rig.xfm.deinit();
         rig.weights.deinit();
@@ -1288,92 +860,7 @@ const Qwen4HeadRig = struct {
         return out;
     }
 
-    fn ids(rig: *Qwen4HeadRig, first: c_int, n: c_int) !mlx.mlx_array {
-        var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_arange(&out, @floatFromInt(first), @floatFromInt(first + n), 1, .int32, rig.xfm.s));
-        return out;
-    }
-
-    /// Committed history of `n` rows, appended in prefill-sized chunks.
-    fn history(rig: *Qwen4HeadRig, st: *Trunk.Qwen4MtpState, n: c_int) !void {
-        var done: c_int = 0;
-        while (done < n) {
-            const chunk = @min(n - done, 2048);
-            const h = try rig.stream(@intCast(done + 1), chunk);
-            defer _ = mlx.mlx_array_free(h);
-            const id = try rig.ids(100 + done, chunk);
-            defer _ = mlx.mlx_array_free(id);
-            const out = try rig.xfm.qwen4MtpForwardOn(st, h, id, st.pos_base + @as(c_int, @intCast(st.seq_offset)) + @intFromBool(st.seq_offset == 0), null, .none);
-            try mlx.check(mlx.mlx_array_eval(out.stream));
-            _ = mlx.mlx_array_free(out.stream);
-            done += chunk;
-        }
-    }
-
-    /// One round's padded history: `1+m` rows at the committed end, rows past `a` built from `dead_seed`.
-    fn paddedHistory(rig: *Qwen4HeadRig, st: *Trunk.Qwen4MtpState, m: c_int, a: c_int, dead_seed: u64) !void {
-        const live = try rig.stream(77, 1 + a);
-        defer _ = mlx.mlx_array_free(live);
-        const dead = try rig.stream(dead_seed, m - a);
-        defer _ = mlx.mlx_array_free(dead);
-        var h = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(h);
-        const hv = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ live, dead }, 2);
-        defer _ = mlx.mlx_vector_array_free(hv);
-        try mlx.check(mlx.mlx_concatenate_axis(&h, hv, 1, rig.xfm.s));
-        const live_ids = try rig.ids(5000, 1 + a);
-        defer _ = mlx.mlx_array_free(live_ids);
-        const dead_ids = try rig.ids(9000 + @as(c_int, @intCast(dead_seed)), m - a);
-        defer _ = mlx.mlx_array_free(dead_ids);
-        var id = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(id);
-        const iv = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ live_ids, dead_ids }, 2);
-        defer _ = mlx.mlx_vector_array_free(iv);
-        try mlx.check(mlx.mlx_concatenate_axis(&id, iv, 0, rig.xfm.s));
-        const out = try rig.xfm.qwen4MtpForwardOn(st, h, id, st.pos_base + @as(c_int, @intCast(st.seq_offset)), null, .none);
-        _ = mlx.mlx_array_free(out.stream);
-    }
-
-    /// `steps` placed draft rows chained like `mtpChainBuild`: each feeds the next its stream and argmax.
-    /// Returns every step's logits, concatenated `[steps, V]`.
-    fn placedDrafts(rig: *Qwen4HeadRig, alloc: std.mem.Allocator, st: *Trunk.Qwen4MtpState, place: *const Trunk.HeadPlace, steps: usize) !mlx.mlx_array {
-        const s = rig.xfm.s;
-        var h = try rig.stream(55, 1);
-        defer _ = mlx.mlx_array_free(h);
-        var tok = mlx.mlx_array_new_int(4242);
-        defer _ = mlx.mlx_array_free(tok);
-        const parts = try alloc.alloc(mlx.mlx_array, steps);
-        defer alloc.free(parts);
-        var built: usize = 0;
-        defer for (parts[0..built]) |p| {
-            _ = mlx.mlx_array_free(p);
-        };
-        for (parts) |*p| {
-            var id = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(id);
-            try mlx.check(mlx.mlx_reshape(&id, tok, &[_]c_int{1}, 1, s));
-            const out = try rig.xfm.qwen4MtpForwardPlacedOn(st, h, id, place, .last_row);
-            _ = mlx.mlx_array_free(h);
-            h = out.stream;
-            p.* = out.logits;
-            built += 1;
-            _ = mlx.mlx_array_free(tok);
-            tok = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_argmax_axis(&tok, out.logits, -1, false, s));
-        }
-        const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
-        defer _ = mlx.mlx_vector_array_free(vec);
-        var all = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_concatenate_axis(&all, vec, 1, s));
-        return all;
-    }
 };
-
-pub fn qwen4MtpForwardPlacedOn(self: *Trunk, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
-    const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
-    var live = qwen4MtpLiveState(st);
-    return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place, null);
-}
 
 const SingleVerifyTestResult = struct {
     logits: mlx.mlx_array,
@@ -1386,21 +873,3 @@ const SingleVerifyTestResult = struct {
         _ = mlx.mlx_array_free(self.all);
     }
 };
-
-fn singleVerifyTestRound(shell: *@import("../../engines/mlx/transformer.zig").Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_array) !SingleVerifyTestResult {
-    const Gen = @import("../../engines/mlx/generate.zig").Generator;
-    var gen: Gen = undefined;
-    gen.xfm = shell;
-    gen.ctx = slot.ctx;
-    defer slot.ctx = gen.ctx;
-    var state: Gen.MtpRoundState = undefined;
-    state.tracing = false;
-    state.verify_input = row;
-    try gen.mtpRoundVerify(&state);
-    var result: SingleVerifyTestResult = .{ .logits = state.verify_logits, .last = state.new_hidden, .all = state.verify_hidden_all };
-    errdefer result.deinit();
-    const values = mlx.mlx_vector_array_new_data(&.{ result.logits, result.last, result.all }, 3);
-    defer _ = mlx.mlx_vector_array_free(values);
-    try mlx.check(mlx.mlx_eval(values));
-    return result;
-}

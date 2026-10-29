@@ -105,13 +105,6 @@ pub const builtins = [_]Builtin{
     .{ .name = "gguf", .claims = &claimsGguf, .validate = &validateGguf },
 };
 
-/// The built-in format serving `block_json`: the highest claim wins, two at that rank are ambiguous.
-pub fn claimant(block_json: []const u8, config_json: []const u8) error{Ambiguous}!?usize {
-    var got: [builtins.len]Claim = undefined;
-    for (builtins, &got) |b, *c| c.* = b.claims(.of(block_json), .of(config_json));
-    return common.pick(&got);
-}
-
 /// A scratch arena for one call: the C-ABI members take no allocator.
 const Scratch = struct {
     arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),

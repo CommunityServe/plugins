@@ -33,29 +33,6 @@ pub fn biasNegScalePeak(weights: *const Weights, base: []const u8, s: mlx.mlx_st
     return peak32;
 }
 
-/// A pack qmv2's ternary kernel may serve once its biases check out: affine
-/// 2-bit group-128 without rotations (Hadamard packs bind per weight).
-/// The first quantized trunk projection the row-exact kernels cannot take
-/// (not 4-bit affine in their geometry), or null when they cover the pack.
-/// Vision towers, the MTP head and a gather-only embedding never reach a verify row.
-pub fn firstRowExactMiss(model: QuantParams, weights: *const Weights, gather_only: mlx.mlx_array) ?[]const u8 {
-    var it = weights.map.iterator();
-    while (it.next()) |kv| {
-        const key = kv.key_ptr.*;
-        if (!std.mem.endsWith(u8, key, ".scales")) continue;
-        if (std.mem.indexOf(u8, key, "vision") != null or std.mem.indexOf(u8, key, "visual") != null or
-            std.mem.indexOf(u8, key, "mtp") != null) continue;
-        const base = key[0 .. key.len - ".scales".len];
-        var buf: [256]u8 = undefined;
-        const w = weights.map.get(std.fmt.bufPrint(&buf, "{s}.weight", .{base}) catch return key) orelse continue;
-        if (gather_only.ctx != null and w.ctx == gather_only.ctx) continue;
-        const bi = weights.map.get(std.fmt.bufPrint(&buf, "{s}.biases", .{base}) catch return key) orelse return key;
-        const qp = computeQuantParams(model, w, kv.value_ptr.*, null);
-        if (qp.mode != .affine or !rowqmv.fits(w, kv.value_ptr.*, bi, qp.bits, qp.group_size)) return key;
-    }
-    return null;
-}
-
 pub fn ternaryKernelCandidate(hadamard_block: u32, model: QuantParams) bool {
     return hadamard_block == 0 and model.mode == .affine and model.bits == 2 and model.group_size == 128;
 }

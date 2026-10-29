@@ -99,29 +99,8 @@ pub fn homeFallback(home: ?[]const u8, profile: ?[]const u8) ?[]const u8 {
     return if (home == null) profile else null;
 }
 
-/// Windows: HOME = USERPROFILE when unset, before anything reads it.
-pub fn exportHomeDefault() void {
-    if (!is_windows) return;
-    const profile = env.get(.USERPROFILE);
-    if (homeFallback(env.span(.HOME), if (profile) |p| std.mem.span(p) else null) != null)
-        env.set(.HOME, profile.?);
-}
-
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
-
-pub fn sleepMs(ms: u32) void {
-    if (is_windows) return Sleep(ms);
-    const ts = std.c.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast(@as(u64, ms % 1000) * 1_000_000) };
-    _ = std.c.nanosleep(&ts, null);
-}
-
-pub fn monotonicMs() i64 {
-    if (is_windows) return @intCast(GetTickCount64());
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
-}
 
 test "homeFallback: Windows takes USERPROFILE only when HOME is unset" {
     try std.testing.expectEqualStrings("C:\\Users\\d", homeFallback(null, "C:\\Users\\d").?);

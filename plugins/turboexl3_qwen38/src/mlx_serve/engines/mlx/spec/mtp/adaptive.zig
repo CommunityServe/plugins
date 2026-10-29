@@ -195,12 +195,6 @@ pub const MtpAdaptive = struct {
         }
     }
 
-    /// Latch a refused re-entry: back to the serial arm, never ask again for this request.
-    pub fn declineReentry(self: *MtpAdaptive) void {
-        self.arm = .serial;
-        self.reentry_declined = true;
-    }
-
     /// Make the serial arm permanent for this request (a `to_serial` on a module-owned head).
     pub fn stickSerial(self: *MtpAdaptive) void {
         self.arm = .serial;
@@ -227,29 +221,6 @@ pub const MtpAdaptive = struct {
     }
 };
 
-/// Drift between the head's position bookkeeping and what its next forward demands
-/// (`pos_offset == pos_base + seq_offset`; `seq_offset == 0` re-seeds). 0 = in sync.
-pub fn mtpHeadPositionDrift(pos_base: i64, seq_offset: usize, next_pos_offset: i64) i64 {
-    if (seq_offset == 0) return 0;
-    return next_pos_offset - (pos_base + @as(i64, @intCast(seq_offset)));
-}
-
-/// The drift the next round would hit. A serial block advances the trunk while the head's
-/// `seq_offset` stays put. Null = no head state.
-pub fn mtpHeadDriftNow(self: *const Generator) ?i64 {
-    if (self.mtp_cache == null) return null;
-    const mc = &self.mtp_cache.?;
-    return switch (mc.*) {
-        .qwen, .plugin => 0,
-        .qwen4 => |r| blk: {
-            r.t.qwen4MtpActivate(r.st);
-            const m = &(r.t.qwen4_mtp orelse break :blk 0);
-            const off0 = mtpRoundOff0(self.mtp_hist_stash, mc.step());
-            break :blk mtpHeadPositionDrift(@intCast(m.pos_base), m.seq_offset, @intCast(off0 + 1));
-        },
-    };
-}
-
 /// May this request resume MTP after a serial block? An M-RoPE turn ropes the head at an
 /// absolute position where the content gap is a wrong answer, so vision turns never come back.
 pub fn mtpAdaptiveHeadMayResume(self: *const Generator) bool {
@@ -262,34 +233,6 @@ pub fn mtpAdaptiveHeadMayResume(self: *const Generator) bool {
 pub fn stickyOnSerialSwitch(head: ?MtpHeadRef) bool {
     const h = head orelse return false;
     return h.moduleOwned();
-}
-
-/// Does this tick newly release the module head? True exactly once per request.
-pub fn stickyReleaseNow(sticky: bool, already_released: bool) bool {
-    return sticky and !already_released;
-}
-
-/// Has this request released the module-owned MTP head?
-pub fn mtpModuleHeadReleased(self: *const Generator) bool {
-    return self.mtp_head_released;
-}
-
-/// Armed but not landed. The release lives in `nextMtp`'s serial branch and the batched
-/// tick never calls `nextMtp`, so `scheduler.batchable` keeps the slot out of a group for the
-/// one tick the release needs.
-pub fn mtpReleasePending(self: *const Generator) bool {
-    return self.mtp_adaptive.sticky_serial and !self.mtp_head_released;
-}
-
-/// Release the module-owned head at a serial block boundary, after `mtpDetachHead`; never
-/// where the switch is decided (that round still runs).
-pub fn mtpMaybeReleaseModuleHead(self: *Generator) void {
-    if (!stickyReleaseNow(self.mtp_adaptive.sticky_serial, self.mtp_head_released)) return;
-    self.mtp_head_released = true;
-    log.info(
-        "  [mtp] sticky-serial: module head released for the rest of the request (kv {d}) — other slots may claim it\n",
-        .{self.mtpKvLen()},
-    );
 }
 
 pub fn mtpAdaptiveArchEligible(self: *const Generator) bool {

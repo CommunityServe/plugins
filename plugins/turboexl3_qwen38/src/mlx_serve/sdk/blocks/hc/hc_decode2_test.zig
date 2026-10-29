@@ -55,26 +55,6 @@ fn readF32(a: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
     return out;
 }
 
-/// Per element within a couple of bf16 ulps (the f32 accumulation order is the only difference), on every output.
-fn expectClose(ref: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream) !void {
-    const rh = try readF32(ref, s);
-    defer testing.allocator.free(rh);
-    const gh = try readF32(got, s);
-    defer testing.allocator.free(gh);
-    try testing.expectEqual(rh.len, gh.len);
-    var dot: f64 = 0;
-    var nr: f64 = 0;
-    var ng: f64 = 0;
-    for (rh, gh) |r, g| {
-        try testing.expect(std.math.isFinite(g));
-        dot += @as(f64, r) * g;
-        nr += @as(f64, r) * r;
-        ng += @as(f64, g) * g;
-        try testing.expect(@abs(r - g) <= 0.02 * @abs(r) + 0.008);
-    }
-    try testing.expect(dot / @sqrt(nr * ng) >= 0.9999);
-}
-
 /// Row `row` of `a`, whose dim 1 holds the rows (rank 3: [1,rows,n], rank 4: [1,rows,n,1]).
 fn sliceRow(a: mlx.mlx_array, row: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     const shape = mlx.getShape(a);
@@ -98,76 +78,6 @@ fn expectEqualBits(ref: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream) !v
     const gh = try readF32(got, s);
     defer testing.allocator.free(gh);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(rh), std.mem.sliceAsBytes(gh));
-}
-
-fn parityRows(h: c_int, r: c_int, bits: u32, gs: u32, seed: u64, rows: c_int) !void {
-    const xfm = @import("../../../engines/mlx/transformer.zig");
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(seed);
-    const rnd = prng.random();
-    const hcf = @import("../../../plugins/qwen4_exp/hc_fused.zig");
-    hcf.hc_fused_override = true;
-    defer hcf.hc_fused_override = null;
-    hc_decode2.rows_override = rows;
-    defer hc_decode2.rows_override = null;
-    const hc: c_int = 4;
-    const k = hc * h;
-    const down = try quantRandom(rnd, r, k, bits, gs, s);
-    defer down.deinit();
-    const up = try quantRandom(rnd, k, r, bits, gs, s);
-    defer up.deinit();
-    // The weight stays lazy on purpose: the launch choice must not depend on whether an earlier read evaluated it.
-    const x = try randBf16(rnd, &.{ 1, rows, k }, 4.0, 0.0, s);
-    defer _ = mlx.mlx_array_free(x);
-    const nw = try randBf16(rnd, &.{ hc, h }, 1.0, 1.0, s);
-    defer _ = mlx.mlx_array_free(nw);
-    const iw = try randBf16(rnd, &.{ k, hc }, 0.1, 0.0, s);
-    defer _ = mlx.mlx_array_free(iw);
-    const wo = try randBf16(rnd, &.{ 1, rows, h }, 2.0, 0.0, s);
-    defer _ = mlx.mlx_array_free(wo);
-    const wi = try randBf16(rnd, &.{ 1, rows, hc, 1 }, 1.0, 1.0, s);
-    defer _ = mlx.mlx_array_free(wi);
-
-    const cases = [_]struct { inject: bool, pending: bool }{ .{ .inject = true, .pending = false }, .{ .inject = true, .pending = true }, .{ .inject = false, .pending = false } };
-    for (cases) |c| {
-        const inj_w: mlx.mlx_array = if (c.inject) iw else .{ .ctx = null };
-        const pend: ?xfm.HcPending = if (c.pending) .{ .out = wo, .inj = wi } else null;
-        const before = hc_decode2.served;
-        const before_vec = hc_decode2.served_vec;
-        const got = (try xfm.hcReadFused(s, x, 1, rows, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, gs, pend)) orelse return error.HcFusedDeclined;
-        defer {
-            _ = mlx.mlx_array_free(got.mixed);
-            if (got.inj.ctx != null) _ = mlx.mlx_array_free(got.inj);
-            if (got.stream.ctx != null) _ = mlx.mlx_array_free(got.stream);
-        }
-        try testing.expectEqual(before + 1, hc_decode2.served);
-        try testing.expectEqual(before_vec + @intFromBool(upVectorized(rows, 4, r, bits, @intCast(gs))), hc_decode2.served_vec);
-        try testing.expect((got.inj.ctx != null) == c.inject);
-        try testing.expect((got.stream.ctx != null) == c.pending);
-        var row: c_int = 0;
-        while (row < rows) : (row += 1) {
-            const xr = try sliceRow(x, row, s);
-            defer _ = mlx.mlx_array_free(xr);
-            const wor = try sliceRow(wo, row, s);
-            defer _ = mlx.mlx_array_free(wor);
-            const wir = try sliceRow(wi, row, s);
-            defer _ = mlx.mlx_array_free(wir);
-            const one_pend: ?xfm.HcPending = if (c.pending) .{ .out = wor, .inj = wir } else null;
-            const one = (try xfm.hcReadFused(s, xr, 1, 1, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, gs, one_pend)) orelse return error.HcFusedDeclined;
-            defer {
-                _ = mlx.mlx_array_free(one.mixed);
-                if (one.inj.ctx != null) _ = mlx.mlx_array_free(one.inj);
-                if (one.stream.ctx != null) _ = mlx.mlx_array_free(one.stream);
-            }
-            inline for (.{ "mixed", "inj", "stream" }) |name| {
-                if (@field(got, name).ctx != null) {
-                    const part = try sliceRow(@field(got, name), row, s);
-                    defer _ = mlx.mlx_array_free(part);
-                    try expectEqualBits(@field(one, name), part, s);
-                }
-            }
-        }
-    }
 }
 
 /// Dense bf16 hc weights as a fully EXL3 pack carries them: the down [R, K] and up [K, R] rows viewed as u32 words,

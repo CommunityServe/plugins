@@ -113,37 +113,6 @@ pub const Index = struct {
         return .{ .draft = toks[p..@min(p + max_draft, toks.len)], .suffix = suffix };
     }
 
-    /// `match` over the last `CANDIDATES` occurrences of the n-gram: the one that agrees furthest back wins,
-    /// the latest among equals. An edit that left the latest occurrence on the wrong copy still finds the right one.
-    pub fn matchBest(self: *const Index, t1: u32, max_draft: u32) ?Match {
-        const toks = self.toks.items;
-        if (toks.len < NGRAM - 1 or max_draft == 0) return null;
-        const t = toks[toks.len - (NGRAM - 1) ..];
-        var p: usize = self.next.get(key(t[0], t[1], t[2], t1)) orelse return null;
-        var best: ?Match = null;
-        var seen: u32 = 0;
-        while (seen < CANDIDATES) : (seen += 1) {
-            const suffix = agreement(toks, p, t1);
-            if (best == null or suffix > best.?.suffix) best = .{ .draft = toks[p..@min(p + max_draft, toks.len)], .suffix = suffix };
-            if (suffix >= SUFFIX_CAP or p >= self.prev.items.len or self.prev.items[p] == none) break;
-            p = self.prev.items[p];
-        }
-        return best;
-    }
-
-    /// Tokens before `p` that agree with the committed tail (plus `t1`), capped.
-    fn agreement(toks: []const u32, p: usize, t1: u32) u32 {
-        var suffix: u32 = 0;
-        var a: usize = p;
-        var b: usize = toks.len + 1;
-        while (suffix < SUFFIX_CAP and a > 0) : (suffix += 1) {
-            a -= 1;
-            b -= 1;
-            if (toks[a] != (if (b == toks.len) t1 else toks[b])) break;
-        }
-        return suffix;
-    }
-
     fn key(a: u32, b: u32, c: u32, d: u32) u128 {
         return (@as(u128, a) << 96) | (@as(u128, b) << 64) | (@as(u128, c) << 32) | d;
     }

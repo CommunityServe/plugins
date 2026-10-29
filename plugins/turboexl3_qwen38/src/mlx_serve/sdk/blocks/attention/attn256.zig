@@ -192,18 +192,6 @@ pub fn fusedSdpa256Prefill(
     return fusedSdpa256Impl(s, q, k, v, scale, window, null, null);
 }
 
-/// The same kernel for the sink-attention arm (gpt_oss / MiMo): any of its head
-/// shapes (MiMo's q/k 192, v 128), the layer's learned sinks, causal or banded.
-/// MLX has no fused kernel at 192/128, so this one serves on NAX too. Null when
-/// it declines (gpt_oss's hd 64 keeps MLX's).
-/// No kill switch: MiMo bills no prefill score tensor (`prefillScoreHeadDim` 0),
-/// so a composed fallback here would be an unbilled one.
-pub fn fusedSinkAttnPrefill(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, window: c_int, sinks: ?mlx.mlx_array) !?mlx.mlx_array {
-    // On NAX the tensor-unit kernel runs 192/128; ours takes everything else.
-    if (try @import("nax_attention.zig").attention(s, q, k, v, scale, window, sinks)) |out| return out;
-    return fusedSdpa256Impl(s, q, k, v, scale, window, null, sinks);
-}
-
 /// True when a bf16 view's bound address is 16-byte aligned — the bar every
 /// `uint4` staging load in `msv_attn_p256` / `msv_attn_qsa256` needs. A lazy
 /// array has no base yet (the kernel binds its buffer at dispatch, like the
@@ -481,23 +469,6 @@ pub var fused256_override: ?bool = null;
 
 // ── tests ──
 
-/// Composed reference for the fused kernel tests: MLX's own SDPA (which takes
-/// the composed matmul→softmax→matmul path at head_dim 256).
-pub fn attn256Reference(
-    q: mlx.mlx_array,
-    k: mlx.mlx_array,
-    v: mlx.mlx_array,
-    scale: f32,
-    mode: [*:0]const u8,
-    mask: mlx.mlx_array,
-    s: mlx.mlx_stream,
-) !mlx.mlx_array {
-    var ref = mlx.mlx_array_new();
-    const none = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, k, v, scale, mode, if (mask.ctx != null) mask else none, .{ .ctx = null }, false, s));
-    return ref;
-}
-
 pub fn attn256RandBf16(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     var n: usize = 1;
     for (shape) |d| n *= @intCast(d);
@@ -521,80 +492,5 @@ pub fn attn256RandBf16Scaled(rnd: std.Random, shape: []const c_int, scale: f32, 
     try mlx.check(mlx.mlx_multiply(&wide, unit, k, s));
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, wide, .bfloat16, s));
-    return out;
-}
-
-/// Largest |element| of an array: the scale a bf16 rounding bar is relative to.
-fn attn256MaxAbs(a: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
-    var a_c = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a_c);
-    try mlx.check(mlx.mlx_contiguous(&a_c, a, false, s));
-    var a32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a32);
-    try mlx.check(mlx.mlx_astype(&a32, a_c, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(a32));
-    const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
-    const n = mlx.mlx_array_size(a32);
-    var m: f32 = 0;
-    for (0..n) |i| m = @max(m, @abs(ad[i]));
-    return m;
-}
-
-/// Two bf16 ulps at the reference's own scale.
-pub fn attn256UlpBar(ref: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
-    const m = try attn256MaxAbs(ref, s);
-    return 2.0 * m * 0.00390625 + 1.0e-6;
-}
-
-/// Cosine of two attention outputs. A max-abs bar alone cannot see a uniform
-/// scale error (a dropped or double-counted key shifts every row a little),
-/// so the gather parity tests assert BOTH.
-pub fn attn256Cosine(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
-    var a_c = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a_c);
-    var b_c = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(b_c);
-    try mlx.check(mlx.mlx_contiguous(&a_c, a, false, s));
-    try mlx.check(mlx.mlx_contiguous(&b_c, b, false, s));
-    var a32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a32);
-    var b32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(b32);
-    try mlx.check(mlx.mlx_astype(&a32, a_c, .float32, s));
-    try mlx.check(mlx.mlx_astype(&b32, b_c, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(a32));
-    try mlx.check(mlx.mlx_array_eval(b32));
-    const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
-    const bd = mlx.mlx_array_data_float32(b32) orelse return error.InvalidDtype;
-    const n = mlx.mlx_array_size(a32);
-    if (n != mlx.mlx_array_size(b32)) return error.ShapeMismatch;
-    var dot: f64 = 0;
-    var na: f64 = 0;
-    var nb: f64 = 0;
-    for (0..n) |i| {
-        dot += @as(f64, ad[i]) * @as(f64, bd[i]);
-        na += @as(f64, ad[i]) * @as(f64, ad[i]);
-        nb += @as(f64, bd[i]) * @as(f64, bd[i]);
-    }
-    if (na == 0 or nb == 0) return error.ZeroNorm;
-    return @floatCast(dot / (@sqrt(na) * @sqrt(nb)));
-}
-
-/// Materialized `[B,H,T,264]` padded cache sliced on the last axis to
-/// `[lo, lo+256)`: a 256-wide view whose row stride is divisible by 8 elements
-/// (16 bytes) while its base sits `lo*2` bytes into the buffer — the shape the
-/// `uint4` staging loads of the two old kernels must not read.
-pub fn attn256SliceLastDim(
-    parent: mlx.mlx_array,
-    lo: c_int,
-    s: mlx.mlx_stream,
-) !mlx.mlx_array {
-    const ps = mlx.getShape(parent);
-    const one = [_]c_int{ 1, 1, 1, 1 };
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    const stop = [_]c_int{ ps[0], ps[1], ps[2], lo + 256 };
-    try mlx.check(mlx.mlx_slice(&out, parent, &[_]c_int{ 0, 0, 0, lo }, 4, &stop, 4, &one, 4, s));
-    try mlx.check(mlx.mlx_array_eval(out));
     return out;
 }

@@ -12,12 +12,6 @@ const affineParamsFromGeometry = @import("../quant/params.zig").affineParamsFrom
 pub const Weights = resident.Weights;
 pub const loadWeightsFile = resident.loadWeightsFile;
 
-/// Load all safetensors files from model_dir.
-/// When `load_vision` is true, vision_tower and multi_modal_projector weights are included.
-pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
-    return loadWeightsOpt(io, allocator, model_dir, .{});
-}
-
 /// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
@@ -59,31 +53,6 @@ pub fn dsv41DropsKey(key: []const u8, vision: bool) bool {
 
 pub fn dsv41VisionKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "vision.") or std.mem.startsWith(u8, key, "aligner.") or std.mem.startsWith(u8, key, "image_");
-}
-
-/// Load ONE safetensors file (absolute path) into a Weights map — for
-/// sidecar files that live beside the trunk shards (e.g. a root-level
-/// `mtp.safetensors`), where a directory scan would sweep in the trunk.
-pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8) !Weights {
-    var weights = Weights.init(allocator);
-    errdefer weights.deinit();
-
-    const s = mlx.weightLoadStream();
-    defer _ = mlx.mlx_stream_free(s);
-
-    const pathz = try allocator.dupeSentinel(u8, abs_path, 0);
-    defer allocator.free(pathz);
-    try loadSafetensorsFile(allocator, &weights, pathz, s, .{});
-
-    if (weights.count() == 0) {
-        log.err("no usable weights loaded from {s} — corrupt or empty safetensors file?\n", .{abs_path});
-        return error.NoWeightFiles;
-    }
-    return weights;
-}
-
-pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
-    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = true });
 }
 
 pub fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) !Weights {
@@ -433,15 +402,3 @@ pub fn dequantizeSmall(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array
 // ── tests ──
 
 const testing = std.testing;
-
-/// One safetensors shard of f16 zeros: two 1-D [2] side tensors, a 2-D [2, 2] `.scales` and a [2, 2] head bias.
-fn writeF16Shard(dir: std.Io.Dir, io: std.Io) !void {
-    const hdr = "{\"m.q.scales\":{\"dtype\":\"F16\",\"shape\":[2],\"data_offsets\":[0,4]}," ++
-        "\"m.q.biases\":{\"dtype\":\"F16\",\"shape\":[2],\"data_offsets\":[4,8]}," ++
-        "\"m.g.scales\":{\"dtype\":\"F16\",\"shape\":[2,2],\"data_offsets\":[8,16]}," ++
-        "\"m.ple.ple_embedding.head_bias\":{\"dtype\":\"F16\",\"shape\":[2,2],\"data_offsets\":[16,24]}}";
-    var shard: [8 + hdr.len + 24]u8 = @splat(0);
-    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
-    @memcpy(shard[8..][0..hdr.len], hdr);
-    try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &shard });
-}

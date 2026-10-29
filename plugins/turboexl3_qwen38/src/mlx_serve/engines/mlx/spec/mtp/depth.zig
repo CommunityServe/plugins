@@ -51,19 +51,6 @@ pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked afte
 /// row is sharp. Measured crossover between 0.3 and 0.7 on Flash Next.
 pub const MTP_SAMPLED_PROPOSAL_MIN_TEMP: f32 = 0.5;
 
-/// Draft-proposal mode is a property of the REQUEST: a greedy target keeps the argmax proposal (the temp-0 identity
-/// contract); a sampled target proposes from the draft sampler, where `min(1, p[argmax])` no longer collapses on a
-/// flat row. `top_k == 1` is a deterministic target whose filtered p is one-hot, so its argmax proposal is optimal.
-pub fn mtpDraftGreedyFor(target: SamplingParams) bool {
-    return target.temperature <= MTP_SAMPLED_PROPOSAL_MIN_TEMP or target.top_k == 1;
-}
-
-/// Greedy drafts at chain depth `step` (0 = the round's first draft). The
-/// greedy tail samples depth 0 of a sampled request and takes the argmax after it.
-pub fn mtpDraftGreedyAt(target: SamplingParams, greedy_tail: bool, step: u32) bool {
-    return mtpDraftGreedyFor(target) or (greedy_tail and step > 0);
-}
-
 // ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
 // Drafts for a stochastic target are SAMPLED from a fixed sharper
 // distribution (constants mirror oMLX's _DRAFT_SAMPLER_*: their comment —
@@ -78,62 +65,7 @@ pub const MTP_DRAFT_TEMP: f32 = 0.6;
 pub const MTP_DRAFT_TOP_P: f32 = 0.95;
 pub const MTP_DRAFT_TOP_K: u32 = 20;
 
-/// Draft temperature is per FAMILY (`SpecPolicy.draft_temperature`): the sidecar head's 0.6 does not carry over.
-pub fn mtpDraftTempFor(config: *const model_mod.ModelConfig) f32 {
-    const b = config.plugin orelse return MTP_DRAFT_TEMP;
-    const t = b.parsed.spec.policy.draft_temperature;
-    return if (std.math.isNan(t)) MTP_DRAFT_TEMP else t;
-}
-
-/// Draft-proposal sampler for a round: greedy targets keep greedy drafts
-/// (temp-0 identity contract); stochastic targets draft from the fixed
-/// sharpened distribution unless greedy is forced. The constants are not
-/// tunable: swept on the oQ4e head (prose@0.6, forced depth 3,
-/// sampled drafts) at draft temp 0.6/0.7/0.85/1.0 and per-draft
-/// acceptance was flat at 49.7-56.9% — no arm beat 0.6.
-pub fn mtpDraftSamplingFor(target: SamplingParams, force_greedy: bool, draft_temp: f32) SamplingParams {
-    var d = target;
-    if (force_greedy or target.temperature <= 0.01) {
-        d.temperature = 0.0;
-        return d;
-    }
-    d.temperature = draft_temp;
-    d.top_p = MTP_DRAFT_TOP_P;
-    d.top_k = MTP_DRAFT_TOP_K;
-    return d;
-}
-
-/// This request's draft sampler at chain depth `step`: the per-request
-/// proposal mode, the greedy tail, the head's own argmax policy
-/// (`MtpHeadRef.exl3Profile`) and the loaded family's draft temperature,
-/// resolved in ONE place so no call site can read a different proposal than
-/// the one the verify's q came from.
-pub fn mtpDraftSampling(self: *const Generator, step: u32) SamplingParams {
-    if (self.mtp) |h| if (h.exl3Profile()) return mtpHeadGreedySampling(self);
-    return mtpDraftSamplingFor(
-        self.sampling,
-        self.mtp_serial_accept or mtpDraftGreedyAt(self.sampling, self.mtp_greedy_tail, step),
-        mtpDraftTempFor(&self.xfm.config),
-    );
-}
-
 var head_greedy_said = false;
-
-/// The head's own argmax policy (an EXL3 trunk pack's head): every depth drafts greedy. Said once, at the first sampled
-/// request whose drafts it makes greedy.
-fn mtpHeadGreedySampling(self: *const Generator) SamplingParams {
-    if (self.sampling.temperature > 0.01 and !head_greedy_said) {
-        head_greedy_said = true;
-        log.info("[mtp-draft] head greedy engaged: a sampled request drafts the head's argmax at every depth\n", .{});
-    }
-    return mtpDraftSamplingFor(self.sampling, true, mtpDraftTempFor(&self.xfm.config));
-}
-
-/// Full Leviathan acceptance ratio; q clamped so a sampled draft (q > 0
-/// by construction) can never divide by an underflowed zero.
-pub fn specAcceptProb(p: f32, q_draft: f32) f32 {
-    return @min(1.0, p / @max(q_draft, 1e-12));
-}
 
 /// Pure depth-policy step. `rate` is the windowed per-draft acceptance
 /// probability. Returns the new depth; 0 means "disable speculation".

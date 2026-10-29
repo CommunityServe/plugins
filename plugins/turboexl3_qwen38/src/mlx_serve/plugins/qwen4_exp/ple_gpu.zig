@@ -342,47 +342,5 @@ pub fn cpuRows(h: *const qwen4.NgramHash, t: *const qwen4.NgramTable, prev: []co
     return out;
 }
 
-fn gpuRows(tbl: Table, h: *const qwen4.NgramHash, t: *const qwen4.NgramTable, prev: []const u32, ids: []const u32) ![]u16 {
-    const a = testing.allocator;
-    const ids_i = try a.alloc(i32, ids.len);
-    defer a.free(ids_i);
-    for (ids, ids_i) |v, *o| o.* = @intCast(v);
-    const shape = [_]c_int{@intCast(ids.len)};
-    const arr = mlx.mlx_array_new_data(ids_i.ptr, &shape, 1, .int32);
-    defer _ = mlx.mlx_array_free(arr);
-    const out = try embed(mlx.gpuStream(), tbl, h, t, arr, prev);
-    defer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_array_eval(out));
-    const want = ids.len * h.n_heads * t.dim;
-    try testing.expectEqual(want, mlx.mlx_array_size(out));
-    const d = mlx.mlx_array_data_bfloat16(out) orelse return error.MlxArrayDataNull;
-    return a.dupe(u16, d[0..want]);
-}
-
-/// Both arms over one table; the GPU bits must equal the CPU bits.
-fn expectArmsEqual(tbl: Table, h: *const qwen4.NgramHash, t: *const qwen4.NgramTable, prev: []const u32, ids: []const u32) !void {
-    const want = try cpuRows(h, t, prev, ids);
-    defer testing.allocator.free(want);
-    const got = try gpuRows(tbl, h, t, prev, ids);
-    defer testing.allocator.free(got);
-    try testing.expectEqualSlices(u16, want, got);
-}
-
 const TEST_VOCAB: u32 = 1000;
 const TEST_EOS: u32 = 999;
-
-fn testHash(ngram: u32, heads: u32) !qwen4.NgramHash {
-    return qwen4.NgramHash.init(TEST_VOCAB, ngram, heads, 500, 1, 1234, 0, TEST_EOS);
-}
-
-fn randIds(r: std.Random, out: []u32) void {
-    for (out) |*v| v.* = r.uintLessThan(u32, TEST_VOCAB);
-}
-
-fn openEmbeddedFixture(td: *std.testing.TmpDir, variant: qwen4_ple.FixtureVariant) !qwen4.NgramTable {
-    try qwen4_ple.writeFixture(td, variant);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try td.dir.realPath(io, &path_buf);
-    return qwen4.NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 });
-}

@@ -187,17 +187,6 @@ pub const RerankFixture = struct {
         return .{ .xfm = xfm, .dense = dense, .vocab = vocab, .hidden = hidden };
     }
 
-    /// The same head left dense: `lm_head_w` the bf16 [V, H] rows, no scales.
-    pub fn initDense(s: mlx.mlx_stream, vocab: c_int, hidden: c_int, seed: u64) !RerankFixture {
-        var fx = try init(s, vocab, hidden, 8, 64, seed);
-        _ = mlx.mlx_array_free(fx.xfm.lm_head_s);
-        _ = mlx.mlx_array_free(fx.xfm.lm_head_b);
-        try mlx.check(mlx.mlx_array_set(&fx.xfm.lm_head_w, fx.dense));
-        fx.xfm.lm_head_s = mlx.mlx_array_new();
-        fx.xfm.lm_head_b = mlx.mlx_array_new();
-        return fx;
-    }
-
     pub fn deinit(self: *RerankFixture) void {
         _ = mlx.mlx_array_free(self.dense);
         _ = mlx.mlx_array_free(self.xfm.lm_head_w);

@@ -51,14 +51,6 @@ pub const Shard = struct {
         return null;
     }
 
-    /// Copies this rank's part of axis `mid` of a row-major `[outer, mid, inner]` buffer.
-    pub fn slice(self: Shard, out: []u8, buf: []const u8, outer: usize, mid: usize, inner: usize) void {
-        const part = mid / self.size;
-        for (0..outer) |o| {
-            const src = (o * mid + self.rank * part) * inner;
-            @memcpy(out[o * part * inner ..][0 .. part * inner], buf[src..][0 .. part * inner]);
-        }
-    }
 };
 
 /// Tensors only rank 0 reads: the MTP head and the vision/audio towers.

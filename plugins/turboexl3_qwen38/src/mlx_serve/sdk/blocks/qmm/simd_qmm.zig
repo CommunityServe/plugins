@@ -325,31 +325,3 @@ fn prepare(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, s:
 // ── tests ──
 
 const testing = std.testing;
-
-fn randBf16(shape: []const c_int, scale: f32, seed: u64, s: mlx.mlx_stream) !mlx.mlx_array {
-    var key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_key(&key, seed));
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_random_normal(&f, shape.ptr, shape.len, .float32, 0.0, scale, key, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
-    return out;
-}
-
-fn rowsOf(x: mlx.mlx_array, lo: c_int, hi: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const k = mlx.getShape(x)[1];
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&out, x, &[_]c_int{ lo, 0 }, 2, &[_]c_int{ hi, k }, 2, &[_]c_int{ 1, 1 }, 2, s));
-    return out;
-}
-
-fn expectSame(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
-    var eq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eq);
-    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
-    var same = false;
-    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
-    try testing.expect(same);
-}

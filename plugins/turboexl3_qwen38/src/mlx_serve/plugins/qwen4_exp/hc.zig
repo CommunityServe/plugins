@@ -467,10 +467,3 @@ pub fn hcWrite(self: *Trunk, stream: mlx.mlx_array, out: mlx.mlx_array, inj: mlx
 const testing = std.testing;
 const bf16BitEqual = @import("../../sdk/testing/parity.zig").bf16BitEqual;
 const testRandUniformBf16 = @import("../../sdk/testing/parity.zig").testRandUniformBf16;
-
-fn tOwned(comptime f: anytype, args: anytype) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(o);
-    try mlx.check(@call(.auto, f, .{&o} ++ args));
-    return o;
-}

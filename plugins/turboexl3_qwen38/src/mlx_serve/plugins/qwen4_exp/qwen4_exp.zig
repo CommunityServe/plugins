@@ -1780,23 +1780,6 @@ pub const Qwen4State = struct {
     }
 };
 
-/// A whole `ngram_table.bin` image in one page-aligned buffer. Caller frees with the page allocator.
-fn ngramTestImage(header: []const u8, data_bytes: usize) ![]align(std.heap.page_size_min) u8 {
-    const hlen: usize = 512;
-    std.debug.assert(header.len <= hlen);
-    const buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), 8 + hlen + data_bytes);
-    @memset(buf, ' ');
-    std.mem.writeInt(u64, buf[0..8], hlen, .little);
-    @memcpy(buf[8 .. 8 + header.len], header);
-    @memset(buf[8 + hlen ..], 0);
-    return buf;
-}
-
-fn ngramTestParse(header: []const u8, data_bytes: usize) !NgramTable {
-    const buf = try ngramTestImage(header, data_bytes);
-    return NgramTable.parse(buf, buf[8..520], 520);
-}
-
 /// rows 4, dim 64, 4-bit, group 32 => wcols 8, scols 2; w 128 B, s/b 16 B each.
 const NGRAM_GOOD_HEADER =
     "{\"__metadata__\":{\"format\":\"mlx-serve-ngram\",\"bits\":\"4\",\"group_size\":\"32\"}," ++
@@ -1805,128 +1788,10 @@ const NGRAM_GOOD_HEADER =
     "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}";
 const NGRAM_GOOD_BYTES = 160;
 
-/// The trellis ring one symbol at a time (the `exl3_ngram_trellis` definition): value_i = MUL1(state_i) * scale
-/// + head's bias_i, state_i stacking symbols i, i-1, ... K bits each from bit 0, through Sushi's `decodeMul1`.
-fn trellisRowRef(t: *const NgramTable, r: u64, head: ?u32, out: []f32) void {
-    const words: usize = t.wcols;
-    const K = t.trellis_k;
-    const raw = t.map[t.w_off + r * words * 2 ..][0 .. words * 2];
-    const scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw[0..2], .little))));
-    const nstream: u32 = @intCast(words - 1);
-    const kmask: u32 = (@as(u32, 1) << @intCast(K)) - 1;
-    var syms: [max_trellis_dim]u16 = undefined;
-    for (0..t.dim) |i| {
-        const bit: u32 = @as(u32, @intCast(i)) * K;
-        const w = bit >> 4;
-        const lo: u32 = std.mem.readInt(u16, raw[2 + 2 * w ..][0..2], .little);
-        const hi: u32 = std.mem.readInt(u16, raw[2 + 2 * ((w + 1) % nstream) ..][0..2], .little);
-        syms[i] = @intCast(((lo | (hi << 16)) >> @intCast(bit & 15)) & kmask);
-    }
-    const stack: u32 = (15 + K) / K;
-    for (0..t.dim) |i| {
-        var state: u32 = 0;
-        for (0..stack) |j| state |= @as(u32, syms[(i + t.dim - j) % t.dim]) << @intCast(j * K);
-        const decoded = @import("../../sdk/quant/exl3/format.zig").sushi.format.decodeMul1(@truncate(state));
-        var v: f32 = @as(f32, @floatCast(@as(f16, @bitCast(decoded)))) * scale;
-        if (head) |h| if (t.head_bias) |hb| {
-            v += hb[@as(usize, h) * t.dim + i];
-        };
-        out[i] = v;
-    }
-}
-
-/// An `exl3_ngram_trellis` file: `rows` rings of `dim` K-bit symbols (random stream bits, a finite f16 scale word per
-/// row) behind a 512-byte safetensors header. The caller frees the bytes.
-fn trellisFixture(a: std.mem.Allocator, rnd: std.Random, rows: usize, dim: u32, K: u32) ![]u8 {
-    const words: usize = 1 + dim * K / 16;
-    const HDR: usize = 512;
-    var hbuf: [HDR]u8 = undefined;
-    const header = try std.fmt.bufPrint(&hbuf, "{{\"__metadata__\":{{\"format\":\"exl3_ngram_trellis\",\"K\":\"{d}\",\"row_dim\":\"{d}\",\"codebook\":\"mul1\"}}," ++
-        "\"ple.ngram_embedding.trellis\":{{\"dtype\":\"I16\",\"shape\":[{d},{d}],\"data_offsets\":[0,{d}]}}}}", .{ K, dim, rows, words, rows * words * 2 });
-    const buf = try a.alloc(u8, 8 + HDR + rows * words * 2);
-    std.mem.writeInt(u64, buf[0..8], HDR, .little);
-    @memset(buf[8 .. 8 + HDR], ' ');
-    @memcpy(buf[8..][0..header.len], header);
-    const data = buf[8 + HDR ..];
-    for (0..rows) |r| {
-        const row_bytes = data[r * words * 2 ..][0 .. words * 2];
-        rnd.bytes(row_bytes);
-        const scale: f16 = @floatCast(0.25 + 2.0 * rnd.float(f32));
-        std.mem.writeInt(u16, row_bytes[0..2], @bitCast(scale), .little);
-    }
-    return buf;
-}
-
-fn trellisBias(a: std.mem.Allocator, rnd: std.Random, heads: u32, dim: u32) ![]u16 {
-    const bias = try a.alloc(u16, @as(usize, heads) * dim);
-    for (bias) |*b| b.* = @bitCast(@as(f16, @floatCast(rnd.floatNorm(f32) * 0.5)));
-    return bias;
-}
-
-/// `file` (a `trellisFixture`) as `name` in `td`; its absolute path in `out`.
-fn writeTrellisFile(td: *std.testing.TmpDir, file: []const u8, out: []u8) ![]const u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    try td.dir.writeFile(io, .{ .sub_path = "ngram_embedding.safetensors", .data = file });
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const root_len = try td.dir.realPath(io, &pbuf);
-    return std.fmt.bufPrint(out, "{s}/ngram_embedding.safetensors", .{pbuf[0..root_len]});
-}
-
-/// The (ngram_size-1)-token history past `ids`, as `advancePlePrev` keeps it: the last `ctx` tokens of `prev ++ ids`.
-fn aheadTestHistory(prev: [MAX_NGRAM_SIZE]u32, ids: []const u32, ctx: usize) [MAX_NGRAM_SIZE]u32 {
-    var out = prev;
-    const n = ids.len;
-    var k: usize = 0;
-    if (n < ctx) {
-        for (0..ctx - n) |i| out[i] = prev[n + i];
-        k = ctx - n;
-    }
-    const from: usize = if (n >= ctx) n - ctx else 0;
-    for (from..n) |i| {
-        out[k] = ids[i];
-        k += 1;
-    }
-    return out;
-}
-
-/// Waits (up to ~10 s) until the open session has planned and read all it will, with no reader inside it.
-fn aheadTestSettle(t: *NgramTable) !void {
-    const a = t.ahead orelse return error.NoPrefetchReaders;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var spins: u32 = 0;
-    while (true) : (spins += 1) {
-        a.mu.lockUncancelable(io);
-        const s = a.session orelse {
-            a.mu.unlock(io);
-            return error.NoPrefetchSession;
-        };
-        const done = s.planned >= s.n_segs and !s.planning and s.bg_next >= s.totalRows() and s.busy == 0;
-        a.mu.unlock(io);
-        if (done) return;
-        if (spins > 10_000) return error.PrefetchNeverSettled;
-        var ts: std.c.timespec = .{ .sec = 0, .nsec = 1_000_000 };
-        _ = std.c.nanosleep(&ts, null);
-    }
-}
-
 const AheadTestStats = struct { open: bool = false, hits: u64 = 0, gathers: u32 = 0, unengaged: u32 = 0, rows: u64 = 0, read_ok: u64 = 0, read_bad: u64 = 0, consumed: usize = 0 };
-
-fn aheadTestStats(t: *NgramTable) AheadTestStats {
-    const a = t.ahead orelse return .{};
-    const io = std.Io.Threaded.global_single_threaded.io();
-    a.mu.lockUncancelable(io);
-    defer a.mu.unlock(io);
-    const s = a.session orelse return .{};
-    return .{ .open = true, .hits = s.hits, .gathers = s.n_gathers, .unengaged = s.unengaged, .rows = s.gather_rows, .read_ok = s.read_ok.load(.monotonic), .read_bad = s.read_bad.load(.monotonic), .consumed = s.consumed };
-}
 
 /// Plays the readers on a session without threads: a read task stages its rows without IO.
 const AheadTestPlay = struct {
-    fn next(sess: *AheadSession) ?AheadTask {
-        const t = sess.pick() orelse return null;
-        sess.busy += 1;
-        return t;
-    }
     fn done(sess: *AheadSession, t: AheadTask) void {
         switch (t) {
             .plan => |p| sess.runPlan(p.seg, p.slot),

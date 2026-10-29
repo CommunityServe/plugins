@@ -91,12 +91,6 @@ pub fn evalCadencePoint(h: mlx.mlx_array, ssm_entries: ?[]SSMCacheEntry) !void {
 // decode ladder loses here: chunked prefill + the eval cadence already
 // collect the overlap. Removed rather than shipped as a dead knob.
 
-/// Fire the ladder at this layer boundary, if it is one. `h` is the live
-/// residual; handing it to `mlx_async_eval` starts every op it depends on.
-pub fn ladderStep(self: *Transformer, h: mlx.mlx_array, layer_idx: usize, seq_len: c_int) void {
-    ladderStepMulti(&.{h}, self.decode_async_ladder, layer_idx, seq_len);
-}
-
 pub fn ladderStepMulti(arrs: []const mlx.mlx_array, stride: u32, layer_idx: usize, seq_len: c_int) void {
     if (seq_len != 1) return;
     if (stride == 0) return;

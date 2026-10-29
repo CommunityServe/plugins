@@ -239,107 +239,14 @@ pub fn prework(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     return out;
 }
 
-/// Same dtype, shape and bit patterns, any strides (`array_equal` would take -0 for +0 and fail NaN).
-pub fn sameBits(x: mlx.mlx_array, y: mlx.mlx_array, s: mlx.mlx_stream) !bool {
-    if (mlx.mlx_array_dtype(x) != mlx.mlx_array_dtype(y) or !std.mem.eql(c_int, mlx.getShape(x), mlx.getShape(y))) return false;
-    const u: mlx.mlx_dtype = switch (mlx.mlx_array_itemsize(x)) {
-        2 => .uint16,
-        4 => .uint32,
-        else => .uint8,
-    };
-    var views: [4]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
-    defer for (views) |v| {
-        _ = mlx.mlx_array_free(v);
-    };
-    try mlx.check(mlx.mlx_contiguous(&views[0], x, false, s));
-    try mlx.check(mlx.mlx_contiguous(&views[1], y, false, s));
-    try mlx.check(mlx.mlx_view(&views[2], views[0], u, s));
-    try mlx.check(mlx.mlx_view(&views[3], views[1], u, s));
-    var eq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eq);
-    try mlx.check(mlx.mlx_array_equal(&eq, views[2], views[3], false, s));
-    try mlx.check(mlx.mlx_array_eval(eq));
-    var same = false;
-    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
-    return same;
-}
-
 // ── tests ──
 
 const testing = std.testing;
 const kernels = @import("../../../sdk/blocks/gdn/kernels.zig");
 const gdnParityRand = decode_fused.gdnParityRand;
 
-/// One prework case at Flash Next's GDN geometry (Hk 16, Hv 48, 128 x 128 heads): the row stream against the packed
-/// kernel on the same arguments. `joined`: qkv read from a wider row and a / b from one [a | 0 | b] row, as the joined
-/// projections hand them over.
-fn preworkCase(s: mlx.mlx_stream, seq: c_int, batch: c_int, cold: bool, joined: bool, gt: mlx.mlx_dtype) !void {
-    var prng = std.Random.DefaultPrng.init(0xC0_2E + @as(u64, @intCast(seq * 7 + batch)));
-    const rnd = prng.random();
-    const hk: c_int = 16;
-    const hv: c_int = 48;
-    const c_dim: c_int = 2 * hk * 128 + hv * 128;
-    const q_stride: c_int = if (joined) c_dim + 6144 + 128 else c_dim;
-    const q_off: c_int = if (joined) 64 else 0;
-    const ab_stride: c_int = if (joined) 112 else hv;
-    const b_off: c_int = if (joined) 64 else 0;
-    const dt: mlx.mlx_dtype = .bfloat16;
-    var arrs: [9]mlx.mlx_array = undefined;
-    const shapes = [_][]const c_int{ &.{ batch, seq, q_stride }, &.{ batch, seq, ab_stride }, &.{ batch, seq, ab_stride }, &.{hv}, &.{hv}, &.{ batch, 3, c_dim }, &.{ c_dim, 4, 1 }, &.{}, &.{} };
-    const scales = [_]f32{ 1, 16, 16, 1, 1, 1, 1, 1, 1 };
-    for (&arrs, shapes, scales, 0..) |*o, sh, sc, i| o.* = switch (i) {
-        3 => try gdnParityRand(rnd, sh, sc, .float32, s),
-        5 => if (cold) blk: {
-            var z = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_zeros(&z, sh.ptr, sh.len, dt, s));
-            break :blk z;
-        } else try gdnParityRand(rnd, sh, sc, dt, s),
-        7 => try @import("../../../mlx/array.zig").scalarOf(1.0 / 128.0, dt, s),
-        8 => try @import("../../../mlx/array.zig").scalarOf(@sqrt(1.0 / 128.0), dt, s),
-        else => try gdnParityRand(rnd, sh, sc, dt, s),
-    };
-    defer for (arrs) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-    const args: GdnPreworkArgs = .{ .qkv = arrs[0], .qkv_off = q_off, .qkv_stride = q_stride, .b = arrs[1], .b_off = b_off, .b_stride = ab_stride, .a = arrs[2], .a_off = 0, .a_stride = ab_stride, .A_log = arrs[3], .dt_bias = arrs[4], .conv_state = arrs[5], .conv_w = arrs[6], .q_scale = arrs[7], .k_scale = arrs[8], .hk = hk, .hv = hv, .dk = 128, .dv = 128, .seq = seq, .batch = batch, .gate = true, .g_dtype = gt };
-    const want = (try decode_fused.gdnPreworkFused(s, args)) orelse return error.PackedDeclined;
-    defer inline for (.{ want.q, want.k, want.v, want.conv_state, want.g, want.beta }) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-    const got = (try prework(s, args)) orelse return error.CoreDeclined;
-    defer inline for (.{ got.q, got.k, got.v, got.conv_state, got.g, got.beta }) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-    inline for (.{ "q", "k", "v", "conv_state", "g", "beta" }) |f| try testing.expect(try sameBits(@field(want, f), @field(got, f), s));
-}
-
 /// The recurrence's inputs as the packed prework leaves them, `t` rows of `batch` slots, and a state of `st`.
 const RecurIn = struct {
     a: [6]mlx.mlx_array,
 
-    fn init(s: mlx.mlx_stream, seed: u64, batch: c_int, t: c_int, in_dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !RecurIn {
-        var prng = std.Random.DefaultPrng.init(seed);
-        const rnd = prng.random();
-        var r: RecurIn = undefined;
-        r.a[0] = try gdnParityRand(rnd, &.{ batch, t, 16, 128 }, 0.02, in_dt, s);
-        r.a[1] = try gdnParityRand(rnd, &.{ batch, t, 16, 128 }, 0.15, in_dt, s);
-        r.a[2] = try gdnParityRand(rnd, &.{ batch, t, 48, 128 }, 2, in_dt, s);
-        // g in (0.8, 1): a decaying state
-        const lo = mlx.mlx_array_new_float(0.8);
-        defer _ = mlx.mlx_array_free(lo);
-        const hi = mlx.mlx_array_new_float(1.0);
-        defer _ = mlx.mlx_array_free(hi);
-        var key = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(key);
-        try mlx.check(mlx.mlx_random_key(&key, seed));
-        r.a[3] = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_random_uniform(&r.a[3], lo, hi, &[_]c_int{ batch, t, 48 }, 3, .float32, key, s));
-        r.a[4] = try gdnParityRand(rnd, &.{ batch, t, 48 }, 0.5, in_dt, s);
-        r.a[5] = try gdnParityRand(rnd, &.{ batch, 48, 128, 128 }, 1, st, s);
-        return r;
-    }
-
-    fn deinit(r: *RecurIn) void {
-        for (r.a) |x| _ = mlx.mlx_array_free(x);
-    }
 };

@@ -88,27 +88,6 @@ pub fn swigluFusedEnabled() bool {
 /// 16-bit pattern by running MLX's own op chain once, then one multiply.
 pub const TABLE_MUL_SOURCE = kernelSource("kernels/mlp/table_mul.metal");
 
-/// `x * c -> erf -> 1 + -> x * -> * half`, five ops in the activation dtype.
-pub fn geluErfChain(x: mlx.mlx_array, one: mlx.mlx_array, half: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const inv_sqrt2 = try scalarOf(0.70710678118654752, mlx.mlx_array_dtype(x), s);
-    defer _ = mlx.mlx_array_free(inv_sqrt2);
-    var scaled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(scaled);
-    try mlx.check(mlx.mlx_multiply(&scaled, x, inv_sqrt2, s));
-    var erf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(erf);
-    try mlx.check(mlx.mlx_erf(&erf, scaled, s));
-    var one_plus = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(one_plus);
-    try mlx.check(mlx.mlx_add(&one_plus, one, erf, s));
-    var x_times = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_times);
-    try mlx.check(mlx.mlx_multiply(&x_times, x, one_plus, s));
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_multiply(&result, x_times, half, s));
-    return result;
-}
-
 /// Every 16-bit pattern of `dt` as an array of that dtype (the domain a
 /// per-dtype op table is evaluated over).
 pub fn all16BitPatterns(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
@@ -129,19 +108,6 @@ pub fn all16BitPatterns(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem
 }
 
 var gelu_erf_tables: [2]?mlx.mlx_array = @splat(null);
-
-fn geluErfTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, one: mlx.mlx_array, half: mlx.mlx_array) !mlx.mlx_array {
-    const slot: usize = if (dt == .bfloat16) 0 else 1;
-    if (gelu_erf_tables[slot]) |t| return t;
-    const vals = try all16BitPatterns(s, dt, std.heap.c_allocator);
-    defer _ = mlx.mlx_array_free(vals);
-    const table = try geluErfChain(vals, one, half, s);
-    errdefer _ = mlx.mlx_array_free(table);
-    if (mlx.mlx_array_dtype(table) != dt) return error.GeluTableDtype;
-    try mlx.check(mlx.mlx_array_eval(table));
-    gelu_erf_tables[slot] = table;
-    return table;
-}
 
 const GateMulKind = enum(usize) {
     silu,
@@ -324,29 +290,7 @@ pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?
     return tableGateMul(s, .silu, gate, up, sigtab, null);
 }
 
-/// `silu(min(gate, limit)) * clip(up, ±limit)` in one dispatch, bit for bit `clampedSwiGLU`.
-pub fn fusedClampedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array, limit: f32) !?mlx.mlx_array {
-    if (!swigluFusedEnabled()) return null;
-    const dt = mlx.mlx_array_dtype(gate);
-    if (dt != .bfloat16 and dt != .float16) return null;
-    const sigtab = try swigluSigTable(s, dt, std.heap.c_allocator);
-    const lim = try scalarOf(limit, dt, s);
-    defer _ = mlx.mlx_array_free(lim);
-    return tableGateMul(s, .silu_clamp, gate, up, sigtab, lim);
-}
-
 /// `gelu_tanh(x)` (whatever `Transformer.gelu` runs: compiled or the op
 /// chain) tabulated per dtype. Null when the chain does not return `dt`.
 pub var gelu_tanh_tables: [2]?mlx.mlx_array = @splat(null);
 pub var gelu_tanh_declined: [2]bool = @splat(false);
-
-/// `gelu_erf(gate) * up` in one dispatch, the activation tabulated from the
-/// op chain itself (`geluErfTable`). Null → caller keeps the chain.
-pub fn fusedGeluErfMul(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array, one: mlx.mlx_array, half: mlx.mlx_array) !?mlx.mlx_array {
-    if (!swigluFusedEnabled()) return null;
-    const dt = mlx.mlx_array_dtype(gate);
-    if (dt != .bfloat16 and dt != .float16) return null;
-    if (mlx.mlx_array_dtype(one) != dt or mlx.mlx_array_dtype(half) != dt) return null;
-    const table = try geluErfTable(s, dt, one, half);
-    return tableGateMul(s, .gelu_erf, gate, up, table, null);
-}

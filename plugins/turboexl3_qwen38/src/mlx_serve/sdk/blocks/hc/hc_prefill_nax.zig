@@ -288,11 +288,6 @@ pub fn injPerTg(wm: c_int, tiles_n: c_int) c_int {
     return @divTrunc(wm + tiles_n - 1, tiles_n);
 }
 
-/// The row block inject simdgroup `j` of column tile `tile_x` runs (>= wm: idle), as the kernels pick it.
-pub fn injBlock(j: c_int, tile_x: c_int, tiles_n: c_int) c_int {
-    return j * tiles_n + tile_x;
-}
-
 pub const RwPlan = struct { tm: c_int, wm: c_int, wn: c_int, swz: c_int, sd: c_int };
 
 /// rwDown's two stages: 2 x BM rows x (32 sd + 8) bf16.
@@ -702,73 +697,6 @@ pub fn rwUpMix(s: mlx.mlx_stream, act: mlx.mlx_array, up_rows: mlx.mlx_array, xs
 const testing = std.testing;
 const testRandUniformBf16 = @import("../../testing/parity.zig").testRandUniformBf16;
 
-fn tOp(comptime f: anytype, args: anytype) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(o);
-    try mlx.check(@call(.auto, f, .{&o} ++ args));
-    return o;
-}
-
-/// The chain's silu (sigmoid, then multiply) and inject gate (2 sigmoid) as uncompiled ops.
-fn tSilu(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const sig = try tOp(mlx.mlx_sigmoid, .{ x, s });
-    defer _ = mlx.mlx_array_free(sig);
-    return tOp(mlx.mlx_multiply, .{ x, sig, s });
-}
-
-fn tGate(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const sig = try tOp(mlx.mlx_sigmoid, .{ x, s });
-    defer _ = mlx.mlx_array_free(sig);
-    const two_f = mlx.mlx_array_new_float(2.0);
-    defer _ = mlx.mlx_array_free(two_f);
-    const two = try tOp(mlx.mlx_astype, .{ two_f, mlx.mlx_array_dtype(x), s });
-    defer _ = mlx.mlx_array_free(two);
-    return tOp(mlx.mlx_multiply, .{ sig, two, s });
-}
-
-/// Every bf16 pattern through tSilu and tGate: the launches only index a table, so any function checks them.
-fn testTables(s: mlx.mlx_stream) !FuseTables {
-    var bits: [65536]u16 = undefined;
-    for (&bits, 0..) |*v, i| v.* = @intCast(i);
-    const x = mlx.mlx_array_new_data(&bits, &[_]c_int{65536}, 1, .bfloat16);
-    defer _ = mlx.mlx_array_free(x);
-    const silu = try tSilu(x, s);
-    errdefer _ = mlx.mlx_array_free(silu);
-    const gate = try tGate(x, s);
-    errdefer _ = mlx.mlx_array_free(gate);
-    try mlx.check(mlx.mlx_array_eval(silu));
-    try mlx.check(mlx.mlx_array_eval(gate));
-    return .{ .silu = silu, .gate = gate };
-}
-
-fn freeTables(t: FuseTables) void {
-    _ = mlx.mlx_array_free(t.silu);
-    _ = mlx.mlx_array_free(t.gate);
-}
-
-/// Same dtype and the same 16-bit patterns in element order (array_equal alone takes -0 for +0), any strides.
-fn bitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
-    if (mlx.mlx_array_size(a) != mlx.mlx_array_size(b) or mlx.mlx_array_dtype(a) != mlx.mlx_array_dtype(b)) return false;
-    const n = [_]c_int{@intCast(mlx.mlx_array_size(a))};
-    var views: [2]mlx.mlx_array = undefined;
-    for ([_]mlx.mlx_array{ a, b }, &views) |x, *v| {
-        const c = try tOp(mlx.mlx_contiguous, .{ x, false, s });
-        defer _ = mlx.mlx_array_free(c);
-        const flat = try tOp(mlx.mlx_reshape, .{ c, &n, n.len, s });
-        defer _ = mlx.mlx_array_free(flat);
-        v.* = try tOp(mlx.mlx_view, .{ flat, if (mlx.mlx_array_dtype(a) == .float32) mlx.mlx_dtype.uint32 else mlx.mlx_dtype.uint16, s });
-    }
-    defer for (views) |v| {
-        _ = mlx.mlx_array_free(v);
-    };
-    const e = try tOp(mlx.mlx_array_equal, .{ views[0], views[1], false, s });
-    defer _ = mlx.mlx_array_free(e);
-    try mlx.check(mlx.mlx_array_eval(e));
-    var same = false;
-    try mlx.check(mlx.mlx_array_item_bool(&same, e));
-    return same;
-}
-
 fn freeAll(xs: []const mlx.mlx_array) void {
     for (xs) |x| _ = mlx.mlx_array_free(x);
 }
@@ -783,31 +711,6 @@ const TestWeights = struct {
     iw: mlx.mlx_array,
     nw: mlx.mlx_array,
     own: [4]mlx.mlx_array,
-
-    fn init(rnd: std.Random, s: mlx.mlx_stream) !TestWeights {
-        const wd = try testRandUniformBf16(rnd, &.{ R, K }, -0.04, 0.04, s);
-        errdefer _ = mlx.mlx_array_free(wd);
-        const wu = try testRandUniformBf16(rnd, &.{ K, R }, -0.1, 0.1, s);
-        errdefer _ = mlx.mlx_array_free(wu);
-        const wi = try testRandUniformBf16(rnd, &.{ HC, K }, -0.05, 0.05, s);
-        errdefer _ = mlx.mlx_array_free(wi);
-        const nw = try testRandUniformBf16(rnd, &.{ HC, HID }, 0.5, 1.5, s);
-        errdefer _ = mlx.mlx_array_free(nw);
-        const wi_t = try tOp(mlx.mlx_transpose, .{ wi, s });
-        defer _ = mlx.mlx_array_free(wi_t);
-        var t: TestWeights = .{
-            .wd_t = try tOp(mlx.mlx_transpose, .{ wd, s }),
-            .wd_rows = try tOp(mlx.mlx_view, .{ wd, mlx.mlx_dtype.uint32, s }),
-            .wu_t = try tOp(mlx.mlx_transpose, .{ wu, s }),
-            .wu_rows = try tOp(mlx.mlx_view, .{ wu, mlx.mlx_dtype.uint32, s }),
-            .iw = try tOp(mlx.mlx_contiguous, .{ wi_t, false, s }),
-            .nw = nw,
-            .own = .{ wd, wu, wi, .{ .ctx = null } },
-        };
-        for ([_]mlx.mlx_array{ t.wd_rows, t.wu_rows, t.iw, t.nw }) |a| try mlx.check(mlx.mlx_array_eval(a));
-        t.own[3] = .{ .ctx = null };
-        return t;
-    }
 
     fn deinit(t: *TestWeights) void {
         freeAll(&.{ t.wd_t, t.wd_rows, t.wu_t, t.wu_rows, t.iw, t.nw });

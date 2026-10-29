@@ -339,14 +339,6 @@ pub const Trunk = struct {
         return self.forwardQwen4With(ctx, token_ids);
     }
 
-    /// `forwardWith` publishing the pre-mixer stream's last row (`out_hidden`).
-    pub fn forwardWithCapture(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, out_hidden: *mlx.mlx_array) !mlx.mlx_array {
-        const saved = ctx.capture_hidden;
-        ctx.capture_hidden = out_hidden;
-        defer ctx.capture_hidden = saved;
-        return self.forwardWith(ctx, token_ids);
-    }
-
     /// `forwardWith` publishing the stream's last row and every row.
     pub fn forwardWithCaptureAll(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, out_hidden: *mlx.mlx_array, out_hidden_all: *mlx.mlx_array) !mlx.mlx_array {
         const saved = ctx.capture_hidden;
@@ -360,21 +352,12 @@ pub const Trunk = struct {
         return self.forwardWith(ctx, token_ids);
     }
 
-    /// The trunk over `weights` with `config` (both borrowed), the closures not compiled (`prepare`).
-    pub fn init(io: std.Io, a: std.mem.Allocator, config: model.ModelConfig, weights: *model.Weights) !Trunk {
-        return @import("trunk_load.zig").load(io, a, &config, weights, .{});
-    }
-
     pub fn actDtype(self: *const Trunk) mlx.mlx_dtype {
         return self.config.actDtype();
     }
 
     pub fn ssmStateDtype(self: *const Trunk) mlx.mlx_dtype {
         return self.config.ssmStateDtype();
-    }
-
-    pub fn useCurrentThreadStream(self: *Trunk) void {
-        self.s = mlx.gpuStream();
     }
 
     /// The compiled routing, GDN gate and hyper-connection closures the forward reads.

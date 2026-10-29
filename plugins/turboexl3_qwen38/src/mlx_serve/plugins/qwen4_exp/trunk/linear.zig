@@ -90,38 +90,6 @@ pub inline fn quantParamsHinted(self: *const Trunk, w: mlx.mlx_array, sc: mlx.ml
     return computeQuantParams(.of(&self.config), w, sc, in_dim);
 }
 
-/// Every row of `x` `[N, …]` projected on its own (`lm_head`: through the trunk's head), the rows stacked again.
-pub fn mtpProjectionRows(self: *Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lm_head: bool) !mlx.mlx_array {
-    const sh = mlx.getShape(x);
-    if (sh.len < 2 or sh.len > 8 or sh[0] < 1 or sh[0] > MAX_BATCH_ROWS) return error.MtpProjectionShape;
-    const n: usize = @intCast(sh[0]);
-    var virtual_rows: c_int = 1;
-    for (sh[1 .. sh.len - 1]) |d| virtual_rows *= d;
-    if (virtual_rows == 1) {
-        const qp = self.quantParamsHinted(w, sc, lastDim(x));
-        if (qp.mode == .affine) {
-            if (try msvQmvRows(self.s, x, w, sc, bi, qp.bits, qp.group_size)) |y| return y;
-        }
-    }
-    var parts: [MAX_BATCH_ROWS]mlx.mlx_array = @splat(.{ .ctx = null });
-    defer for (parts[0..n]) |a| {
-        if (a.ctx != null) _ = mlx.mlx_array_free(a);
-    };
-    for (0..n) |row| {
-        var starts: [8]c_int = @splat(0);
-        var stops: [8]c_int = @splat(0);
-        const strides: [8]c_int = @splat(1);
-        @memcpy(stops[0..sh.len], sh);
-        starts[0] = @intCast(row);
-        stops[0] = @intCast(row + 1);
-        var xrow = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(xrow);
-        try mlx.check(mlx.mlx_slice(&xrow, x, &starts, @intCast(sh.len), &stops, @intCast(sh.len), &strides, @intCast(sh.len), self.s));
-        parts[row] = if (lm_head) try self.lmHeadProject(xrow) else try self.qmatmul(xrow, w, sc, bi);
-    }
-    return concatAxis0(self.s, parts[0..n]);
-}
-
 /// A single verify's fused route packing and expert reduction: only while capturing for a spec verify, 2..6 rows.
 pub fn verifyFeatureEnabled(self: *const Trunk, comptime feature: verify_projection.SingleVerifyFeature, grouped: bool, batch: c_int, width: c_int) bool {
     if (grouped) return true;

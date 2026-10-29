@@ -52,10 +52,6 @@ pub const QsaHeadMark = struct {
 /// warm turn merges the donor's; past this the list thins like the checkpoints themselves.
 pub const QSA_HEAD_MARKS_MAX: usize = 32;
 
-fn markPosOf(m: *const QsaHeadMark) usize {
-    return @intCast(@max(m.pos, 0));
-}
-
 /// One owner of a head's marks: the live head holds one, its committed snapshot a
 /// refcount-sharing copy. Positions ascend.
 pub const QsaHeadMarkSet = struct {
@@ -87,15 +83,6 @@ pub const QsaHeadMarkSet = struct {
         self.len = 0;
     }
 
-    pub fn bytes(self: *const QsaHeadMarkSet) u64 {
-        var total: u64 = 0;
-        for (self.items[0..self.len]) |m| {
-            if (m.rows.ctx == null) continue;
-            total += @as(u64, mlx.mlx_array_size(m.rows)) * @as(u64, mlx.mlx_array_itemsize(m.rows));
-        }
-        return total;
-    }
-
     pub fn find(self: *const QsaHeadMarkSet, pos: c_int) ?mlx.mlx_array {
         for (self.items[0..self.len]) |m| {
             if (m.pos == pos and m.rows.ctx != null) return m.rows;
@@ -114,24 +101,6 @@ pub const QsaHeadMarkSet = struct {
         self.len = i;
     }
 
-    fn dropAt(self: *QsaHeadMarkSet, idx: usize) void {
-        if (self.items[idx].rows.ctx != null) _ = mlx.mlx_array_free(self.items[idx].rows);
-        var i = idx;
-        while (i + 1 < self.len) : (i += 1) self.items[i] = self.items[i + 1];
-        self.items[self.len - 1] = .{};
-        self.len -= 1;
-    }
-
-    /// Takes ownership of `rows`. A repeat at `pos` replaces; a full set thins its interior.
-    pub fn put(self: *QsaHeadMarkSet, pos: c_int, rows: mlx.mlx_array) void {
-        self.dropAbove(pos);
-        if (self.len > 0 and self.items[self.len - 1].pos == pos) self.dropAt(self.len - 1);
-        if (self.len == QSA_HEAD_MARKS_MAX) {
-            self.dropAt(spanPreservingDropIndex(QsaHeadMark, self.slice(), markPosOf, .min_span_recency, null, 0));
-        }
-        self.items[self.len] = .{ .pos = pos, .rows = rows };
-        self.len += 1;
-    }
 };
 
 pub fn qsaLeftoverAt(aux: mlx.mlx_array, hist: c_int, pos: c_int, ratio: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -200,19 +169,6 @@ pub var qsa_cap_buf_allocs: usize = 0;
 pub var qsa_history_seeds: usize = 0;
 
 pub var qsa_score_incremental_appends: usize = 0;
-
-/// Ask every live entry's QSA history to hold `tokens` rows up front (same lever as `KVCache.reserve`).
-pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, tokens: usize) void {
-    const es = entries orelse return;
-    for (es) |*e| {
-        if (tokens > e.qsa_reserve_rows) e.qsa_reserve_rows = tokens;
-    }
-}
-
-pub fn reserveQsaHistoryWithHead(entries: ?[]SSMCacheEntry, head: ?*SSMCacheEntry, tokens: usize) void {
-    reserveQsaHistory(entries, tokens);
-    if (head) |h| reserveQsaHistory(h[0..1], tokens);
-}
 
 /// Append `chunk` into a pre-grown capacity buffer along `axis` and republish `view` as the
 /// tight `count`-long prefix. The published view is dropped first: while it lives mlx copies
@@ -374,52 +330,6 @@ fn capBufReslice(s: mlx.mlx_stream, buf: mlx.mlx_array, view: *mlx.mlx_array, co
     count.* = new_count;
 }
 
-pub fn qsaTestAppendPool(xfm: *Trunk, entry: *SSMCacheEntry, chunk: mlx.mlx_array, offset: c_int, s: mlx.mlx_stream) !void {
-    const ratio = @max(entry.qsa_ratio, 1);
-    const add = mlx.getShape(chunk)[1];
-    const kv = offset + add;
-    const nb = @divTrunc(kv, ratio);
-    const nb_cached: c_int = if (entry.qsa_pooled.ctx != null) mlx.getShape(entry.qsa_pooled)[1] else 0;
-    if (nb > nb_cached) {
-        const leftover_n = offset - nb_cached * ratio;
-        const n_new = nb - nb_cached;
-        const need = n_new * ratio;
-        const from_k = need - leftover_n;
-        var kb_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kb_flat);
-        if (leftover_n == 0) {
-            try mlx.check(mlx.mlx_slice(&kb_flat, chunk, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, need, mlx.getShape(chunk)[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-        } else {
-            const ash = mlx.getShape(entry.aux_state);
-            var leftover = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(leftover);
-            try mlx.check(mlx.mlx_slice(&leftover, entry.aux_state, &[_]c_int{ 0, ash[1] - leftover_n, 0 }, 3, &[_]c_int{ ash[0], ash[1], ash[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-            var k_part = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k_part);
-            try mlx.check(mlx.mlx_slice(&k_part, chunk, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, from_k, mlx.getShape(chunk)[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-            const parts = [_]mlx.mlx_array{ leftover, k_part };
-            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
-            defer _ = mlx.mlx_vector_array_free(vec);
-            try mlx.check(mlx.mlx_concatenate_axis(&kb_flat, vec, 1, s));
-        }
-        const hd = mlx.getShape(chunk)[2];
-        var kb4 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kb4);
-        try mlx.check(mlx.mlx_reshape(&kb4, kb_flat, &[_]c_int{ 1, n_new, ratio, hd }, 4, s));
-        var f32b = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(f32b);
-        try mlx.check(mlx.mlx_astype(&f32b, kb4, .float32, s));
-        var mean = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(mean);
-        try mlx.check(mlx.mlx_mean_axis(&mean, f32b, 2, false, s));
-        var new3 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(new3);
-        try mlx.check(mlx.mlx_astype(&new3, mean, .bfloat16, s));
-        try xfm.qsaAppendPooled(entry, new3, nb_cached);
-    }
-    try xfm.qsaAppendKeys(entry, chunk, offset);
-}
-
 /// Keep the pooled-key rows that are still complete blocks of a key history
 /// truncated to `keep_rows` (the block size is implied by the two shapes).
 /// Cut the pooled bank to the blocks `keep_rows` completes. `materialize` = a fresh buffer; false = a slice view.
@@ -450,36 +360,3 @@ pub fn truncatePooled(pooled: *mlx.mlx_array, keep_rows: c_int, ratio: c_int, s:
 }
 
 // ── tests ──
-
-fn qsaRingTail(src: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const sh = mlx.getShape(src);
-    const n: c_int = @min(sh[1], QSA_RING_ROWS);
-    if (n == sh[1]) return materializedOwnedCopy(s, src);
-    var view = mlx.mlx_array_new();
-    mlx.check(mlx.mlx_slice(&view, src, &[_]c_int{ 0, sh[1] - n, 0 }, 3, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s)) catch |err| {
-        _ = mlx.mlx_array_free(view);
-        return err;
-    };
-    defer _ = mlx.mlx_array_free(view);
-    return materializedOwnedCopy(s, view);
-}
-
-pub fn qsaTestMeanBlocks(keys: mlx.mlx_array, row0: c_int, n_blocks: c_int, ratio: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const sh = mlx.getShape(keys);
-    const n_rows = n_blocks * ratio;
-    var flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat);
-    try mlx.check(mlx.mlx_slice(&flat, keys, &[_]c_int{ 0, row0, 0 }, 3, &[_]c_int{ sh[0], row0 + n_rows, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-    var kb4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(kb4);
-    try mlx.check(mlx.mlx_reshape(&kb4, flat, &[_]c_int{ sh[0], n_blocks, ratio, sh[2] }, 4, s));
-    var f32b = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f32b);
-    try mlx.check(mlx.mlx_astype(&f32b, kb4, .float32, s));
-    var mean = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mean);
-    try mlx.check(mlx.mlx_mean_axis(&mean, f32b, 2, false, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, mean, .bfloat16, s));
-    return out;
-}

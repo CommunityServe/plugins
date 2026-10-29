@@ -404,27 +404,3 @@ pub fn moeRouterTopK(
 }
 
 // ── tests ──
-
-/// Host-side reference for one router row: exact top-K by key with the
-/// LOWEST-INDEX tie-break, weights in f64. Returns the selected ids in
-/// descending-key order, matching the kernel's emission order.
-fn routerRefRow(keys: []const f64, k: usize, out_ids: []usize) void {
-    var taken = std.testing.allocator.alloc(bool, keys.len) catch unreachable;
-    defer std.testing.allocator.free(taken);
-    @memset(taken, false);
-    for (0..k) |r| {
-        var best: f64 = -std.math.inf(f64);
-        var bidx: usize = 0;
-        var found = false;
-        for (keys, 0..) |v, i| {
-            if (taken[i]) continue;
-            if (!found or v > best) {
-                best = v;
-                bidx = i;
-                found = true;
-            }
-        }
-        taken[bidx] = true;
-        out_ids[r] = bidx;
-    }
-}

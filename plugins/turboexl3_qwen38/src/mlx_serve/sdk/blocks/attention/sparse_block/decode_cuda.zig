@@ -111,25 +111,3 @@ pub fn attend(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_
 }
 
 const testing = std.testing;
-
-pub fn randomBf16(s: mlx.mlx_stream, shape: []const c_int, seed: u64) !mlx.mlx_array {
-    var key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_key(&key, seed));
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_random_normal(&f, shape.ptr, shape.len, .float32, 0.0, 1.0, key, s));
-    var b = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(b);
-    try mlx.check(mlx.mlx_astype(&b, f, .bfloat16, s));
-    return b;
-}
-
-pub fn hostF32(s: mlx.mlx_stream, a: mlx.mlx_array) !struct { arr: mlx.mlx_array, data: []const f32 } {
-    var f = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_astype(&f, a, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(f));
-    const p = mlx.mlx_array_data_float32(f) orelse return error.Unreadable;
-    return .{ .arr = f, .data = p[0..mlx.mlx_array_size(f)] };
-}

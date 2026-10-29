@@ -453,56 +453,6 @@ pub fn writeFixture(td: *std.testing.TmpDir, variant: FixtureVariant) !void {
     try writeSafetensors(td, "b.safetensors", header_b, &data_b);
 }
 
-/// One affine shard of two rows at dim 32, group 32, packed at `bits`: row 0 mixed codes (values
-/// straddle words at 3/5/6 bits), row 1 all ones, scale 1.0, bias 0.
-pub fn writeAffineFixture(td: *std.testing.TmpDir, bits: u32) !void {
-    const a = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"" ++ prefix ++ "0.weight\":\"a.safetensors\",\"" ++ prefix ++ "0.scales\":\"a.safetensors\",\"" ++ prefix ++ "0.biases\":\"a.safetensors\"}}" });
-    const wbytes = 2 * bits * 4;
-    const header = try std.fmt.allocPrint(a, "{{\"{s}0.weight\":{{\"dtype\":\"U32\",\"shape\":[2,{d}],\"data_offsets\":[0,{d}]}}," ++
-        "\"{s}0.scales\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[{d},{d}]}}," ++
-        "\"{s}0.biases\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[{d},{d}]}}}}", .{ prefix, bits, wbytes, prefix, wbytes, wbytes + 4, prefix, wbytes + 4, wbytes + 8 });
-    defer a.free(header);
-    const data = try a.alloc(u8, wbytes + 8);
-    defer a.free(data);
-    for (data[0 .. wbytes / 2], 0..) |*b, i| b.* = @truncate(i *% 0x9d +% 0x35);
-    @memset(data[wbytes / 2 .. wbytes], 0xff);
-    @memset(data[wbytes..], 0);
-    for (0..2) |r| std.mem.writeInt(u16, data[wbytes + r * 2 ..][0..2], 0x3f80, .little);
-    try writeSafetensors(td, "a.safetensors", header, data);
-}
-
-/// A ModelOpt NVFP4 table under `tensors/`: rows 0-1 in shard 0, row 2 in shard 1, dim 32. Row r's
-/// codes are all `r + 1`, its two e4m3 group scales 1.0 and 2.0, the global scale 0.5.
-pub fn writeNvfp4Fixture(td: *std.testing.TmpDir) !void {
-    return writeNvfp4FixtureGroups(td, false);
-}
-
-/// `wide`: one scale per 32-value row, i.e. a group of 32 the NVFP4 readers cannot take.
-pub fn writeNvfp4FixtureGroups(td: *std.testing.TmpDir, comptime wide: bool) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const p = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.";
-    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"" ++ p ++ "shard_0.weight\":\"tensors/a.safetensors\",\"" ++ p ++ "shard_0.weight_scale\":\"tensors/a.safetensors\",\"" ++ p ++ "shard_1.weight\":\"tensors/a.safetensors\",\"" ++ p ++ "shard_1.weight_scale\":\"tensors/a.safetensors\",\"" ++ p ++ "weight_scale_2\":\"tensors/a.safetensors\"}}" });
-    const header = "{\"" ++ p ++ "shard_0.weight\":{\"dtype\":\"U8\",\"shape\":[2,16],\"data_offsets\":[0,32]}," ++
-        "\"" ++ p ++ "shard_0.weight_scale\":{\"dtype\":\"F8_E4M3\",\"" ++ (if (wide) "shape\":[2,1],\"data_offsets\":[32,34]" else "shape\":[2,2],\"data_offsets\":[32,36]") ++ "}," ++
-        "\"" ++ p ++ "shard_1.weight\":{\"dtype\":\"U8\",\"shape\":[1,16],\"data_offsets\":[36,52]}," ++
-        "\"" ++ p ++ "shard_1.weight_scale\":{\"dtype\":\"F8_E4M3\",\"" ++ (if (wide) "shape\":[1,1],\"data_offsets\":[52,53]" else "shape\":[1,2],\"data_offsets\":[52,54]") ++ "}," ++
-        "\"" ++ p ++ "weight_scale_2\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[56,60]}}";
-    var data: [60]u8 = @splat(0);
-    for (0..3) |r| {
-        const w_off: usize = if (r < 2) r * 16 else 36;
-        const s_off: usize = if (r < 2) 32 + r * 2 else 52;
-        const c: u8 = @intCast(r + 1);
-        @memset(data[w_off..][0..16], c | c << 4);
-        data[s_off] = 0x38;
-        data[s_off + 1] = 0x40;
-    }
-    std.mem.writeInt(u32, data[56..60], @bitCast(@as(f32, 0.5)), .little);
-    try td.dir.createDirPath(io, "tensors");
-    try writeSafetensors(td, "tensors/a.safetensors", header, &data);
-}
-
 fn writeSafetensors(td: *std.testing.TmpDir, name: []const u8, header: []const u8, data: []const u8) !void {
     const a = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

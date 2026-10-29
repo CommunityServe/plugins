@@ -14,9 +14,6 @@ pub const OneShotBits = struct {
         self.seen |= m;
         return true;
     }
-    pub fn reset(self: *OneShotBits) void {
-        self.seen = 0;
-    }
 };
 
 /// Query-width bucket: decode (1), verify (2 .. FUSED256_MIN_Q_LEN-1),

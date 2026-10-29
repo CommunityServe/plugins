@@ -30,7 +30,8 @@ budget's close through the MTP head; the plugin can once the host calls it).
   `scripts/sync-mlx-serve.sh`), over mlx-c through the kit's `mlx_c`; each slot runs on state the model keeps itself.
   The copy is cut to what the plugin's builds compile (the dylib, `zig build test`, mlx-free-test, gpu-test), as those
   builds' symbols and the compiler's errors show it: a file with no such code is an empty stand-in, and a test none of
-  them runs is left out.
+  them runs, or a function none of them compiles (`scripts/cut-functions.txt`), is left out: `src/mlx_serve/` holds
+  87,046 lines, 164,603 before the cut.
 - MTP: the pack's head drafts as the model's native drafter (`src/spec/drafter.zig`) under #1005's own round policy,
   copied: a prompt-lookup run when the context repeats, else the head's chain at the depth #1005's EV planner picks
   (two-chunk plans priced for EXL3), with the next round's drafts dispatched at each greedy round's tail; one trunk

@@ -13,15 +13,6 @@ const hadamardBlock = block_mod.hadamardBlock;
 const registry = @import("../../plugins/registry.zig");
 const testing = std.testing;
 
-fn expectClaimant(want: ?[]const u8, block_json: []const u8, config_json: []const u8) !void {
-    const got = try claimant(block_json, config_json);
-    const name: ?[]const u8 = if (got) |i| builtins[i].name else null;
-    if (want) |w| {
-        try testing.expect(name != null);
-        try testing.expectEqualStrings(w, name.?);
-    } else try testing.expectEqual(@as(?[]const u8, null), name);
-}
-
 test "quant block: blocks are found under their keys; a config without one has none" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

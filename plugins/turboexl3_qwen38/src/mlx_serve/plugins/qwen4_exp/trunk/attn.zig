@@ -46,20 +46,6 @@ const BATCHED_PER_SLOT_ATTN_MIN_KV = @import("../../../sdk/blocks/attention/batc
 const sdpaForceFused = @import("../../../sdk/blocks/attention/sdpa.zig").sdpaForceFused;
 const splitCausalSdpa = @import("../../../sdk/blocks/attention/sdpa.zig").splitCausalSdpa;
 
-pub fn gatedFullAttnWith(
-    self: *Trunk,
-    ctx: *ForwardCtx,
-    x: mlx.mlx_array,
-    fa: *const FullAttnWeights,
-    layer: u32,
-    offset: c_int,
-    batch: c_int,
-    seq_len: c_int,
-    is_prefill: bool,
-) !mlx.mlx_array {
-    return self.gatedFullAttnProjected(ctx, x, fa, layer, offset, batch, seq_len, is_prefill, null, false);
-}
-
 pub fn gatedFullAttnProjected(
     self: *Trunk,
     ctx: *ForwardCtx,
@@ -993,14 +979,4 @@ pub fn perSlotBatchedAttn(
     errdefer _ = mlx.mlx_array_free(joined);
     try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 0, self.s));
     return joined;
-}
-
-/// Partial neox RoPE of `x [B,1,N,hd]` at positions `base + step*i` (the QSA rope cache's oracle).
-/// copied_from: engines/mlx/methods/rope.zig (`ropeAtPositions`).
-pub fn ropeAtPositions(self: *Trunk, x: mlx.mlx_array, rope_dims: c_int, theta: f32, base: f32, step: f32, n: c_int) !mlx.mlx_array {
-    const inv_freq = try self.ropeInvFreq(rope_dims, theta);
-    const cs = try self.ropeCosSinFromFreqs(rope_dims, inv_freq, base, step, n, mlx.mlx_array_dtype(x));
-    defer _ = mlx.mlx_array_free(cs.cos);
-    defer _ = mlx.mlx_array_free(cs.sin);
-    return self.ropeApplyCosSin(x, rope_dims, cs.cos, cs.sin);
 }

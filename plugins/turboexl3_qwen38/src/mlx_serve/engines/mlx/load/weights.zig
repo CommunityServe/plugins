@@ -34,61 +34,10 @@ pub fn structFields(comptime T: type) []const WeightField {
     };
 }
 
-/// Pre-transpose a plain-BF16 weight stored as `[out, in]` to `[in, out]` so
-/// `mlx_matmul(x, w_t)` lands the contraction over the input axis. Used by
-/// Unsloth Dynamic checkpoints that leave linear-attention projections
-/// unquantized while quantizing the rest. Caller owns the returned array.
-/// Exported for module-owned archs that load a dense weight outside
-/// `initMoeLayers`' owned-list machinery.
-pub fn transposeBf16WeightPub(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    return transposeBf16Weight(w, s);
-}
-
 pub const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;
-
-/// A depthwise conv weight is `[C, K, 1]` in MLX and `[C, 1, K]` in torch, and
-/// which one a checkpoint ships is a CONVERTER choice, not an arch property:
-/// mlx_lm's LFM2 conversion writes the MLX layout, while LiquidAI's own bf16
-/// repos (LFM2.5-1.2B-Instruct, LFM2.5-2.6B) ship the torch one straight out of
-/// the training code. This is the `patchProjLayout` class, with one mercy —
-/// reading it wrong is not a plausible-but-wrong number, it is a hard abort:
-/// mlx_conv1d solves in_channels off the LAST axis, so a [2048, 1, 3] weight at
-/// groups=2048 demands 6144 input channels and kills the load at warmup.
-///
-/// `K == 1` is the one shape the layouts share, and it is its own transpose.
-pub fn depthwiseConvNeedsTranspose(shape: []const c_int) bool {
-    if (shape.len != 3) return false;
-    return shape[1] == 1 and shape[2] > 1;
-}
 
 /// One-shot so a mixed-converter library says which layout it found, once.
 var depthwise_conv_layout_logged: bool = false;
-
-/// In-place: swap a torch-layout depthwise conv weight into the layout the
-/// forward's `mlx_conv1d` contracts against, recording the new array in `owned`
-/// so `Transformer.deinit` frees it.
-pub fn maybeTransposeDepthwiseConv(
-    w: *mlx.mlx_array,
-    owned: *std.ArrayList(mlx.mlx_array),
-    allocator: std.mem.Allocator,
-    s: mlx.mlx_stream,
-) !void {
-    if (w.ctx == null) return;
-    if (!depthwiseConvNeedsTranspose(mlx.getShape(w.*))) return;
-    const perm = [_]c_int{ 0, 2, 1 };
-    var w_t = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_transpose_axes(&w_t, w.*, &perm, 3, s));
-    // A transpose is a VIEW; the conv reads raw row-major bytes, so materialize.
-    var w_c = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_contiguous(&w_c, w_t, false, s));
-    _ = mlx.mlx_array_free(w_t);
-    w.* = w_c;
-    try owned.append(allocator, w_c);
-    if (!depthwise_conv_layout_logged) {
-        depthwise_conv_layout_logged = true;
-        log.info("[conv] depthwise weights are torch-layout [C, 1, K] — transposed at load\n", .{});
-    }
-}
 
 /// In-place: if `*sc` is null-ctx, we treat the matching `*w` as plain bf16.
 /// Replace `*w` with its pre-transposed `[in, out]` form and record the new
@@ -136,22 +85,6 @@ pub fn groupedNormView(weights: *const Weights, name: []const u8, hc: u32, hidde
     try mlx.check(mlx.mlx_reshape(&view, raw, &shape, 2, s));
     try owned_bf16.append(allocator, view);
     return view;
-}
-
-/// A small table widened to f32 (and transposed for `x @ t`) once, at load.
-pub fn f32Table(w: mlx.mlx_array, transpose: bool, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !mlx.mlx_array {
-    var t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(t);
-    if (transpose) try mlx.check(mlx.mlx_transpose(&t, w, s)) else _ = mlx.mlx_array_set(&t, w);
-    var f = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_astype(&f, t, .float32, s));
-    const c = try materializedOwnedCopy(s, f);
-    _ = mlx.mlx_array_free(f);
-    errdefer _ = mlx.mlx_array_free(c);
-    try mlx.check(mlx.mlx_array_eval(c));
-    try owned.append(allocator, c);
-    return c;
 }
 
 /// Multiply a projection by a scalar: scales+biases of an affine weight, or
@@ -314,55 +247,12 @@ pub fn getLayerWeightOpt(weights: *const Weights, buf: *[256]u8, prefix: []const
     return weights.get(name);
 }
 
-/// `getLayerWeight` for `<base>.<rest>`, formatted into its own buffer.
-/// `<prefix>.layers.<li>`: the name base of one trunk layer.
-pub fn layerBase(buf: *[96]u8, prefix: []const u8, li: u32) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}.layers.{d}", .{ prefix, li }) catch unreachable;
-}
-
-pub fn getWeightAt(weights: *const Weights, buf: *[256]u8, base: []const u8, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
-    const name = std.fmt.bufPrint(buf, "{s}.{s}", .{ base, suffix }) catch unreachable;
-    return weights.get(name) orelse {
-        log.err("MISSING WEIGHT: {s}\n", .{name});
-        return error.MissingWeight;
-    };
-}
-
-pub fn getWeightAtOpt(weights: *const Weights, buf: *[256]u8, base: []const u8, suffix: []const u8) ?mlx.mlx_array {
-    const name = std.fmt.bufPrint(buf, "{s}.{s}", .{ base, suffix }) catch unreachable;
-    return weights.get(name);
-}
-
-pub fn getLayerWeightAt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, base: []const u8, rest: []const u8) error{MissingWeight}!mlx.mlx_array {
-    var nb: [128]u8 = undefined;
-    return getLayerWeight(weights, buf, prefix, layer, std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, rest }) catch unreachable);
-}
-
-pub fn getLayerWeightAtOpt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, base: []const u8, rest: []const u8) ?mlx.mlx_array {
-    var nb: [128]u8 = undefined;
-    return getLayerWeightOpt(weights, buf, prefix, layer, std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, rest }) catch unreachable);
-}
-
-/// A quantized (or dense) projection `<base>.{weight,scales,biases}`.
-pub fn loadQW(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, base: []const u8) error{MissingWeight}!QW {
-    return .{
-        .w = try getLayerWeightAt(weights, buf, prefix, layer, base, "weight"),
-        .s = getLayerWeightAtOpt(weights, buf, prefix, layer, base, "scales") orelse mlx.mlx_array_new(),
-        .b = getLayerWeightAtOpt(weights, buf, prefix, layer, base, "biases") orelse mlx.mlx_array_new(),
-    };
-}
-
 pub fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "{s}.layers.{d}.{s}", .{ prefix, layer, suffix }) catch unreachable;
     return weights.get(name) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{name});
         return error.MissingWeight;
     };
-}
-
-/// "<container>.<proj>.<leaf>" for an expert bank, built into `buf`.
-fn expertLeaf(buf: []u8, container: []const u8, proj: []const u8, leaf: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}.{s}.{s}", .{ container, proj, leaf }) catch unreachable;
 }
 
 /// Build a "<container>.<leaf>" layer-weight suffix into `buf`. Used where the
@@ -400,24 +290,8 @@ pub fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, 
     return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
 }
 
-/// Optional-typed variant for fields stored as `?mlx_array` (e.g. PLE projections).
-/// Dense bf16 ⇒ `some(null-ctx)` so call sites that unwrap with `.?` still get a
-/// valid (empty) array that qmatmul reads as bf16. Quantized ⇒ optional fetch.
-pub fn getLayerScaleOrEmptyOpt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, quant_bits: u32) ?mlx.mlx_array {
-    if (quant_bits == 0) return mlx.mlx_array_new();
-    return getLayerWeightOpt(weights, buf, prefix, layer, suffix);
-}
-
 pub const scalarOf = @import("../../../mlx/array.zig").scalarOf;
 
 pub const bf16Scalar = @import("../../../mlx/array.zig").bf16Scalar;
-
-pub fn addOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const one = bf16Scalar(1.0, s);
-    defer _ = mlx.mlx_array_free(one);
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&result, one, arr, s));
-    return result;
-}
 
 // ── tests ──

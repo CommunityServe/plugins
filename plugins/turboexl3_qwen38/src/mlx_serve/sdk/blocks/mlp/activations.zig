@@ -17,17 +17,6 @@ const tableGateMul = @import("fused_activations.zig").tableGateMul;
 
 // ── Activation functions ──
 
-pub fn reluSquaredOp(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const zero = bf16Scalar(0.0, s);
-    defer _ = mlx.mlx_array_free(zero);
-    var relu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(relu);
-    try mlx.check(mlx.mlx_maximum(&relu, x, zero, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_square(&out, relu, s));
-    return out;
-}
-
 /// gpt_oss clamped SwiGLU (mlx-lm `gpt_oss.swiglu`):
 ///
 ///     x_glu    = clip(gate, max=limit)        // asymmetric — no lower clip
@@ -60,63 +49,6 @@ pub fn clampedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array, 
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_multiply(&out, act, u, s));
-    return out;
-}
-
-pub fn gptOssSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array, limit: f32, alpha: f32) !mlx.mlx_array {
-    const dt = mlx.mlx_array_dtype(gate);
-
-    const lim_f = mlx.mlx_array_new_float(limit);
-    defer _ = mlx.mlx_array_free(lim_f);
-    var lim = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(lim);
-    try mlx.check(mlx.mlx_astype(&lim, lim_f, dt, s));
-
-    const neg_lim_f = mlx.mlx_array_new_float(-limit);
-    defer _ = mlx.mlx_array_free(neg_lim_f);
-    var neg_lim = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(neg_lim);
-    try mlx.check(mlx.mlx_astype(&neg_lim, neg_lim_f, dt, s));
-
-    const alpha_f = mlx.mlx_array_new_float(alpha);
-    defer _ = mlx.mlx_array_free(alpha_f);
-    var alpha_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(alpha_a);
-    try mlx.check(mlx.mlx_astype(&alpha_a, alpha_f, dt, s));
-
-    const one_f = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one_f);
-    var one = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(one);
-    try mlx.check(mlx.mlx_astype(&one, one_f, dt, s));
-
-    // x_glu = min(gate, limit) — upper clip only.
-    var x_glu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_glu);
-    try mlx.check(mlx.mlx_minimum(&x_glu, gate, lim, s));
-
-    // x_linear = clip(up, -limit, +limit)
-    var x_lin = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_lin);
-    try mlx.check(mlx.mlx_clip(&x_lin, up, neg_lim, lim, s));
-
-    var scaled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(scaled);
-    try mlx.check(mlx.mlx_multiply(&scaled, x_glu, alpha_a, s));
-    var sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sig);
-    try mlx.check(mlx.mlx_sigmoid(&sig, scaled, s));
-
-    var out_glu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out_glu);
-    try mlx.check(mlx.mlx_multiply(&out_glu, x_glu, sig, s));
-
-    var lin_plus1 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(lin_plus1);
-    try mlx.check(mlx.mlx_add(&lin_plus1, x_lin, one, s));
-
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_multiply(&out, out_glu, lin_plus1, s));
     return out;
 }
 

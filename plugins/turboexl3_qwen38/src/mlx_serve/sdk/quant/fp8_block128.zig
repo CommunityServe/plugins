@@ -229,19 +229,3 @@ pub const table: abi.QuantTable = .{
 // ── tests ──
 
 const testing = std.testing;
-
-fn codesOf(r: std.Random, out: []u8) void {
-    for (out) |*c| c.* = while (true) {
-        const v = r.int(u8);
-        if (v & 0x7f != 0x7f) break v;
-    };
-}
-
-fn bf16Of(r: std.Random, out: []u16) void {
-    for (out) |*b| b.* = plan.f32ToBf16(1.5 * r.floatNorm(f32));
-}
-
-fn evalBf16(y: mlx.mlx_array) ![]const u16 {
-    try mlx.check(mlx.mlx_array_eval(y));
-    return (mlx.mlx_array_data_bfloat16(y) orelse return error.NoData)[0..mlx.mlx_array_size(y)];
-}

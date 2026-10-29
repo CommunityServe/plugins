@@ -209,14 +209,5 @@ const ev_plan = @import("ev_plan.zig");
 const Transformer = @import("../../transformer.zig").Transformer;
 const Qwen4Trunk = @import("../../../../plugins/qwen4_exp/trunk.zig").Trunk;
 
-/// A planning state after the warm-up at cap 3: single-chunk cells at w2 and w3 (two-chunk rounds never feed the
-/// table), w2 the cheaper per token.
-fn measuredTable(t: *round_cost.Table, kv: u32) void {
-    for (0..round_cost.MIN_SAMPLES) |_| {
-        _ = t.observe(2, kv, 26.9, 2.40, true, false);
-        _ = t.observe(3, kv, 30.4, 2.55, true, false);
-    }
-}
-
 /// Per-index conditional acceptance at cap 3.
 const fix_accept = [_]f32{ 0.88, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85 };

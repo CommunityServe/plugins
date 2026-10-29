@@ -156,17 +156,3 @@ pub fn ssmGroupRelease(self: *Trunk, ctx: *ForwardCtx) !void {
 pub fn ssmGroupDrop(self: *Trunk, entries: []SSMCacheEntry) void {
     group.ssmGroupDropMember(&self.ssm_group, self.s, entries) catch {};
 }
-
-/// One layer's per-slot recurrent state merged into a batch-N entry.
-/// copied_from: engines/mlx/ssm/group.zig (`mergeSsmAcrossSlots`).
-pub fn mergeSsmAcrossSlots(self: *Trunk, ctxs: []const *ForwardCtx, layer: usize) !SSMCacheEntry {
-    const lw = &self.moe_layers[layer];
-    return group.ssmMergeLayer(self.s, ctxs, layer, .{ .linear = lw.is_linear, .ple = lw.ple != null });
-}
-
-/// Writes the batch-N entry `m` back to each slot's own entry at `layer`.
-/// copied_from: engines/mlx/ssm/group.zig (`splitSsmToSlots`).
-pub fn splitSsmToSlots(self: *Trunk, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize) !void {
-    const lw = &self.moe_layers[layer];
-    try group.ssmSplitLayer(self.s, m, ctxs, layer, .{ .linear = lw.is_linear, .ple = lw.ple != null });
-}

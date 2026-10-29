@@ -563,7 +563,3 @@ var gate_gemv_said = false;
 // ── tests ──
 
 const testing = std.testing;
-
-fn testFacts() AttnInFacts {
-    return .{ .output_gate = true, .batch = 1, .prefill = true, .rows = 512, .plain_rope = true, .head_dim = 256, .rope_dims = 64, .norms = true, .linears = true, .dtype_ok = true };
-}

@@ -22,16 +22,6 @@ const MtpEvCosts = @import("ev_costs.zig").MtpEvCosts;
 const init = @import("../../generate/generator.zig").Generator.init;
 
 
-/// Write the model's round-cost table to disk when this request folded
-/// new samples (request end; inference thread, so no lock).
-pub fn persistRoundCost(self: *Generator) void {
-    const t = &self.xfm.round_cost;
-    const folded = round_cost.totalFolded(t);
-    if (folded == t.stored_at) return;
-    round_cost.storeCached(self.timer.io, self.xfm.round_cost_key_buf[0..self.xfm.round_cost_key_len], t);
-    t.stored_at = folded;
-}
-
 /// KV length the next verify forward reads.
 pub fn mtpKvLen(self: *const Generator) u32 {
     return @intCast(self.prompt_ids_owned.len + self.generated_ids.items.len);
@@ -97,11 +87,6 @@ pub fn mtpDepthCapFree(configured: u32) u32 {
     return depth_bounds.liftCap(free, depth_bounds.active, mtp_mod.MAX_DEPTH);
 }
 
-/// Same, with the chip string injected (tests, and the one live caller).
-pub fn mtpDepthCapForProfileChip(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile, chip: []const u8) u32 {
-    return mtpDepthCapResolved(configured, adaptive, profile, chip);
-}
-
 /// Same, with the machine's MEASURED verify ladder when one exists.
 ///
 /// The per-silicon rows exist because the EV controller cannot see time:
@@ -139,18 +124,6 @@ pub fn resolveMtpDepthCapForProfile(configured: u32, profile: mtp_mod.MtpCostPro
     return mtpDepthCapForProfile(configured, true, profile);
 }
 
-/// Legacy q8 boolean selector retained for source compatibility.
-pub fn mtpDepthCapFor(configured: u32, adaptive: bool, nax_profile: bool) u32 {
-    const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
-    return mtpDepthCapForProfile(configured, adaptive, profile);
-}
-
-/// Legacy q8 boolean selector retained for source compatibility.
-pub fn resolveMtpDepthCap(configured: u32, nax_profile: bool) u32 {
-    const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
-    return resolveMtpDepthCapForProfile(configured, profile);
-}
-
 /// Expected committed tokens for an m-deep round: the always-committed t1
 /// plus the acceptance chain sum (draft k lands iff drafts 0..k all land).
 pub fn mtpEvExpectedTokens(a: []const f32, m: u32) f32 {
@@ -169,39 +142,11 @@ pub fn mtpEvMarginalCostAt(costs: MtpEvCosts, k: u32, kv_len: u32) f32 {
     return mtpEvMarginalCost(costs, k);
 }
 
-/// Round cost in verify-base units (piecewise per-position marginals).
-pub fn mtpEvRoundCost(costs: MtpEvCosts, m: u32, with_sync: bool) f32 {
-    return mtpEvRoundCostAt(costs, m, with_sync, 0);
-}
-
 pub fn mtpEvRoundCostAt(costs: MtpEvCosts, m: u32, with_sync: bool, kv_len: u32) f32 {
     var c: f32 = 1.0 + (if (with_sync) costs.sync else 0.0);
     var k: u32 = 1;
     while (k <= m) : (k += 1) c += mtpEvMarginalCostAt(costs, k, kv_len);
     return c;
-}
-
-/// Pure EV plan: pick (m_lo, m_hi, tau) maximizing expected tok/round-cost.
-/// `m_lo_max` damps the base-depth climb (hysteresis — the caller passes
-/// last round's m_lo + 1); demotions are never damped.
-///  1. m_lo = argmax over single-chunk depths of E(m)/T(m).
-///  2. m_hi = deepest position whose marginal chain still pays under FULL
-///     confidence in chunk A (the best case the gate can certify).
-///  3. tau: extend when the confidence-implied chain beats the stop rate
-///     on the margin — c*S/dt > r  =>  tau = r*dt/S.
-/// There is deliberately NO separate "is the sync worth it" gate: tau
-/// already keeps low-confidence rounds single-chunk, the horizon check
-/// collapses m_hi on cold EMAs (killing the sync entirely), and a
-/// prior-weighted expected-gain gate measurably starves exploration —
-/// deep indices are only observed when extension fires, so a gate fed by
-/// their priors blocks the first trial forever (live: ext_rounds=0 on
-/// pure echo).
-pub fn mtpEvPlanFor(a: []const f32, cap_in: u32, costs: MtpEvCosts, m_lo_max: u32) MtpRoundPlan {
-    return mtpEvPlanForAt(a, cap_in, costs, m_lo_max, 0);
-}
-
-pub fn mtpEvPlanForAt(a: []const f32, cap_in: u32, costs: MtpEvCosts, m_lo_max: u32, kv_len: u32) MtpRoundPlan {
-    return mtpEvPlanSrc(a, cap_in, MtpCostSource.init(costs, kv_len, null), m_lo_max);
 }
 
 /// Smallest marginal the table may report, in floor units: a measured
@@ -416,57 +361,3 @@ pub fn mtpChainLogConf(confs: []const f32) f32 {
 
 // ── tests ──
 
-
-pub fn mtpEvTestGenerator() Generator {
-    var g: Generator = undefined;
-    g.mtp_depth = Generator.MTP_ADAPTIVE_DEFAULT_CAP;
-    g.mtp_depth_current = 1;
-    g.mtp_window_drafted = @splat(0);
-    g.mtp_window_accepted = @splat(0);
-    g.mtp_window_idx = 0;
-    g.mtp_rounds_since_switch = 0;
-    g.mtp_promote_cooldown = 0;
-    g.mtp_ev_accept = @splat(Generator.MTP_EV_PRIOR);
-    g.mtp_ev_rounds = Generator.MTP_EV_WARMUP_ROUNDS;
-    g.mtp_ev_m_lo_prev = 1;
-    g.mtp_ev_costs = Generator.MTP_EV_DEFAULT_COSTS;
-    g.spec_disabled_runtime = false;
-    return g;
-}
-
-pub fn mtpBoundsPlanFixture(xfm: *Transformer, prompt: []u32, depth: u32) Generator {
-    xfm.config.model_type = "qwen4_exp";
-    xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
-    for (0..round_cost.MIN_SAMPLES) |_| {
-        _ = xfm.round_cost.observe(2, 1000, 29.0, 2.6, true, false);
-        _ = xfm.round_cost.observe(3, 1000, 31.0, 2.9, true, false);
-        _ = xfm.round_cost.observe(4, 1000, 36.0, 3.1, true, false);
-        _ = xfm.round_cost.observe(5, 1000, 42.0, 3.5, true, false);
-    }
-    return Generator{
-        .xfm = xfm,
-        .ctx = undefined,
-        .tok = undefined,
-        .next_token_id = 0,
-        .step = 0,
-        .max_tokens = 1,
-        .sampling = .{ .temperature = 0 },
-        .prompt_tokens = 0,
-        .completion_tokens = 0,
-        .finish_reason = "length",
-        .done = false,
-        .eos_token_ids = &.{},
-        .generated_ids = .empty,
-        .timeout_ns = 0,
-        .timer = io_util.Stopwatch.init(testing.io),
-        .last_hidden = .{ .ctx = null },
-        .has_last_hidden = false,
-        .prompt_ids_owned = prompt,
-        .mtp_depth = depth,
-        .mtp_depth_free = depth,
-        .mtp_ev_rounds = 64,
-        .mtp_ev_accept = .{ 0.92, 0.9, 0.88, 0.86, 0.84, 0.8, 0.8, 0.8 },
-        .mtp_ev_m_lo_prev = 4,
-        .spec_cost_solo = false,
-    };
-}

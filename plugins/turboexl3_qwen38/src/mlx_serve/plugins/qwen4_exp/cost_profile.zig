@@ -125,14 +125,6 @@ fn qwen4MixedModelPacksMatch(target: *const Trunk) bool {
     return true;
 }
 
-/// Live resolver for the qwen4_exp head: validates the runtime fingerprint
-/// the G17 surface was measured on — uniform affine-4/gs-64 config and both
-/// head fc packs at that width (K derived from the scales, so no input-dim
-/// formula is assumed).
-pub fn qwen4G17CostProfile(target: *const Trunk, trunk_kv: kv_quant.KVQuantConfig) MtpCostProfile {
-    return qwen4G17CostProfileForKv(target, trunk_kv);
-}
-
 /// Mixed-pack prices use the request's actual KV format, including a slot
 /// override. The original all-4-bit classifier retains its existing scope.
 pub fn qwen4G17CostProfileForKv(target: *const Trunk, kv: kv_quant.KVQuantConfig) MtpCostProfile {
