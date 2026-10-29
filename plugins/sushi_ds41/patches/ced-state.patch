@@ -1,0 +1,62 @@
+diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
+index 1442d98..6597979 100644
+--- a/src/sushi/dsv41/dsv41_model.zig
++++ b/src/sushi/dsv41/dsv41_model.zig
+@@ -3253,17 +3253,54 @@ fn cedRows(m: *const Model, st: *const State, L: usize, want: Want) ?usize {
+     return if (L > w) w else null;
+ }
+ 
++/// The CED decoder's first layer `li` over every row of the pass: only its compressor, whose ratio-1 rows (and index
++/// keys) every later layer reads.
++fn cedCompress(sc: *Scope, m: *Model, p: *Pass, li: usize) !void {
++    const ly = &m.layers[li];
++    const pa = try hcPre(sc, m, p.x, null, p.cpre, &ly.hc_attn, ly.attn_norm);
++    try compress(sc, m, p.st, li, pa.h, p.p0, none);
++}
++
++/// A prompt chunk whose CED decoder tail nothing reads (patches/ced-state.patch): another chunk wider than the window
++/// follows it before the prompt's last token. The tail would only fill the decoder's and DSpark's window rings
++/// (`window` rows), and the next chunk's tail overwrites those rows before any query reads one: its band starts at its
++/// own first row (`cedReplay`). So the chunk runs the encoder layers and the split layer's compressor over every row,
++/// then stops: no decoder, no DSpark rows, no head. The prompt's state is the full pass's, bit for bit.
++pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows, ahead: []const u32) !void {
++    const split = m.ced_split orelse return error.Dsv41NoCedSplit;
++    errdefer m.dropAhead();
++    errdefer m.dropEmbedAhead();
++    const st = try ensureState(m);
++    if (st.verify != null or ids.len <= m.cfg.window) return error.Dsv41NoCedSplit;
++    transient_peak.begin();
++    var pass = try beginPassWith(m, st, ids, st.n, span, vision);
++    defer pass.deinit(m.gpa);
++    pass.ahead = ahead;
++    aheadEmbed(m, ahead);
++    try prefetchEngram(m, &pass);
++    for (0..split) |li| try passLayer(m, &pass, li);
++    _ = try settleLast(m, &pass);
++    var sc = Scope.init(m.gpa, m.s);
++    defer sc.deinit();
++    try cedCompress(&sc, m, &pass, split);
++    var ev: std.ArrayList(A) = .empty;
++    defer ev.deinit(m.gpa);
++    try appendStateArrays(m.gpa, &ev, &st.layers[split]);
++    try evalAll(ev.items);
++    reportEngramWait(m, ids.len);
++    st.n = pass.p0 + ids.len;
++    transient_peak.end(.prefill_chunk, ids.len);
++}
++
+ /// CED: the decoder's first layer `li` compresses every row of the pass (the ratio-1 rows every later layer reads),
+ /// then the pass keeps its last `t` rows. The decoder writes no window rows before them, and none of its queries
+ /// reaches one: the replay's band starts at its first row.
+ fn cedReplay(m: *Model, p: *Pass, li: usize, t: usize) !void {
+     const gpa = m.gpa;
+     const L = p.ids.len;
+-    const ly = &m.layers[li];
+     var sc = Scope.init(gpa, m.s);
+     defer sc.deinit();
+-    const pa = try hcPre(&sc, m, p.x, null, p.cpre, &ly.hc_attn, ly.attn_norm);
+-    try compress(&sc, m, p.st, li, pa.h, p.p0, none);
++    try cedCompress(&sc, m, p, li);
+     const x = sc.out(try sc.slice(p.x, 0, L - t, L));
+     errdefer _ = mlx.mlx_array_free(x);
+     const pre = sc.out(try sc.slice(p.cpre, 0, L - t, L));
