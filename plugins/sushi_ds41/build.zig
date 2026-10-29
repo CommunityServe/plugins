@@ -21,9 +21,9 @@ pub fn build(b: *std.Build) void {
     const run = b.addRunArtifact(tests);
     b.step("claims", "Run the claim and parse tests").dependOn(&run.step);
 
-    // The Metal tests of src/attn_nax.zig and src/vision_key.zig, linked to an MLX the caller names (the server's own,
-    // so its pin), never to the dylib: `zig build gpu-test -Dmlx-lib=<dir holding libmlxc.dylib>`. The attention test
-    // skips without an M5.
+    // The Metal tests of src/attn_nax.zig, src/index_nax.zig and src/vision_key.zig, linked to an MLX the caller names
+    // (the server's own, so its pin), never to the dylib: `zig build gpu-test -Dmlx-lib=<dir holding libmlxc.dylib>`.
+    // The matmul2d tests skip without an M5.
     const mlx_lib = b.option([]const u8, "mlx-lib", "Directory holding the libmlxc.dylib the Metal test links") orelse return;
     const gpu = b.createModule(.{ .root_source_file = b.path("src/attn_nax_test.zig"), .target = root.resolved_target, .optimize = root.optimize, .link_libc = true });
     gpu.addLibraryPath(.{ .cwd_relative = mlx_lib });
