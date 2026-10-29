@@ -5,9 +5,9 @@
 //! DSpark's own part is the price of a verify, which grows with context and with every added row (each row's routed
 //! experts are their own GEMVs), so it is fitted from the rounds the request runs.
 const std = @import("std");
-const dflash_policy = @import("dflash_policy.zig");
-const spec_cost_gate = @import("spec_cost_gate.zig");
-const depth_bounds = @import("mtp_depth_bounds.zig");
+const dflash_policy = @import("../dflash_policy.zig");
+const spec_cost_gate = @import("../spec_cost_gate.zig");
+const depth_bounds = @import("../mtp_depth_bounds.zig");
 
 const max_rows = dflash_policy.MAX_ROWS;
 

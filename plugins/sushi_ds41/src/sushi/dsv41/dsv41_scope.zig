@@ -1,7 +1,7 @@
 //! An op scope for the deepseek_v41 forward: every intermediate an op chain makes is freed together,
 //! so a layer's graph is built with `try sc.op(...)` and no per-array bookkeeping.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("../mlx.zig");
 
 pub const A = mlx.mlx_array;
 pub const S = mlx.mlx_stream;

@@ -1,4 +1,5 @@
-sushi-ds41 vendors a slice of sushi (MIT, Theinruj Toranavikrai and David Dalcu) in src/sushi/, copied by
-scripts/sync-sushi.sh from commit 3fc47d8a460970b1e86b24de1cab3b0f2067bc72. The files model.zig, transformer.zig, status.zig,
-scheduler.zig, test_models.zig and tokenizer.zig there are this repo's own cut edges. It is built against the mlx-serve plugin kit.
-The sync then applies this repo's edits to the copy: patches/*.patch and the bill fix in the script itself.
+sushi-ds41 vendors a slice of sushi (MIT, Theinruj Toranavikrai and David Dalcu) in src/sushi/, in sushi's own folders
+(dsv41/, glm5/, exl3/), copied by scripts/sync-sushi.sh from commit cc1981df3a5def60cf35ea6b78e99656a2fa229e. The files
+model.zig, transformer.zig, status.zig, scheduler.zig, test_models.zig, tokenizer.zig, dflash.zig and dsv41/transient_peak.zig
+there are this repo's own cut edges. It is built against the mlx-serve plugin kit.
+The sync then applies this repo's edits to the copy: patches/*.patch.

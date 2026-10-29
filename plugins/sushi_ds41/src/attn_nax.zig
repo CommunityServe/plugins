@@ -1,12 +1,14 @@
 //! DeepSeek-V4.1's wide-span attention (`attnFused` of the vendored slice) on the M5 GPU's matrix units: the same
 //! one-pass kernel and tiling (16 heads a threadgroup, 8 simdgroups of D / 8 channels, tiles of 16 keys, online f32
 //! softmax seeded by the sink, P split into a bf16 high and low part), with both products through Metal 4's tensor ops
-//! (MetalPerformancePrimitives `matmul2d`, as MLX's `steel/attn/nax.h`). `dsv41_model.zig`'s `attention()` calls it
-//! first (patches/attn-nax.patch) and keeps `attnFused` where `fits` is false.
+//! (MetalPerformancePrimitives `matmul2d`, as MLX's `steel/attn/nax.h`). `dsv41_model.zig`'s `fusedHeads` calls it
+//! first (patches/attn-nax.patch), for picked rows as values (`attnFusedNax`) or read packed from the compressed store
+//! (`attnFusedNaxPacked`), and keeps `attnFused` / `attnFusedPacked` where `fits` is false.
 const std = @import("std");
 const mlx = @import("sushi/mlx.zig");
-const sc_mod = @import("sushi/dsv41_scope.zig");
-const kernels = @import("sushi/dsv41_kernels.zig");
+const sc_mod = @import("sushi/dsv41/dsv41_scope.zig");
+const kernels = @import("sushi/dsv41/dsv41_kernels.zig");
+const qat_mod = @import("sushi/dsv41/dsv41_qat.zig");
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -44,8 +46,9 @@ const HEADER =
 /// channels over the 16 keys. The keys of row l (its band of window rows from `wp`, then its K picked compressed rows,
 /// `topk` < 0 or >= nc skipped) are staged in threadgroup memory 16 at a time and shared by the 16 heads; each
 /// simdgroup scores its channels (partials summed in simdgroup order) and accumulates its slice of the output.
-/// meta = {wp, window, K, nc}.
-const SOURCE =
+/// meta = {wp, window, K, nc}. The tile load between `HEAD` and `TAIL` is the slice's own (`attnFused` and
+/// `attnFusedPacked`), so the tile holds the bytes those kernels stage.
+const HEAD =
     \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
     \\const ushort lane = thread_index_in_simdgroup;
     \\const int l = threadgroup_position_in_grid.y, h0 = threadgroup_position_in_grid.x * HB;
@@ -83,13 +86,10 @@ const SOURCE =
     \\  bool any = false;
     \\  for (int j = 0; j < KT; ++j) any = any || rsrc[j] != -1;
     \\  if (!any) continue;
-    \\  for (int i = int(tid); i < KT * (D / 8); i += NT) {
-    \\    const int j = i / (D / 8), cc = i % (D / 8), src = rsrc[j];
-    \\    metal::uint4 v = metal::uint4(0);
-    \\    if (src >= 0) v = ((const device metal::uint4*)(keys + size_t(src) * D))[cc];
-    \\    else if (src != -1) v = ((const device metal::uint4*)(comp + size_t(-2 - src) * D))[cc];
-    \\    ((threadgroup metal::uint4*)kt)[i] = v;
-    \\  }
+;
+
+/// The second half, from the staged tile on: the scores, the online softmax and P x V.
+const TAIL =
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  float s[8];
     \\  #pragma clang loop unroll(full)
@@ -159,7 +159,8 @@ const SOURCE =
     \\  }
 ;
 
-var def = kernels.Def{ .name = "sushi_ds41_attn_nax", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal" }, .outs = &.{"out"}, .source = SOURCE, .header = HEADER };
+var def = kernels.Def{ .name = "sushi_ds41_attn_nax", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal" }, .outs = &.{"out"}, .source = HEAD ++ kernels.ATTN_FUSED_LOAD_ROWS ++ TAIL, .header = HEADER };
+var packed_def = kernels.Def{ .name = "sushi_ds41_attn_nax_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal" }, .outs = &.{"out"}, .source = HEAD ++ kernels.ATTN_FUSED_LOAD_FP4 ++ TAIL, .header = qat_mod.PACK_HEADER ++ "\n" ++ HEADER };
 
 const hb = 16;
 const nsg = 8;
@@ -178,20 +179,56 @@ pub fn fits(h: usize, d: usize, dt: mlx.mlx_dtype) bool {
 /// (wp + i - window, wp + i]) and the compressed rows `comp_rows` it picked (`topk` `[L, K]`), on the matrix units.
 /// `fits(H, D, dtype(q))` must hold.
 pub fn attnFusedNax(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, comp_rows: A, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
+    const dt = mlx.mlx_array_dtype(q);
+    const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
+    const comp = if (K > 0) try sc.astype(comp_rows, dt) else try sc.astype(keys_w, dt);
+    const picks = if (K > 0) try sc.astype(topk, .int32) else sc_mod.none;
+    return launch(sc, &def, sink, q, keys_w, &.{comp}, wp, window, K, if (K > 0) dim(comp_rows, 0) else 0, picks, scale, out_dt, null);
+}
+
+/// `attnFusedNax` with the picked rows read where the compressed store keeps them, as `attnFusedPacked` takes them:
+/// `codes` `[rows, D / 2]` and `scales` `[rows, D / group]` (`qat_mod.packFp4`'s form), `topk` the ids into them.
+/// The tile load is `attnFusedPacked`'s, so the heads are the bytes `attnFusedNax` gives for the unpacked rows.
+pub fn attnFusedNaxPacked(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, codes: A, scales: A, mode: qat_mod.Qat, group: usize, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
+    std.debug.assert(group % 8 == 0 and dim(codes, 1) * 2 == dim(q, 2));
+    return launch(sc, &packed_def, sink, q, keys_w, &.{ codes, scales }, wp, window, dim(topk, 1), dim(codes, 0), try sc.astype(topk, .int32), scale, out_dt, .{ .group = ci(group), .mode = qat_mod.packMode(mode) });
+}
+
+/// `kernels.launch`'s template-integer type (private to the slice).
+const Tmpl = std.meta.Child(@typeInfo(@TypeOf(kernels.launch)).@"fn".param_types[6].?);
+
+/// The packed store's template values: the scale group and `qat_mod.packMode` of its format.
+const Fp4 = struct { group: c_int, mode: c_int };
+
+/// `comp`: the picked rows' arrays, as `d` takes them; `picks`: `topk` as int32, none without picks; `fp4` for the
+/// packed kernel.
+fn launch(sc: *Scope, d: *kernels.Def, sink: A, q: A, keys_w: A, comp: []const A, wp: usize, window: usize, K: usize, nc: usize, picks: A, scale: f32, out_dt: mlx.mlx_dtype, fp4: ?Fp4) !A {
     const L = dim(q, 0);
     const H = dim(q, 1);
     const D = dim(q, 2);
     const dt = mlx.mlx_array_dtype(q);
-    const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
-    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), if (K > 0) ci(dim(comp_rows, 0)) else 0 };
+    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), ci(nc) };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
-    const keys = try sc.astype(keys_w, dt);
-    const comp = if (K > 0) try sc.astype(comp_rows, dt) else keys;
-    const picks = if (K > 0) try sc.astype(topk, .int32) else meta;
+    var ins: [8]A = undefined;
+    ins[0] = q;
+    ins[1] = try sc.astype(keys_w, dt);
+    @memcpy(ins[2..][0..comp.len], comp);
+    var n = 2 + comp.len;
+    for ([_]A{ if (picks.ctx != null) picks else meta, sink, meta, try kernels.f32Const(sc, &.{scale}) }) |a| {
+        ins[n] = a;
+        n += 1;
+    }
+    var tmpl: [6]Tmpl = undefined;
+    const base = [_]Tmpl{ .{ .name = "D", .v = ci(D) }, .{ .name = "HB", .v = hb }, .{ .name = "NSG", .v = nsg }, .{ .name = "KT", .v = kt } };
+    @memcpy(tmpl[0..base.len], &base);
+    var nt: usize = base.len;
+    if (fp4) |f| {
+        tmpl[4] = .{ .name = "G", .v = f.group };
+        tmpl[5] = .{ .name = "MODE", .v = f.mode };
+        nt = 6;
+    }
     var o: [1]A = undefined;
-    try kernels.launch(sc, &def, &.{ q, keys, comp, picks, sink, meta, try kernels.f32Const(sc, &.{scale}) }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = out_dt }}, .{ H / hb * nsg * 32, L, 1 }, .{ nsg * 32, 1, 1 }, &.{
-        .{ .name = "D", .v = ci(D) }, .{ .name = "HB", .v = hb }, .{ .name = "NSG", .v = nsg }, .{ .name = "KT", .v = kt },
-    }, &.{ .{ .name = "T", .dt = dt }, .{ .name = "OT", .dt = out_dt } }, &o);
+    try kernels.launch(sc, d, ins[0..n], &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = out_dt }}, .{ H / hb * nsg * 32, L, 1 }, .{ nsg * 32, 1, 1 }, tmpl[0..nt], &.{ .{ .name = "T", .dt = dt }, .{ .name = "OT", .dt = out_dt } }, &o);
     return o[0];
 }
 

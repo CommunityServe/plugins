@@ -4,7 +4,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const expert_io = @import("expert_io.zig");
-const dsv41_config = @import("dsv41_config.zig");
+const dsv41_config = @import("dsv41/dsv41_config.zig");
 
 /// The fields the vision tower reads of sushi's `ModelConfig`.
 pub const ModelConfig = struct {
@@ -54,6 +54,13 @@ pub const Weights = struct {
             _ = mlx.mlx_array_free(removed.value);
             self.allocator.free(removed.key);
         }
+    }
+
+    /// Takes `name` out of the map: the caller owns the array, or null when it is absent.
+    pub fn take(self: *Weights, name: []const u8) ?mlx.mlx_array {
+        const removed = self.map.fetchRemove(name) orelse return null;
+        self.allocator.free(removed.key);
+        return removed.value;
     }
 
     pub fn count(self: *const Weights) u32 {

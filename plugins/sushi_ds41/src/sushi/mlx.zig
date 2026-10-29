@@ -316,7 +316,7 @@ pub extern "c" fn mlx_conv3d(res: *mlx_array, input: mlx_array, weight: mlx_arra
 pub extern "c" fn mlx_conv_transpose1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, output_padding: c_int, groups: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_conv_transpose2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, output_padding_0: c_int, output_padding_1: c_int, groups: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_conv_transpose3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, output_padding_0: c_int, output_padding_1: c_int, output_padding_2: c_int, groups: c_int, s: mlx_stream) c_int;
-// Seed-exact noise for diffusion latents (FLUX): pair with mlx_random_key(seed).
+// Seed-exact normal noise: pair with mlx_random_key(seed).
 pub extern "c" fn mlx_random_normal(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, loc: f32, scale: f32, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_argpartition_axis(res: *mlx_array, a: mlx_array, kth: c_int, axis: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_take_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
@@ -408,20 +408,14 @@ pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
 pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_seed(seed: u64) c_int;
 pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
-// Uniform random integers in [low, high) — DiffusionGemma canvas init/renoise.
+// Uniform random integers in [low, high).
 pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 
-// ── Diffusion sampler ops ──
-pub extern "c" fn mlx_cummax(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
+// ── Reductions and elementwise ops ──
 pub extern "c" fn mlx_logsumexp_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_all(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_isfinite(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
-pub extern "c" fn mlx_clip(res: *mlx_array, a: mlx_array, a_min: mlx_array, a_max: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_contiguous(res: *mlx_array, a: mlx_array, allow_col_major: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_mean(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_mean_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
-pub extern "c" fn mlx_std(res: *mlx_array, a: mlx_array, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
-pub extern "c" fn mlx_std_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_max(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int;
 
@@ -438,6 +432,11 @@ pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;
 pub extern "c" fn mlx_get_cache_memory(res: *usize) c_int;
 pub extern "c" fn mlx_get_peak_memory(res: *usize) c_int;
 pub extern "c" fn mlx_reset_peak_memory() c_int;
+// Patched in by patches/mlx-transient-cap.patch (not upstream MLX).
+pub extern "c" fn mlx_set_transient_limit(res: *usize, limit: usize) c_int;
+pub extern "c" fn mlx_get_external_memory(res: *usize) c_int;
+pub extern "c" fn mlx_get_transient_peak(res: *usize) c_int;
+pub extern "c" fn mlx_reset_transient_peak() c_int;
 
 // ── Device info ──
 pub const mlx_device_info = extern struct { ctx: ?*anyopaque = null };
@@ -468,9 +467,20 @@ pub fn noGpuBackend() bool {
     if (no_gpu_backend_cache == null) {
         var avail: bool = false;
         _ = mlx_metal_is_available(&avail);
-        no_gpu_backend_cache = !avail;
+        no_gpu_backend_cache = !avail or (builtin.is_test and testNoGpuEnv());
     }
     return no_gpu_backend_cache.?;
+}
+
+/// A test build reads `SUSHI_TEST_NO_GPU` (empty or a leading `0` is off) as a machine whose MLX has no Metal backend.
+fn testNoGpuEnv() bool {
+    const v = std.c.getenv("SUSHI_TEST_NO_GPU") orelse return false;
+    return v[0] != 0 and v[0] != '0';
+}
+
+/// The first line of a test that needs Metal kernels: it skips where MLX has no GPU backend.
+pub fn requireGpu() !void {
+    if (noGpuBackend()) return error.SkipZigTest;
 }
 
 var test_error_handler_installed = std.atomic.Value(bool).init(false);
@@ -688,6 +698,7 @@ pub fn check(ret: c_int) !void {
 pub fn maxRecommendedWorkingSet() usize {
     var dev = mlx_device{ .ctx = null };
     _ = mlx_get_default_device(&dev);
+    defer _ = mlx_device_free(dev);
     var info = mlx_device_info_new();
     defer _ = mlx_device_info_free(info);
     if (mlx_device_info_get(&info, dev) != 0) return 0;
@@ -723,6 +734,38 @@ fn lockErrBuf() void {
 }
 fn unlockErrBuf() void {
     _ = std.c.pthread_mutex_unlock(&mlx_error_mtx);
+}
+
+/// Opens the message of an allocation the transient cap refused.
+pub const transient_cap_tag = "[mlx-transient-cap]";
+
+pub fn mlxErrorIsTransientCap(msg: []const u8) bool {
+    return std.mem.startsWith(u8, msg, transient_cap_tag);
+}
+
+/// Cap on the bytes MLX allocates itself, imported buffers left out; 0 turns it off. Returns the previous cap.
+pub fn setTransientLimit(limit: usize) usize {
+    var prev: usize = 0;
+    _ = mlx_set_transient_limit(&prev, limit);
+    return prev;
+}
+
+/// Active bytes that are imported (no-copy) buffers.
+pub fn externalMemory() usize {
+    var n: usize = 0;
+    _ = mlx_get_external_memory(&n);
+    return n;
+}
+
+/// High-water of MLX's own active bytes since `resetTransientPeak`.
+pub fn transientPeak() usize {
+    var n: usize = 0;
+    _ = mlx_get_transient_peak(&n);
+    return n;
+}
+
+pub fn resetTransientPeak() void {
+    _ = mlx_reset_transient_peak();
 }
 
 /// Memory-class latched messages become a memory 503 (`[METAL] ... Insufficient Memory`,
@@ -775,7 +818,9 @@ pub fn peekErrorName() ?[]const u8 {
     if (!mlx_error_latched.load(.acquire)) return null;
     lockErrBuf();
     defer unlockErrBuf();
-    return if (mlxErrorIsMemory(mlx_error_buf[0..mlx_error_len])) "OutOfMemory" else "MlxFailure";
+    const msg = mlx_error_buf[0..mlx_error_len];
+    if (mlxErrorIsTransientCap(msg)) return "TransientCapExceeded";
+    return if (mlxErrorIsMemory(msg)) "OutOfMemory" else "MlxFailure";
 }
 
 /// Consume the latched message into `buf` (copied), clearing the latch.
@@ -874,11 +919,13 @@ const FaultSite = struct {
 var fault_chunk = FaultSite{ .env = "SUSHI_MLX_FAULT_CHUNK", .msg = FAULT_CHUNK_MSG };
 var fault_step = FaultSite{ .env = "SUSHI_MLX_FAULT_STEP", .msg = FAULT_STEP_MSG };
 
-/// Consume a latched failure: `error.OutOfMemory` for the memory class, else `error.MlxFailure`.
+/// Consume a latched failure: `error.TransientCapExceeded` for a refused allocation, `error.OutOfMemory`
+/// for the memory class, else `error.MlxFailure`.
 fn consumeLatch() !void {
     if (!mlx_error_latched.load(.acquire)) return;
     var buf: [512]u8 = undefined;
     const msg = takeError(&buf) orelse return;
+    if (mlxErrorIsTransientCap(msg)) return error.TransientCapExceeded;
     if (mlxErrorIsMemory(msg)) return error.OutOfMemory;
     return error.MlxFailure;
 }
@@ -890,6 +937,7 @@ pub fn settledErrorName(err: anyerror) []const u8 {
     if (err != error.MlxError) return @errorName(err);
     var buf: [512]u8 = undefined;
     const msg = takeError(&buf) orelse return @errorName(err);
+    if (mlxErrorIsTransientCap(msg)) return "TransientCapExceeded";
     return if (mlxErrorIsMemory(msg)) "OutOfMemory" else @errorName(err);
 }
 
@@ -1080,6 +1128,31 @@ test "settledErrorName leaves other errors and an unlatched MlxError alone" {
     try t.expect(errorPending());
 }
 
+test "a transient-cap refusal is its own failure, at every checkpoint, and is consumed once" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    const refusal = transient_cap_tag ++ " Allocating 4096 bytes needs 8192 bytes of transient memory; the limit is 4096.";
+    try t.expect(!mlxErrorIsMemory(refusal));
+    try t.expect(mlxErrorIsTransientCap(refusal));
+    try t.expect(!mlxErrorIsTransientCap("[METAL] Insufficient Memory"));
+
+    latchErrorForTest(refusal);
+    try t.expectEqualStrings("TransientCapExceeded", peekErrorName().?);
+    try t.expectError(error.TransientCapExceeded, checkError());
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest(refusal);
+    try t.expectError(error.TransientCapExceeded, checkErrorDecode());
+    try t.expect(!errorPending());
+
+    latchErrorForTest(refusal);
+    try t.expectEqualStrings("TransientCapExceeded", settledErrorName(error.MlxError));
+    try t.expect(!errorPending());
+}
+
 test "takeErrorIf leaves unrelated errors latched" {
     var buf: [512]u8 = undefined;
     _ = takeError(&buf);
@@ -1090,4 +1163,190 @@ test "takeErrorIf leaves unrelated errors latched" {
     latchErrorForTest("exceeds maximum allowed threads per threadgroup");
     try std.testing.expect(takeErrorIf("maximum allowed threads per threadgroup"));
     try std.testing.expect(!errorPending());
+}
+
+const cap_test_mib: usize = 1 << 20;
+const cap_test_region_len: usize = 64 * 16384;
+
+fn capTestUnmap(data: ?*anyopaque) callconv(.c) void {
+    _ = std.c.munmap(@ptrCast(@alignCast(data.?)), cap_test_region_len);
+}
+
+fn capTestTransient() usize {
+    var active: usize = 0;
+    _ = mlx_get_active_memory(&active);
+    return active - externalMemory();
+}
+
+fn capTestCache() usize {
+    var cache: usize = 0;
+    _ = mlx_get_cache_memory(&cache);
+    return cache;
+}
+
+/// A lazy float32 array of `mib` MiB; its buffer is allocated at eval.
+fn capTestOnes(mib: usize, s: mlx_stream) !mlx_array {
+    const shape = [_]c_int{@intCast(mib * cap_test_mib / 4)};
+    var out = mlx_array_new();
+    errdefer _ = mlx_array_free(out);
+    try check(mlx_ones(&out, &shape, 1, .float32, s));
+    return out;
+}
+
+/// Frees an evaluated array and waits until its buffer is back in the pool.
+fn capTestRelease(arr: mlx_array, s: mlx_stream) void {
+    _ = mlx_array_free(arr);
+    _ = mlx_synchronize(s);
+}
+
+/// Leaves exactly one `mib`-MiB buffer parked in the pool.
+fn capTestPool(mib: usize, s: mlx_stream) !void {
+    _ = mlx_clear_cache();
+    const arr = try capTestOnes(mib, s);
+    try check(mlx_array_eval(arr));
+    capTestRelease(arr, s);
+}
+
+test "the transient cap: external bytes follow a no-copy import and nothing else" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const before = externalMemory();
+
+    const mapped = std.c.mmap(null, cap_test_region_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    try t.expect(mapped != std.c.MAP_FAILED);
+    const shape = [_]c_int{@intCast(cap_test_region_len)};
+    const arr = mlx_array_new_data_managed(mapped, &shape, 1, .uint8, capTestUnmap);
+    try t.expect(arr.ctx != null);
+    try check(mlx_array_eval(arr));
+    try t.expect(mlx_array_data_uint8(arr) == @as(?[*]const u8, @ptrCast(mapped)));
+    try t.expectEqual(before + cap_test_region_len, externalMemory());
+
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    const own = try capTestOnes(2, s);
+    try check(mlx_array_eval(own));
+    try t.expectEqual(before + cap_test_region_len, externalMemory());
+    capTestRelease(own, s);
+
+    _ = mlx_array_free(arr);
+    _ = mlx_synchronize(s);
+    var tries: usize = 0;
+    while (externalMemory() != before and tries < 100) : (tries += 1) {
+        var ts = std.c.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    try t.expectEqual(before, externalMemory());
+}
+
+test "the transient cap trims the pool first, then refuses with the tagged error" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    defer _ = setTransientLimit(0);
+
+    // Four pooled MiB, then a two-MiB request that cannot reuse them.
+    try capTestPool(4, s);
+    try t.expect(capTestCache() >= 4 * cap_test_mib);
+
+    // Control: no cap, the request is served and the pool is left alone.
+    try t.expectEqual(@as(usize, 0), setTransientLimit(0));
+    const free_run = try capTestOnes(2, s);
+    try check(mlx_array_eval(free_run));
+    capTestRelease(free_run, s);
+    try t.expect(capTestCache() >= 4 * cap_test_mib);
+
+    // Room once the pool is trimmed: served, pool released.
+    try capTestPool(4, s);
+    const fits = try capTestOnes(2, s);
+    _ = setTransientLimit(capTestTransient() + 3 * cap_test_mib);
+    try check(mlx_array_eval(fits));
+    try t.expect(capTestCache() < 4 * cap_test_mib);
+    capTestRelease(fits, s);
+
+    // No room even with an empty pool: refused, tagged, and a latched error.
+    _ = mlx_clear_cache();
+    const over = try capTestOnes(2, s);
+    _ = setTransientLimit(capTestTransient() + cap_test_mib);
+    try t.expectError(error.MlxError, check(mlx_array_eval(over)));
+    try t.expect(errorPending());
+    try t.expectEqualStrings("TransientCapExceeded", settledErrorName(error.MlxError));
+    try t.expect(!errorPending());
+    _ = mlx_array_free(over);
+    _ = mlx_synchronize(s);
+}
+
+test "the transient peak is the high-water of MLX's own bytes and restarts on reset" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+
+    _ = mlx_clear_cache();
+    resetTransientPeak();
+    const base = capTestTransient();
+    try t.expect(transientPeak() >= base);
+    try t.expect(transientPeak() < base + cap_test_mib);
+
+    const big = try capTestOnes(4, s);
+    try check(mlx_array_eval(big));
+    try t.expect(transientPeak() >= base + 4 * cap_test_mib);
+    capTestRelease(big, s);
+    try t.expect(transientPeak() >= base + 4 * cap_test_mib);
+
+    resetTransientPeak();
+    try t.expect(transientPeak() < base + 4 * cap_test_mib);
+}
+
+test "an op after a refused allocation is correct once the stream is drained and the latch cleared" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    defer _ = setTransientLimit(0);
+
+    const shape = [_]c_int{4};
+    const data = [_]f32{ 1, 2, 3, 4 };
+    const x = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+    defer _ = mlx_array_free(x);
+    try check(mlx_array_eval(x));
+
+    const big = try capTestOnes(2, s);
+    defer _ = mlx_array_free(big);
+    _ = mlx_clear_cache();
+    _ = setTransientLimit(capTestTransient() + cap_test_mib);
+    try t.expectError(error.MlxError, check(mlx_array_eval(big)));
+    _ = mlx_synchronize(s);
+    try t.expectEqualStrings("TransientCapExceeded", settledErrorName(error.MlxError));
+    _ = setTransientLimit(0);
+
+    var doubled = mlx_array_new();
+    defer _ = mlx_array_free(doubled);
+    try check(mlx_add(&doubled, x, x, s));
+    try check(mlx_array_eval(doubled));
+    const got = mlx_array_data_float32(doubled).?;
+    try t.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, got[0..4]);
+
+    // The array that failed evaluates once there is room.
+    try check(mlx_array_eval(big));
+    var sum = mlx_array_new();
+    defer _ = mlx_array_free(sum);
+    try check(mlx_sum(&sum, big, false, s));
+    var total: f32 = 0;
+    try check(mlx_array_item_float32(&total, sum));
+    try t.expectEqual(@as(f32, 2 * cap_test_mib / 4), total);
+    try t.expect(!errorPending());
+}
+
+test "requireGpu skips a test when MLX has no GPU backend" {
+    const saved = no_gpu_backend_cache;
+    defer no_gpu_backend_cache = saved;
+    no_gpu_backend_cache = true;
+    try std.testing.expectError(error.SkipZigTest, requireGpu());
+    no_gpu_backend_cache = false;
+    try requireGpu();
 }

@@ -154,10 +154,10 @@ fn laneSource(comptime source: []const u8) [:0]const u8 {
     }
     return result ++ "";
 }
-const LANE_TILED_SOURCE = laneSource(TILED_SOURCE);
-const LANE_TILED_PAIR_SOURCE = laneSource(TILED_PAIR_SOURCE);
-const LANE_THREE_SOURCE = laneSource(THREE_SOURCE);
-const LANE_THREE_PAIR_SOURCE = laneSource(
+pub const LANE_TILED_SOURCE = laneSource(TILED_SOURCE);
+pub const LANE_TILED_PAIR_SOURCE = laneSource(TILED_PAIR_SOURCE);
+pub const LANE_THREE_SOURCE = laneSource(THREE_SOURCE);
+pub const LANE_THREE_PAIR_SOURCE = laneSource(
     "const bool upper=threadgroup_position_in_grid.z!=0u;\nconst device half* x=upper?xu:xg;\nconst device ushort* trellis=upper?tu:tg;\ndevice half* y=upper?yu:yg;\n" ++
         replace(THREE_SOURCE, "uint split = uint(threadgroup_position_in_grid.z);", "uint split=0u;"),
 );
@@ -375,49 +375,55 @@ fn exact(a: Arr, b: Arr) !void {
     if (mlx.mlx_array_dtype(a) == .float16) try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float16(a).?[0..n]), std.mem.sliceAsBytes(mlx.mlx_array_data_float16(b).?[0..n])) else try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(a).?[0..n], mlx.mlx_array_data_bfloat16(b).?[0..n]);
 }
 
-test "GLM group2 cooperative projections preserve F16 bits at all rates and ballot boundaries" {
+const BALLOT_COUNTS = [_]c_int{ 3, 7, 32, 65, 128 };
+const SAMPLED_COUNTS = [_]c_int{ 3, 65, 128 };
+
+fn cooperativeProjectionsCase(production: bool, rate: c_int, counts: []const c_int) !void {
     const s = mlx.gpuStream();
-    base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
-    defer base.setDecodeParams(.mul1);
-    const expert = @import("expert_exl3.zig");
-    const rates = (expert.Rate.max_n - expert.Rate.min_n) / 2 + 1;
-    for (0..rates + 1) |case| {
-        const production = case == rates;
-        const k: c_int = if (production) 4096 else 128;
-        const n: c_int = if (production) 2048 else 128;
-        const e: c_int = if (production) 32 else 128;
-        const rate: c_int = if (production) 36 else @intCast(expert.Rate.min_n + case * 2);
-        var owned: Owned = .{};
-        defer owned.deinit();
-        const tg = try owned.weights(e, k, n, rate, 132);
-        const tu = try owned.weights(e, k, n, rate, 175);
-        for ([_]c_int{ 3, 7, 32, 65, 128 }) |count| {
-            const xg = try owned.floats(&.{ count, k }, .float16, 821, 0.3, s);
-            const xu = try owned.floats(&.{ count, k }, .float16, 823, 0.5, s);
-            var data: [128]u32 = undefined;
-            for (data[0..@intCast(count)], 0..) |*v, i| v.* = @intCast(i % @as(usize, @intCast(e)));
-            for ([_]usize{ 0, 2, 6, 31, 32, 63, 64, 127 }) |i| if (i < count) {
-                data[i] = 0;
+    const k: c_int = if (production) 4096 else 128;
+    const n: c_int = if (production) 2048 else 128;
+    const e: c_int = if (production) 32 else 128;
+    var owned: Owned = .{};
+    defer owned.deinit();
+    const tg = try owned.weights(e, k, n, rate, 132);
+    const tu = try owned.weights(e, k, n, rate, 175);
+    for (counts) |count| {
+        const xg = try owned.floats(&.{ count, k }, .float16, 821, 0.3, s);
+        const xu = try owned.floats(&.{ count, k }, .float16, 823, 0.5, s);
+        var data: [128]u32 = undefined;
+        for (data[0..@intCast(count)], 0..) |*v, i| v.* = @intCast(i % @as(usize, @intCast(e)));
+        for ([_]usize{ 0, 2, 6, 31, 32, 63, 64, 127 }) |i| if (i < count) {
+            data[i] = 0;
+        };
+        const ids = try owned.own(mlx.mlx_array_new_data(&data, &.{count}, 1, .uint32));
+        const rg = try owned.own(try base.indexedGemvCoopF16(s, xg, tg, ids));
+        const ru = try owned.own(try base.indexedGemvCoopF16(s, xu, tu, ids));
+        for ([_]Reduction{ .parallel, .serial }) |reduction| {
+            const got = (try project(s, xg, tg, ids, reduction)) orelse return error.TestExpectedGroup2;
+            defer _ = mlx.mlx_array_free(got);
+            try exact(rg, got);
+            const both = (try pair(s, xg, xu, tg, tu, ids, reduction)) orelse return error.TestExpectedGroup2;
+            defer for (both) |a| {
+                _ = mlx.mlx_array_free(a);
             };
-            const ids = try owned.own(mlx.mlx_array_new_data(&data, &.{count}, 1, .uint32));
-            const rg = try owned.own(try base.indexedGemvCoopF16(s, xg, tg, ids));
-            const ru = try owned.own(try base.indexedGemvCoopF16(s, xu, tu, ids));
-            for ([_]Reduction{ .parallel, .serial }) |reduction| {
-                const got = (try project(s, xg, tg, ids, reduction)) orelse return error.TestExpectedGroup2;
-                defer _ = mlx.mlx_array_free(got);
-                try exact(rg, got);
-                const both = (try pair(s, xg, xu, tg, tu, ids, reduction)) orelse return error.TestExpectedGroup2;
-                defer for (both) |a| {
-                    _ = mlx.mlx_array_free(a);
-                };
-                try exact(rg, both[0]);
-                try exact(ru, both[1]);
-            }
+            try exact(rg, both[0]);
+            try exact(ru, both[1]);
         }
     }
 }
 
+test "GLM group2 cooperative projections preserve F16 bits at all rates and ballot boundaries" {
+    try mlx.requireGpu();
+    base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer base.setDecodeParams(.mul1);
+    for (@import("expert_exl3.zig").ADMITTED_SAMPLE) |n| {
+        try cooperativeProjectionsCase(false, @intCast(n), if (n == 36) &BALLOT_COUNTS else &SAMPLED_COUNTS);
+    }
+    try cooperativeProjectionsCase(true, 36, &BALLOT_COUNTS);
+}
+
 test "GLM group2 singleton and all-shared routes preserve strided input bits" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer base.setDecodeParams(.mul1);
@@ -493,47 +499,52 @@ fn laneInput(owned: *Owned, x: Arr, s: mlx.mlx_stream) !Arr {
     return owned.own(result);
 }
 
-test "GLM group2 half4 composition preserves all-rate cooperative projection bits" {
+const LANE_COUNTS = [_]c_int{ 2, 3, 16, 24, 32, 40, 48, 56, 64, 65, 128 };
+
+fn half4CompositionCase(production: bool, rate: c_int, counts: []const c_int) !void {
     const s = mlx.gpuStream();
-    base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
-    defer base.setDecodeParams(.mul1);
-    const expert = @import("expert_exl3.zig");
-    const rates = (expert.Rate.max_n - expert.Rate.min_n) / 2 + 1;
-    for (0..rates + 1) |case| {
-        const production = case == rates;
-        const k: c_int = if (production) 4096 else 128;
-        const n: c_int = if (production) 2048 else 128;
-        const rate: c_int = if (production) 36 else @intCast(expert.Rate.min_n + 2 * case);
-        var owned: Owned = .{};
-        defer owned.deinit();
-        const g = try owned.weights(32, k, n, rate, 987);
-        const u = try owned.weights(32, k, n, rate, 977);
-        for ([_]c_int{ 2, 3, 16, 24, 32, 40, 48, 56, 64, 65, 128 }) |count| {
-            const xg = try owned.floats(&.{ count, k }, .float16, 877, 0.3, s);
-            const xu = try owned.floats(&.{ count, k }, .float16, 857, 0.5, s);
-            const pg = try laneInput(&owned, xg, s);
-            const pu = try laneInput(&owned, xu, s);
-            var data: [128]u32 = undefined;
-            for (data[0..@intCast(count)], 0..) |*id, i| id.* = @intCast(i % @as(usize, if (count == 24) 8 else 17));
-            const ids = try owned.own(mlx.mlx_array_new_data(&data, &.{count}, 1, .uint32));
-            const rg = try owned.own(try base.indexedGemvCoopF16(s, xg, g, ids));
-            const ru = try owned.own(try base.indexedGemvCoopF16(s, xu, u, ids));
-            for ([_]Reduction{ .parallel, .serial }) |reduction| {
-                const got = (try projectLayout(s, pg, g, ids, reduction, .lane)) orelse return error.TestExpectedGroup2;
-                defer _ = mlx.mlx_array_free(got);
-                try exact(rg, got);
-                const pair_out = (try pairLayout(s, pg, pu, g, u, ids, reduction, .lane)) orelse return error.TestExpectedGroup2;
-                defer for (pair_out) |v| {
-                    _ = mlx.mlx_array_free(v);
-                };
-                try exact(rg, pair_out[0]);
-                try exact(ru, pair_out[1]);
-            }
+    const k: c_int = if (production) 4096 else 128;
+    const n: c_int = if (production) 2048 else 128;
+    var owned: Owned = .{};
+    defer owned.deinit();
+    const g = try owned.weights(32, k, n, rate, 987);
+    const u = try owned.weights(32, k, n, rate, 977);
+    for (counts) |count| {
+        const xg = try owned.floats(&.{ count, k }, .float16, 877, 0.3, s);
+        const xu = try owned.floats(&.{ count, k }, .float16, 857, 0.5, s);
+        const pg = try laneInput(&owned, xg, s);
+        const pu = try laneInput(&owned, xu, s);
+        var data: [128]u32 = undefined;
+        for (data[0..@intCast(count)], 0..) |*id, i| id.* = @intCast(i % @as(usize, if (count == 24) 8 else 17));
+        const ids = try owned.own(mlx.mlx_array_new_data(&data, &.{count}, 1, .uint32));
+        const rg = try owned.own(try base.indexedGemvCoopF16(s, xg, g, ids));
+        const ru = try owned.own(try base.indexedGemvCoopF16(s, xu, u, ids));
+        for ([_]Reduction{ .parallel, .serial }) |reduction| {
+            const got = (try projectLayout(s, pg, g, ids, reduction, .lane)) orelse return error.TestExpectedGroup2;
+            defer _ = mlx.mlx_array_free(got);
+            try exact(rg, got);
+            const pair_out = (try pairLayout(s, pg, pu, g, u, ids, reduction, .lane)) orelse return error.TestExpectedGroup2;
+            defer for (pair_out) |v| {
+                _ = mlx.mlx_array_free(v);
+            };
+            try exact(rg, pair_out[0]);
+            try exact(ru, pair_out[1]);
         }
     }
 }
 
+test "GLM group2 half4 composition preserves all-rate cooperative projection bits" {
+    try mlx.requireGpu();
+    base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer base.setDecodeParams(.mul1);
+    for (@import("expert_exl3.zig").ADMITTED_SAMPLE) |n| {
+        try half4CompositionCase(false, @intCast(n), if (n == 36) &LANE_COUNTS else &SAMPLED_COUNTS);
+    }
+    try half4CompositionCase(true, 36, &LANE_COUNTS);
+}
+
 test "GLM group2 serves every admitted rate, exact to the cooperative reader" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer base.setDecodeParams(.mul1);
@@ -556,6 +567,7 @@ test "GLM group2 serves every admitted rate, exact to the cooperative reader" {
 }
 
 test "GLM group2 keeps the cooperative reader's bytes under PAIR1" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     base.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
     defer base.setDecodeParams(.mul1);
@@ -585,6 +597,7 @@ test "GLM group2 keeps the cooperative reader's bytes under PAIR1" {
 
 // Group2 needs two rows; DFlash verify sends three or four.
 test "GLM serves spec1 and std1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer base.setDecodeParams(.mul1);
     defer base.unfolded_for_test = false;
@@ -626,6 +639,7 @@ test "GLM serves spec1 and std1 on group2's routed chain with the unfolded oracl
 }
 
 test "GLM serves PAIR1 on group2's routed chain with the unfolded oracle's bytes, fused middle-down included" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     defer base.setDecodeParams(.mul1);
     defer base.unfolded_for_test = false;
@@ -667,6 +681,7 @@ test "GLM serves PAIR1 on group2's routed chain with the unfolded oracle's bytes
 }
 
 test "GLM group2 shared expert joined in the reduce equals the separate BF16 add" {
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const dec: @import("expert_exl3.zig").Decode = .{ .codebook = .mcg, .window = .w14 };
     defer base.setDecodeParams(.mul1);
