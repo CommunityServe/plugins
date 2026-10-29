@@ -1,0 +1,18 @@
+{
+  "name": "turboexl3_qwen38",
+  "kind": "model",
+  "version": "0.1.0",
+  "summary": "turboderp's fully EXL3 Qwen3.8-Flash packs (K2 to K5) through turboexl3.",
+  "models": [
+    "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-EXL3-2.05-mlx-serve)",
+    "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-EXL3-3.05-mlx-serve)",
+    "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-EXL3-4.05-mlx-serve)",
+    "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-EXL3-5.05-mlx-serve)"
+  ],
+  "requires_mlx_serve": ">=26.11.1",
+  "fixture": "none",
+  "fixture_reason": "A fully EXL3 pack has no small form: the conformance suite needs a tiny pack the plugin can load.",
+  "test_step": "mlx-free-test",
+  "maintainers": ["davidtai"],
+  "license": "MIT"
+}
