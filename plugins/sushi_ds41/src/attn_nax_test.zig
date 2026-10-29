@@ -1,6 +1,6 @@
 //! The Metal test of `attn_nax.zig`: `attnFusedNax` against the slice's `attnFused` at the release's attention shape.
 //! The root of `zig build gpu-test -Dmlx-lib=<dir>` only (it links that MLX and sets SUSHI_DS41_GPU_TEST); skipped
-//! without an M5.
+//! without an M5. It also runs `vision_key.zig`'s test, which needs MLX but no M5.
 const std = @import("std");
 const mlx = @import("sushi/mlx.zig");
 const sc_mod = @import("sushi/dsv41_scope.zig");
@@ -10,6 +10,10 @@ const nax = @import("attn_nax.zig");
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
 const ci = sc_mod.ci;
+
+test {
+    _ = @import("vision_key.zig");
+}
 
 const Case = struct { L: usize, wp: usize, K: usize, nc: usize, dt: mlx.mlx_dtype = .bfloat16, packed_rows: bool = false, holes: bool = false, all_neg: bool = false, oob: bool = false };
 

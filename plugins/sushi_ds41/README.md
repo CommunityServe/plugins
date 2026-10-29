@@ -39,7 +39,8 @@ simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2
 0.1849, against 0.1854 for the simdgroup kernel. Decode does not run it (spans of 16 rows or fewer).
 
 - DSpark: greedy and sampled requests (the engine accepts a sampled block; the plugin drafts and keeps what it accepts). `{"mtp": false}` in the model settings keeps the stages off.
-- Prefix cache: a restore point at the prompt's last token, text only.
+- Prefix cache: a restore point at the prompt's last token, images included: it is keyed by its ids and a hash of the
+  image rows they cover (`src/vision_key.zig`), so two images, whose placeholder ids are the same, never share one.
 - Images: one frame, decoded by mlx-serve (`MediaInput`); the plugin lays it out as the release's processor does.
 - Attention: on an M5 GPU (`applegpu_g17` or later, macOS 26.2 or later) a prompt's wide spans run on the matrix
   units through Metal 4 tensor ops (`src/attn_nax.zig`), within 3e-5 of the simdgroup kernel; other GPUs keep that

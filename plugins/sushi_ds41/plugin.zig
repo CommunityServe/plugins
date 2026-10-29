@@ -23,6 +23,7 @@ const rows_policy = @import("src/sushi/dspark_rows.zig");
 const borrow = @import("src/sushi/dsv41_borrow.zig");
 const depth_bounds = @import("src/sushi/mtp_depth_bounds.zig");
 const attn_nax = @import("src/attn_nax.zig");
+const vision_key = @import("src/vision_key.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -396,10 +397,13 @@ test {
 
 // ── prefix cache ──
 
-const Arm = struct { target: usize, capture: bool };
+/// `vision_key` is the key of the target's ids under the prompt's image rows (`vision_key.prefixKey`), taken when the
+/// prompt began: the host lends the rows to that call only.
+const Arm = struct { target: usize, capture: bool, vision_key: u64 = 0 };
 
-/// A restore point: the model's whole state at `n` (`dsv.captureState`) and the tokens it was built from.
-const Snap = struct { slots: []dsv.Slot, n: usize, ids: []u32 };
+/// A restore point: the model's whole state at `n` (`dsv.captureState`), the tokens it was built from, and the key of
+/// the image rows those tokens splice in (0 for none), which the host matches beside the ids.
+const Snap = struct { slots: []dsv.Slot, n: usize, ids: []u32, vision_key: u64 = 0 };
 
 fn freeSnap(sn: *Snap) void {
     for (sn.slots) |*sl| dsv.freeSlot(sl);
@@ -417,6 +421,7 @@ fn capture(m: *Model) !void {
     const sn = try gpa.create(Snap);
     errdefer gpa.destroy(sn);
     sn.n = a.target;
+    sn.vision_key = a.vision_key;
     sn.ids = try gpa.dupe(u32, m.ids.items);
     errdefer gpa.free(sn.ids);
     sn.slots = try gpa.alloc(dsv.Slot, dsv.slotCount(m.mdl));
@@ -464,15 +469,26 @@ fn auxCommit(mp: *anyopaque, _: u32, len: u64) callconv(.c) Verdict {
     return .ok;
 }
 
-/// Text only: the key of a prefix is its ids.
-fn auxPrefixKey(_: *anyopaque, _: abi.Span(u32), _: abi.Array, out: *u64) callconv(.c) Verdict {
-    out.* = 0;
+/// The key of a prefix beside its ids: a hash of the image rows it covers, so two images (the same placeholder ids)
+/// never share a restore point.
+fn auxPrefixKey(mp: *anyopaque, ids: abi.Span(u32), rows: abi.Array, out: *u64) callconv(.c) Verdict {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    out.* = 0; // a refused key leaves 0
+    out.* = keyOf(m, ids.slice(), rows) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;
+}
+
+fn keyOf(m: *const Model, ids: []const u32, rows: abi.Array) !u64 {
+    const r: ?mlx.mlx_array = if (rows.ctx != null) .{ .ctx = rows.ctx } else null;
+    return vision_key.prefixKey(ids, m.cfg.image_token_id, r, m.s);
 }
 
 fn auxBeginPrompt(mp: *anyopaque, _: u32, prompt: abi.Span(u32), media: abi.Array, restored_at: u64, capture_on: bool) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (prompt.len == 0) return Verdict.refuse(.failed, "sushi_ds41: an empty prompt");
+    // The restore point covers all but the last token; its rows are lent to this call only, so the key is taken now.
+    const ids = prompt.slice()[0 .. prompt.len - 1];
+    const key = if (capture_on and ids.len > 0) keyOf(m, ids, media) catch |e| return Verdict.named(.failed, @errorName(e)) else 0;
     if (restored_at == 0) {
         reset(m);
     } else {
@@ -484,8 +500,7 @@ fn auxBeginPrompt(mp: *anyopaque, _: u32, prompt: abi.Span(u32), media: abi.Arra
         freeSnap(sn);
         m.snap = null;
     }
-    // A restore point is keyed by token ids alone, which two different images share.
-    m.arm = .{ .target = prompt.len - 1, .capture = capture_on and media.ctx == null };
+    m.arm = .{ .target = prompt.len - 1, .capture = capture_on, .vision_key = key };
     return .ok;
 }
 
@@ -515,6 +530,7 @@ fn auxSlice(_: *anyopaque, h: abi.Handle, len: u64, out: *abi.Handle) callconv(.
     if (len != sn.n) return Verdict.refuse(.unsupported, "sushi_ds41: a snapshot cannot be shortened through its rings");
     const copy = gpa.create(Snap) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
     copy.n = sn.n;
+    copy.vision_key = sn.vision_key;
     copy.ids = gpa.dupe(u32, sn.ids) catch {
         gpa.destroy(copy);
         return Verdict.refuse(.failed, "sushi_ds41: out of memory");
@@ -553,7 +569,7 @@ fn auxBytes(_: *anyopaque, h: abi.Handle) callconv(.c) u64 {
 
 fn auxDescribe(_: *anyopaque, h: abi.Handle, out: *abi.AuxSnapshotInfo) callconv(.c) Verdict {
     const sn = snapOf(h) orelse return Verdict.refuse(.unsupported, "sushi_ds41: no snapshot to describe");
-    out.* = .{ .n = sn.n, .ids = .of(sn.ids), .prefix_key = 0 };
+    out.* = .{ .n = sn.n, .ids = .of(sn.ids), .prefix_key = sn.vision_key };
     return .ok;
 }
 
@@ -572,6 +588,31 @@ fn auxExportArrays(_: *anyopaque, _: abi.Handle, out: *abi.AuxExport) callconv(.
 fn auxImportArrays(_: *anyopaque, _: abi.Span(u32), _: abi.Str, _: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
     return Verdict.refuse(.unsupported, "sushi_ds41: snapshot import is unavailable");
+}
+
+test "sushi_ds41 aux: a restore point's image key survives describe and slice; a prefix with no image keys 0" {
+    const testing = std.testing;
+    const sn = try gpa.create(Snap);
+    sn.* = .{ .slots = try gpa.alloc(dsv.Slot, 0), .n = 3, .ids = try gpa.dupe(u32, &.{ 3, 17, 4 }), .vision_key = 0xabc };
+    defer freeSnap(sn);
+    var m: Model = undefined;
+    m.cfg.image_token_id = 17;
+    var info: abi.AuxSnapshotInfo = .{};
+    try testing.expect(auxDescribe(&m, sn, &info).isOk());
+    try testing.expectEqual(@as(u64, 0xabc), info.prefix_key);
+    var copy: abi.Handle = null;
+    try testing.expect(auxSlice(&m, sn, 3, &copy).isOk());
+    defer auxFree(&m, copy);
+    try testing.expectEqual(@as(u64, 0xabc), snapOf(copy).?.vision_key);
+    try testing.expect(auxDescribe(&m, copy, &info).isOk());
+    try testing.expectEqual(@as(u64, 0xabc), info.prefix_key);
+    // Neither case reaches MLX: no rows, or rows (a pointer never read) but no image token among the ids.
+    var key: u64 = 1;
+    try testing.expect(auxPrefixKey(&m, .of(&.{ 3, 17, 4 }), .{}, &key).isOk());
+    try testing.expectEqual(@as(u64, 0), key);
+    key = 1;
+    try testing.expect(auxPrefixKey(&m, .of(&.{ 3, 4, 5 }), .{ .ctx = @ptrFromInt(0x10) }, &key).isOk());
+    try testing.expectEqual(@as(u64, 0), key);
 }
 
 // ── images ──
