@@ -17,7 +17,13 @@ jobs:
           name="${GITHUB_REF_NAME%-v*}"
           [ -d "plugins/$name" ] || { echo "no plugins/$name" >&2; exit 1; }
           echo "name=$name" >> "$GITHUB_OUTPUT"
+      - name: Kit build tools (for a KIT_VERSION with no release kit yet)
+        run: |
+          brew install cmake webp
+          xcrun -sdk macosx metal --version >/dev/null 2>&1 || sudo xcodebuild -downloadComponent MetalToolchain
       - run: scripts/build.sh "${{ steps.tag.outputs.name }}"
+        env:
+          MLX_SERVE_KIT_FROM_SOURCE: "1"
       - name: Hash
         run: |
           cd "plugins/${{ steps.tag.outputs.name }}/zig-out/lib"
