@@ -20,6 +20,7 @@ const smodel = @import("src/sushi/model.zig");
 const sc = @import("src/sushi/dsv41_config.zig");
 const vis = @import("src/sushi/dsv41_vision.zig");
 const rows_policy = @import("src/sushi/dspark_rows.zig");
+const borrow = @import("src/sushi/dsv41_borrow.zig");
 const depth_bounds = @import("src/sushi/mtp_depth_bounds.zig");
 const stb = @import("stb");
 
@@ -69,6 +70,8 @@ const Model = struct {
     /// A round whose verify the engine is accepting (`NativeDrafter.verify` until `finish`).
     open: ?Open = null,
     prev_cache_limit: ?usize = null,
+    /// The MLX buffer-pool cap in force (`borrow.poolCap` of the last pass's rows): `pool_bytes` at decode widths.
+    pool_now: u64 = pool_bytes,
     /// Positions the expert cache was sized to leave room for (a request's state and one prefill chunk's working set).
     billed_context: u64 = default_context,
 };
@@ -188,6 +191,14 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.engine.warmCache() catch |e| log.warn("[sushi_ds41] expert cache warm failed: {s}\n", .{@errorName(e)});
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
+    // As sushi's server does: a synced per-stage `[dsv41-prof]` line per wide chunk, and with the verify profile per
+    // decode-width chunk too.
+    const verify_profile = std.c.getenv("SUSHI_DSV41_VERIFY_PROFILE") != null;
+    if (verify_profile or std.c.getenv("SUSHI_DSV41_PREFILL_PROFILE") != null) {
+        const pf = try gpa.create(dsv.Profile);
+        pf.* = dsv.Profile.init(verify_profile);
+        m.mdl.profile = pf;
+    }
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
     errdefer if (m.tower) |*t| t.deinit();
@@ -215,6 +226,9 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
 
 /// MLX's freed-buffer pool during decode, which the ledger bills.
 const pool_bytes: u64 = 1 << 30;
+/// The pool a prefill chunk of `sc.prefill_width` rows parks (sushi's `dsv41_prefill_pool_bytes` and its RAM-wide cap on
+/// a 128 GB+ box). At `pool_bytes` a 2048-row chunk frees and remakes its buffers op after op, which halves prefill.
+const prefill_pool_bytes: u64 = 8 << 30;
 /// The prompt positions the expert cache leaves room for when the model sets no `ctx_size`.
 const default_context: u64 = 131072;
 /// The host's default prefill chunk, which its admission bills.
@@ -233,7 +247,8 @@ fn gb(b: u64) f64 {
 /// process overhead and one request of `context` positions (its state and one prefill chunk's working set).
 fn expertRoom(ctx: *const abi.LoadCtx, c: *const sc.Config, context: u64) !u64 {
     const ceiling = if (kit.host.Host.of(ctx.host)) |h| h.memoryCeiling() else |_| mlx.maxRecommendedWorkingSet();
-    const request = c.transientBytes(host_chunk, context) +| (context +| generation_rows) *| c.stateBytesPerToken() +| c.stateFixedBytes(false);
+    const request = c.transientBytes(host_chunk, context) +| (context +| generation_rows) *| c.stateBytesPerToken() +| c.stateFixedBytes(false) +|
+        (prefill_pool_bytes - pool_bytes);
     return ceiling -| ctx.wired_margin_bytes -| host_bytes -| request;
 }
 
@@ -342,11 +357,24 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows) !mlx
 
 /// One pass over `rows`; the logits are the caller's to free (an intermediate chunk's are dropped).
 fn forwardRows(m: *Model, rows: []const u32, want: dsv.Want, ahead: []const u32, media: ?dsv.VisionRows) !mlx.mlx_array {
+    poolForRows(m, rows.len);
     m.engine.beginForward();
     const logits = try dsv.extendAhead(m.mdl, rows, want, dsv.SPAN, media, ahead);
     m.engine.finishForward(rows.len);
     try m.ids.appendSlice(gpa, rows);
     return logits;
+}
+
+/// Moves MLX's buffer-pool cap to the one a pass of `rows` parks, as sushi's server does per forward
+/// (`dsv41_borrow.enterForward`): the decode cap up to a verify block, growing to the prefill cap at a full chunk. A
+/// lower cap trims lazily, so the clear makes the parked pool what the expert room billed.
+fn poolForRows(m: *Model, rows: usize) void {
+    const want = borrow.poolCap(rows, pool_bytes, prefill_pool_bytes, prefill_pool_bytes);
+    if (want == m.pool_now) return;
+    var prev: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev, @intCast(want));
+    if (want < m.pool_now) _ = mlx.mlx_clear_cache();
+    m.pool_now = want;
 }
 
 fn stateBytes(mp: *anyopaque) callconv(.c) u64 {
@@ -413,8 +441,9 @@ const aux_hooks = abi.AuxHooks{
     .handoff = &auxHandoff,
     .free = &auxFree,
     .bytes = &auxBytes,
-    .serialize = &auxSerialize,
-    .deserialize = &auxDeserialize,
+    .import_plan = &auxImportPlan,
+    .export_arrays = &auxExportArrays,
+    .import_arrays = &auxImportArrays,
 };
 
 fn auxEnabled(_: *anyopaque) callconv(.c) bool {
@@ -525,41 +554,30 @@ fn auxDescribe(_: *anyopaque, h: abi.Handle, out: *abi.AuxSnapshotInfo) callconv
     return .ok;
 }
 
-fn auxSerialize(_: *anyopaque, _: abi.Handle, _: [*]u8, _: usize, len: *usize) callconv(.c) Verdict {
-    len.* = 0;
-    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot serialization is unavailable");
+fn auxImportPlan(_: *anyopaque, _: abi.Str, peak: *u64) callconv(.c) Verdict {
+    peak.* = 0;
+    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot import is unavailable");
 }
 
-fn auxDeserialize(_: *anyopaque, _: abi.Str, out: *abi.Handle) callconv(.c) Verdict {
+fn auxExportArrays(_: *anyopaque, _: abi.Handle, _: *abi.AuxExport) callconv(.c) Verdict {
+    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot export is unavailable");
+}
+
+fn auxImportArrays(_: *anyopaque, _: abi.Span(u32), _: abi.Str, _: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot deserialization is unavailable");
+    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot import is unavailable");
 }
 
 // ── images ──
 
-/// Packed RGB8 of a JPEG, PNG, GIF or BMP, transparency composited onto white.
-fn decodeRgb(encoded: []const u8) ?struct { rgb: []u8, w: u32, h: u32 } {
-    var w: c_int = 0;
-    var h: c_int = 0;
-    var channels: c_int = 0;
-    const rgba = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4) orelse return null;
-    defer stb.stbi_image_free(rgba);
-    const px: usize = @intCast(w * h);
-    const rgb = gpa.alloc(u8, px * 3) catch return null;
-    for (0..px) |i| {
-        const al: u16 = rgba[i * 4 + 3];
-        for (0..3) |c| rgb[i * 3 + c] = @intCast((al * @as(u16, rgba[i * 4 + c]) + (255 - al) * 255) / 255);
-    }
-    return .{ .rgb = rgb, .w = @intCast(w), .h = @intCast(h) };
-}
-
-fn mediaPrepare(p: *const abi.Parsed, kind: abi.MediaKind, bytes: abi.Str, budget: u64, out: *abi.MediaItem) callconv(.c) Verdict {
-    _ = budget; // the release's processor bounds the image by its own token budget
-    if (kind != .image) return Verdict.refuse(.unsupported, "sushi_ds41: images only");
+/// The host decodes the image to packed RGB8 (one frame); the release's processor bounds it by its own token budget.
+fn mediaPrepare(p: *const abi.Parsed, in: *const abi.MediaInput, budget: u64, out: *abi.MediaItem) callconv(.c) Verdict {
+    _ = budget;
+    if (in.kind != .image or in.frames > 1) return Verdict.refuse(.unsupported, "sushi_ds41: images only");
     const v = config.of(p).vision orelse return Verdict.refuse(.unsupported, "sushi_ds41: this pack has no vision tower");
-    const src = decodeRgb(bytes.slice()) orelse return Verdict.refuse(.failed, "sushi_ds41: the image does not decode (JPEG, PNG, GIF or BMP)");
-    defer gpa.free(src.rgb);
-    const px = vis.preprocess(gpa, src.rgb, src.h, src.w, vis.Processor.of(v)) catch return Verdict.refuse(.failed, "sushi_ds41: the image's dimensions have no grid");
+    const rgb = in.rgb.slice();
+    if (in.width == 0 or in.height == 0 or rgb.len < @as(usize, in.width) * in.height * 3) return Verdict.refuse(.failed, "sushi_ds41: the host's image has no pixels");
+    const px = vis.preprocess(gpa, rgb, in.height, in.width, vis.Processor.of(v)) catch return Verdict.refuse(.failed, "sushi_ds41: the image's dimensions have no grid");
     // The host copies these float32 bytes on a connection thread (no MLX there) and calls `releasePixels`.
     out.* = .{
         .kind = .image,
@@ -586,7 +604,7 @@ fn mediaTower(mp: *anyopaque, item: *const abi.MediaItem, out: *abi.Array) callc
 }
 
 /// Every position of an image's span carries the image token; the span's delimiters are the tower's learned rows.
-fn placeholderRows(p: *const abi.Parsed, item: *const abi.MediaItem, out: [*]u32, cap: u32) callconv(.c) u32 {
+fn placeholderRows(p: *const abi.Parsed, item: *const abi.MediaItem, _: *const abi.TextTokens, out: [*]u32, cap: u32) callconv(.c) u32 {
     const n = @min(item.rows, cap);
     @memset(out[0..n], config.of(p).image_token_id);
     return n;

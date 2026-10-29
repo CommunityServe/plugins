@@ -8,7 +8,9 @@ DeepSeek-V4.1-Flash on sushi's own model code, as an outside plugin for mlx-serv
     scripts/sync-sushi.sh <sushi checkout>  # refresh src/sushi/ from sushi
     scripts/sync-sushi.sh --check <sushi checkout> <tag>  # does a sushi release touch this slice? exit 0 = keep the pin
 
-Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`, `finish`) and outside-plugin image hooks (ddalcu/mlx-serve#1002).
+Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`, `finish`), outside-plugin image hooks
+(ddalcu/mlx-serve#1002), host-decoded media (`MediaInput`, ddalcu/mlx-serve#1003) and the array-based aux snapshot hooks
+(ddalcu/mlx-serve#1000).
 
 Measured on M4 Max 128 GB, Sushi-STQ-1.75bpw, greedy:
 
@@ -20,12 +22,22 @@ Measured on M4 Max 128 GB, Sushi-STQ-1.75bpw, greedy:
 | 3.6k prompt, cold | 26 | 366 |
 | 3.6k prompt, repeated (prefix cache) | 43 | 3638 cached |
 
+Measured on M5 Ultra 256 GB (every routed expert resident, 384 slots a layer), Sushi-STQ-1.75bpw, 1 stream, mean of 2
+runs against sushi v1.4.0 serving the same pack:
+
+| | plugin tok/s | sushi tok/s |
+|---|---|---|
+| prefill 8k / 32k / 64k | 1903 / 2074 / 2050 | 1804 / 1904 / 1871 |
+| decode, short / after 32k / after 64k (DSpark) | 100.3 / 91.6 / 98.5 | 100.1 / 92.5 / 99.4 |
+
 Text matches sushi (prompt 2 identical, prompt 1 identical for the first 239 characters, a known near-tie), with
 DSpark on or off.
 
 - DSpark: greedy and sampled requests (the engine accepts a sampled block; the plugin drafts and keeps what it accepts). `{"mtp": false}` in the model settings keeps the stages off.
 - Prefix cache: a restore point at the prompt's last token, text only.
-- Images: JPEG, PNG, GIF, BMP (stb); WebP is refused.
+- Images: one frame, decoded by mlx-serve (`MediaInput`); the plugin lays it out as the release's processor does.
+- Prefill: the whole prompt in one host call (`whole_prompt_prefill`), chunked here at `prefill_width` as sushi does; a
+  long prompt is one uncancellable call.
 - Not supported: Thunderbolt pair, other quant formats, snapshot serialization (no SSD tier).
 
 `plugin check` needs a conformance fixture pack, which an STQ pack cannot provide small; the plugin is checked by serving.
