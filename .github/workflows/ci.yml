@@ -18,7 +18,22 @@ jobs:
         run: |
           scripts/gen-index.sh
           git diff --exit-code plugins.json
+      # While KIT_VERSION has no release with a kit asset, fetch-kit builds the kit from mlx-serve at MLX_SERVE_REF
+      # (scripts/build-kit.sh). Its mlx + mlx-c stage is the slow part, so it and the kit are cached on the pins.
+      - name: Kit build tools
+        run: |
+          brew install cmake webp
+          xcrun -sdk macosx metal --version >/dev/null 2>&1 || sudo xcodebuild -downloadComponent MetalToolchain
+      - name: Cache the kit and its mlx stage
+        uses: actions/cache@v4
+        with:
+          path: |
+            .kit
+            .kit-src/lib/mlx
+          key: kit-${{ hashFiles('KIT_VERSION', 'MLX_SERVE_REF') }}-${{ runner.os }}-${{ runner.arch }}
       - name: Pinned toolchain and kit
+        env:
+          MLX_SERVE_KIT_FROM_SOURCE: "1"
         run: scripts/setup.sh
       - name: Every plugin compiles and passes its tests
         run: scripts/build.sh --all
