@@ -35,8 +35,8 @@ Text matches sushi (prompt 2 identical, prompt 1 identical for the first 239 cha
 DSpark on or off.
 
 With the wide-span attention on the M5's matrix units (`src/attn_nax.zig`), same machine and pack, A/B against the
-simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 64k 2050 to 2343 (1.12x to 1.14x); KLD against the FP8 teacher 0.1849, against
-0.1854 for the simdgroup kernel. 32k and decode not measured.
+simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2343 (1.12x to 1.14x); KLD against the FP8 teacher
+0.1849, against 0.1854 for the simdgroup kernel. Decode does not run it (spans of 16 rows or fewer).
 
 - DSpark: greedy and sampled requests (the engine accepts a sampled block; the plugin drafts and keeps what it accepts). `{"mtp": false}` in the model settings keeps the stages off.
 - Prefix cache: a restore point at the prompt's last token, text only.
