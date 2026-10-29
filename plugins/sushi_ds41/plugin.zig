@@ -23,7 +23,6 @@ const rows_policy = @import("src/sushi/dspark_rows.zig");
 const borrow = @import("src/sushi/dsv41_borrow.zig");
 const depth_bounds = @import("src/sushi/mtp_depth_bounds.zig");
 const attn_nax = @import("src/attn_nax.zig");
-const stb = @import("stb");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -563,7 +562,10 @@ fn auxImportPlan(_: *anyopaque, _: abi.Str, peak: *u64) callconv(.c) Verdict {
     return Verdict.refuse(.unsupported, "sushi_ds41: snapshot import is unavailable");
 }
 
-fn auxExportArrays(_: *anyopaque, _: abi.Handle, _: *abi.AuxExport) callconv(.c) Verdict {
+fn auxExportArrays(_: *anyopaque, _: abi.Handle, out: *abi.AuxExport) callconv(.c) Verdict {
+    out.tensor_len = 0;
+    out.names_len = 0;
+    out.header_len = 0;
     return Verdict.refuse(.unsupported, "sushi_ds41: snapshot export is unavailable");
 }
 

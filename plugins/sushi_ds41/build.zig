@@ -14,11 +14,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "mlx_host", .module = root }},
     });
     root.addImport("sushi_exl3", exl3);
-    const stb = b.addTranslateC(.{ .root_source_file = b.path("src/stb/stb_image.h"), .target = root.resolved_target.?, .optimize = root.optimize.? });
-    stb.addIncludePath(b.path("src/stb"));
-    root.addImport("stb", stb.createModule());
-    root.addCSourceFile(.{ .file = b.path("src/stb/stb_image_impl.c"), .flags = &.{"-O2"} });
-    root.addIncludePath(b.path("src/stb"));
     // The kit's test step roots config.zig, which needs the vendored module; this one roots the plugin and leaves MLX
     // undefined (the tests never call it).
     const tests = b.addTest(.{ .root_module = root, .filters = &.{"sushi_ds41"} });
