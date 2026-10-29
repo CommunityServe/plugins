@@ -106,7 +106,9 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     priv.dspark = priv.cfg.dspark.block > 0 and priv.cfg.n_mtp > 0 and mtpAllowed(settings_json.slice()) and shipsStages(dir);
     const c = &priv.cfg;
     var p: abi.Parsed = .{
-        .caps = .{ .owns_decode_state = true, .prefix_cache = true, .moe = true, .long_ctx = true, .images = c.vision != null, .streamed_weights = true },
+        // whole_prompt_prefill: the plugin chunks the prompt itself (`prefill_width`, sushi's schedule); host chunks that
+        // shrink with depth each cost a CED tail and a lone last-token pass.
+        .caps = .{ .owns_decode_state = true, .prefix_cache = true, .moe = true, .long_ctx = true, .images = c.vision != null, .streamed_weights = true, .whole_prompt_prefill = true },
         .chat = .{ .thinking_default = .on, .effort_vocab = .dsv41, .template_family = abi.Str.of(model_types[0]) },
         .spec = .{ .native_stages = if (priv.dspark) c.n_mtp else 0, .native_block = if (priv.dspark) c.dspark.block else 0, .policy = .{ .drafter_ok = false } },
         .placeholder_ids = .{ .image = if (c.vision != null) c.image_token_id else 0 },
