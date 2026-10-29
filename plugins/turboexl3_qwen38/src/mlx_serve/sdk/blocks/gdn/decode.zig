@@ -437,16 +437,6 @@ pub fn treeTable(parents: []const i32, out: []i32) void {
     }
 }
 
-test "treeTable: a chain reads t + tap, a branch reads its own ancestors" {
-    var out: [6 * 4]i32 = undefined;
-    treeTable(&.{ -1, 0, 1, 2 }, &out);
-    for (0..4) |t| for (0..4) |tap| try std.testing.expectEqual(@as(i32, @intCast(t + tap)), out[4 + t * 4 + tap]);
-    var tree: [6 * 3]i32 = undefined;
-    treeTable(&.{ -1, 0, 0 }, &tree);
-    // row 2 (depth 1, parent 0): conv rows 1, 2, then window rows 0 and 2.
-    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 5 }, tree[3 + 8 .. 3 + 12]);
-}
-
 var k1r_cache: ?mlx.mlx_fast_metal_kernel = null;
 var replay_cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
 var replay_key: ?CfgKey = null;

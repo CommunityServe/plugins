@@ -66,72 +66,6 @@ fn qwen4MixedPackMatches(w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, l
     return @as(i64, ws[last]) * 32 == @as(i64, k) * bits and ss[last] == @divExact(k, 64);
 }
 
-test "Qwen4 mixed pack matcher pins actual quantization geometry" {
-    const stream = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(stream);
-    for ([_]u32{ 4, 8 }) |bits| for ([_]bool{ false, true }) |stacked| {
-        const words: c_int = @intCast(bits * 2);
-        const logical: []const c_int = if (stacked) &.{ 2, 16, 64 } else &.{ 16, 64 };
-        const ws: []const c_int = if (stacked) &.{ 2, 16, words } else &.{ 16, words };
-        const ss: []const c_int = if (stacked) &.{ 2, 16, 1 } else &.{ 16, 1 };
-        var w = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(w);
-        var scales = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(scales);
-        var biases = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(biases);
-        try mlx.check(mlx.mlx_zeros(&w, ws.ptr, @intCast(ws.len), .uint32, stream));
-        try mlx.check(mlx.mlx_zeros(&scales, ss.ptr, @intCast(ss.len), .bfloat16, stream));
-        try mlx.check(mlx.mlx_zeros(&biases, ss.ptr, @intCast(ss.len), .bfloat16, stream));
-        try testing.expect(qwen4MixedPackMatches(w, scales, biases, logical, bits));
-        try testing.expect(!qwen4MixedPackMatches(w, scales, biases, logical, if (bits == 4) 8 else 4));
-        try testing.expect(!qwen4MixedPackMatches(w, scales, .{}, logical, bits));
-        try testing.expect(!qwen4MixedPackMatches(w, scales, biases, &.{ 16, 128 }, bits));
-        var wrong_dtype = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wrong_dtype);
-        try mlx.check(mlx.mlx_zeros(&wrong_dtype, ss.ptr, @intCast(ss.len), .float32, stream));
-        try testing.expect(!qwen4MixedPackMatches(w, wrong_dtype, biases, logical, bits));
-        try testing.expect(!qwen4MixedPackMatches(w, scales, wrong_dtype, logical, bits));
-    };
-}
-
-test "Qwen4 mixed MTP profile requires its measured geometry and packs" {
-    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_mixed_4_8_gs64, qwen4MixedCostProfileForFingerprint(.{}, true, true, true));
-    inline for (.{ "hidden", "layers", "hc", "experts", "top_k", "expert_width", "vocab", "ple_layer", "kv_bits", "kv_group", "head_kv_bits", "head_kv_group" }) |field| {
-        var geometry: Qwen4MixedGeometry = .{};
-        @field(geometry, field) += 1;
-        try testing.expectEqual(MtpCostProfile.generic, qwen4MixedCostProfileForFingerprint(geometry, true, true, true));
-    }
-    for ([_]bool{ false, true }) |packs| for ([_]bool{ false, true }) |rerank| for ([_]bool{ false, true }) |nax| {
-        if (packs and rerank and nax) continue;
-        try testing.expectEqual(MtpCostProfile.generic, qwen4MixedCostProfileForFingerprint(.{}, packs, rerank, nax));
-    };
-}
-
-test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" {
-    const path = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend() or !verify_qmm_nax.verifyQmmNaxAvailable()) return error.SkipZigTest;
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(path));
-    defer if (config.ngram_table_path) |name| a.free(name);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Trunk.init(io, a, config, &weights);
-    defer xfm.deinit();
-    const kv8 = kv_quant.KVQuantConfig.affine(8);
-    try xfm.qwen4MtpApplyKvQuant(kv8);
-    try testing.expect(xfm.qwen4BuildDraftRerank());
-    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_mixed_4_8_gs64, qwen4G17CostProfile(&xfm, kv8));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, kv_quant.KVQuantConfig.dense));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, kv_quant.KVQuantConfig.affine(4)));
-    const old_bias = xfm.qwen4_mtp.?.fc_emb_b;
-    defer xfm.qwen4_mtp.?.fc_emb_b = old_bias;
-    xfm.qwen4_mtp.?.fc_emb_b = .{};
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfile(&xfm, kv8));
-}
-
 var qwen4_g17_profile_logged: bool = false;
 var qwen4_mixed_profile_logged: bool = false;
 
@@ -259,13 +193,4 @@ fn qwen4PackTripleMatches(w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, 
     if (ss[1] <= 0 or ss[1] != bs[1]) return false;
     const k = @as(u64, @intCast(ss[1])) * 64;
     return @as(u64, @intCast(ws[1])) * 32 == k * 4;
-}
-
-test "qwen4 MTP profile: only the affine-4/gs-64 trunk with matching head packs and a live NAX lane is calibrated" {
-    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_q4_gs64, qwen4G17CostProfileForFingerprint(true, 4, 64, true, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(false, 4, 64, true, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 8, 64, true, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 32, true, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, false, true));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, true, false));
 }

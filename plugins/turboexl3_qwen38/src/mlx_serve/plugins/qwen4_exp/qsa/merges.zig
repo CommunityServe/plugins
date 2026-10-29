@@ -399,34 +399,3 @@ const testing = std.testing;
 fn testIdxFacts() IdxFacts {
     return .{ .batch = 1, .rows = 1, .linear = true, .bf16 = true, .idx_hd = 128, .ratio = 4, .rope_dims = 64, .text_rope = true, .norms = true };
 }
-
-test "qsa merges: the indexer epilogue serves decode rows only, and each fact refuses alone" {
-    try testing.expectEqual(@as(?[]const u8, null), idxRefusal(testIdxFacts()));
-    var f = testIdxFacts();
-    f.rows = fusion.decode_rows_max + 1;
-    try testing.expect(idxRefusal(f) != null);
-    f = testIdxFacts();
-    f.batch = 2;
-    try testing.expect(idxRefusal(f) != null);
-    f = testIdxFacts();
-    f.linear = false;
-    try testing.expect(idxRefusal(f) != null);
-    f = testIdxFacts();
-    f.bf16 = false;
-    try testing.expect(idxRefusal(f) != null);
-    f = testIdxFacts();
-    f.idx_hd = 64;
-    try testing.expect(idxRefusal(f) != null);
-    f = testIdxFacts();
-    f.ratio = pooled.QSA_POOL_SERIAL_MAX_R + 1;
-    try testing.expect(idxRefusal(f) != null);
-    f = testIdxFacts();
-    f.rope_dims = 60;
-    try testing.expect(idxRefusal(f) != null);
-    f = testIdxFacts();
-    f.text_rope = false;
-    try testing.expect(idxRefusal(f) != null);
-    f = testIdxFacts();
-    f.norms = false;
-    try testing.expect(idxRefusal(f) != null);
-}

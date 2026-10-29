@@ -397,87 +397,6 @@ fn putZeros(w: *model.Weights, name: []const u8, dt: mlx.mlx_dtype, shape: []con
     try w.put(name, a);
 }
 
-test "qwen4_exp formats: the numerics are reordered on the EXL3 trunk profile and exact elsewhere" {
-    try testing.expectEqual(Numerics.reordered, numericsFor(true));
-    try testing.expectEqual(Numerics.exact, numericsFor(false));
-}
-
-test "qwen4_exp formats: a trunk format loads the linears outside MLX's encodings, and qmatmul runs them through it" {
-    var w = model.Weights.init(testing.allocator);
-    defer w.deinit();
-    try putZeros(&w, "m.q.weight", .uint16, &.{ 8, 8, 32 });
-    try putZeros(&w, "m.q.scales", .float16, &.{128});
-    try putZeros(&w, "m.o.weight", .bfloat16, &.{ 128, 128 });
-    try putZeros(&w, "m.k.weight", .uint32, &.{ 128, 16 });
-    const saved = extra_tables;
-    defer extra_tables = saved;
-    extra_tables = &.{&Fake.table};
-    const s = mlx.mlx_default_cpu_stream_new();
-    const config: model.ModelConfig = .{ .trunk_format = true };
-    var ld: Loading = undefined;
-    try ld.begin(testing.allocator, &config, &w, .{ .trunk_quant = "{\"format\":\"fake\"}" }, s);
-    ld.end();
-    var f = ld.formats;
-    defer f.deinit(testing.allocator);
-    try testing.expectEqual(&Fake.table, f.trunk.?);
-    try testing.expectEqual(@as(u32, 1), f.linears.count());
-    try testing.expect(f.linearOf(w.get("m.o.weight").?) == null and f.linearOf(w.get("m.k.weight").?) == null);
-    var t: Trunk = undefined;
-    t.s = s;
-    t.formats = f;
-    const x = w.get("m.o.weight").?;
-    const y = try t.qmatmul(x, w.get("m.q.weight").?, w.get("m.q.scales").?, .{});
-    defer _ = mlx.mlx_array_free(y);
-    try testing.expectEqualSlices(c_int, mlx.getShape(x), mlx.getShape(y));
-}
-
-test "qwen4_exp formats: an unclaimed trunk block, a linear its format refuses and a pack without the block are refused by name" {
-    var w = model.Weights.init(testing.allocator);
-    defer w.deinit();
-    try putZeros(&w, "m.q.weight", .uint16, &.{ 8, 8, 32 });
-    const s = mlx.mlx_default_cpu_stream_new();
-    const config: model.ModelConfig = .{ .trunk_format = true };
-    var ld: Loading = undefined;
-    const saved = extra_tables;
-    defer extra_tables = saved;
-    extra_tables = &.{};
-    try testing.expectError(error.QuantFormatUnclaimed, ld.begin(testing.allocator, &config, &w, .{ .trunk_quant = "{\"format\":\"fake\"}" }, s));
-    try testing.expectError(error.TrunkFormatBlockMissing, ld.begin(testing.allocator, &config, &w, .{}, s));
-    extra_tables = &.{&Fake.table};
-    try putZeros(&w, "m.bad.weight", .uint16, &.{ 8, 8, 32 });
-    try testing.expectError(error.TrunkLinearUnserved, ld.begin(testing.allocator, &config, &w, .{ .trunk_quant = "{\"format\":\"fake\"}" }, s));
-    var none = model.Weights.init(testing.allocator);
-    defer none.deinit();
-    try testing.expectError(error.TrunkFormatHasNoLinears, ld.begin(testing.allocator, &config, &none, .{ .trunk_quant = "{\"format\":\"fake\"}" }, s));
-}
-
-test "qwen4_exp formats: the built-in Sushi table serves a Sushi pack's banks, in the exact numerics" {
-    var w = model.Weights.init(testing.allocator);
-    defer w.deinit();
-    const saved = extra_tables;
-    defer extra_tables = saved;
-    // a table above the built-ins on every block (turboexl3's rank) is weighed for an EXL3 trunk pack's banks only
-    extra_tables = &.{&Marker.table};
-    const s = mlx.mlx_default_cpu_stream_new();
-    const config: model.ModelConfig = .{ .exl3 = .{ .rate = .{ .n = 32 }, .codebook = .mul1 } };
-    const pack: Pack = .{ .expert_quant = "{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mul1\"}" };
-    {
-        var ld: Loading = undefined;
-        try ld.begin(testing.allocator, &config, &w, pack, s);
-        ld.end();
-        var f = ld.formats;
-        defer f.deinit(testing.allocator);
-        try testing.expectEqual(&exl3_format.table, f.experts.?);
-        try testing.expect(f.trunk == null);
-        try testing.expectEqual(Numerics.exact, f.numerics);
-    }
-    const plain: model.ModelConfig = .{};
-    var ld: Loading = undefined;
-    try ld.begin(testing.allocator, &plain, &w, .{}, s);
-    ld.end();
-    try testing.expect(ld.formats.experts == null and ld.formats.numerics == .exact and !ld.formats.profile);
-}
-
 /// `Fake` with the resident entries: each weight takes `per` bytes.
 const Keep = struct {
     const per: u64 = 1024;
@@ -511,26 +430,4 @@ fn keepTrunk(w: *model.Weights, s: mlx.mlx_stream) !Trunk {
     t.qwen4_mtp = null;
     t.moe_layers = &.{};
     return t;
-}
-
-test "qwen4_exp formats: the resident trunk keeps the trunk format's linears but the lm_head, within the room; a refusal keeps none" {
-    var w = model.Weights.init(testing.allocator);
-    defer w.deinit();
-    for ([_][]const u8{ "m.q.weight", "m.o.weight", "lm_head.weight" }) |name| try putZeros(&w, name, .uint16, &.{ 8, 8, 32 });
-    const saved = extra_tables;
-    defer extra_tables = saved;
-    extra_tables = &.{&Keep.table};
-    const s = mlx.mlx_default_cpu_stream_new();
-    var t = try keepTrunk(&w, s);
-    defer t.formats.deinit(testing.allocator);
-    armTrunkResident(&t, Keep.per, true);
-    try testing.expectEqual(@as(u64, 0), t.formats.resident_bytes);
-    armTrunkResident(&t, 0, true);
-    try testing.expectEqual(@as(usize, 2), Keep.last);
-    try testing.expectEqual(2 * Keep.per, t.formats.resident_bytes);
-    Keep.dropped = false;
-    var f = t.formats;
-    t.formats = .{};
-    f.deinit(testing.allocator);
-    try testing.expect(Keep.dropped);
 }

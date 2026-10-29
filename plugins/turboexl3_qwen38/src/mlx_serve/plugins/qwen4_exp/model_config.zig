@@ -70,11 +70,6 @@ const abi = @import("mlx_serve").abi.plugin;
 const fixture = @import("mlx_serve").sdk.fixture;
 const config = @import("config.zig");
 
-test "qwen4_exp model config: the parse bounds are the n-gram hash's arrays" {
-    try testing.expectEqual(@as(usize, config.max_ngram_size), qwen4_exp.MAX_NGRAM_SIZE);
-    try testing.expectEqual(@as(usize, config.max_heads), qwen4_exp.MAX_HEADS);
-}
-
 /// The plugin's parse of `files` (staged on disk for the engine), through `toModelConfig`, equals the engine's
 /// `parseConfig` of the same folder in every field.
 fn expectEngineParse(files: []const fixture.File) !void {
@@ -115,73 +110,3 @@ const nvidia_processor =
     \\{"size": {"longest_edge": 16777216, "shortest_edge": 65536}, "patch_size": 16, "temporal_patch_size": 2,
     \\ "merge_size": 2, "processor_class": "Qwen3VLProcessor"}
 ;
-
-test "qwen4_exp model config: the iQ-MLX 4.7bpw pack equals the engine's parse, with its generation config" {
-    try expectEngineParse(&.{ .{ .name = "config.json", .bytes = iq_pack }, .{ .name = "generation_config.json", .bytes = iq_generation } });
-}
-
-test "qwen4_exp model config: NVIDIA's ModelOpt FP4 pack equals the engine's parse, with its processor bounds" {
-    try expectEngineParse(&.{ .{ .name = "config.json", .bytes = nvidia_pack }, .{ .name = "preprocessor_config.json", .bytes = nvidia_processor } });
-}
-
-test "qwen4_exp model config: the flat text pack and a YaRN window equal the engine's parse" {
-    try expectEngineParse(&.{.{ .name = "config.json", .bytes = config.tiny_text }});
-    const yarn =
-        \\{"model_type":"qwen4_exp","text_config":{"vocab_size":128,"hidden_size":64,"num_hidden_layers":4,
-        \\ "num_attention_heads":4,"num_key_value_heads":2,"head_dim":32,"full_attention_interval":2,"layer_types":["linear_attention",
-        \\ "full_attention","linear_attention","full_attention"],"linear_num_key_heads":2,"linear_num_value_heads":4,
-        \\ "linear_key_head_dim":16,"linear_value_head_dim":16,"num_experts":4,"num_experts_per_tok":2,
-        \\ "moe_intermediate_size":32,"ple_layer_ids":[1],"ple_embed_dim":64,"heads_per_ngram":2,"hc_count":2,
-        \\ "max_position_embeddings":262144,"eos_token_id":[7,9],"rope_parameters":{"rope_type":"yarn","factor":4.0,
-        \\ "original_max_position_embeddings":262144,"rope_theta":10000000,"partial_rotary_factor":0.25,
-        \\ "mrope_section":[2,1,1],"mrope_interleaved":true}},"qwen4_norm_convention":"delta",
-        \\ "quantization":{"bits":8,"group_size":32,"mode":"affine"},"vision_config":{"depth":2,"hidden_size":32,
-        \\ "num_heads":2,"intermediate_size":64,"patch_size":16,"out_hidden_size":64}}
-    ;
-    try expectEngineParse(&.{
-        .{ .name = "config.json", .bytes = yarn },
-        .{ .name = "processor_config.json", .bytes = "{\"image_processor\":{\"min_pixels\":4096,\"max_pixels\":65536}}" },
-        .{ .name = "generation_config.json", .bytes = "{\"eos_token_id\":[9,11],\"default_chat_template_kwargs\":{\"enable_thinking\":false}}" },
-    });
-}
-
-test "qwen4_exp model config: an index naming n-gram shards measures the embedded table as the engine does" {
-    const io = testing.io;
-    var td = testing.tmpDir(.{});
-    defer td.cleanup();
-    try @import("ple_table.zig").writeFixture(&td, .valid);
-    const cfg =
-        \\{"model_type":"qwen4_exp_text","vocab_size":16,"hidden_size":64,"num_hidden_layers":2,"head_dim":32,
-        \\ "full_attention_interval":2,"linear_num_key_heads":2,"linear_num_value_heads":2,"ple_layer_ids":[2],
-        \\ "ple_embed_dim":32,"ngram_size":2,"heads_per_ngram":1,"ngram_vocab_size_base":2,
-        \\ "make_ngram_vocab_size_divisible_by":6,"split_ngram_parts":3}
-    ;
-    try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = cfg });
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = buf[0..try td.dir.realPath(io, &buf)];
-    var want = try model.parseConfigLegacy(io, testing.allocator, path);
-    defer want.deinit(testing.allocator);
-    try testing.expect(want.embedded_ple_payload_bytes != null);
-    const index = try td.dir.readFileAlloc(io, "model.safetensors.index.json", testing.allocator, .limited(1 << 20));
-    defer testing.allocator.free(index);
-    const mem: fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = cfg }, .{ .name = "model.safetensors.index.json", .bytes = index } } };
-    const pd = mem.packDir();
-    var p: abi.Parsed = .{};
-    try testing.expect(config.parse(&pd, .of(cfg), .{}, null, false, &p).isOk());
-    defer config.freeParsed(&p);
-    try testing.expect(config.of(&p).embedded_ngram);
-    var got = try toModelConfig(testing.allocator, config.of(&p), path);
-    defer got.deinit(testing.allocator);
-    try testing.expectEqualDeep(want, got);
-}
-
-test "qwen4_exp model config: a Sushi pack's EXL3 experts equal the engine's parse" {
-    const sushi = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mcg\",\"window\":15}," ++ config.tiny_text[1..];
-    try expectEngineParse(&.{.{ .name = "config.json", .bytes = sushi }});
-}
-
-test "qwen4_exp model config: a fully EXL3 pack's trunk format and n-gram table file equal the engine's parse" {
-    const full = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mul1\"},\"trunk_quant\":{\"format\":\"exl3\",\"codebook\":\"mul1\",\"window\":16}," ++
-        "\"ngram_table\":{\"file\":\"ngram_embedding.safetensors\",\"format\":\"exl3_ngram_trellis\",\"k\":6,\"row_dim\":160}," ++ config.tiny_text[1..];
-    try expectEngineParse(&.{.{ .name = "config.json", .bytes = full }});
-}

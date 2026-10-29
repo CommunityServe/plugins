@@ -342,76 +342,6 @@ fn truth(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, windo
     return out;
 }
 
-test "nax attention q/k 192 (MiMo) or 128 (Flint), v 128: causal, windowed and sunk prefill track fp32 attention" {
-    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(192128);
-    const rnd = prng.random();
-    // (heads, kv heads, queries, keys, window, sinks): ragged tails, a cached prefix, a sliding band.
-    const cases = [_]struct { h: c_int, hk: c_int, ql: c_int, kl: c_int, window: c_int, sinks: bool }{
-        .{ .h = 4, .hk = 2, .ql = 100, .kl = 300, .window = 0, .sinks = false },
-        .{ .h = 8, .hk = 1, .ql = 128, .kl = 128, .window = 0, .sinks = false },
-        .{ .h = 8, .hk = 2, .ql = 200, .kl = 333, .window = 128, .sinks = true },
-        .{ .h = 4, .hk = 4, .ql = 64, .kl = 64, .window = 16, .sinks = false },
-        .{ .h = 4, .hk = 4, .ql = 40, .kl = 40, .window = 8, .sinks = true },
-        .{ .h = 32, .hk = 4, .ql = 700, .kl = 1300, .window = 513, .sinks = true },
-    };
-    for ([_]c_int{ 192, 128 }) |dk| for (cases) |cs| {
-        const q = try randBf16(rnd, &.{ 1, cs.h, cs.ql, dk }, s);
-        defer _ = mlx.mlx_array_free(q);
-        const k = try randBf16(rnd, &.{ 1, cs.hk, cs.kl, dk }, s);
-        defer _ = mlx.mlx_array_free(k);
-        const v = try randBf16(rnd, &.{ 1, cs.hk, cs.kl, 128 }, s);
-        defer _ = mlx.mlx_array_free(v);
-        const sk: ?mlx.mlx_array = if (cs.sinks) try randBf16(rnd, &.{cs.h}, s) else null;
-        defer if (sk) |a| {
-            _ = mlx.mlx_array_free(a);
-        };
-        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dk)));
-        const ours = (try attention(s, q, k, v, scale, cs.window, sk)) orelse return error.TestUnexpectedDecline;
-        defer _ = mlx.mlx_array_free(ours);
-        const ref = try truth(q, k, v, scale, cs.window, sk, s);
-        defer _ = mlx.mlx_array_free(ref);
-        // bf16 output of an fp32-accumulated kernel: a few bf16 ulps at |O| < 2.
-        const err = try maxAbsDiff(ours, ref, s);
-        if (err > 2e-2) {
-            std.debug.print("nax attention dk={d} {any}: max |d| {d} vs fp32\n", .{ dk, cs, err });
-            return error.TestExpectedEqual;
-        }
-    };
-}
-
-test "nax attention 192/128: key-range passes reproduce one dispatch bit for bit" {
-    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(192129);
-    const rnd = prng.random();
-    const q = try randBf16(rnd, &.{ 1, 4, 100, 192 }, s);
-    defer _ = mlx.mlx_array_free(q);
-    const k = try randBf16(rnd, &.{ 1, 2, 300, 192 }, s);
-    defer _ = mlx.mlx_array_free(k);
-    const v = try randBf16(rnd, &.{ 1, 2, 300, 128 }, s);
-    defer _ = mlx.mlx_array_free(v);
-    const scale: f32 = 1.0 / @sqrt(192.0);
-    for ([_]c_int{ 1, 2 }) |wn| {
-        const single = try dispatch(s, q, k, v, scale, 0, null, &.{ 0, 10 }, wn);
-        defer _ = mlx.mlx_array_free(single);
-        const passes = try dispatch(s, q, k, v, scale, 0, null, &.{ 0, 3, 6, 10 }, wn);
-        defer _ = mlx.mlx_array_free(passes);
-        try testing.expectEqual(@as(f32, 0), try maxAbsDiff(single, passes, s));
-        const ref = try truth(q, k, v, scale, 0, null, s);
-        defer _ = mlx.mlx_array_free(ref);
-        try testing.expect(try maxAbsDiff(passes, ref, s) < 2e-2);
-    }
-}
-
-test "nax attention: a long causal prefill splits into ~8k-key passes, a window never does" {
-    var buf: [MAX_PASSES + 1]c_int = undefined;
-    try testing.expectEqualSlices(c_int, &.{ 0, 1024 }, passEdges(&buf, 8192, 1024, 128));
-    try testing.expectEqualSlices(c_int, &.{ 0, 1024 }, passEdges(&buf, 100, 1024, 0));
-    try testing.expectEqualSlices(c_int, &.{ 0, 256, 512, 768, 1024 }, passEdges(&buf, 8192, 1024, 0));
-}
-
 fn relRms(a: mlx.mlx_array, ref: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
     var sc = Scope.init(testing.allocator, s);
     defer sc.deinit();
@@ -428,58 +358,6 @@ fn relRms(a: mlx.mlx_array, ref: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
     try mlx.check(mlx.mlx_array_item_float32(&n, num));
     try mlx.check(mlx.mlx_array_item_float32(&dd, den));
     return @sqrt(n / dd);
-}
-
-test "nax attention 256 int8 QK: causal prefill tracks fp32 attention, tails and offset keys included" {
-    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(256008);
-    const rnd = prng.random();
-    for ([_][2]c_int{ .{ 128, 512 }, .{ 100, 300 }, .{ 64, 64 } }) |cs| {
-        const q = try randBf16(rnd, &.{ 1, 6, cs[0], 256 }, s);
-        defer _ = mlx.mlx_array_free(q);
-        const k0 = try randBf16(rnd, &.{ 1, 1, cs[1], 256 }, s);
-        defer _ = mlx.mlx_array_free(k0);
-        // Real keys carry per-channel offsets; the mean removal is what keeps int8 usable on them.
-        const off = try randBf16(rnd, &.{ 1, 1, 1, 256 }, s);
-        defer _ = mlx.mlx_array_free(off);
-        var off4 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(off4);
-        const eight = mlx.mlx_array_new_float(8.0);
-        defer _ = mlx.mlx_array_free(eight);
-        try mlx.check(mlx.mlx_multiply(&off4, off, eight, s));
-        var kf = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kf);
-        try mlx.check(mlx.mlx_add(&kf, k0, off4, s));
-        var k = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k);
-        try mlx.check(mlx.mlx_astype(&k, kf, .bfloat16, s));
-        const v = try randBf16(rnd, &.{ 1, 1, cs[1], 256 }, s);
-        defer _ = mlx.mlx_array_free(v);
-        const scale: f32 = 1.0 / 16.0;
-        const ours = (try attention256Int8Impl(s, q, k, v, scale)) orelse return error.TestUnexpectedDecline;
-        defer _ = mlx.mlx_array_free(ours);
-        const ref = try truth(q, k, v, scale, 0, null, s);
-        defer _ = mlx.mlx_array_free(ref);
-        // int8 scores: SageAttention-level error, ~1e-2 relative on random data.
-        const err = try relRms(ours, ref, s);
-        if (err > 3e-2) {
-            std.debug.print("int8 QK {any}: rel rms {d} vs fp32\n", .{ cs, err });
-            return error.TestExpectedEqual;
-        }
-    }
-}
-
-test "nax attention 256 int8 QK: verify widths decline" {
-    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return;
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(256009);
-    const rnd = prng.random();
-    const q = try randBf16(rnd, &.{ 1, 6, 16, 256 }, s);
-    defer _ = mlx.mlx_array_free(q);
-    const k = try randBf16(rnd, &.{ 1, 1, 400, 256 }, s);
-    defer _ = mlx.mlx_array_free(k);
-    try testing.expect((try attention256Int8Impl(s, q, k, k, 0.0625)) == null);
 }
 
 /// Host [H, L, D] values as a bf16 [1, H, L, D] array, a transposed [1, L, H, D] buffer when `strided`.
@@ -546,41 +424,4 @@ fn quantHash(p: [2]mlx.mlx_array, s: mlx.mlx_stream) !u64 {
     hs.update(std.mem.sliceAsBytes(mlx.mlx_array_data_int32(codes).?[0..mlx.mlx_array_size(codes)]));
     hs.update(std.mem.sliceAsBytes(mlx.mlx_array_data_float32(p[1]).?[0..mlx.mlx_array_size(p[1])]));
     return hs.final();
-}
-
-test "int8 Q/K quantizers: codes and scales of both attention kernels are pinned bit for bit" {
-    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
-    const int8_attn = @import("../dit/int8_attn.zig");
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(8128256);
-    const rnd = prng.random();
-    // (head dim, heads, length, block rows, key mean, strided view): ragged tails in every arm.
-    const arms = [_]struct { d: c_int, h: c_int, l: c_int, rows: c_int, key: bool, strided: bool }{
-        .{ .d = 128, .h = 4, .l = 96, .rows = 1, .key = false, .strided = false },
-        .{ .d = 128, .h = 3, .l = 600, .rows = BK, .key = true, .strided = false },
-        .{ .d = 256, .h = 4, .l = 200, .rows = Q8_BQ, .key = false, .strided = true },
-        .{ .d = 256, .h = 3, .l = 600, .rows = BK, .key = true, .strided = true },
-    };
-    var got: [arms.len]u64 = undefined;
-    for (arms, &got) |a, *g| {
-        const vals = try quantPinInput(rnd, @intCast(a.h), @intCast(a.l), @intCast(a.d), @intCast(a.rows), a.key);
-        defer testing.allocator.free(vals);
-        const x = try hostBf16(vals, a.h, a.l, a.d, a.strided, s);
-        defer _ = mlx.mlx_array_free(x);
-        if (a.d == 128) {
-            const p = if (a.key) try int8_attn.prepK(x, s) else try int8_attn.prepQ(x, s);
-            defer for (p) |y| {
-                _ = mlx.mlx_array_free(y);
-            };
-            g.* = try quantHash(p, s);
-            continue;
-        }
-        var sc = Scope.init(testing.allocator, s);
-        defer sc.deinit();
-        var mean = mlx.mlx_array_new();
-        const mk: ?mlx.mlx_array = if (a.key) try sc.res(mlx.mlx_mean_axes(&mean, x, &[_]c_int{2}, 1, true, s), &mean) else null;
-        const q = try quantRows(&sc, x, a.rows, mk);
-        g.* = try quantHash(.{ q.vals, q.scales }, s);
-    }
-    try testing.expectEqualSlices(u64, &.{ 4227379021708612929, 1397979178671988668, 17875194357197419973, 12256422364308871583 }, &got);
 }

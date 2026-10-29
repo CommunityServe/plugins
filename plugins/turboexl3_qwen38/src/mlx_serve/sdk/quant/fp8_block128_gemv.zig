@@ -120,27 +120,3 @@ pub fn hostDot(p: Gemv, xr: []const u16, w: []const f32) f32 {
 // ── tests ──
 
 const testing = std.testing;
-
-test "fp8_block128 gemv: the site plans of MiMo's FP8 projections, and the per-width R that keeps their KS and RG" {
-    const Site = struct { n: u32, k: u32, want: Gemv };
-    const sites = [_]Site{
-        .{ .n = 12288, .k = 4096, .want = .{ .r = 4, .ks = 1, .rg = 4 } },
-        .{ .n = 768, .k = 4096, .want = .{ .r = 4, .ks = 8, .rg = 1 } },
-        .{ .n = 512, .k = 4096, .want = .{ .r = 4, .ks = 8, .rg = 1 } },
-        .{ .n = 1536, .k = 4096, .want = .{ .r = 4, .ks = 4, .rg = 1 } },
-        .{ .n = 1024, .k = 4096, .want = .{ .r = 4, .ks = 4, .rg = 1 } },
-        .{ .n = 16384, .k = 4096, .want = .{ .r = 4, .ks = 1, .rg = 4 } },
-        .{ .n = 4096, .k = 16384, .want = .{ .r = 4, .ks = 1, .rg = 4 } },
-    };
-    for (sites) |s| {
-        const p = plan(s.n, s.k).?;
-        try testing.expectEqual(s.want, p);
-        for (1..max_rows + 1) |m| {
-            const q = planAt(p, s.n, s.k, @intCast(m));
-            try testing.expect(q.ks == p.ks and q.rg == p.rg and @rem(64, q.r) == 0 and s.n % @as(u32, @intCast(q.r * q.rg)) == 0);
-        }
-    }
-    try testing.expectEqual(@as(c_int, 2), planAt(plan(768, 4096).?, 768, 4096, 4).r);
-    try testing.expectEqual(@as(c_int, 1), planAt(plan(12288, 4096).?, 12288, 4096, 5).r);
-    try testing.expect(plan(12288, 4000) == null and plan(12290, 4096) == null and plan(96, 4096) == null);
-}

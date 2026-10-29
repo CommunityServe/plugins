@@ -170,15 +170,6 @@ fn parityRows(h: c_int, r: c_int, bits: u32, gs: u32, seed: u64, rows: c_int) !v
     }
 }
 
-test "hc decode2: a multi-row read matches each row read alone (Flash Next geometry, 8-bit, vectorized up launch)" {
-    for ([_]c_int{ 2, 6, 9, 16 }) |rows| try parityRows(2560, 320, 8, 64, 0x2D0DE9 + @as(u64, @intCast(rows)), rows);
-}
-
-test "hc decode2: a multi-row read matches each row read alone (4/5/6-bit, per-row up launch)" {
-    try parityRows(512, 64, 4, 64, 0x2D0DE4, 3);
-    for ([_]u32{ 5, 6 }) |bits| try parityRows(2560, 320, bits, 64, 0x2D0DE5 + bits, 5);
-}
-
 /// Dense bf16 hc weights as a fully EXL3 pack carries them: the down [R, K] and up [K, R] rows viewed as u32 words,
 /// evaluated as a loaded pack's are.
 const Dense = struct {

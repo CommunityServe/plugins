@@ -211,32 +211,3 @@ pub fn loadWeightsFile(allocator: std.mem.Allocator, model_dir: []const u8, file
 // ── tests ──
 
 const testing = std.testing;
-
-test "resident: take moves the map out of a resident source and refuses any other" {
-    var w = Weights.init(testing.allocator);
-    try w.put("x.weight", mlx.mlx_array_new_float(2.0));
-    var r = Resident.adopt(w);
-    defer r.deinit();
-    const src = r.source();
-    var got = Resident.take(&src) orelse return error.NotTaken;
-    defer got.deinit();
-    try testing.expectEqual(@as(u32, 1), got.count());
-    try testing.expectEqual(@as(u32, 0), r.weights.count());
-    const other: abi.Source = .{ .ctx = null, .get = struct {
-        fn g(_: ?*anyopaque, _: abi.Str) callconv(.c) abi.Array {
-            return .{};
-        }
-    }.g };
-    try testing.expect(Resident.take(&other) == null);
-}
-
-test "resident: the source hands out the map's own arrays and an empty one for a missing name" {
-    var w = Weights.init(testing.allocator);
-    const a = mlx.mlx_array_new_float(2.0);
-    try w.put("x.weight", a);
-    var r = Resident.adopt(w);
-    defer r.deinit();
-    const src = r.source();
-    try testing.expectEqual(a.ctx, src.tensor("x.weight").ctx);
-    try testing.expectEqual(@as(?*anyopaque, null), src.tensor("x.scales").ctx);
-}

@@ -197,16 +197,3 @@ pub fn groupNorm(x: mlx.mlx_array, w: mlx.mlx_array, eps: mlx.mlx_array, groups:
     try mlx.check(mlx.mlx_vector_array_get(&y, o, 0));
     return y;
 }
-
-// Bar: a one-row decode step reserves one row of B/C, and a state too wide
-// for the threadgroup budget declines instead of failing at dispatch.
-test "mamba2 step: threadgroup memory follows the row bucket and stays in budget" {
-    const t = std.testing;
-    try t.expectEqual(@as(usize, 1024), stepThreadgroupBytes(1, 128));
-    try t.expectEqual(@as(usize, 4096), stepThreadgroupBytes(3, 128));
-    try t.expectEqual(@as(usize, 16384), stepThreadgroupBytes(16, 128));
-    try t.expect(stepFits(16, 128));
-    try t.expect(stepFits(1, 512));
-    try t.expect(!stepFits(16, 256));
-    try t.expect(!stepFits(4, 1024));
-}

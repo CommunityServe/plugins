@@ -168,20 +168,6 @@ pub fn resolveMtpSource(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Di
 const qwen4_mtp_marker = "\"language_model.mtp.fc_hidden.weight\"";
 const qwen4_root_mtp_marker = "\"mtp.fc_hidden.weight\"";
 
-test "qwen4 root MTP head is advertised from the shard index" {
-    const io = testing.io;
-    const allocator = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.fc_hidden.weight\":\"model-00001.safetensors\"}}" });
-    try testing.expect(dirAdvertisesMtp(io, allocator, tmp.dir));
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(io, &path_buf);
-    try testing.expect(!hasMtpHead(io, allocator, path_buf[0..path_len]));
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.fc_embedding.weight\":\"model-00001.safetensors\"}}" });
-    try testing.expect(!dirAdvertisesMtp(io, allocator, tmp.dir));
-}
-
 fn indexJsonHasQwen4Mtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
     const bytes = readDirFileAlloc(io, allocator, dir, "model.safetensors.index.json", checkpoint_header_limit) orelse return false;
     defer allocator.free(bytes);

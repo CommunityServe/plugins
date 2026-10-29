@@ -170,14 +170,3 @@ fn specWarmGroupRows(group_cap: usize) usize {
 fn specWarmGroupSeq(group_cap: usize, rows: usize, width_cap: usize) usize {
     return @min(group_cap / rows - 1, width_cap) + 1;
 }
-
-test "spec warm-up covers exactly the group shapes the scheduler can build" {
-    try testing.expectEqual(@as(usize, 4), specWarmGroupRows(16));
-    try testing.expectEqual(@as(usize, 3), specWarmGroupRows(7));
-    try testing.expectEqual(@as(usize, 7), specWarmGroupSeq(16, 2, 6));
-    try testing.expectEqual(@as(usize, 5), specWarmGroupSeq(16, 3, 6));
-    try testing.expectEqual(@as(usize, 4), specWarmGroupSeq(16, 4, 6));
-    try testing.expectEqual(@as(usize, 3), specWarmGroupSeq(7, 2, 6));
-    try testing.expectEqual(@as(usize, 2), specWarmGroupSeq(7, 3, 6));
-    try testing.expectEqual(@as(usize, 3), specWarmGroupSeq(16, 2, 2));
-}

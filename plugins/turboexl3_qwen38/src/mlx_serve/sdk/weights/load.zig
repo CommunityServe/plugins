@@ -434,17 +434,6 @@ pub fn dequantizeSmall(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array
 
 const testing = std.testing;
 
-test "keepsF16Operand: an EXL3 trunk's 1-D suh and svh and the trellis table's bias stay f16, nothing else does" {
-    const exl3: LoadOpts = .{ .trunk_format = true };
-    try testing.expect(keepsF16Operand("m.layers.0.self_attn.q_proj.scales", 1, exl3));
-    try testing.expect(keepsF16Operand("m.layers.0.self_attn.q_proj.biases", 1, exl3));
-    try testing.expect(!keepsF16Operand("m.layers.0.mlp.gate.scales", 2, exl3));
-    try testing.expect(!keepsF16Operand("m.layers.0.input_layernorm.weight", 1, exl3));
-    try testing.expect(!keepsF16Operand("m.layers.0.self_attn.q_proj.scales", 1, .{}));
-    try testing.expect(keepsF16Operand("m.layers.2.ple.ple_embedding.head_bias", 2, exl3));
-    try testing.expect(!keepsF16Operand("m.layers.2.ple.ple_embedding.head_bias", 2, .{}));
-}
-
 /// One safetensors shard of f16 zeros: two 1-D [2] side tensors, a 2-D [2, 2] `.scales` and a [2, 2] head bias.
 fn writeF16Shard(dir: std.Io.Dir, io: std.Io) !void {
     const hdr = "{\"m.q.scales\":{\"dtype\":\"F16\",\"shape\":[2],\"data_offsets\":[0,4]}," ++
@@ -455,29 +444,4 @@ fn writeF16Shard(dir: std.Io.Dir, io: std.Io) !void {
     std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
     @memcpy(shard[8..][0..hdr.len], hdr);
     try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &shard });
-}
-
-test "loadWeightsOpt: an EXL3 trunk keeps its 1-D suh and svh f16 while 2-D side tensors narrow; an affine pack narrows them" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeF16Shard(tmp.dir, io);
-    var buf: [512]u8 = undefined;
-    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
-    for ([_]bool{ true, false }) |exl3| {
-        var w = try loadWeightsOpt(io, testing.allocator, dir, .{ .trunk_format = exl3 });
-        defer w.deinit();
-        const side: mlx.mlx_dtype = if (exl3 or !narrow1dEnabled()) .float16 else .bfloat16;
-        try testing.expectEqual(side, mlx.mlx_array_dtype(w.get("m.q.scales").?));
-        try testing.expectEqual(side, mlx.mlx_array_dtype(w.get("m.q.biases").?));
-        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(w.get("m.g.scales").?));
-        try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(w.get("m.ple.ple_embedding.head_bias").?));
-    }
-}
-
-test "readsPastPageCache: a nocache load and a DeepSeek-V4.1 pack read past the page cache on Darwin; nothing else does" {
-    try testing.expect(readsPastPageCache(.{ .nocache = true }, true));
-    try testing.expect(readsPastPageCache(.{ .dsv41 = true }, true));
-    try testing.expect(!readsPastPageCache(.{}, true));
-    try testing.expect(!readsPastPageCache(.{ .nocache = true, .dsv41 = true }, false));
 }

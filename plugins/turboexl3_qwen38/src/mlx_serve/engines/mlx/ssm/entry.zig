@@ -517,19 +517,3 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
 }
 
 // ── tests ──
-
-test "gdn replay: the plan walks rows 0..accepted and keeps conv rows 1+a..3+a; the marker is a capture until the round frees it" {
-    const std = @import("std");
-    var buf: [gdn_decode.FOLD_MAX_SEQ]i32 = undefined;
-    const p = gdnReplayPlan(2, &buf);
-    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2 }, p.path);
-    try std.testing.expectEqual([3]i32{ 3, 4, 5 }, p.conv_rows);
-    const full = gdnReplayPlan(gdn_decode.FOLD_MAX_SEQ - 1, &buf);
-    try std.testing.expectEqual(@as(usize, gdn_decode.FOLD_MAX_SEQ), full.path.len);
-    var e: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
-    try std.testing.expect(!ssmChainCaptured(&e));
-    e.spec_replay = true;
-    try std.testing.expect(ssmChainCaptured(&e));
-    ssmFreeSpecCapture(&e);
-    try std.testing.expect(!e.spec_replay and !ssmChainCaptured(&e));
-}

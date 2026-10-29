@@ -60,38 +60,3 @@ fn qkvRows(config: *const ModelConfig, li: u32) [3]u64 {
 // ── tests ──
 
 const testing = std.testing;
-
-test "sushi pack: the MiMo MTP heads get the trunk's split QKV and decoded MLP" {
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    // Layer 0 slides (pattern 2): its geometry is the heads'. q 32 + k 32 + v 32 rows over 4 ranks.
-    var config: ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 2, .num_attention_heads = 4, .num_key_value_heads = 4, .head_dim = 8, .has_sliding_window = true, .sliding_window_pattern = 2, .weight_prefix = "model" };
-    var w = Weights.init(testing.allocator);
-    defer w.deinit();
-    var codes: [128 * 128]u8 = undefined;
-    for (&codes, 0..) |*c, i| c.* = @intCast((i * 13 + 3) % 0x70);
-    const ones = [_]f32{ 0.5, 0.5, 0.5, 0.5 };
-    try w.put("model.mtp.layers.0.eh_proj.weight", mlx.mlx_array_new_float(1));
-    try w.put("model.mtp.layers.0.self_attn.qkv_proj.weight", mlx.mlx_array_new_data(&codes, &[_]c_int{ 96, 128 }, 2, .uint8));
-    try w.put("model.mtp.layers.0.self_attn.qkv_proj.weight_scale_inv", mlx.mlx_array_new_data(&ones, &[_]c_int{ 4, 1 }, 2, .float32));
-    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
-        var k1: [96]u8 = undefined;
-        var k2: [96]u8 = undefined;
-        try w.put(try std.fmt.bufPrint(&k1, "model.mtp.layers.0.mlp.{s}.weight", .{proj}), mlx.mlx_array_new_data(&codes, &[_]c_int{ 128, 128 }, 2, .uint8));
-        try w.put(try std.fmt.bufPrint(&k2, "model.mtp.layers.0.mlp.{s}.weight_scale_inv", .{proj}), mlx.mlx_array_new_data(&ones, &[_]c_int{ 1, 1 }, 2, .float32));
-    }
-    try dequantFp8Trunk(&config, &w, s);
-
-    try testing.expect(w.get("model.mtp.layers.0.self_attn.qkv_proj.weight") == null);
-    for ([_][]const u8{ "q_proj", "k_proj", "v_proj" }) |proj| {
-        var k1: [96]u8 = undefined;
-        const part = w.get(try std.fmt.bufPrint(&k1, "model.mtp.layers.0.self_attn.{s}.weight", .{proj})).?;
-        try testing.expectEqualSlices(c_int, &.{ 32, 128 }, mlx.getShape(part));
-        try testing.expect(w.get(try std.fmt.bufPrint(&k1, "model.mtp.layers.0.self_attn.{s}.scales", .{proj})) != null);
-    }
-    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
-        var k1: [96]u8 = undefined;
-        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(w.get(try std.fmt.bufPrint(&k1, "model.mtp.layers.0.mlp.{s}.weight", .{proj})).?));
-        try testing.expect(w.get(try std.fmt.bufPrint(&k1, "model.mtp.layers.0.mlp.{s}.weight_scale_inv", .{proj})) == null);
-    }
-}

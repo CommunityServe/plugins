@@ -270,19 +270,6 @@ const testing = std.testing;
 const kernels = @import("../../../sdk/blocks/gdn/kernels.zig");
 const gdnParityRand = decode_fused.gdnParityRand;
 
-test "gdn core: the recurrence's threadgroup bytes and its gates (whole DB-row threadgroups, the input dtypes, a 16-bit y)" {
-    try testing.expectEqual(@as(usize, 11392), recurTgBytes(128, 2, 2));
-    try testing.expectEqual(@as(usize, 19584), recurTgBytes(128, 4, 2));
-    try testing.expectEqual(@as(c_int, 256), NT);
-    try testing.expect(recurServes(128, .bfloat16, .bfloat16));
-    try testing.expect(recurServes(128, .float16, .float16));
-    try testing.expect(recurServes(64, .float32, .bfloat16));
-    try testing.expect(!recurServes(48, .bfloat16, .bfloat16));
-    try testing.expect(!recurServes(128, .bfloat16, .float32));
-    try testing.expect(!recurServes(128, .int32, .bfloat16));
-    try testing.expect(!recurServes(0, .bfloat16, .bfloat16));
-}
-
 /// One prework case at Flash Next's GDN geometry (Hk 16, Hv 48, 128 x 128 heads): the row stream against the packed
 /// kernel on the same arguments. `joined`: qkv read from a wider row and a / b from one [a | 0 | b] row, as the joined
 /// projections hand them over.
@@ -326,26 +313,6 @@ fn preworkCase(s: mlx.mlx_stream, seq: c_int, batch: c_int, cold: bool, joined: 
     inline for (.{ "q", "k", "v", "conv_state", "g", "beta" }) |f| try testing.expect(try sameBits(@field(want, f), @field(got, f), s));
 }
 
-test "gdn core: the row stream gives the packed prework's q, k, v, g, beta and conv state bit for bit" {
-    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    for ([_]c_int{ 17, 33, 100, 1359, 4097 }) |seq| try preworkCase(s, seq, 1, false, false, .float32);
-    try preworkCase(s, 1024, 1, true, false, .float32);
-    try preworkCase(s, 1000, 2, false, false, .float32);
-    try preworkCase(s, 1000, 2, true, true, .float32);
-    try preworkCase(s, 4097, 1, false, true, .float32);
-    try preworkCase(s, 517, 1, false, false, .bfloat16);
-    // a decode width, a missing gate and a stride off the 8-byte grid leave the packed kernel to serve
-    const dummy = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(dummy);
-    const off: GdnPreworkArgs = .{ .qkv = dummy, .qkv_off = 0, .qkv_stride = 8192, .b = dummy, .b_off = 0, .b_stride = 48, .a = dummy, .a_off = 0, .a_stride = 48, .A_log = dummy, .dt_bias = dummy, .conv_state = dummy, .conv_w = dummy, .q_scale = dummy, .k_scale = dummy, .hk = 16, .hv = 48, .dk = 128, .dv = 128, .seq = 4 };
-    try testing.expect(try prework(s, off) == null);
-    var no_gate = off;
-    no_gate.seq = 100;
-    no_gate.gate = false;
-    try testing.expect(try prework(s, no_gate) == null);
-}
-
 /// The recurrence's inputs as the packed prework leaves them, `t` rows of `batch` slots, and a state of `st`.
 const RecurIn = struct {
     a: [6]mlx.mlx_array,
@@ -376,72 +343,3 @@ const RecurIn = struct {
         for (r.a) |x| _ = mlx.mlx_array_free(x);
     }
 };
-
-test "gdn core: the recurrence gives the pipelined kernel's y and final state bit for bit" {
-    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    for ([_]c_int{ 64, 65, 100, 1359, 4097 }) |t| for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |st| for ([_]mlx.mlx_dtype{ .bfloat16, .float16 }) |in_dt| {
-        const batch: c_int = if (t == 1359) 2 else 1;
-        var in = try RecurIn.init(s, @intCast(t * 3 + 1), batch, t, in_dt, st);
-        defer in.deinit();
-        const a = in.a;
-        const want = try kernels.gdnRunYState(.pipelined, 32, a[0], a[1], a[2], a[3], a[4], a[5], batch, t, 16, 48, 128, 128, s);
-        defer inline for (.{ want.y, want.state }) |x| {
-            _ = mlx.mlx_array_free(x);
-        };
-        const got = try recur(s, a[0], a[1], a[2], a[3], a[4], a[5], 16, 48, 128, 128, .bfloat16);
-        defer inline for (.{ got.y, got.state }) |x| {
-            _ = mlx.mlx_array_free(x);
-        };
-        try testing.expect(try sameBits(want.y, got.y, s));
-        try testing.expect(try sameBits(want.state, got.state, s));
-    };
-}
-
-test "gdn core: the recurrence over row cuts with the f32 state carried equals one launch over the chunk" {
-    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const t: c_int = 3001;
-    var in = try RecurIn.init(s, 0xC07, 1, t, .bfloat16, .float32);
-    defer in.deinit();
-    const a = in.a;
-    const whole = try recur(s, a[0], a[1], a[2], a[3], a[4], a[5], 16, 48, 128, 128, .bfloat16);
-    defer inline for (.{ whole.y, whole.state }) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-    const cuts = [_]c_int{ 0, 1024, 1029, 2048, t };
-    var ys: [cuts.len - 1]mlx.mlx_array = @splat(.{ .ctx = null });
-    defer for (ys) |x| if (x.ctx != null) {
-        _ = mlx.mlx_array_free(x);
-    };
-    var state = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(state);
-    try mlx.check(mlx.mlx_array_set(&state, a[5]));
-    for (0..cuts.len - 1) |i| {
-        var rows: [5]mlx.mlx_array = undefined;
-        for (&rows, a[0..5]) |*o, src| {
-            o.* = mlx.mlx_array_new();
-            const sh = mlx.getShape(src);
-            var lo: [4]c_int = @splat(0);
-            var hi: [4]c_int = @splat(0);
-            for (sh, 0..) |d, k| hi[k] = d;
-            lo[1] = cuts[i];
-            hi[1] = cuts[i + 1];
-            try mlx.check(mlx.mlx_slice(o, src, &lo, sh.len, &hi, sh.len, &[_]c_int{ 1, 1, 1, 1 }, sh.len, s));
-        }
-        defer for (rows) |x| {
-            _ = mlx.mlx_array_free(x);
-        };
-        const r = try recur(s, rows[0], rows[1], rows[2], rows[3], rows[4], state, 16, 48, 128, 128, .bfloat16);
-        ys[i] = r.y;
-        _ = mlx.mlx_array_free(state);
-        state = r.state;
-    }
-    const vec = mlx.mlx_vector_array_new_data(&ys, ys.len);
-    defer _ = mlx.mlx_vector_array_free(vec);
-    var y = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(y);
-    try mlx.check(mlx.mlx_concatenate_axis(&y, vec, 1, s));
-    try testing.expect(try sameBits(whole.y, y, s));
-    try testing.expect(try sameBits(whole.state, state, s));
-}

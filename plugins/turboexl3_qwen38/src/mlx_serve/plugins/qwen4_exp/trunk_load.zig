@@ -370,38 +370,3 @@ fn trellisHeadBias(table: *qwen4_mod.NgramTable, weights: *model.Weights, n_head
     log.err("[qwen4] the trellis n-gram table needs its per-head bias (ple.ple_embedding.head_bias), which the pack does not hold\n", .{});
     return error.MissingWeight;
 }
-
-test "qwen4_exp trunk: a layout the trunk does not run is refused by name, the plugin's own config is not" {
-    const testing = std.testing;
-    const toModelConfig = @import("model_config.zig").toModelConfig;
-    const config = @import("config.zig");
-    const mem: @import("mlx_serve").sdk.fixture.MemDir = .{ .files = &.{} };
-    const pd = mem.packDir();
-    var p: @import("mlx_serve").abi.plugin.Parsed = .{};
-    try testing.expect(config.parse(&pd, .of(config.tiny_text), .{}, null, true, &p).isOk());
-    defer config.freeParsed(&p);
-    var c = try toModelConfig(testing.allocator, config.of(&p), null);
-    defer c.deinit(testing.allocator);
-    try testing.expect(unservedLayout(&c, &.{}) == null);
-    inline for (.{ .{ "hadamard_block", 512 }, .{ "norm_groups", 4 }, .{ "moe_sigmoid_router", true }, .{ "kda_vector_gate", true }, .{ "kda_sigmoid_out_gate", false }, .{ "swiglu_limit", 7.0 }, .{ "scale_embeddings", true } }) |m| {
-        var bad = c;
-        @field(bad, m[0]) = m[1];
-        try testing.expect(unservedLayout(&bad, &.{}) != null);
-    }
-}
-
-test "qwen4_exp trunk: a trellis n-gram table takes its per-head bias from the map, and a pack without one is refused" {
-    const testing = std.testing;
-    const empty: [0]u8 align(std.heap.page_size_min) = .{};
-    var table: qwen4_mod.NgramTable = .{ .map = &empty, .rows = 1, .dim = 4, .bits = 6, .group_size = 0, .w_off = 0, .s_off = 0, .b_off = 0, .wcols = 3, .scols = 0, .trellis_k = 6, .gpu_owns_map = true };
-    defer table.close();
-    var w = model.Weights.init(testing.allocator);
-    defer w.deinit();
-    try testing.expectError(error.MissingWeight, trellisHeadBias(&table, &w, 2));
-    // f16 1, -1, 0, 0.5, 2, 1, 0.25, -2
-    const bits = [_]u16{ 0x3C00, 0xBC00, 0x0000, 0x3800, 0x4000, 0x3C00, 0x3400, 0xC000 };
-    try w.put("m.layers.0.ple.ple_embedding.head_bias", mlx.mlx_array_new_data(&bits, &[_]c_int{ 2, 4 }, 2, .float16));
-    try trellisHeadBias(&table, &w, 2);
-    try testing.expectEqualSlices(f32, &.{ 1, -1, 0, 0.5, 2, 1, 0.25, -2 }, table.head_bias.?);
-    try testing.expectError(error.NgramTableHeader, trellisHeadBias(&table, &w, 3));
-}

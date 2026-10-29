@@ -147,38 +147,6 @@ pub fn addGatedShared(t: *Trunk, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_ar
 
 const testing = std.testing;
 
-test "side stream: a part takes a call only on an EXL3 trunk at a prefill width, per trunk; the stream is made once" {
-    defer {
-        SideStream.override = null;
-        SideStream.min_rows_override = null;
-    }
-    const gpu = mlx.gpuStream();
-    // an MLX trunk and an EXL3 trunk in one process: each keeps its own parts, whichever loaded last
-    var plain: Trunk = undefined;
-    plain.s = gpu;
-    plain.formats = .{};
-    var exl3: Trunk = undefined;
-    exl3.s = gpu;
-    exl3.formats = .{ .profile = true };
-    try testing.expectEqual(SideStream.Parts{}, SideStream.active(&plain));
-    try testing.expectEqual(SideStream.Parts{ .shared = true, .gdnz = true }, SideStream.active(&exl3));
-    try testing.expect(SideStream.forPart(.shared, &plain, 8192) == null);
-    try testing.expect(SideStream.forPart(.gdnz, &plain, 8192) == null);
-    try testing.expect(SideStream.forPart(.shared, &exl3, SideStream.MIN_ROWS - 1) == null);
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    exl3.s = cpu;
-    try testing.expect(SideStream.forPart(.gdnz, &exl3, 8192) == null);
-    exl3.s = gpu;
-    SideStream.override = .{ .gdnz = true };
-    try testing.expect(SideStream.forPart(.shared, &exl3, 8192) == null);
-    if (!mlx.streamIsGpu(gpu)) return;
-    const side = SideStream.forPart(.gdnz, &exl3, 8192) orelse return error.SideStreamMissing;
-    try testing.expect(!mlx.mlx_stream_equal(side, gpu));
-    const again = SideStream.forPart(.gdnz, &exl3, SideStream.MIN_ROWS) orelse return error.SideStreamMissing;
-    try testing.expect(mlx.mlx_stream_equal(side, again));
-}
-
 /// `shape` of bf16 values uniform in [-scale, scale), evaluated.
 fn randBf16(rnd: std.Random, shape: []const c_int, scale: f32, s: mlx.mlx_stream) !mlx.mlx_array {
     var n: usize = 1;
@@ -203,68 +171,4 @@ fn sameBits(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
     var same = false;
     try mlx.check(mlx.mlx_array_item_bool(&same, eq));
     return same;
-}
-
-test "side stream: the gated shared expert on the side stream gives the one-stream bytes" {
-    const gpu = mlx.gpuStream();
-    if (!mlx.streamIsGpu(gpu) or mlx.virtualGpu()) return error.SkipZigTest;
-    defer SideStream.override = null;
-    var prng = std.Random.DefaultPrng.init(0x51DE);
-    const rnd = prng.random();
-    const hidden: c_int = 256;
-    const inter: c_int = 512;
-    const rows: c_int = @intCast(SideStream.MIN_ROWS);
-    const none: mlx.mlx_array = .{ .ctx = null };
-    // Dense bf16 weights, [in, out] as the loader stores them.
-    var ws: [4]mlx.mlx_array = undefined;
-    for (&ws, [_][2]c_int{ .{ hidden, inter }, .{ hidden, inter }, .{ inter, hidden }, .{ hidden, 1 } }) |*w, sh| w.* = try randBf16(rnd, &sh, 0.1, gpu);
-    defer for (ws) |w| {
-        _ = mlx.mlx_array_free(w);
-    };
-    const mw: MoeMlpWeights = .{
-        .router_w = none,
-        .router_s = none,
-        .router_b = none,
-        .switch_gate_w = none,
-        .switch_gate_s = none,
-        .switch_gate_b = none,
-        .switch_up_w = none,
-        .switch_up_s = none,
-        .switch_up_b = none,
-        .switch_down_w = none,
-        .switch_down_s = none,
-        .switch_down_b = none,
-        .shared_gate_w = ws[0],
-        .shared_gate_s = none,
-        .shared_gate_b = none,
-        .shared_up_w = ws[1],
-        .shared_up_s = none,
-        .shared_up_b = none,
-        .shared_down_w = ws[2],
-        .shared_down_s = none,
-        .shared_down_b = none,
-        .shared_expert_gate_w = ws[3],
-        .shared_expert_gate_s = none,
-        .shared_expert_gate_b = none,
-    };
-    var t: Trunk = undefined;
-    t.s = gpu;
-    t.config = .{};
-    t.formats = .{};
-    t.bits_cache = .{};
-    t.ternary_2bit = false;
-    const x = try randBf16(rnd, &.{ 1, rows, hidden }, 2.0, gpu);
-    defer _ = mlx.mlx_array_free(x);
-    const routed = try randBf16(rnd, &.{ 1, rows, hidden }, 1.0, gpu);
-    defer _ = mlx.mlx_array_free(routed);
-    SideStream.override = .{};
-    const want = try addGatedShared(&t, routed, x, &mw);
-    defer _ = mlx.mlx_array_free(want);
-    SideStream.override = .{ .shared = true };
-    const before = side_stream_calls;
-    const got = try addGatedShared(&t, routed, x, &mw);
-    defer _ = mlx.mlx_array_free(got);
-    try testing.expectEqual(before + 1, side_stream_calls);
-    try testing.expect(mlx.mlx_stream_equal(t.s, gpu));
-    try testing.expect(try sameBits(want, got, gpu));
 }

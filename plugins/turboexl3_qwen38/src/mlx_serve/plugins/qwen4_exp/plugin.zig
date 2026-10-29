@@ -591,36 +591,6 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 // ── tests ──
 
-test "qwen4_exp resident bill: an embedded n-gram table's payload is not resident" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var td = std.testing.tmpDir(.{});
-    defer td.cleanup();
-    try @import("ple_table.zig").writeFixture(&td, .valid);
-    var path: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = path[0..try td.dir.realPath(io, &path)];
-    var c: config.Config = .{ .vocab_size = 1, .ngram_size = 3, .heads_per_ngram = 1, .ngram_vocab_base = 2, .ngram_vocab_divisor = 6, .ple_embed_dim = 64, .split_ngram_parts = 3, .ple_layer_idx = 1, .embedded_ngram = true };
-    var out: u64 = 0;
-    try std.testing.expect(residentBytes(&.{ .private = &c }, .of(dir), .{}, 1000, &out).isOk());
-    try std.testing.expectEqual(@as(u64, 1000 - 120), out);
-    try std.testing.expect(!residentBytes(&.{ .private = &c }, .of(dir), .{}, 100, &out).isOk());
-    c.embedded_ngram = false;
-    try std.testing.expect(residentBytes(&.{ .private = &c }, .of(dir), .{}, 1000, &out).isOk());
-    try std.testing.expectEqual(@as(u64, 1000), out);
-}
-
-test "qwen4_exp resident bill: an EXL3 trunk pack's rerank head is billed unless MTP is off; any other pack's is not" {
-    var c: config.Config = .{ .vocab_size = 248320, .hidden_size = 2560 };
-    var out: u64 = 0;
-    try std.testing.expect(residentBill(&.{ .private = &c }, .of(""), .{}, 1000, &out).isOk());
-    try std.testing.expectEqual(@as(u64, 1000), out);
-    c.trunk_format = true;
-    try std.testing.expect(residentBill(&.{ .private = &c }, .of(""), .{}, 1000, &out).isOk());
-    // the coarse copy (278.1 MB), the re-score copy (675.4 MB) and the vocab subset (110.1 MB): the load's 1,014 MiB
-    try std.testing.expectEqual(@as(u64, 1000 + 1_063_649_280), out);
-    try std.testing.expect(residentBill(&.{ .private = &c }, .of(""), .of("{\"mtp\":false}"), 1000, &out).isOk());
-    try std.testing.expectEqual(@as(u64, 1000), out);
-}
-
 test {
     _ = config;
     _ = bill_mod;

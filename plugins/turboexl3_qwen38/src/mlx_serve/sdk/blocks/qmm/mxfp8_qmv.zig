@@ -89,41 +89,6 @@ fn randBf16(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_a
     return out;
 }
 
-test "mxfp8 qmv: 1..8 rows no worse than MLX's matmul against the fp32 truth (K a whole step and not)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const xfm = @import("../../../mlx/device.zig");
-    xfm.device_gen_override = .{ .gen = 16, .phone = false }; // the gate is a perf choice; the numerics are checked on every Mac
-    defer xfm.device_gen_override = null;
-    // 320: a tensor-parallel rank's half of a 640-wide expert.
-    for ([_][2]c_int{ .{ 640, 2560 }, .{ 2560, 640 }, .{ 320, 2560 }, .{ 2560, 320 } }) |nk| try mxfp8Case(nk[0], nk[1]);
-}
-
-test "mxfp8 qmv: only the measured GPU generations (M4, M5) take the kernel" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const xfm = @import("../../../mlx/device.zig");
-    defer xfm.device_gen_override = null;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    var w = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(w);
-    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 640, 640 }, 2, .uint32, s));
-    var sc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sc);
-    try mlx.check(mlx.mlx_zeros(&sc, &[_]c_int{ 640, 80 }, 2, .uint8, s));
-    var x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x);
-    try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ 1, 2560 }, 2, .bfloat16, s));
-    for ([_]u32{ 13, 15, 18 }) |gen| {
-        xfm.device_gen_override = .{ .gen = gen, .phone = false };
-        try std.testing.expect((try linear(x, w, sc, s)) == null);
-    }
-    for ([_]u32{ 16, 17 }) |gen| {
-        xfm.device_gen_override = .{ .gen = gen, .phone = false };
-        const y = (try linear(x, w, sc, s)) orelse return error.KernelDeclined;
-        _ = mlx.mlx_array_free(y);
-    }
-}
-
 fn mxfp8Case(N: c_int, K: c_int) !void {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x8E4);

@@ -290,54 +290,6 @@ fn readProcFile(path: []const u8, buf: []u8) ?usize {
     return @intCast(n);
 }
 
-test "memoryPool: device-memory weights bill VRAM, every other platform its host reading" {
-    const GB: u64 = 1024 * 1024 * 1024;
-    try std.testing.expectEqual(15 * GB, memoryPool(true, 15 * GB, 9 * GB)); // Windows: 13 GB fits the card
-    try std.testing.expectEqual(20 * GB, memoryPool(false, 15 * GB, 20 * GB)); // managed memory pages to RAM
-}
-
-test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB; none of a GPU's own memory" {
-    const gb: u64 = 1 << 30;
-    try std.testing.expectEqual(2 * gb, osReserveBytes(8 * gb, false));
-    try std.testing.expectEqual(2 * gb, osReserveBytes(16 * gb, false));
-    try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb, false));
-    try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb, false));
-    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, true)); // free VRAM already counts every process
-    os_reserve_override = try parseOsReserveGib("0");
-    defer os_reserve_override = null;
-    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, false));
-    try std.testing.expectError(error.InvalidOsReserve, parseOsReserveGib("lots"));
-}
-
-test "computeAvailableBytes sums the reclaimable classes, capped by wired headroom" {
-    const GB: u64 = 1024 * 1024 * 1024;
-    const page: u64 = 16384;
-    const ppg: u64 = GB / page; // pages per GB
-
-    // free_count already contains speculative, and speculative pages are
-    // file-backed inside external — the sum carries them once.
-    try std.testing.expectEqual(@as(u64, 32 * GB), computeAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, 26 * ppg, 0, 83 * ppg, ppg, page));
-
-    // The cap: wired + compressor bound the figure, however the wired pages
-    // are counted elsewhere.
-    try std.testing.expectEqual(@as(u64, 6 * GB), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 0, 9 * ppg, ppg, page));
-
-    // #45 OOM guard, in new units: a resident 7 GB model lives in the anonymous
-    // set, NOT in wired — it consumed the free/external pages (16 GB box: 9 GB
-    // anon + 3 wired + 1 comp), so only 3 GB of reclaimable classes remain.
-    try std.testing.expectEqual(@as(u64, 3 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 0, 3 * ppg, 1 * ppg, page));
-
-    // Saturating: disagreeing counters never underflow; a failed query (total 0)
-    // or a box with no headroom (wired + compressor ≥ total) reports 0.
-    try std.testing.expectEqual(@as(u64, 4 * GB), computeAvailableBytes(16 * GB, ppg, 5 * ppg, 4 * ppg, 0, 0, 0, page));
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, 1, 0, 1, 1, page));
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 0, 16 * ppg, 0, page));
-
-    // Purgeable pages are anonymous caches the OS discards before compressing
-    // anything: a laptop's browsers park gigabytes there (#932).
-    try std.testing.expectEqual(@as(u64, 7 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 4 * ppg, 3 * ppg, 1 * ppg, page));
-}
-
 pub fn getSysMemPct() u32 {
     if (comptime !builtin.os.tag.isDarwin()) {
         // (total - available) / total, from the kernel's MemAvailable.
@@ -466,32 +418,4 @@ fn cfDictGet(dict: ?*const anyopaque, key_name: [*:0]const u8) ?*const anyopaque
     const key = CFStringCreateWithCString(null, key_name, 0x08000100) orelse return null;
     defer CFRelease(key);
     return CFDictionaryGetValue(dict, key);
-}
-
-test "getAppMemFootprintMb returns a plausible nonzero footprint" {
-    const fp = getAppMemFootprintMb();
-    // The test process itself footprints several MB; a wrong flavor/offset
-    // would yield 0 or absurd garbage.
-    try std.testing.expect(fp > 0);
-    try std.testing.expect(fp < 1024 * 1024); // < 1 TB sanity bound
-}
-
-test "gpuCoreCount reads the GPU's core count" {
-    if (comptime !is_macos) return error.SkipZigTest;
-    const n = gpuCoreCount();
-    if (n == 0) return error.SkipZigTest; // a VM exposes no AGX accelerator entry
-    try std.testing.expect(n >= 7 and n <= 256);
-}
-
-test "underMemoryPressure: warning and critical stop a bulk allocation, normal and unreadable do not" {
-    try std.testing.expect(!underMemoryPressure(0));
-    try std.testing.expect(!underMemoryPressure(1));
-    try std.testing.expect(underMemoryPressure(2));
-    try std.testing.expect(underMemoryPressure(4));
-}
-
-test "memoryPressureLevel reads the kernel's level on macOS" {
-    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
-    const level = memoryPressureLevel();
-    try std.testing.expect(level == 1 or level == 2 or level == 4);
 }

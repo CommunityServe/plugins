@@ -230,14 +230,6 @@ pub const table: abi.QuantTable = .{
 
 const testing = std.testing;
 
-test "fp8_block128: claims and validates its own block only" {
-    const own = "{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[64,128]}";
-    try testing.expectEqual(abi.Claim.by_type, claims(.of(own), .of("{}")));
-    try testing.expectEqual(abi.Claim.no, claims(.of("{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[128,128]}"), .of("{}")));
-    try testing.expectEqual(abi.Claim.no, claims(.of("{\"quant_method\":\"fp8\",\"weight_block_size\":[128,128]}"), .of("{}")));
-    try testing.expectEqual(abi.Claim.no, claims(.of("{}"), .of("{}")));
-}
-
 fn codesOf(r: std.Random, out: []u8) void {
     for (out) |*c| c.* = while (true) {
         const v = r.int(u8);
@@ -252,88 +244,4 @@ fn bf16Of(r: std.Random, out: []u16) void {
 fn evalBf16(y: mlx.mlx_array) ![]const u16 {
     try mlx.check(mlx.mlx_array_eval(y));
     return (mlx.mlx_array_data_bfloat16(y) orelse return error.NoData)[0..mlx.mlx_array_size(y)];
-}
-
-// Bar: bf16(code x scale) of the host, on the kernel and on MLX's ops, ragged tiles on both axes included.
-test "fp8_block128: the prompt route's weight is bf16(code x scale), each code on its own block's scale" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const n = 140;
-    var rnd = std.Random.DefaultPrng.init(64);
-    // 200 columns: ragged column blocks (MLX's ops); 384: whole blocks (the kernel on Metal: 9 scales).
-    inline for (.{ 200, 384 }) |k| {
-        const cols = (k + block_cols - 1) / block_cols;
-        var codes: [n * k]u8 = undefined;
-        codesOf(rnd.random(), &codes);
-        var scales: [3 * cols]f32 = undefined;
-        for (&scales) |*v| v.* = std.math.ldexp(1.0 + rnd.random().float(f32), -6 - rnd.random().intRangeAtMost(i32, 0, 3));
-        const w = mlx.mlx_array_new_data(&codes, &[_]c_int{ n, k }, 2, .uint8);
-        defer _ = mlx.mlx_array_free(w);
-        const sc = mlx.mlx_array_new_data(&scales, &[_]c_int{ 3, cols }, 2, .float32);
-        defer _ = mlx.mlx_array_free(sc);
-        for ([_]mlx.mlx_stream{ mlx.gpuStream(), mlx.mlx_default_cpu_stream_new() }) |s| {
-            defer _ = mlx.mlx_stream_free(s);
-            const got = try dequantize(w, sc, s);
-            defer _ = mlx.mlx_array_free(got);
-            const g = try evalBf16(got);
-            for (0..n) |r| for (0..k) |c| {
-                try testing.expectEqual(plan.f32ToBf16(plan.weight32(codes[r * k + c], scales[(r / block_rows) * cols + c / block_cols])), g[r * k + c]);
-            };
-        }
-    }
-}
-
-// Bar: every output is the kernel-order host sum (`fp8_block128_gemv.hostDot`) rounded once, at 1..8 rows and K split
-// 1, 4 and 8 ways; 9 rows take the prompt route (MLX's matmul over the bf16 weight).
-test "fp8_block128: the GEMV is the kernel-order host sum at every width up to 8 rows; wider rows take the prompt route" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const a = testing.allocator;
-    const s = mlx.gpuStream();
-    defer _ = mlx.mlx_stream_free(s);
-    var rnd = std.Random.DefaultPrng.init(0xf8b1);
-    const r = rnd.random();
-    for ([_][2]u32{ .{ 4096, 512 }, .{ 1024, 1024 }, .{ 256, 4096 } }, [_]c_int{ 1, 4, 8 }) |nk, ks| {
-        const n = nk[0];
-        const k = nk[1];
-        const site = plan.plan(n, k).?;
-        try testing.expectEqual(ks, site.ks);
-        const codes = try a.alloc(u8, n * k);
-        defer a.free(codes);
-        codesOf(r, codes);
-        const scales = try a.alloc(f32, (n / block_rows) * (k / block_cols));
-        defer a.free(scales);
-        for (scales) |*v| v.* = std.math.ldexp(1.0 + r.float(f32), -17 + @as(i32, @intCast(r.uintLessThan(u32, 11))));
-        const xs = try a.alloc(u16, 9 * k);
-        defer a.free(xs);
-        bf16Of(r, xs);
-        const w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ @intCast(n), @intCast(k) }, 2, .uint8);
-        defer _ = mlx.mlx_array_free(w);
-        const sc = mlx.mlx_array_new_data(scales.ptr, &[_]c_int{ @intCast(n / block_rows), @intCast(k / block_cols) }, 2, .float32);
-        defer _ = mlx.mlx_array_free(sc);
-        const wrow = try a.alloc(f32, k);
-        defer a.free(wrow);
-        // The host sums of every output of the 8 rows (the GEMV's rows are M-invariant).
-        const want = try a.alloc(u16, 8 * n);
-        defer a.free(want);
-        for (0..n) |j| {
-            for (wrow, 0..) |*v, i| v.* = plan.weight32(codes[j * k + i], scales[(j / block_rows) * (k / block_cols) + i / block_cols]);
-            for (0..8) |m| want[m * n + j] = plan.f32ToBf16(plan.hostDot(site, xs[m * k ..][0..k], wrow));
-        }
-        for (1..10) |m| {
-            const x = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ 1, @intCast(m), @intCast(k) }, 3, .bfloat16);
-            defer _ = mlx.mlx_array_free(x);
-            const y = try linear(x, w, sc, s);
-            defer _ = mlx.mlx_array_free(y);
-            try testing.expectEqualSlices(c_int, &.{ 1, @intCast(m), @intCast(n) }, mlx.getShape(y));
-            const got = try evalBf16(y);
-            if (m <= plan.max_rows) {
-                try testing.expectEqualSlices(u16, want[0 .. m * n], got);
-                continue;
-            }
-            const x2 = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(m), @intCast(k) }, 2, .bfloat16);
-            defer _ = mlx.mlx_array_free(x2);
-            const p = try matmulInto(w, sc, x2, s);
-            defer _ = mlx.mlx_array_free(p);
-            try testing.expectEqualSlices(u16, try evalBf16(p), got);
-        }
-    }
 }

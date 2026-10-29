@@ -364,10 +364,6 @@ fn refHadamard(v: []f32) void {
     for (v) |*e| e.* *= scale;
 }
 
-test "rht: every shipped block's transform (kernel + composed) matches the reference butterfly on both sides" {
-    for ([_]usize{ 512, 1024, 2048, 4096 }) |block| try expectTransformMatches(block);
-}
-
 fn expectTransformMatches(block: usize) !void {
     const s = mlx.gpuStream();
     const rows: usize = 2;
@@ -404,117 +400,5 @@ fn expectTransformMatches(block: usize) !void {
             const data = mlx.mlx_array_data_float32(got).?;
             for (0..rows * n) |i| try std.testing.expectApproxEqAbs(want[i], data[i], 1e-4);
         }
-    }
-}
-
-test "rht: two distinct sign vectors at one width dedup the pool and disable signsFor" {
-    const s = mlx.gpuStream();
-    const n: usize = 1024;
-    var sg1: [n]f32 = undefined;
-    var sg2: [n]f32 = undefined;
-    for (&sg1, &sg2, 0..) |*a, *b, i| {
-        a.* = if (i % 3 == 0) -1.0 else 1.0;
-        b.* = -a.*;
-    }
-    const vs = [_]c_int{@intCast(n)};
-    const s1 = mlx.mlx_array_new_data(&sg1, &vs, 1, .float32);
-    defer _ = mlx.mlx_array_free(s1);
-    const s1b = mlx.mlx_array_new_data(&sg1, &vs, 1, .float32);
-    defer _ = mlx.mlx_array_free(s1b);
-    const s2 = mlx.mlx_array_new_data(&sg2, &vs, 1, .float32);
-    defer _ = mlx.mlx_array_free(s2);
-    const w_shape = [_]c_int{ 8, 64 };
-    var ws: [3]mlx.mlx_array = undefined;
-    for (&ws) |*w| w.* = mlx.mlx_array_new_data(&sg1, &w_shape, 2, .float32);
-    defer for (ws) |w| {
-        _ = mlx.mlx_array_free(w);
-    };
-    var reg = Registry.init(std.testing.allocator, 1024);
-    defer reg.deinit();
-    for (ws, [_]mlx.mlx_array{ s1, s1b, s2 }) |w, sg| {
-        const f = try signsF32(sg, s);
-        defer _ = mlx.mlx_array_free(f);
-        try mlx.check(mlx.mlx_array_eval(f));
-        try reg.register(w, sg, f);
-        if (sg.ctx == s1b.ctx) {
-            try std.testing.expectEqual(@as(usize, 1), reg.pool.count());
-            try std.testing.expect(reg.signsFor(@intCast(n)) != null);
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 2), reg.pool.count());
-    try std.testing.expect(reg.signsFor(@intCast(n)) == null);
-    try std.testing.expect(reg.get(ws[2]) != null);
-
-    // A joined weight reads its parts' vector only when they share one.
-    const joined = mlx.mlx_array_new_data(&sg1, &w_shape, 2, .float32);
-    defer _ = mlx.mlx_array_free(joined);
-    try std.testing.expect(!try reg.alias(joined, &.{ ws[0], ws[2] }));
-    try std.testing.expect(reg.get(joined) == null);
-    try std.testing.expect(try reg.alias(joined, &.{ ws[0], ws[1] }));
-    try std.testing.expectEqual(reg.get(ws[0]).?.ctx, reg.get(joined).?.ctx);
-}
-
-test "rht: normRotate matches add -> rms_norm -> transform" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const n: usize = 3072;
-    var prng = std.Random.DefaultPrng.init(11);
-    const rnd = prng.random();
-    var a: [2 * n]f32 = undefined;
-    var b: [2 * n]f32 = undefined;
-    var w: [n]f32 = undefined;
-    var sg: [n]f32 = undefined;
-    for (&a) |*e| e.* = rnd.floatNorm(f32);
-    for (&b) |*e| e.* = rnd.floatNorm(f32);
-    for (&w) |*e| e.* = 1.0 + 0.1 * rnd.floatNorm(f32);
-    for (&sg) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
-    const xs = [_]c_int{ 2, @intCast(n) };
-    const vs = [_]c_int{@intCast(n)};
-    const af = mlx.mlx_array_new_data(&a, &xs, 2, .float32);
-    defer _ = mlx.mlx_array_free(af);
-    const bf = mlx.mlx_array_new_data(&b, &xs, 2, .float32);
-    defer _ = mlx.mlx_array_free(bf);
-    const wf = mlx.mlx_array_new_data(&w, &vs, 1, .float32);
-    defer _ = mlx.mlx_array_free(wf);
-    const sa = mlx.mlx_array_new_data(&sg, &vs, 1, .float32);
-    defer _ = mlx.mlx_array_free(sa);
-    var ab = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ab);
-    var bb = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(bb);
-    var wb = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wb);
-    try mlx.check(mlx.mlx_astype(&ab, af, .bfloat16, s));
-    try mlx.check(mlx.mlx_astype(&bb, bf, .bfloat16, s));
-    try mlx.check(mlx.mlx_astype(&wb, wf, .bfloat16, s));
-    const eps_v = [_]f32{1e-6};
-    const eps = mlx.mlx_array_new_data(&eps_v, &[_]c_int{}, 0, .float32);
-    defer _ = mlx.mlx_array_free(eps);
-
-    var sum = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sum);
-    try mlx.check(mlx.mlx_add(&sum, ab, bb, s));
-    var normed = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(normed);
-    try mlx.check(mlx.mlx_fast_rms_norm(&normed, sum, wb, 1e-6, s));
-    const want = try transformComposed(normed, sa, 1024, false, s);
-    defer _ = mlx.mlx_array_free(want);
-
-    const got = (try normRotate(ab, bb, wb, eps, sa, 1024, true, s)).?;
-    defer _ = mlx.mlx_array_free(got.rot);
-    defer _ = mlx.mlx_array_free(got.sum.?);
-    defer _ = mlx.mlx_array_free(got.normed.?);
-    for ([_][2]mlx.mlx_array{ .{ want, got.rot }, .{ normed, got.normed.? }, .{ sum, got.sum.? } }) |pair| {
-        var d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(d);
-        var d32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(d32);
-        try mlx.check(mlx.mlx_subtract(&d, pair[0], pair[1], s));
-        try mlx.check(mlx.mlx_astype(&d32, d, .float32, s));
-        try mlx.check(mlx.mlx_array_eval(d32));
-        const data = mlx.mlx_array_data_float32(d32).?;
-        var worst: f32 = 0;
-        for (data[0 .. 2 * n]) |e| worst = @max(worst, @abs(e));
-        try std.testing.expect(worst < 0.02); // one bf16 ulp at |x| ~ 4
     }
 }

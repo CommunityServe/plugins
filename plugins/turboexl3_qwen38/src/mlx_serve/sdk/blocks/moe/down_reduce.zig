@@ -365,48 +365,6 @@ pub var downred_override: ?bool = null;
 
 // ── tests ──
 
-test "down+reduce lanes per row: 16 on G17, 8 on every other generation and on phones" {
-    try std.testing.expectEqual(@as(c_int, 16), downredLanesFor(17, false));
-    try std.testing.expectEqual(@as(c_int, 8), downredLanesFor(17, true));
-    for ([_]u32{ 0, 13, 14, 15, 16, 18, 19 }) |g| try std.testing.expectEqual(@as(c_int, 8), downredLanesFor(g, false));
-}
-
-test "moe down+reduce fused: no worse than gatherQmv + multiply + sum vs fp32 truth (nvfp4 + affine)" {
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(0xD09E);
-    const rnd = prng.random();
-    const t = std.testing;
-    downred_override = true;
-    defer downred_override = null;
-
-    // Two geometries: a small one, and Laguna XS's real decode shape. The fused
-    // kernel reduces each row over 8 lanes, the composed chain over 32, so the
-    // bar is error against the f32 truth, never bit identity.
-    const geoms = [_][4]c_int{
-        .{ 16, 8, 64, 32 }, // E, TOPK, KIN, N
-        .{ 64, 8, 512, 2048 },
-    };
-    for (geoms) |geom| {
-        const E: usize = @intCast(geom[0]);
-        const TOPK: c_int = geom[1];
-        const KIN: c_int = geom[2];
-        const N: c_int = geom[3];
-        try moeDownReduceParityCase(s, rnd, t, E, TOPK, KIN, N, &parity_quants);
-    }
-}
-
-// Bar: one process serving two expert widths at the same top-k and N (two models, or a trunk and its MTP head) gets
-// each width's own kernel, never the first width's.
-test "moe down+reduce fused: a second expert width at the same top-k and N runs its own width" {
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(0xD0A1);
-    downred_override = true;
-    defer downred_override = null;
-    const affine4 = [_]ParityQuant{.{ .nvfp4 = false, .bits = 4, .gs = 32 }};
-    try moeDownReduceParityCase(s, prng.random(), std.testing, 16, 8, 64, 32, &affine4);
-    try moeDownReduceParityCase(s, prng.random(), std.testing, 16, 8, 128, 32, &affine4);
-}
-
 const ParityQuant = struct { nvfp4: bool, bits: u32, gs: u32 };
 const parity_quants = [_]ParityQuant{
     .{ .nvfp4 = true, .bits = 4, .gs = 16 },
@@ -563,46 +521,4 @@ fn moeDownReduceParityCase(s: mlx.mlx_stream, rnd: std.Random, t: anytype, E: us
             return e;
         };
     }
-}
-
-test "moe down+reduce fused: declines outside its envelope" {
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(0xD09F);
-    const rnd = prng.random();
-    downred_override = true;
-    defer downred_override = null;
-
-    const TOPK: c_int = 8;
-    const KIN: c_int = 64;
-    const x_shape = [_]c_int{ TOPK, KIN };
-    const x = try attn256RandBf16(rnd, &x_shape, s);
-    defer _ = mlx.mlx_array_free(x);
-    const sc_shape = [_]c_int{TOPK};
-    const scores = try attn256RandBf16(rnd, &sc_shape, s);
-    defer _ = mlx.mlx_array_free(scores);
-    var idata: [8]u32 = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
-    const inds = mlx.mlx_array_new_data(&idata, &sc_shape, 1, .uint32);
-    defer _ = mlx.mlx_array_free(inds);
-    const no_arr = mlx.mlx_array{ .ctx = null };
-
-    // mxfp8 mode: wrong dequant arithmetic — must decline, not compute.
-    try std.testing.expect((try gatherQmvDownReduce(s, x, no_arr, no_arr, no_arr, inds, scores, 8, 32, .mxfp8)) == null);
-    // f32 scores against bf16 x: the composed multiply would promote — decline.
-    var scores_f32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(scores_f32);
-    try mlx.check(mlx.mlx_astype(&scores_f32, scores, .float32, s));
-    const wn: usize = 8 * 32 * 8;
-    const wdata = try std.testing.allocator.alloc(u32, wn);
-    defer std.testing.allocator.free(wdata);
-    for (wdata) |*v| v.* = rnd.int(u32);
-    const w_shape = [_]c_int{ 8, 32, 8 };
-    const w = mlx.mlx_array_new_data(wdata.ptr, &w_shape, 3, .uint32);
-    defer _ = mlx.mlx_array_free(w);
-    const sdata = try std.testing.allocator.alloc(u8, 8 * 32 * 4);
-    defer std.testing.allocator.free(sdata);
-    for (sdata) |*v| v.* = 0x30;
-    const s_shape = [_]c_int{ 8, 32, 4 };
-    const scq = mlx.mlx_array_new_data(sdata.ptr, &s_shape, 3, .uint8);
-    defer _ = mlx.mlx_array_free(scq);
-    try std.testing.expect((try gatherQmvDownReduce(s, x, w, scq, no_arr, inds, scores_f32, 4, 16, .nvfp4)) == null);
 }

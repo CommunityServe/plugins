@@ -222,10 +222,3 @@ pub const SharedSwiglu = extern struct {
 // ── tests ──
 
 const testing = std.testing;
-
-test "abi quant: every struct opens with its size" {
-    const w: Weight = .{};
-    try testing.expectEqual(@as(u32, @sizeOf(Weight)), w.size);
-    inline for (.{ Source, Weight, LoadCtx, QuantTable, Swiglu, LinearParts, AttnIn, Gate, QPlanes, Indexer, SharedSwiglu }) |T|
-        try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
-}

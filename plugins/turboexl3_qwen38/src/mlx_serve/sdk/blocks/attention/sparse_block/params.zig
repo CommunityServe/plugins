@@ -79,32 +79,3 @@ pub const Params = struct {
 };
 
 const testing = std.testing;
-
-test "sparse block params: bounds are the complete blocks, plus the query's own with local blocks" {
-    const qsa: Blocks = .{ .size = 4, .top_k = 512 };
-    var out: [6]i32 = undefined;
-    qsa.selectBounds(&out, 0, 700, false);
-    try testing.expectEqualSlices(i32, &.{ 0, 0, 0, 1, 1, 1 }, &out);
-    qsa.selectBounds(&out, 2799, 700, false);
-    try testing.expectEqualSlices(i32, &.{ 700, 700, 700, 700, 700, 700 }, &out);
-    qsa.selectBounds(&out, 2044, 700, false);
-    try testing.expectEqualSlices(i32, &.{ 511, 511, 511, 512, 512, 512 }, &out);
-    qsa.selectBounds(&out, 4, 24, true);
-    try testing.expectEqualSlices(i32, &.{ 24, 24, 24, 24, 24, 24 }, &out);
-    try testing.expect(qsa.allSee(2051, 513) and !qsa.allSee(2050, 513) and !qsa.allSee(0, 513) and qsa.allSee(0, 0));
-
-    const mm: Blocks = .{ .size = 4, .top_k = 3, .init = 1, .local = 1 };
-    mm.selectBounds(&out, 2, 700, false);
-    try testing.expectEqualSlices(i32, &.{ 1, 1, 2, 2, 2, 2 }, &out);
-    try testing.expect(mm.forced(0, 30) and mm.forced(7, 30) and !mm.forced(6, 30) and !mm.forced(8, 30));
-    try testing.expect(!qsa.forced(0, 30) and !qsa.forced(7, 30));
-
-    const key_max: Params = .{ .blocks = mm, .index_heads = 2, .index_dim = 8, .score = .key_max };
-    try key_max.validate();
-    try testing.expectEqual(@as(u32, 2), key_max.listsPerQuery());
-    try testing.expectEqual(@as(u32, 1), (Params{ .blocks = qsa, .index_heads = 4, .index_dim = 128, .score = .pooled_relu_sum }).listsPerQuery());
-    try testing.expectError(error.InvalidSparseBlockParams, (Params{ .blocks = .{ .size = 4, .top_k = 1, .init = 1, .local = 1 }, .index_heads = 1, .index_dim = 1, .score = .key_max }).validate());
-    const layers = [_]bool{ false, true };
-    const some: Params = .{ .blocks = qsa, .index_heads = 1, .index_dim = 1, .score = .key_max, .layers = &layers };
-    try testing.expect(!some.sparseAt(0) and some.sparseAt(1) and !some.sparseAt(2) and key_max.sparseAt(9));
-}

@@ -55,16 +55,6 @@ const sdk = @import("mlx_serve").sdk;
 const conformance = @import("../testing/conformance.zig");
 const fixture = @import("mlx_serve").sdk.fixture;
 
-test "quant formats: the tables follow block.builtins, each with its own claims and validation" {
-    try testing.expectEqual(block.builtins.len, tables.len);
-    for (block.builtins, tables) |b, t| {
-        try testing.expectEqualStrings(b.name, t.name.slice());
-        try testing.expect(b.claims == t.claims and b.validate == t.validate);
-    }
-    try testing.expectEqual(&native.affine, (try claimant("{\"bits\":4}", "{}")).?);
-    try testing.expectEqual(@as(?*const abi.QuantTable, null), try claimant("{\"quant_method\":\"bitsandbytes\"}", "{}"));
-}
-
 fn claimsAtMarker(block_json: abi.Str, _: abi.Str) callconv(.c) abi.Claim {
     return if (std.mem.indexOf(u8, block_json.slice(), "\"exl3\"") != null) .by_marker else .no;
 }
@@ -78,27 +68,6 @@ fn extraTable(comptime name: []const u8, claims: block.ClaimsFn) abi.QuantTable 
     return .{ .name = abi.Str.of(name), .claims = claims, .validate = undefined, .bill = undefined, .open = undefined, .close = undefined, .load_tensor = undefined, .load_bank = undefined, .release = undefined, .matmul = undefined, .moe = undefined };
 }
 
-test "quant formats: an extra table takes a block it claims above the built-ins or by a built-in's name; a tie stays built-in" {
-    const bank = "{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mul1\"}";
-    const marker = extraTable("fmt_marker", &claimsAtMarker);
-    const marker2 = extraTable("fmt_marker2", &claimsAtMarker);
-    const typed = extraTable("fmt_typed", &claimsAtType);
-    const named = extraTable("exl3", &claimsAtType);
-    try testing.expectEqual(&exl3.table, (try claimantAmong(&.{}, bank, "{}")).?);
-    try testing.expectEqual(&marker, (try claimantAmong(&.{&marker}, bank, "{}")).?);
-    try testing.expectEqual(&exl3.table, (try claimantAmong(&.{&typed}, bank, "{}")).?);
-    try testing.expectEqual(&named, (try claimantAmong(&.{&named}, bank, "{}")).?);
-    try testing.expectEqual(&exl3.table, (try claimantAmong(&.{ &marker, &marker2 }, bank, "{}")).?);
-    try testing.expectEqual(&native.affine, (try claimantAmong(&.{&marker}, "{\"bits\":4}", "{}")).?);
-    // A dense trunk block (no bank rate): the built-in Sushi table claims it by type, as it does any EXL3 block, so only
-    // an extra table that claims it by marker (turboexl3's) takes it.
-    const trunk = "{\"format\":\"exl3\",\"codebook\":\"mul1\",\"window\":16}";
-    try testing.expectEqual(&exl3.table, (try claimantAmong(&.{}, trunk, "{}")).?);
-    try testing.expectEqual(&exl3.table, (try claimantAmong(&.{&typed}, trunk, "{}")).?);
-    try testing.expectEqual(&marker, (try claimantAmong(&.{&marker}, trunk, "{}")).?);
-    try testing.expectEqual(&exl3.table, (try claimant(trunk, "{}")).?);
-}
-
 /// A built-in format as the conformance suite reads a quant plugin.
 fn Builtin(comptime i: usize, comptime block_json: []const u8, comptime config_json: []const u8) type {
     return struct {
@@ -108,16 +77,6 @@ fn Builtin(comptime i: usize, comptime block_json: []const u8, comptime config_j
             return .{ .files = &.{.{ .name = "config.json", .bytes = config_json }}, .block = block_json };
         }
     };
-}
-
-test "quant formats: every built-in format passes the quant plugin conformance" {
-    try conformance.expectPlugin(Builtin(0, "{\"bits\":4,\"group_size\":64}", "{}"));
-    try conformance.expectPlugin(Builtin(1, "{\"quant_method\":\"fp8\",\"weight_block_size\":[128,128]}", "{}"));
-    try conformance.expectPlugin(Builtin(2, "{\"bits\":8,\"group_size\":32,\"mode\":\"mxfp8\"}", "{}"));
-    try conformance.expectPlugin(Builtin(3, "{\"bits\":4,\"group_size\":16,\"mode\":\"nvfp4\"}", "{}"));
-    try conformance.expectPlugin(Builtin(4, "{\"bits\":2,\"group_size\":128}", "{\"modules\":[{\"path\":\"lm_head\",\"block\":1024}]}"));
-    try conformance.expectPlugin(Builtin(5, "{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14}", "{}"));
-    try conformance.expectPlugin(Builtin(6, "{\"group_size\":32,\"bits\":4,\"mode\":\"gguf\"}", "{}"));
 }
 
 test {

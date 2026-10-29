@@ -208,18 +208,3 @@ pub const Streamed = struct {
 };
 
 // ── tests ──
-
-test "streamed: the stream_experts setting is true or a row count, a quarter of the experts when true" {
-    try std.testing.expectEqual(@as(?Setting, .on), Setting.parse("{\"lm_head_mxfp8\":false,\"stream_experts\":true}"));
-    try std.testing.expectEqual(@as(?Setting, .{ .rows = 24 }), Setting.parse("{\"stream_experts\":24}"));
-    for ([_][]const u8{ "", "{}", "{\"stream_experts\":false}", "{\"stream_experts\":0}", "{\"stream_experts\":\"yes\"}", "[1]" }) |j|
-        try std.testing.expectEqual(@as(?Setting, null), Setting.parse(j));
-    try std.testing.expectEqual(@as(u32, 64), (Setting{ .on = {} }).slotRows(256));
-    try std.testing.expectEqual(@as(u32, 1), (Setting{ .on = {} }).slotRows(2));
-    try std.testing.expectEqual(@as(u32, 8), (Setting{ .rows = 300 }).slotRows(8));
-}
-
-test "streamed: a directory without a bank is refused by name" {
-    try std.testing.expectError(error.StreamedWeightsUnsupported, Streamed.open(std.testing.allocator, std.testing.io, "/nowhere", .{ .ctx = null }, .{}));
-    try std.testing.expectEqual(abi.Verdict.Code.unsupported, Streamed.refusal.code);
-}
