@@ -1,0 +1,22 @@
+diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
+index 1442d98..5d50517 100644
+--- a/src/sushi/dsv41/dsv41_model.zig
++++ b/src/sushi/dsv41/dsv41_model.zig
+@@ -1866,8 +1866,15 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
+ 
+         const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si, one_pass);
+         if (pf) |p| {
+-            const got = [_]A{ keys_w, picks.comp_rows, picks.topk };
+-            try p.mark(.indexer, got[0..if (picks.comp_rows.ctx != null) 3 else 1]);
++            // The picks of a packed store go to the kernel as they are (no comp_rows), and their top-k still has to be
++            // timed here rather than inside `core`.
++            var got: [3]A = undefined;
++            var n: usize = 0;
++            for ([_]A{ keys_w, picks.comp_rows, picks.topk }) |x| if (x.ctx != null) {
++                got[n] = x;
++                n += 1;
++            };
++            try p.mark(.indexer, got[0..n]);
+         }
+         const K = if (picks.any()) dim(picks.topk, 1) else 0;
+         const head = if (one_pass)

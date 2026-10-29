@@ -19,7 +19,7 @@ const ci = sc_mod.ci;
 /// cooperative tensors). A 16 x 16 fragment's lane holds 8 elements, rows fm and fm + 8, columns fn .. fn + 3
 /// (`dsv41_nax_r` / `dsv41_nax_c` of element i); operands are in their logical layout (A 16 x KK, B KK x N), and a
 /// dimension of 32 is two consecutive 16-wide fragments.
-const HEADER =
+pub const HEADER =
     \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
     \\inline short dsv41_nax_r(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 4) | ((short(lane) >> 1) & 3)) + (i >> 2) * 8; }
     \\inline short dsv41_nax_c(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 2) | (short(lane) & 1)) * 4 + (i & 3); }

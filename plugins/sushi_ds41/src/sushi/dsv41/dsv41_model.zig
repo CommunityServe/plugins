@@ -13,6 +13,7 @@ const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const attn_nax = @import("../../attn_nax.zig");
+const index_nax = @import("../../index_nax.zig");
 const engram = @import("dsv41_engram.zig");
 const embed_ssd = @import("dsv41_embed.zig");
 const source = @import("dsv41_source.zig");
@@ -1474,6 +1475,13 @@ fn candidatePicks(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A,
     return .{ .chosen = chosen, .reach = try sc.op2(mlx.mlx_greater, try sc.takeAlong(blocks, chosen, -1), ninf) };
 }
 
+/// `kernels.indexScoresTile` on the M5's matrix units where `index_nax.fits` (patches/index-nax.patch): the same scores
+/// to f32 rounding, R query rows sharing each key tile.
+fn indexScoresWide(sc: *Scope, q: A, keys: A, w: A, wscale: f32, p0: usize, r: usize, key0: usize) !A {
+    if (index_nax.fits(dim(q, 1), dim(q, 2), mlx.mlx_array_dtype(keys))) return index_nax.indexScoresNax(sc, q, keys, w, wscale, p0, r, key0);
+    return kernels.indexScoresTile(sc, q, keys, w, wscale, p0, r, key0);
+}
+
 /// The indexer's scores `[Ls, nb]` of `q` (f32 `[Ls, ih, ihd]`) against `keys`: sum over heads of the weight (the
 /// projection `w` times `wscale`) times relu(q . k), -inf past the groups a query sees. A kernel for a few rows, the
 /// matrix kernel for a wide block, else the op chain over key tiles.
@@ -1484,7 +1492,7 @@ pub fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32
     const ihd = dim(q, 2);
     if (fusedOn(sc, m) and nb > 0) {
         if (Ls <= NARROW_ROWS and ih * ihd <= 8192) return kernels.indexScores(sc, q, keys, w, wscale, p0, r);
-        if (kernels.indexTileFits(ih, ihd, nb)) return kernels.indexScoresTile(sc, q, keys, w, wscale, p0, r, 0);
+        if (kernels.indexTileFits(ih, ihd, nb)) return indexScoresWide(sc, q, keys, w, wscale, p0, r, 0);
     }
     const weights = try sc.mul(try sc.astype(w, .float32), try sc.f(wscale));
     const keysf = try sc.astype(keys, .float32);
@@ -1555,7 +1563,7 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
         const t1 = @min(nb, t0 + tile);
         var ts = Scope.init(sc.a, sc.s);
         defer ts.deinit();
-        var scores = try kernels.indexScoresTile(&ts, q, try rows.rowsIn(&ts, t0, t1), w, wscale, p0, r, t0);
+        var scores = try indexScoresWide(&ts, q, try rows.rowsIn(&ts, t0, t1), w, wscale, p0, r, t0);
         var next_blocks = Running{};
         errdefer next_blocks.free();
         if (kb > 0) {
@@ -1866,8 +1874,15 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
 
         const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si, one_pass);
         if (pf) |p| {
-            const got = [_]A{ keys_w, picks.comp_rows, picks.topk };
-            try p.mark(.indexer, got[0..if (picks.comp_rows.ctx != null) 3 else 1]);
+            // The picks of a packed store go to the kernel as they are (no comp_rows), and their top-k still has to be
+            // timed here rather than inside `core`.
+            var got: [3]A = undefined;
+            var n: usize = 0;
+            for ([_]A{ keys_w, picks.comp_rows, picks.topk }) |x| if (x.ctx != null) {
+                got[n] = x;
+                n += 1;
+            };
+            try p.mark(.indexer, got[0..n]);
         }
         const K = if (picks.any()) dim(picks.topk, 1) else 0;
         const head = if (one_pass)

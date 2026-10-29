@@ -24,6 +24,7 @@ const borrow = @import("src/sushi/dsv41/dsv41_borrow.zig");
 const depth_bounds = @import("src/sushi/mtp_depth_bounds.zig");
 const vision_common = @import("src/sushi/vision_common.zig");
 const attn_nax = @import("src/attn_nax.zig");
+const index_nax = @import("src/index_nax.zig");
 const vision_key = @import("src/vision_key.zig");
 
 /// Shown at install and in Settings.
@@ -195,6 +196,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     errdefer m.mdl.deinit();
     const nax = attn_nax.fits(c.heads, c.head_dim, .bfloat16);
     log.info("[sushi_ds41] wide-span attention: {s}\n", .{if (nax) "matmul2d (the M5's matrix units)" else "attnFused (simdgroup matrices)"});
+    const idx_nax = index_nax.fits(c.index_heads, c.index_head_dim, .bfloat16);
+    log.info("[sushi_ds41] prefill index scores: {s}\n", .{if (idx_nax) "matmul2d (the M5's matrix units)" else "indexScoresTile (simdgroup matrices)"});
     // As sushi's server does: a synced per-stage `[dsv41-prof]` line per wide chunk, and with the verify profile per
     // decode-width chunk too.
     const verify_profile = std.c.getenv("SUSHI_DSV41_VERIFY_PROFILE") != null;

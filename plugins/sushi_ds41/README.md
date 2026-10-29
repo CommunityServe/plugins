@@ -53,6 +53,11 @@ simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2
   units through Metal 4 tensor ops (`src/attn_nax.zig`), within 3e-5 of the simdgroup kernel, with the picked
   compressed rows read packed from the store as sushi's kernel reads them; other GPUs keep that kernel. The edit to the
   slice that calls it is `patches/attn-nax.patch` (`fusedHeads`).
+- Index scores: on an M5 GPU a prompt's wide spans score their compressed blocks on the matrix units
+  (`src/index_nax.zig`, `patches/index-nax.patch`): 16 query rows share each staged 32-key tile, with the relu, head
+  weights and head sum in registers. 3.3x on the scorer (0.70 against 2.32 ms a 256-row span at 24k blocks); the
+  scores are within 1.2e-7 of `indexScoresTile`'s and 10 of 194 million top-512 picks differ on real 32k-64k prompts,
+  so long-prompt text can differ from the simdgroup scorer after a few tokens, as with the matmul2d attention.
 - Prefill: the whole prompt in one host call (`whole_prompt_prefill`), chunked here at `prefill_width` as sushi does; a
   long prompt is one uncancellable call. A chunk that another chunk follows skips its CED decoder tail
   (`patches/ced-state.patch`, `extendState`): it runs the layers below the split and the split layer's compressor, since
