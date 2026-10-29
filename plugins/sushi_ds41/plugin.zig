@@ -21,7 +21,6 @@ const sc = @import("src/sushi/dsv41_config.zig");
 const vis = @import("src/sushi/dsv41_vision.zig");
 const rows_policy = @import("src/sushi/dspark_rows.zig");
 const depth_bounds = @import("src/sushi/mtp_depth_bounds.zig");
-const stb = @import("stb");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -413,8 +412,9 @@ const aux_hooks = abi.AuxHooks{
     .handoff = &auxHandoff,
     .free = &auxFree,
     .bytes = &auxBytes,
-    .serialize = &auxSerialize,
-    .deserialize = &auxDeserialize,
+    .import_plan = &auxImportPlan,
+    .export_arrays = &auxExportArrays,
+    .import_arrays = &auxImportArrays,
 };
 
 fn auxEnabled(_: *anyopaque) callconv(.c) bool {
@@ -525,41 +525,34 @@ fn auxDescribe(_: *anyopaque, h: abi.Handle, out: *abi.AuxSnapshotInfo) callconv
     return .ok;
 }
 
-fn auxSerialize(_: *anyopaque, _: abi.Handle, _: [*]u8, _: usize, len: *usize) callconv(.c) Verdict {
-    len.* = 0;
-    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot serialization is unavailable");
+// The SSD tier's hooks: snapshots stay in RAM (the ABI lets the disk hooks refuse while the RAM ones serve).
+fn auxImportPlan(_: *anyopaque, _: abi.Str, peak: *u64) callconv(.c) Verdict {
+    peak.* = 0;
+    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot import is unavailable");
 }
 
-fn auxDeserialize(_: *anyopaque, _: abi.Str, out: *abi.Handle) callconv(.c) Verdict {
+fn auxExportArrays(_: *anyopaque, _: abi.Handle, out: *abi.AuxExport) callconv(.c) Verdict {
+    out.tensor_len = 0;
+    out.names_len = 0;
+    out.header_len = 0;
+    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot export is unavailable");
+}
+
+fn auxImportArrays(_: *anyopaque, _: abi.Span(u32), _: abi.Str, _: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot deserialization is unavailable");
+    return Verdict.refuse(.unsupported, "sushi_ds41: snapshot import is unavailable");
 }
 
 // ── images ──
 
-/// Packed RGB8 of a JPEG, PNG, GIF or BMP, transparency composited onto white.
-fn decodeRgb(encoded: []const u8) ?struct { rgb: []u8, w: u32, h: u32 } {
-    var w: c_int = 0;
-    var h: c_int = 0;
-    var channels: c_int = 0;
-    const rgba = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4) orelse return null;
-    defer stb.stbi_image_free(rgba);
-    const px: usize = @intCast(w * h);
-    const rgb = gpa.alloc(u8, px * 3) catch return null;
-    for (0..px) |i| {
-        const al: u16 = rgba[i * 4 + 3];
-        for (0..3) |c| rgb[i * 3 + c] = @intCast((al * @as(u16, rgba[i * 4 + c]) + (255 - al) * 255) / 255);
-    }
-    return .{ .rgb = rgb, .w = @intCast(w), .h = @intCast(h) };
-}
-
-fn mediaPrepare(p: *const abi.Parsed, kind: abi.MediaKind, bytes: abi.Str, budget: u64, out: *abi.MediaItem) callconv(.c) Verdict {
+/// The host decodes the image (transparency composited onto white) and hands one packed RGB8 frame.
+fn mediaPrepare(p: *const abi.Parsed, in: *const abi.MediaInput, budget: u64, out: *abi.MediaItem) callconv(.c) Verdict {
     _ = budget; // the release's processor bounds the image by its own token budget
-    if (kind != .image) return Verdict.refuse(.unsupported, "sushi_ds41: images only");
+    if (in.kind != .image) return Verdict.refuse(.unsupported, "sushi_ds41: images only");
     const v = config.of(p).vision orelse return Verdict.refuse(.unsupported, "sushi_ds41: this pack has no vision tower");
-    const src = decodeRgb(bytes.slice()) orelse return Verdict.refuse(.failed, "sushi_ds41: the image does not decode (JPEG, PNG, GIF or BMP)");
-    defer gpa.free(src.rgb);
-    const px = vis.preprocess(gpa, src.rgb, src.h, src.w, vis.Processor.of(v)) catch return Verdict.refuse(.failed, "sushi_ds41: the image's dimensions have no grid");
+    const rgb = in.rgb.slice();
+    if (in.frames != 1 or rgb.len != @as(usize, in.width) * in.height * 3) return Verdict.refuse(.failed, "sushi_ds41: the image is not one packed RGB8 frame");
+    const px = vis.preprocess(gpa, rgb, in.height, in.width, vis.Processor.of(v)) catch return Verdict.refuse(.failed, "sushi_ds41: the image's dimensions have no grid");
     // The host copies these float32 bytes on a connection thread (no MLX there) and calls `releasePixels`.
     out.* = .{
         .kind = .image,
@@ -586,7 +579,7 @@ fn mediaTower(mp: *anyopaque, item: *const abi.MediaItem, out: *abi.Array) callc
 }
 
 /// Every position of an image's span carries the image token; the span's delimiters are the tower's learned rows.
-fn placeholderRows(p: *const abi.Parsed, item: *const abi.MediaItem, out: [*]u32, cap: u32) callconv(.c) u32 {
+fn placeholderRows(p: *const abi.Parsed, item: *const abi.MediaItem, _: *const abi.TextTokens, out: [*]u32, cap: u32) callconv(.c) u32 {
     const n = @min(item.rows, cap);
     @memset(out[0..n], config.of(p).image_token_id);
     return n;

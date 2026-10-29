@@ -8,7 +8,7 @@ DeepSeek-V4.1-Flash on sushi's own model code, as an outside plugin for mlx-serv
     scripts/sync-sushi.sh <sushi checkout>  # refresh src/sushi/ from sushi
     scripts/sync-sushi.sh --check <sushi checkout> <tag>  # does a sushi release touch this slice? exit 0 = keep the pin
 
-Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`, `finish`) and outside-plugin image hooks (ddalcu/mlx-serve#1002).
+Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`, `finish`) and outside-plugin image hooks (ddalcu/mlx-serve#1002), images decoded by the host (#1003) and the aux hooks' import/export (#1000).
 
 Measured on M4 Max 128 GB, Sushi-STQ-1.75bpw, greedy:
 
@@ -25,7 +25,7 @@ DSpark on or off.
 
 - DSpark: greedy and sampled requests (the engine accepts a sampled block; the plugin drafts and keeps what it accepts). `{"mtp": false}` in the model settings keeps the stages off.
 - Prefix cache: a restore point at the prompt's last token, text only.
-- Images: JPEG, PNG, GIF, BMP (stb); WebP is refused.
-- Not supported: Thunderbolt pair, other quant formats, snapshot serialization (no SSD tier).
+- Images: decoded by mlx-serve (JPEG, PNG, GIF, BMP, WebP), transparency composited onto white.
+- Not supported: Thunderbolt pair, other quant formats, snapshot export and import (no SSD tier).
 
 `plugin check` needs a conformance fixture pack, which an STQ pack cannot provide small; the plugin is checked by serving.
