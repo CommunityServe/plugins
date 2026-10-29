@@ -304,7 +304,9 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     capture(m) catch return Verdict.refuse(.failed, "sushi_ds41: the restore point could not be taken");
     const want: dsv.Want = if (f.logits == .all_rows) .all else .last;
     const rows: ?dsv.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
-    const logits = run(m, host.ids, want, rows) catch |e| {
+    // A host older than `Forward.progress` passes a shorter struct.
+    const progress: ?*u64 = if (f.size >= @offsetOf(abi.Forward, "progress") + @sizeOf(?*u64)) f.progress else null;
+    const logits = run(m, host.ids, want, rows, progress) catch |e| {
         log.err("[sushi_ds41] forward failed: {s}\n", .{@errorName(e)});
         return Verdict.refuse(.failed, "sushi_ds41: the forward failed");
     };
@@ -341,8 +343,8 @@ fn reset(m: *Model) void {
 
 /// A prompt as sushi runs it: all but its last token in chunks (`prefill_width`, a short tail merged into the last), each
 /// told what follows it so the next chunk's Engram rows read while it runs, then the last token alone for the logits.
-/// Logits `[rows, vocab]`.
-fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows) !mlx.mlx_array {
+/// Logits `[rows, vocab]`. `progress` gets the rows forwarded after each chunk (`Forward.progress`).
+fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64) !mlx.mlx_array {
     var rows = media;
     const prefix = if (want == .last and ids.len > 1) ids.len - 1 else 0;
     var at: usize = 0;
@@ -356,6 +358,7 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows) !mlx
         if (end < prefix and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
         if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
         at = end;
+        if (progress) |p| @atomicStore(u64, p, at, .monotonic);
     }
     try capture(m);
     const logits = try forwardRows(m, ids[prefix..], want, &.{}, rows);
