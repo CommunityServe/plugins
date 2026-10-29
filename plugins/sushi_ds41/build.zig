@@ -20,4 +20,15 @@ pub fn build(b: *std.Build) void {
     tests.linker_allow_shlib_undefined = true;
     const run = b.addRunArtifact(tests);
     b.step("claims", "Run the claim and parse tests").dependOn(&run.step);
+
+    // The Metal test of src/attn_nax.zig, linked to an MLX the caller names (the server's own, so its pin), never to
+    // the dylib: `zig build gpu-test -Dmlx-lib=<dir holding libmlxc.dylib>`. It skips without an M5.
+    const mlx_lib = b.option([]const u8, "mlx-lib", "Directory holding the libmlxc.dylib the Metal test links") orelse return;
+    const gpu = b.createModule(.{ .root_source_file = b.path("src/attn_nax_test.zig"), .target = root.resolved_target, .optimize = root.optimize, .link_libc = true });
+    gpu.addLibraryPath(.{ .cwd_relative = mlx_lib });
+    gpu.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
+    gpu.addRPath(.{ .cwd_relative = mlx_lib });
+    const gpu_run = b.addRunArtifact(b.addTest(.{ .root_module = gpu, .filters = &.{"sushi_ds41 gpu"} }));
+    gpu_run.setEnvironmentVariable("SUSHI_DS41_GPU_TEST", "1");
+    b.step("gpu-test", "Run the Metal test (needs -Dmlx-lib; skips without an M5)").dependOn(&gpu_run.step);
 }
