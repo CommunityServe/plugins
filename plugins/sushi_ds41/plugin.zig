@@ -811,7 +811,7 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
     }
     o.draft_ms = nanosSince(draft_start);
     const wanted: usize = if (plain) 1 else m.policy.rows(o.conf[0 .. o.block_len - 1]);
-    var rows = std.math.clamp(wanted, 1, @min(@as(usize, cap) + 1, max_verify_rows));
+    const rows = std.math.clamp(wanted, 1, @min(@as(usize, cap) + 1, max_verify_rows));
     o.rows = @min(rows, o.block_len);
     return verifyOpen(m, o);
 }
