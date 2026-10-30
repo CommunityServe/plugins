@@ -1,15 +1,13 @@
 //! This plugin's own, in place of mlx-serve's `src/mlx/device.zig` (a cut edge of scripts/sync-mlx-serve.sh): the GPU's
-//! generation and MLX's NAX gate (an M5-class GPU, G17 or later, G18 for a phone part, on macOS 26.2 or later), which
-//! the copies' kernel choices read. No fallback lever: the gate is the machine's.
+//! generation and MLX's NAX gate (an M5-class GPU, G17 or later, G18 for a phone part, on macOS 26.2 or later). The
+//! plugin serves M5-class GPUs only: its load checks the gate (`naxPresent`), and the copies' kernel choices read it as
+//! true.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("ffi.zig");
 
 pub const DeviceGen = struct { gen: u32, phone: bool };
-
-/// A test seam of the copies; never set here.
-pub var device_gen_override: ?DeviceGen = null;
 
 /// `applegpu_g17s` / `g18p` into its generation and whether it is a phone part; 0 for anything else.
 pub fn naxArchGeneration(arch: []const u8) DeviceGen {
@@ -22,17 +20,6 @@ pub fn naxArchGeneration(arch: []const u8) DeviceGen {
     if (digits == 0 or tail.len - digits > 1) return none;
     if (digits < tail.len and !std.ascii.isAlphabetic(tail[digits])) return none;
     return .{ .gen = std.fmt.parseInt(u32, tail[0..digits], 10) catch 0, .phone = digits < tail.len and tail[digits] == 'p' };
-}
-
-var gen_cache: ?DeviceGen = null;
-
-pub fn deviceGeneration() DeviceGen {
-    if (device_gen_override) |g| return g;
-    if (gen_cache == null) {
-        var buf: [128]u8 = undefined;
-        gen_cache = naxArchGeneration(gpuArchitecture(&buf) orelse "");
-    }
-    return gen_cache.?;
 }
 
 /// `ver` (`26.4.1`) at least `major.minor`.
@@ -69,7 +56,8 @@ pub fn gpuArchitecture(buf: []u8) ?[]const u8 {
     return buf[0..arch.len];
 }
 
-pub fn computeNaxAvailable() bool {
+/// This GPU has NAX: the plugin's load refuses any GPU without it (M5-class only).
+pub fn naxPresent() bool {
     var arch_buf: [128]u8 = undefined;
     const g = naxArchGeneration(gpuArchitecture(&arch_buf) orelse "");
     if (g.gen < @as(u32, if (g.phone) 18 else 17)) return false;
@@ -77,11 +65,15 @@ pub fn computeNaxAvailable() bool {
     return macosVersionAtLeast(macosProductVersion(&ver_buf) orelse "", 26, 2);
 }
 
-var nax_cache: ?bool = null;
+// The copies' NAX gate, answered at compile time: a model loads only where `naxPresent` holds, so a copy's fallback for a
+// GPU without NAX is never analyzed and not built.
 
-pub fn naxAvailable() bool {
-    if (nax_cache == null) nax_cache = computeNaxAvailable();
-    return nax_cache.?;
+pub inline fn computeNaxAvailable() bool {
+    return true;
+}
+
+pub inline fn naxAvailable() bool {
+    return true;
 }
 
 test "the NAX gate's pure parts: G17 (G18 for a phone part), macOS 26.2" {

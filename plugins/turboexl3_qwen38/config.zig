@@ -1,12 +1,12 @@
 //! The plugin's claims and parse, MLX-free. A narrow claim: a Qwen3.8 pack (`qwen4_exp`) whose config names a
-//! `trunk_quant` block, which is a fully EXL3 pack. The built-in `qwen4_exp` keeps every other pack (the iQ-MLX packs,
-//! Sushi's expert-only EXL3 packs). The parse is mlx-serve's own (`src/mlx_serve/plugins/qwen4_exp/config.zig`), after
-//! the pack's EXL3 blocks are checked against what turboexl3 decodes.
+//! `trunk_quant` block, which is a fully EXL3 pack. The built-in `qwen4_exp` keeps every other pack. The parse is the
+//! direct model's (`src/direct/config.zig`, the K packs' keys), after the pack's EXL3 blocks are checked against what
+//! turboexl3 decodes.
 
 const std = @import("std");
 const kit = @import("mlx_serve");
 const abi = kit.abi.plugin;
-const q4 = @import("src/mlx_serve/plugins/qwen4_exp/config.zig");
+const q4 = @import("src/direct/config.zig");
 
 pub const model_types = q4.model_types;
 
@@ -115,11 +115,6 @@ const k_packs = [_][]const u8{
     @embedFile("tests/fixtures/k4.json"),
     @embedFile("tests/fixtures/k5.json"),
 };
-const iq_mlx = @embedFile("tests/fixtures/iq_mlx_4.7.json");
-const sushi_experts_only = @embedFile("tests/fixtures/sushi_k5_experts_only.json");
-/// A published Sushi pack's own config.json (beamster/Qwen3.8-Flash-Next-Sushi-3bpw at 76bd8f55): EXL3 experts in an
-/// `expert_quant` block, an affine MLX trunk, no `trunk_quant` block.
-const sushi_3bpw = @embedFile("tests/fixtures/beamster_sushi_3bpw.json");
 
 fn claimOf(model_type: []const u8, json: []const u8) kit.abi.common.Claim {
     const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
@@ -139,19 +134,15 @@ fn edited(a: std.mem.Allocator, json: []const u8, old: []const u8, new: []const 
     return std.mem.concat(a, u8, &.{ json[0..at], new, json[at + old.len ..] });
 }
 
-test "turboexl3_qwen38 claims the K2 to K5 packs by marker and leaves the iQ-MLX and Sushi packs to the built-in" {
+test "turboexl3_qwen38 claims the K2 to K5 packs by marker" {
     for (k_packs) |json| try testing.expectEqual(kit.abi.common.Claim.by_marker, claimOf("qwen4_exp", json));
-    try testing.expectEqual(kit.abi.common.Claim.no, claimOf("qwen4_exp", iq_mlx));
-    try testing.expectEqual(kit.abi.common.Claim.no, claimOf("qwen4_exp", sushi_experts_only));
 }
 
-test "turboexl3_qwen38 leaves a published Sushi expert-only pack to the built-in" {
-    try testing.expectEqual(kit.abi.common.Claim.no, claimOf("qwen4_exp", sushi_3bpw));
-}
-
-test "turboexl3_qwen38 claims nothing from broken JSON, another model type or a null trunk block" {
+test "turboexl3_qwen38 claims nothing from broken JSON, another model type, or a pack with no trunk block or a null one" {
     for ([_][]const u8{ "{", "[]", "7", "" }) |json| try testing.expectEqual(kit.abi.common.Claim.no, claimOf("qwen4_exp", json));
     try testing.expectEqual(kit.abi.common.Claim.no, claimOf("llama", k_packs[2]));
+    // an MLX-quantized pack: no `trunk_quant` block, so the built-in keeps it
+    try testing.expectEqual(kit.abi.common.Claim.no, claimOf("qwen4_exp", "{\"model_type\":\"qwen4_exp\",\"quantization\":{\"group_size\":64,\"bits\":4}}"));
     try testing.expectEqual(kit.abi.common.Claim.no, claimOf("qwen4_exp", "{\"model_type\":\"qwen4_exp\",\"trunk_quant\":null}"));
 }
 
@@ -173,6 +164,7 @@ test "turboexl3_qwen38 parses the K4 pack into the built-in's shell, its own slo
     try testing.expectEqual(mtp_depth, p.spec.native_stages);
     try testing.expectEqual(abi.DType.f32, p.shell.state_dtype);
     try testing.expect(of(&p).trunk_format and of(&p).expert_quant);
+    try testing.expectEqualStrings("ngram_embedding.safetensors", of(&p).ngramTableFile());
 }
 
 test "turboexl3_qwen38 refuses by name a trunk block that is no object and EXL3 blocks turboexl3 does not decode" {
@@ -182,7 +174,7 @@ test "turboexl3_qwen38 refuses by name a trunk block that is no object and EXL3 
     const k4 = k_packs[2];
     const trunk = "\"trunk_quant\": {\n    \"format\": \"exl3\",\n    \"codebook\": \"mul1\",\n    \"window\": 16,";
     const cases = [_]struct { json: []const u8, why: []const u8 }{
-        .{ .json = try edited(a, k4, trunk, "\"trunk_quant\": \"exl3\", \"x\": {"), .why = "qwen4_exp: TrunkQuantNotAnObject" },
+        .{ .json = try edited(a, k4, trunk, "\"trunk_quant\": \"exl3\", \"x\": {"), .why = "turboexl3_qwen38: TrunkQuantNotAnObject" },
         .{ .json = try edited(a, k4, "\"codebook\": \"mul1\",\n    \"window\": 16,", "\"codebook\": \"3inst\",\n    \"window\": 16,"), .why = "turboexl3_qwen38: Exl3CodebookUnsupported" },
         .{ .json = try edited(a, k4, "\"window\": 16,", "\"window\": 20,"), .why = "turboexl3_qwen38: Exl3WindowUnsupported" },
         .{ .json = try edited(a, k4, "\"format\": \"exl3\",\n    \"codebook\": \"mul1\",\n    \"window\"", "\"format\": \"gptq\",\n    \"codebook\": \"mul1\",\n    \"window\""), .why = "turboexl3_qwen38: NotExl3" },

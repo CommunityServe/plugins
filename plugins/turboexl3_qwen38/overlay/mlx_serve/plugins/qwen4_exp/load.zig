@@ -1,7 +1,6 @@
 //! copied_from: src/plugins/qwen4_exp/load.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! Loads one hyper-connection block (`loadHcWeights`, its 1/hc fold into the down and inject projections) and the
 //! PLE layer's weights (`loadPleWeights`).
-
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const Weights = @import("../../sdk/config/model.zig").Weights;
@@ -13,9 +12,7 @@ const weightTriple = @import("../../engines/mlx/load/weights.zig").weightTriple;
 const HcWeights = @import("weights.zig").HcWeights;
 const PleWeights = @import("weights.zig").PleWeights;
 const log = @import("../../sdk/util/log.zig");
-
 var hc_rows_said = false;
-
 pub fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: bool, hc: u32, hidden: u32, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !HcWeights {
     var nb: [160]u8 = undefined;
     const down = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.input_mix_weight_down", .{base}) catch unreachable, null, owned_bf16, allocator, s);
@@ -75,7 +72,6 @@ pub fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: boo
     }
     return out;
 }
-
 /// Says once, at an EXL3 trunk pack's load (`compileQwen4Hc`), why the hc prefill read, write and norm kernels decline
 /// its hyper-connection rows `w`, if they do. No other pack's load says anything.
 pub fn sayHcPrefillAtLoad(w: *const HcWeights) void {
@@ -86,7 +82,6 @@ pub fn sayHcPrefillAtLoad(w: *const HcWeights) void {
     else if (!@import("../../mlx/device.zig").naxAvailable())
         log.info("[hc-prefill] declined at load: this GPU has no NAX (the read, write and norm kernels need an M5 or later)\n", .{});
 }
-
 pub fn loadPleWeights(weights: *const Weights, name_buf: *[256]u8, prefix: []const u8, li: u32, hc: u32, hidden: u32, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !PleWeights {
     var nb: [160]u8 = undefined;
     const key = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.key_proj", .{ prefix, li }) catch unreachable, null, owned_bf16, allocator, s);

@@ -2,15 +2,10 @@
 //! MTP EV round planning: depth caps, cost sources, depth policy.
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
-const env = @import("../../../../env.zig");
-const transformer_mod = @import("../../transformer.zig");
 const log = @import("../../../../sdk/util/log.zig");
-const io_util = @import("../../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const round_cost = @import("../round_cost.zig");
 const ane_mod = @import("../../../../sdk/ane/offload.zig");
-const Transformer = transformer_mod.Transformer;
-const testing = std.testing;
 const depth_mod = @import("depth.zig");
 const Generator = @import("../../generate/generator.zig").Generator;
 const MTP_ADAPTIVE_DEFAULT_CAP = @import("depth.zig").MTP_ADAPTIVE_DEFAULT_CAP;
@@ -20,13 +15,10 @@ const MTP_EV_TAU_MAX = @import("depth.zig").MTP_EV_TAU_MAX;
 const MTP_EV_TAU_MIN = @import("depth.zig").MTP_EV_TAU_MIN;
 const MtpEvCosts = @import("ev_costs.zig").MtpEvCosts;
 const init = @import("../../generate/generator.zig").Generator.init;
-
-
 /// KV length the next verify forward reads.
 pub fn mtpKvLen(self: *const Generator) u32 {
     return @intCast(self.prompt_ids_owned.len + self.generated_ids.items.len);
 }
-
 /// Marginal round cost of draft position k (1-based), kv-blind. This is
 /// the fitted SHAPE; `mtpEvMarginalCostAt` applies the kv term.
 pub fn mtpEvMarginalCost(costs: MtpEvCosts, k: u32) f32 {
@@ -38,7 +30,6 @@ pub fn mtpEvMarginalCost(costs: MtpEvCosts, k: u32) f32 {
         costs.per_pos_hi;
     return costs.draft + verify_cost;
 }
-
 /// One round's draft plan. `m_hi > m_lo` means "pay the chunk-A sync and
 /// extend to m_hi when the chain log-confidence clears tau_ln".
 pub const MtpRoundPlan = struct {
@@ -54,7 +45,6 @@ pub const MtpRoundPlan = struct {
     fire_ideal: f32 = 0,
     gain_ideal: f32 = 0,
 };
-
 /// Resolve the configured depth cap. 0 = auto (`--mtp-max-depth` not passed):
 /// MTP_ADAPTIVE_NAX_CAP only when the EV controller and a calibrated G17
 /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
@@ -79,14 +69,12 @@ pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.M
     }
     return depth_bounds.liftCap(cap, depth_bounds.active, mtp_mod.MAX_DEPTH);
 }
-
 /// The cap with no per-silicon row applied: explicit wins, else the
 /// adaptive default (fixed mode keeps DEFAULT_DEPTH).
 pub fn mtpDepthCapFree(configured: u32) u32 {
     const free = if (configured != 0) @min(mtp_mod.MAX_DEPTH, @max(1, configured)) else MTP_ADAPTIVE_DEFAULT_CAP;
     return depth_bounds.liftCap(free, depth_bounds.active, mtp_mod.MAX_DEPTH);
 }
-
 /// Same, with the machine's MEASURED verify ladder when one exists.
 ///
 /// The per-silicon rows exist because the EV controller cannot see time:
@@ -119,11 +107,9 @@ pub fn mtpDepthCapResolved(
         .g17_nax_qwen4_q4_gs64, .g17_nax_qwen4_mixed_4_8_gs64 => MTP_ADAPTIVE_DEFAULT_CAP,
     };
 }
-
 pub fn resolveMtpDepthCapForProfile(configured: u32, profile: mtp_mod.MtpCostProfile) u32 {
     return mtpDepthCapForProfile(configured, true, profile);
 }
-
 /// Expected committed tokens for an m-deep round: the always-committed t1
 /// plus the acceptance chain sum (draft k lands iff drafts 0..k all land).
 pub fn mtpEvExpectedTokens(a: []const f32, m: u32) f32 {
@@ -136,24 +122,20 @@ pub fn mtpEvExpectedTokens(a: []const f32, m: u32) f32 {
     }
     return tok;
 }
-
 pub fn mtpEvMarginalCostAt(costs: MtpEvCosts, k: u32, kv_len: u32) f32 {
     _ = kv_len;
     return mtpEvMarginalCost(costs, k);
 }
-
 pub fn mtpEvRoundCostAt(costs: MtpEvCosts, m: u32, with_sync: bool, kv_len: u32) f32 {
     var c: f32 = 1.0 + (if (with_sync) costs.sync else 0.0);
     var k: u32 = 1;
     while (k <= m) : (k += 1) c += mtpEvMarginalCostAt(costs, k, kv_len);
     return c;
 }
-
 /// Smallest marginal the table may report, in floor units: a measured
 /// pair that reads a wider round CHEAPER is noise, and a non-positive
 /// marginal would make every extension free.
 pub const MTP_EV_TABLE_MIN_MARGINAL: f32 = 0.02;
-
 /// Where the EV plan's round costs come from: the measured round-cost
 /// table when the kv bucket (or its nearest active neighbour) has
 /// MIN_WIDTHS measured widths, else the fitted surface as the cold-start
@@ -169,7 +151,6 @@ pub const MtpCostSource = struct {
     scale: f32 = 0,
     /// False = the table prices round TIME only and tokens come from the acceptance EMAs.
     table_tokens: bool = true,
-
     pub fn init(costs: MtpEvCosts, kv_len: u32, table: ?*const round_cost.Table) MtpCostSource {
         var src = MtpCostSource{ .costs = costs, .kv_len = kv_len, .table = table };
         const t = table orelse return src;
@@ -181,11 +162,9 @@ pub const MtpCostSource = struct {
         src.scale = mtpEvRoundCostAt(costs, ref, false, kv_len) / ref_ms;
         return src;
     }
-
     pub fn fromTable(self: MtpCostSource) bool {
         return self.scale > 0;
     }
-
     /// Realized tokens per single-chunk round at a MEASURED width, else
     /// null (the acceptance-EMA model fills in). The model's E(6) on the
     /// M4 Max @16k said 6.85 while the measured single-6 round emitted
@@ -195,7 +174,6 @@ pub const MtpCostSource = struct {
         if (self.scale <= 0 or !self.table_tokens) return null;
         return self.table.?.measuredTok(m, self.bucket);
     }
-
     pub fn roundCost(self: MtpCostSource, m: u32, with_sync: bool) f32 {
         if (self.scale > 0) {
             const sync: f32 = if (with_sync) self.costs.sync else 0.0;
@@ -224,7 +202,6 @@ pub const MtpCostSource = struct {
         }
         return mtpEvRoundCostAt(self.costs, m, with_sync, self.kv_len);
     }
-
     pub fn marginal(self: MtpCostSource, k: u32) f32 {
         if (self.scale > 0 and k >= 1) {
             return @max(self.roundCost(k, false) - self.roundCost(k - 1, false), MTP_EV_TABLE_MIN_MARGINAL);
@@ -232,7 +209,6 @@ pub const MtpCostSource = struct {
         return mtpEvMarginalCostAt(self.costs, k, self.kv_len);
     }
 };
-
 /// How the base depth is chosen. `.accept`: expected tokens come from the acceptance EMAs
 /// (every round refreshes every index it drafted) and the table prices round TIME only, in
 /// ONE chunk, so no round reads confidences mid-round. `.legacy`: the table's realized
@@ -243,17 +219,14 @@ pub const MtpDepthPolicy = enum { accept, legacy };
 /// the read overlaps GPU work, and a shallow base + chunk B undercuts every single-chunk
 /// depth, so the legacy planner stays.
 pub const MTP_ACCEPT_MAX_KV: u32 = 8192;
-
 pub fn mtpDepthPolicyFor(configured: MtpDepthPolicy, kv_len: u32) MtpDepthPolicy {
     return if (kv_len >= MTP_ACCEPT_MAX_KV) .legacy else configured;
 }
-
 /// Test seam: forces the configured policy (past `MTP_ACCEPT_MAX_KV` it is legacy either way).
 pub var mtp_depth_policy_override: ?MtpDepthPolicy = null;
 pub fn mtpDepthPolicy() MtpDepthPolicy {
     return mtp_depth_policy_override orelse .accept;
 }
-
 pub fn mtpBasePlan(policy: MtpDepthPolicy, a: []const f32, cap: u32, src_in: MtpCostSource, m_lo_max: u32) MtpRoundPlan {
     var src = src_in;
     src.table_tokens = policy == .legacy;
@@ -264,7 +237,6 @@ pub fn mtpBasePlan(policy: MtpDepthPolicy, a: []const f32, cap: u32, src_in: Mtp
     }
     return plan;
 }
-
 pub fn mtpEvPlanSrc(a: []const f32, cap_in: u32, src: MtpCostSource, m_lo_max: u32) MtpRoundPlan {
     const cap: u32 = @intCast(@min(@as(usize, @max(1, cap_in)), a.len));
     const lo_cap: u32 = @min(cap, @max(1, m_lo_max));
@@ -336,7 +308,6 @@ pub fn mtpEvPlanSrc(a: []const f32, cap_in: u32, src: MtpCostSource, m_lo_max: u
     const tau = std.math.clamp(best_r * t_sum / s_sum, MTP_EV_TAU_MIN, MTP_EV_TAU_MAX);
     return .{ .m_lo = m_lo, .m_hi = m_hi, .tau_ln = @log(tau) };
 }
-
 /// Update the conditional acceptance EMAs from one realized round.
 /// Acceptance is prefix-structured: indices < accepted saw a success, the
 /// index AT `accepted` saw the reject (when one happened), and deeper
@@ -346,7 +317,6 @@ pub fn mtpEvObserve(a: []f32, drafted: u32, accepted: u32, beta: f32) void {
     while (i < accepted and i < a.len) : (i += 1) a[i] += beta * (1.0 - a[i]);
     if (accepted < drafted and accepted < a.len) a[accepted] += beta * (0.0 - a[accepted]);
 }
-
 /// Chain log-confidence of a drafted chunk: sum of per-draft log p_head,
 /// clamped to <= 0 per term (a log-prob is never positive; bf16 noise
 /// can be). NaN poisons to -inf so a broken confidence can never extend.
@@ -358,6 +328,4 @@ pub fn mtpChainLogConf(confs: []const f32) f32 {
     }
     return sum;
 }
-
 // ── tests ──
-

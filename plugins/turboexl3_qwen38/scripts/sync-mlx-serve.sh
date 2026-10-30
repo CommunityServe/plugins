@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Generates src/mlx_serve/ (git-ignored): the slice of mlx-serve this plugin runs (scripts/slice.txt), at the same paths as
-# in mlx-serve's src/ so their relative imports hold, with the Metal kernels they embed. scripts/prepare.sh runs it.
+# Generates src/mlx_serve/ (git-ignored): the slice of mlx-serve this plugin runs (scripts/slice.txt), at the same
+# paths as in mlx-serve's src/ so their relative imports hold, with the Metal kernels they and this plugin's own code
+# embed. scripts/prepare.sh runs it.
 # Usage: OVERLAY=<overlay/mlx_serve> scripts/sync-mlx-serve.sh <mlx-serve checkout at MLX_SERVE_REF>
-# OVERLAY holds what is not mlx-serve's text at that ref: the cut edges (EDGES), the files ddalcu/mlx-serve#1005 changed
-# (as this script wrote them from its head), its new files and abi/quant.zig. A slice file the overlay has is kept as
-# the overlay has it; everything else is written from the checkout, so it follows mlx-serve. prepare.sh then copies
-# the overlay over the result.
+# OVERLAY holds what is not mlx-serve's text at that ref: the cut edges (EDGES), and each copy, kernel and abi/quant.zig
+# whose text at mlx-serve 1b3e624b (ddalcu/mlx-serve#1005's head), as this script writes it from there, differs from
+# what it writes at the ref. A slice file the overlay has is kept as the overlay has it; everything else is written
+# from the checkout, so it follows mlx-serve. prepare.sh then copies the overlay over the result.
 # The copies are unchanged but for the edits below, made here and nowhere else:
 #   - a `//! copied_from: src/<path>@<sha>` first line;
 #   - the imports of what the plugin kit ships (abi, the SDK's plugin helpers and root, generation, the test fixture)
@@ -14,69 +15,39 @@
 #     declares them without field defaults;
 #   - in the built-in's root (plugins/qwen4_exp/plugin.zig), `pub` on the functions this plugin's table takes from it,
 #     and on the model's `ownSlot`, which the prefix cache's restores reach the slot by;
+#   - in plugins/qwen4_exp/qwen4_exp.zig, `pub` on the n-gram table's `parse`, which the direct load's open calls;
+#   - in plugins/qwen4_exp/trunk/fusion.zig, `pub` on the calls into the trunk format's fused entries and their
+#     helpers, which the direct model (src/direct) makes itself;
 #   - abi/quant.zig, the quant ABI as #1005 extends it (`QuantTable`'s fused members, read only between the copies and
 #     turboexl3's table, both inside this dylib): each declaration the kit's quant ABI has unchanged is re-exported from
 #     the kit, so the types the host's tables carry are one type on both sides;
-#   - in the kernel contract's registry (sdk/testing/kernel_contract/registry.zig), its `areas` cut to REGISTRY_AREAS:
-#     the areas whose kernels this plugin ships, which its GPU tests (`zig build gpu-test`) hold to the contract;
-#   - every named test no build of the plugin runs taken out, with the comment lines right above it: a copy keeps the
-#     named tests of KIT_TESTS (the files whose tests `zig build test` runs) and those a gpu-test or mlx-free-test filter
-#     in build.zig picks, and every unnamed `test {}` block. A module's named tests go (no test build roots a module);
-#   - the functions scripts/cut-functions.txt names taken out, with their `///` lines: functions no build of the plugin
-#     compiles (a method as Container.method). A name the copy lacks stops the sync.
-# MODULES are directories mlx-serve builds as modules of their own (Sushi's EXL3 decode, `sushi_exl3`): their Zig files
-# are copied whole (their test fixtures are not), with no edit but the `copied_from` line, but for MODULE_STAND_INS,
-# and of their other files only the kernels a copied Zig file of theirs names. The kernel contract's planted controls
-# (`controls/*.metal`) come with its `controls.zig`.
+#   - every named test but #1005's EXL3 tests taken out, with the comment lines right above it: a copy keeps the named
+#     tests a gpu-test or mlx-free-test filter in build.zig picks, and every unnamed `test {}` block;
+#   - the functions and declarations scripts/cut.txt names taken out, with their `///` lines: what no build of the
+#     plugin compiles or names (a member as Container.name). A name the copy lacks stops the sync;
+#   - blank lines taken out, but one between two lines of multiline strings, which would join them.
 # Files in EDGES are this plugin's own, at the paths of the mlx-serve files they stand in for, and never overwritten.
 # Every other file a copy imports gets a stand-in: an empty file, so the import resolves while nothing of it is used
 # (a use is a compile error, never a silent difference). Zig loads every file a file imports, used or not, so a file
-# the plugin's builds reach no code of is a stand-in rather than a copy: slice.txt leaves it out, MODULE_STAND_INS
-# names it inside a module.
-# scripts/sync-mlx-serve.sh --check <mlx-serve checkout> <ref>: does <ref> change the slice (or a cut edge's mlx-serve
-# file, which is then reviewed by hand) since MLX_SERVE_COMMIT? Exit 0 when the pin holds, 1 with the changed files.
+# the plugin's builds reach no code of is a stand-in rather than a copy: slice.txt leaves it out.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 dst="$here/src/mlx_serve"
 
 # Ours, at the paths of the mlx-serve files they stand in for: the cut edges where the slice meets the engine, the host
 # and mlx-serve's own MLX layer (which this plugin replaces with mlx-c through the kit's `mlx_c`).
-EDGES="env.zig mlx/ffi.zig mlx/array.zig mlx/device.zig mlx/dtype.zig mlx/kernel_cache.zig mlx/kernels.zig mlx/scope.zig sdk/util/log.zig engines/mlx/transformer.zig engines/mlx/cluster/distributed.zig engines/mlx/plugin/config.zig
-plugins/deepseek_v41/deepseek_v41.zig sdk/quant/gguf/claim.zig sdk/quant/nvfp4/modelopt_pack.zig sdk/blocks/dit/w8a8.zig
-engines/mlx/runtime/preflight.zig sdk/quant/nvfp4/stream_bank.zig plugins/hy_v3/load.zig sdk/quant/gguf/root.zig
-sdk/quant/gguf/format.zig engines/mlx/admission/bills.zig sdk/util/shared.zig engines/mlx/generate/generator.zig
-engines/mlx/spec/mtp_head_ref.zig sdk/ane/offload.zig"
-
-MODULES="sdk/quant/exl3/sushi"
-# A module's files the plugin's builds reach no code of (its root imports them).
-MODULE_STAND_INS="sdk/quant/exl3/sushi/glm_group2.zig sdk/quant/exl3/sushi/glm_prefill_grid.zig
-sdk/quant/exl3/sushi/layout.zig sdk/quant/exl3/sushi/rate_groups.zig"
-
-# The copies whose named tests `zig build test` (config.zig's root) runs, all of them.
-KIT_TESTS="sdk/vision/mrope.zig plugins/qwen4_exp/ple_table.zig plugins/qwen4_exp/config.zig sdk/util/crt.zig
-sdk/quant/exl3/pack_keys.zig"
-
-# The kernel contract's areas this plugin keeps (the registry's paths), in the registry's order.
-REGISTRY_AREAS="controls.zig ../../blocks/hc/contract.zig ../../blocks/gdn/contract.zig ../../../engines/mlx/spec/contract.zig
-../../../plugins/qwen4_exp/contract.zig ../../blocks/moe/contract.zig"
-
-if [ "${1:-}" = "--check" ]; then
-  repo="${2:?mlx-serve checkout}"; ref="${3:?commit or tag}"
-  pin="$(tr -d '[:space:]' < "$dst/MLX_SERVE_COMMIT")"
-  paths=(); while read -r f; do paths+=("src/$f"); done < <(grep -v '^#' "$here/scripts/slice.txt"; for e in $EDGES; do echo "$e"; done)
-  for m in $MODULES; do paths+=("src/$m"); done
-  changed="$(git -C "$repo" diff --name-only "$pin" "$ref" -- "${paths[@]}" src/kernels src/plugins/qwen4_exp/kernels)"
-  if [ -z "$changed" ]; then echo "pin holds: $ref changes nothing in the slice since ${pin:0:8}"; exit 0; fi
-  echo "sync due: $ref changes the slice since ${pin:0:8}:"; echo "$changed" | sed 's/^/  /'; exit 1
-fi
+EDGES="env.zig mlx/ffi.zig mlx/array.zig mlx/device.zig mlx/dtype.zig mlx/kernel_cache.zig mlx/kernels.zig sdk/util/log.zig
+engines/mlx/transformer.zig engines/mlx/cluster/distributed.zig engines/mlx/plugin/config.zig sdk/blocks/dit/w8a8.zig
+plugins/hy_v3/load.zig sdk/util/shared.zig engines/mlx/generate/generator.zig engines/mlx/spec/mtp_head_ref.zig
+sdk/ane/offload.zig sdk/quant/formats.zig engines/mlx/load/exl3_bank.zig sdk/kv/cache.zig engines/mlx/forward_ctx.zig
+plugins/qwen4_exp/trunk.zig sdk/config/model.zig"
 
 repo="${1:?mlx-serve checkout}"
 sha="$(git -C "$repo" rev-parse HEAD)"
 for e in $EDGES; do [ -f "$dst/$e" ] || { echo "the cut edge $e is missing" >&2; exit 1; }; done
-REGISTRY_AREAS="$(echo $REGISTRY_AREAS)" MODULE_STAND_INS="$(echo $MODULE_STAND_INS)" KIT_TESTS="$(echo $KIT_TESTS)" python3 - "$repo" "$sha" "$dst" "$here/scripts/slice.txt" "$MODULES" $EDGES <<'P'
+python3 - "$repo" "$sha" "$dst" "$here/scripts/slice.txt" $EDGES <<'P'
 import os, pathlib, re, sys
-repo, sha, dst, slice_file, edges = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3]), sys.argv[4], set(sys.argv[6:])
-modules = sys.argv[5].split()
+repo, sha, dst, slice_file, edges = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3]), sys.argv[4], set(sys.argv[5:])
 overlay = pathlib.Path(os.environ["OVERLAY"]) if os.environ.get("OVERLAY") else None
 files = [l.strip() for l in open(slice_file) if l.strip() and not l.startswith("#")]
 if edges & set(files):
@@ -90,9 +61,10 @@ handles = "mlx_array|mlx_stream|mlx_device|mlx_device_info|mlx_string|mlx_vector
           "mlx_map_string_to_array|mlx_map_string_to_string|mlx_closure|mlx_fast_metal_kernel|mlx_fast_metal_kernel_config|" \
           "mlx_fast_cuda_kernel|mlx_fast_cuda_kernel_config|mlx_io_reader|mlx_distributed_group"
 imp = re.compile(r'@import\("([^"]+\.zig)"\)')
-kernel_text = re.compile(r'"((?:kernels|plugins/qwen4_exp/kernels)/[^"]+\.(?:metal|h|cu))"')
+# The kernels a copy names, Metal only: mlx/ffi.zig answers the CUDA questions at compile time, so no CUDA kernel is built in.
+kernel_text = re.compile(r'"((?:kernels|plugins/qwen4_exp/kernels)/[^"]+\.(?:metal|h))"')
 wanted, kernels = set(), set()
-# The named tests a build of the plugin runs: KIT_TESTS' files, whole, and the names build.zig's filters pick.
+# The named tests a build of the plugin runs: the names build.zig's filters pick.
 build_zig = (dst.parent.parent / "build.zig").read_text()
 test_filters = []
 for name in ("gpu_filters", "mlx_free_filters"):
@@ -100,9 +72,6 @@ for name in ("gpu_filters", "mlx_free_filters"):
     if m is None:
         sys.exit(f"build.zig: no `{name}`: the test strip needs updating")
     test_filters += re.findall(r'"((?:\\.|[^"\\])*)"', m.group(1))
-kit_tests = set(os.environ["KIT_TESTS"].split())
-if kit_tests - set(files):
-    sys.exit(f"KIT_TESTS names files outside the slice: {sorted(kit_tests - set(files))}")
 test_head = re.compile(r'^test "((?:\\.|[^"\\])*)"\s*\{')
 def code_of(line):
     """The line with its comment, strings and character literals blanked: what its braces are."""
@@ -146,10 +115,11 @@ def strip_tests(f, text, keep):
         i, n = j + 1, n + 1
     return "\n".join(out), n
 tests_out = 0
-# The functions no build compiles, per file (scripts/cut-functions.txt), and the scanner that finds them: top-level
-# functions and methods of named containers, by path; what sits inside a function body is that function's.
+# What no build compiles or names, per file (scripts/cut.txt), and the scanners that find it: top-level functions and
+# declarations and those of named containers, by path; what sits inside a function body or a declaration's value is
+# that one's.
 cut_lists = {}
-for l in open(pathlib.Path(slice_file).parent / "cut-functions.txt"):
+for l in open(pathlib.Path(slice_file).parent / "cut.txt"):
     if l.strip() and not l.startswith("#"):
         k, v = l.split(":", 1)
         cut_lists[k.strip()] = set(v.split())
@@ -202,24 +172,102 @@ def functions(lines):
             stack.pop()
         i += 1
     return out
-def cut_functions(f, text):
+decl_head = re.compile(r'^\s*(?:pub\s+)?(?:export\s+)?(?:threadlocal\s+)?(?:const|var)\s+([A-Za-z_][A-Za-z0-9_]*)\b')
+extern_decl = re.compile(r'^\s*(?:pub\s+)?extern\b.*?\b(?:fn|var|const)\s+([A-Za-z_][A-Za-z0-9_]*)')
+block_head = re.compile(r'^\s*(?:test\b|comptime\s*\{)')
+def block_end(lines, i):
+    """The line where the braces a test or `comptime` block opens on lines[i] close."""
+    depth, opened, j = 0, False, i
+    while j < len(lines):
+        code = code_of(lines[j])
+        depth += code.count("{") - code.count("}")
+        opened = opened or "{" in code
+        if opened and depth <= 0:
+            return j
+        j += 1
+    sys.exit("a block has no end: the cut needs updating")
+def decl_end(lines, i):
+    """The last line of the declaration starting at lines[i]: where its brackets close and a `;` ends it."""
+    depth, j = 0, i
+    while j < len(lines):
+        for ch in code_of(lines[j]):
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == ";" and depth == 0:
+                return j
+        j += 1
+    sys.exit("a declaration has no end: the cut needs updating")
+def declarations(lines):
+    """[(path, first line, last line)] of each declaration at a container's level, a container's own included."""
+    out, stack, depth, i = [], [], 0, 0
+    while i < len(lines):
+        line, code = lines[i], code_of(lines[i])
+        if depth == (stack[-1][1] + 1 if stack else 0):
+            m = fn_head.match(line)
+            if m and not extern_head.match(line):
+                i = fn_end(lines, i, m.end() - 1) + 1
+                continue
+            if block_head.match(line):
+                i = block_end(lines, i) + 1
+                continue
+            c = container_head.match(line)
+            if c:
+                stack.append((c.group(1), depth, i))
+                depth += code.count("{") - code.count("}")
+                i += 1
+                continue
+            m = extern_decl.match(line) if extern_head.match(line) else decl_head.match(line)
+            if m:
+                j = decl_end(lines, i)
+                out.append((".".join([s[0] for s in stack] + [m.group(1)]), i, j))
+                i = j + 1
+                continue
+        depth += code.count("{") - code.count("}")
+        while stack and depth <= stack[-1][1]:
+            name, _, start = stack.pop()
+            out.append((".".join([s[0] for s in stack] + [name]), start, i))
+        i += 1
+    return out
+def cut_names(f, text):
     paths = cut_lists.get(f)
     if not paths:
         return text, 0
     lines = text.split("\n")
-    found = [fn for fn in functions(lines) if fn[0] in paths]
+    found = [fn for fn in functions(lines) if fn[0] in paths] + [d for d in declarations(lines) if d[0] in paths]
     missing = sorted(paths - {fn[0] for fn in found})
     if missing:
-        sys.exit(f"{f}: scripts/cut-functions.txt names functions it lacks: {missing}")
+        sys.exit(f"{f}: scripts/cut.txt names what it lacks: {missing}")
     drop = set()
     for _, a, b in found:
         while a > 0 and lines[a - 1].lstrip().startswith("///"):
             a -= 1
+        # a doc comment stands for the declaration below it across blank lines too
+        k = a
+        while k > 0 and lines[k - 1].strip() == "":
+            k -= 1
+        if k < a and k > 0 and lines[k - 1].lstrip().startswith("///"):
+            a = k
+            while a > 0 and lines[a - 1].lstrip().startswith("///"):
+                a -= 1
         drop.update(range(a, b + 1))
         if b + 1 < len(lines) and lines[b + 1] == "" and a > 0 and lines[a - 1] == "":
             drop.add(b + 1)
     return "\n".join(l for k, l in enumerate(lines) if k not in drop), len(found)
-fns_out = 0
+cut_out = 0
+def strip_blanks(text):
+    """`text` without its blank lines, but one between two lines of multiline strings, which would join them."""
+    lines, out = text.split("\n"), []
+    for i, l in enumerate(lines):
+        if l.strip() == "":
+            before = next((x for x in reversed(out) if x.strip()), "")
+            after = next((x for x in lines[i + 1:] if x.strip()), "")
+            if before.lstrip().startswith("\\\\") and after.lstrip().startswith("\\\\"):
+                out.append(l)
+            continue
+        out.append(l)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 for f in files:
     if overlay is not None and (overlay / f).is_file():
         # Ours, already as a copy is written: kept as it is, its imports still name what the slice needs.
@@ -248,20 +296,22 @@ for f in files:
         text, n = re.subn(r'^    fn ownSlot\(', '    pub fn ownSlot(', text, flags=re.M)
         if n != 1:
             sys.exit("plugins/qwen4_exp/plugin.zig: `fn ownSlot(` is not there once: the prefix cache's edit needs updating")
-    if f == "sdk/testing/kernel_contract/registry.zig":
-        # The areas whose kernels this plugin ships: every other area's import goes.
-        keep = os.environ["REGISTRY_AREAS"].split()
-        m = re.search(r'^const areas = \.\{\n((?:    @import\("[^"]+"\),\n)+)\};\n', text, flags=re.M)
-        if m is None:
-            sys.exit("sdk/testing/kernel_contract/registry.zig: no `areas` list: the registry's edit needs updating")
-        rows = re.findall(r'@import\("([^"]+)"\)', m.group(1))
-        if [a for a in keep if a not in rows]:
-            sys.exit(f"sdk/testing/kernel_contract/registry.zig: no area {[a for a in keep if a not in rows]}: REGISTRY_AREAS needs updating")
-        text = text[:m.start(1)] + "".join(f'    @import("{a}"),\n' for a in rows if a in keep) + text[m.end(1):]
-    text, n = strip_tests(f, text, (lambda name: True) if f in kit_tests else (lambda name: any(x in name for x in test_filters)))
+    if f == "plugins/qwen4_exp/qwen4_exp.zig":
+        # The n-gram table's parse, for the direct load's open (src/direct/load.zig), which starts no prefetch readers.
+        text, n = re.subn(r'^    fn parse\(map: ', '    pub fn parse(map: ', text, flags=re.M)
+        if n != 1:
+            sys.exit("plugins/qwen4_exp/qwen4_exp.zig: `fn parse(map: ` is not there once: the direct load's edit needs updating")
+    if f == "plugins/qwen4_exp/trunk/fusion.zig":
+        # The fused entries' calls, for the direct model's layers (src/direct).
+        for fn in ("refused", "strm", "own", "freeAll", "callAttnIn", "callAttnPrep", "callLinearPreparedIdx", "callGatedOut", "callQPlanes", "callSharedSwiglu"):
+            text, n = re.subn(r'^fn ' + fn + r'\(', 'pub fn ' + fn + '(', text, flags=re.M)
+            if n != 1:
+                sys.exit(f"plugins/qwen4_exp/trunk/fusion.zig: `fn {fn}(` is not there once: the direct model's edit needs updating")
+    text, n = strip_tests(f, text, lambda name: any(x in name for x in test_filters))
     tests_out += n
-    text, n = cut_functions(f, text)
-    fns_out += n
+    text, n = cut_names(f, text)
+    cut_out += n
+    text = strip_blanks(text)
     out = dst / f
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(f"//! copied_from: src/{f}@{sha}\n" + text)
@@ -298,11 +348,9 @@ def decls(text):
 if overlay is not None and (overlay / "abi/quant.zig").is_file():
     (dst / "abi").mkdir(parents=True, exist_ok=True)
     (dst / "abi/quant.zig").write_text((overlay / "abi/quant.zig").read_text())
-    qsrc = None
 else:
     qsrc = (repo / "src/abi/quant.zig").read_text()
-kq = decls((kit_dir / "src/abi/quant.zig").read_text())
-if qsrc is not None:
+    kq = decls((kit_dir / "src/abi/quant.zig").read_text())
     mine = decls(qsrc)
     same = sorted((name for name in mine if name in kq and kq[name][2] == mine[name][2]), key=lambda k: -mine[k][0])
     for name in same:
@@ -312,6 +360,7 @@ if qsrc is not None:
     qsrc = qsrc.replace('const std = @import("std");', 'const std = @import("std");\nconst kit_quant = @import("mlx_serve").abi.quant;', 1)
     qsrc, n = strip_tests("abi/quant.zig", qsrc, lambda name: any(x in name for x in test_filters))
     tests_out += n
+    qsrc = strip_blanks(qsrc)
     (dst / "abi").mkdir(parents=True, exist_ok=True)
     (dst / "abi/quant.zig").write_text(f"//! copied_from: src/abi/quant.zig@{sha}\n" + qsrc)
     print(f"abi/quant.zig: {len(same)} declarations re-exported from the kit ({', '.join(sorted(same))}); its own: {', '.join(sorted(set(mine) - set(same)))}")
@@ -319,11 +368,14 @@ if qsrc is not None:
 for e in edges:
     for m in imp.finditer((dst / e).read_text()):
         wanted.add(os.path.normpath(os.path.join(os.path.dirname(e), m.group(1))))
+# The plugin's own code (src/direct and the rest outside the copies) embeds kernels of the same tree.
+for p in sorted(dst.parent.rglob("*.zig")) + sorted(dst.parent.parent.glob("*.zig")):
+    if dst not in p.parents:
+        for m in kernel_text.finditer(p.read_text()):
+            if (repo / "src" / m.group(1)).is_file():
+                kernels.add(m.group(1))
 # hc_prefill_nax.zig names its kernel files by a comptime part: every one of that family.
 kernels |= {str(p.relative_to(repo / "src")) for p in (repo / "src/kernels/hc").glob("hc_prefill_*.metal")}
-# The kernel contract's controls, embedded by name beside controls.zig.
-if "sdk/testing/kernel_contract/controls.zig" in files:
-    kernels |= {str(p.relative_to(repo / "src")) for p in (repo / "src/sdk/testing/kernel_contract/controls").glob("*.metal")}
 for k in sorted(kernels):
     out = dst / k
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -333,46 +385,16 @@ for s in stand_ins:
     out = dst / s
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(f"//! stand_in: src/{s}@{sha}: the copies import it, this plugin uses nothing of it.\n")
-module_files = set()
-module_stand_ins = set(os.environ["MODULE_STAND_INS"].split())
-for mdir in modules:
-    srcs = [q for q in sorted((repo / "src" / mdir).rglob("*")) if q.is_file() and "/fixtures/" not in str(q.relative_to(repo / "src"))]
-    missing = sorted(m for m in module_stand_ins if m.startswith(mdir + "/") and not (repo / "src" / m).is_file())
-    if missing:
-        sys.exit(f"MODULE_STAND_INS names files {mdir} does not have: {missing}")
-    # What the module's copied Zig files say: a kernel only they name comes along.
-    stripped = {}
-    for q in srcs:
-        rel = str(q.relative_to(repo / "src"))
-        if q.suffix == ".zig" and rel not in module_stand_ins:
-            stripped[rel], n = strip_tests(rel, q.read_text(), lambda name: False)
-            tests_out += n
-            stripped[rel], n = cut_functions(rel, stripped[rel])
-            fns_out += n
-    named = "".join(stripped.values())
-    for q in srcs:
-        rel = str(q.relative_to(repo / "src"))
-        if q.suffix != ".zig" and f'"{q.relative_to(repo / "src" / mdir)}"' not in named:
-            continue
-        out = dst / rel
-        out.parent.mkdir(parents=True, exist_ok=True)
-        if rel in module_stand_ins:
-            out.write_text(f"//! stand_in: src/{rel}@{sha}: the module's root imports it, this plugin uses nothing of it.\n")
-        elif q.suffix == ".zig":
-            out.write_text(f"//! copied_from: src/{rel}@{sha}\n" + stripped[rel])
-        else:
-            out.write_bytes(q.read_bytes())
-        module_files.add(rel)
-unknown = sorted(set(cut_lists) - set(files) - module_files)
+unknown = sorted(set(cut_lists) - set(files))
 if unknown:
-    sys.exit(f"scripts/cut-functions.txt names files that are not copies: {unknown}")
-known = set(files) | edges | set(stand_ins) | set(kernels) | module_files | {"MLX_SERVE_COMMIT", "abi/quant.zig"}
+    sys.exit(f"scripts/cut.txt names files that are not copies: {unknown}")
+known = set(files) | edges | set(stand_ins) | set(kernels) | {"MLX_SERVE_COMMIT", "abi/quant.zig"}
 for p in sorted(dst.rglob("*")):
     rel = str(p.relative_to(dst))
     if p.is_file() and rel not in known:
         p.unlink()
         print(f"removed {rel} (no longer in the slice)")
-print(f"synced {len(files)} files, {len(kernels)} kernels, {len(module_files)} module files, {len(stand_ins)} stand-ins from {sha[:8]}; {tests_out} named tests no build runs and {fns_out} functions none compiles left out")
+print(f"synced {len(files)} files, {len(kernels)} kernels, {len(stand_ins)} stand-ins from {sha[:8]}; {tests_out} named tests no build runs and {cut_out} functions and declarations none reaches left out")
 P
 find "$dst" -type d -empty -delete
 # No env levers: the copies reach the environment only through env.zig (ours), but for the variables mlx-serve's own

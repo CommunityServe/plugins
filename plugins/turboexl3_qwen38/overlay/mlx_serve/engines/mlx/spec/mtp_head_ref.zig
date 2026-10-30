@@ -32,12 +32,6 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
-    pub fn canRerankDrafts(self: MtpHeadRef) bool {
-        return switch (self) {
-            .qwen4 => |t| t.qwen4DraftRerankReady(),
-        };
-    }
-
     /// The head's last healthy acceptance surface, or null when it has never published one.
     pub fn evSeed(self: MtpHeadRef) ?struct { accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32 } {
         return switch (self) {

@@ -2,12 +2,10 @@
 //! The quant plugin table (`QuantTable`): a format claims a config's quantization block, validates and bills it,
 //! loads its tensors and banks from a weight source (`Source`), runs its matmul and MoE dispatch, registers its
 //! kernels. The built-in formats (`src/sdk/quant/`) implement the same table.
-
 const Host = @import("mlx_serve").abi.host.Host;
 const std = @import("std");
 const kit_quant = @import("mlx_serve").abi.quant;
 const common = @import("mlx_serve").abi.common;
-
 pub const Span = kit_quant.Span;
 pub const Str = kit_quant.Str;
 pub const Verdict = kit_quant.Verdict;
@@ -15,17 +13,12 @@ pub const Array = kit_quant.Array;
 pub const Stream = kit_quant.Stream;
 pub const Claim = kit_quant.Claim;
 pub const PackDir = kit_quant.PackDir;
-
 pub const version: u32 = 1;
-
 /// Where a format reads a pack's tensors: the resident source (`sdk/weights/resident.zig`) or the streamed one.
 pub const Source = kit_quant.Source;
-
 /// A loaded weight in the format's own layout. It owns every array in it; `QuantTable.release` frees them.
 pub const Weight = kit_quant.Weight;
-
 pub const LoadCtx = kit_quant.LoadCtx;
-
 /// A quant plugin's table, exported as `exportName(name, version)`. `claims`, `validate` and `bill` never reach MLX.
 /// A load runs `open`, then any number of `load_tensor`/`load_bank`, then `close`; the weights outlive `close`.
 pub const QuantTable = extern struct {
@@ -55,13 +48,11 @@ pub const QuantTable = extern struct {
     /// Routed SwiGLU experts in one dispatch, for a format whose kernels fuse the three projections (EXL3): `x`
     /// [B, S, D] through the banks' experts `inds` [B, S, K], weighted by `scores`. Null: compose `moe` per projection.
     swiglu: ?*const fn (gate: *const Weight, up: *const Weight, down: *const Weight, x: Array, inds: Array, scores: Array, opts: *const Swiglu, s: Stream, out: *Array) callconv(.c) Verdict = null,
-
     // ── The GDN layer's tail: one trunk linear in parts around the host's own launches (qwen4_exp `trunk/gdn_tail.zig`).
     // The host's fused tail repeats a serving format's prepare and finish, so a format serves these only if, per 128-column
     // block, its prepare is xp = f16(H(f16(x) * scales) / sqrt(128)) and its finish y = f16(H(f16(z)) / sqrt(128) *
     // biases) then the output dtype: H the 128-wide Hadamard butterfly turboexl3's kernels splice (`sources.had128`), in its
     // order; `scales` f16 [in], `biases` f16 [out] (the `Weight`'s arrays). Null or a refusal: the host runs `matmul`. ──
-
     /// `matmul` with the work after x's prepare (on `s`) recorded on `opts.side`; with `opts.inner` it stops before the
     /// finish and `out` is the inner product f16 [rows, out] that `linear_finish` takes.
     linear_split: ?*const fn (w: *const Weight, x: Array, opts: *const LinearParts, s: Stream, out: *Array) callconv(.c) Verdict = null,
@@ -75,10 +66,8 @@ pub const QuantTable = extern struct {
     /// One piece's inner product against `opts.held` (what `linear_pieces` made): of x [..., in], or with `opts.prepared`
     /// of rows the host prepared.
     linear_piece: ?*const fn (w: *const Weight, x: Array, opts: *const LinearParts, s: Stream, out: *Array) callconv(.c) Verdict = null,
-
     // A gated attention layer's linears and the shared expert in fused launches, each the bytes of the host's chain it
     // replaces. Null, or a refusal: the host runs that chain.
-
     /// q (each head [query | gate]), k and v of `x` [1, S, D] at prefill rows, the q / k RMSNorm and partial RoPE in
     /// the finish: `out` q, k, v [1, heads, S, head_dim] (q and k normed and rotated), gate [1, S, heads, head_dim].
     attn_in: ?*const fn (q: *const Weight, k: *const Weight, v: *const Weight, x: Array, opts: *const AttnIn, s: Stream, out: *AttnInOut) callconv(.c) Verdict = null,
@@ -104,9 +93,7 @@ pub const QuantTable = extern struct {
     /// `SharedSwiglu.logits` the routing (the host's softmax router) runs in the launches and `inds` / `scores` are
     /// empty.
     swiglu_shared: ?*const fn (gate: *const Weight, up: *const Weight, down: *const Weight, x: Array, inds: Array, scores: Array, opts: *const SharedSwiglu, s: Stream, out: *Array) callconv(.c) Verdict = null,
-
     // ── Resident matrices (memory for speed: an EXL3 trunk's `resident` mode) ──
-
     /// Keeps each of `ws`' decoded matrices from its first prefill call on, when they fit in `room` bytes (0: no
     /// bound); `bytes` receives what they take. Refused `too_large` past `room`. An empty `ws` drops every kept matrix.
     resident: ?*const fn (ws: Span(Weight), room: u64, s: Stream, bytes: *u64) callconv(.c) Verdict = null,
@@ -119,9 +106,7 @@ pub const QuantTable = extern struct {
     /// output widths] in x's dtype. Refused where the format holds them otherwise and at decode widths.
     linear_joined: ?*const fn (ws: Span(Weight), x: Array, s: Stream, out: *Array) callconv(.c) Verdict = null,
 };
-
 pub const Swiglu = kit_quant.Swiglu;
-
 /// The GDN tail entries' options; each entry reads the fields its doc names.
 pub const LinearParts = extern struct {
     size: u32 = @sizeOf(LinearParts),
@@ -140,7 +125,6 @@ pub const LinearParts = extern struct {
     /// `linear_finish`: the inner products, in row order.
     parts: Span(Array) = .{},
 };
-
 pub const AttnIn = extern struct {
     size: u32 = @sizeOf(AttnIn),
     heads: u32,
@@ -160,10 +144,8 @@ pub const AttnIn = extern struct {
     std: Array = .{},
     std_offs: [3]u32 = @splat(0),
 };
-
 /// New arrays, the caller's.
 pub const AttnInOut = extern struct { q: Array = .{}, gate: Array = .{}, k: Array = .{}, v: Array = .{} };
-
 /// Where the gate lies: element (row, head h, d) at base[row * row_stride + h * head_stride + off + d].
 pub const Gate = extern struct {
     size: u32 = @sizeOf(Gate),
@@ -174,13 +156,11 @@ pub const Gate = extern struct {
     /// MLX's sigmoid of every 16-bit pattern [65536], in the gate's dtype.
     sigtab: Array,
 };
-
 pub const QPlanes = extern struct {
     size: u32 = @sizeOf(QPlanes),
     heads: u32,
     head_dim: u32,
 };
-
 pub const Indexer = extern struct {
     size: u32 = @sizeOf(Indexer),
     /// Index query heads, each one 128-block of the projection; the raw key's block follows them.
@@ -202,7 +182,6 @@ pub const Indexer = extern struct {
     pcos: Array = .{},
     psin: Array = .{},
 };
-
 pub const SharedSwiglu = extern struct {
     size: u32 = @sizeOf(SharedSwiglu),
     /// The shared expert's linears, as the trunk's format loaded them.
@@ -218,7 +197,5 @@ pub const SharedSwiglu = extern struct {
     logits: Array = .{},
     k: u32 = 0,
 };
-
 // ── tests ──
-
 const testing = std.testing;
