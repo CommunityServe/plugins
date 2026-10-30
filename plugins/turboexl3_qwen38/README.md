@@ -18,6 +18,9 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load. MTP needs tw
 - MTP drafts with the pack's own head (src/spec/drafter.zig). The server's `mtp` load setting reaches it, and
   src/host_flags.zig reads the server's `--mtp-min-depth` and `--mtp-max-depth` (and the old `--mtp-depth`) off its
   arguments: equal values pin the depth every round drafts.
+- The prefix cache's snapshots (src/cache/aux.zig: KV, recurrent state with the QSA history, the head's history) go to
+  the server's disk tier with `--prefix-cache-disk`, and at exit within `--shutdown-persist-secs`, in
+  src/cache/codec.zig's form; a later prompt, after a restart too, restores from there as it would from RAM.
 
 ## Measured
 
