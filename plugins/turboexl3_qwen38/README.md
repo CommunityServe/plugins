@@ -18,6 +18,8 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load. MTP needs tw
 - MTP drafts with the pack's own head (src/spec/drafter.zig). The server's `mtp` load setting reaches it, and
   src/host_flags.zig reads the server's `--mtp-min-depth` and `--mtp-max-depth` (and the old `--mtp-depth`) off its
   arguments: equal values pin the depth every round drafts.
+- `--int8-qk`, read the same way, runs a dense prefill block of 64 rows or more (below the QSA budget) on int8 Q and K,
+  as the built-in does (lossy).
 
 ## Measured
 
