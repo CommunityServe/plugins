@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Generates src/mlx_serve/ (git-ignored): the slice of mlx-serve this plugin runs (scripts/slice.txt), at the same paths as
-# in mlx-serve's src/ so their relative imports hold, with the Metal kernels they and this plugin's own code embed.
-# scripts/prepare.sh runs it.
+# Generates src/mlx_serve/ (git-ignored): the slice of mlx-serve this plugin runs (scripts/slice.txt), at the same
+# paths as in mlx-serve's src/ so their relative imports hold, with the Metal kernels they and this plugin's own code
+# embed. scripts/prepare.sh runs it.
 # Usage: OVERLAY=<overlay/mlx_serve> scripts/sync-mlx-serve.sh <mlx-serve checkout at MLX_SERVE_REF>
 # OVERLAY holds what is not mlx-serve's text at that ref: the cut edges (EDGES), and each copy, kernel and abi/quant.zig
-# whose text at the head of ddalcu/mlx-serve#1005 (as this script wrote it from that head) differs from what it writes
-# at the ref. A slice file the overlay has is kept as the overlay has it; everything else is written from the checkout,
-# so it follows mlx-serve. prepare.sh then copies the overlay over the result.
+# whose text at mlx-serve 1b3e624b (ddalcu/mlx-serve#1005's head), as this script writes it from there, differs from
+# what it writes at the ref. A slice file the overlay has is kept as the overlay has it; everything else is written
+# from the checkout, so it follows mlx-serve. prepare.sh then copies the overlay over the result.
 # The copies are unchanged but for the edits below, made here and nowhere else:
 #   - a `//! copied_from: src/<path>@<sha>` first line;
 #   - the imports of what the plugin kit ships (abi, the SDK's plugin helpers and root, generation, the test fixture)
@@ -29,8 +29,6 @@
 # Every other file a copy imports gets a stand-in: an empty file, so the import resolves while nothing of it is used
 # (a use is a compile error, never a silent difference). Zig loads every file a file imports, used or not, so a file
 # the plugin's builds reach no code of is a stand-in rather than a copy: slice.txt leaves it out.
-# scripts/sync-mlx-serve.sh --check <mlx-serve checkout> <ref>: does <ref> change the slice (or a cut edge's mlx-serve
-# file, which is then reviewed by hand) since MLX_SERVE_COMMIT? Exit 0 when the pin holds, 1 with the changed files.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 dst="$here/src/mlx_serve"
@@ -43,15 +41,6 @@ plugins/deepseek_v41/deepseek_v41.zig sdk/blocks/dit/w8a8.zig plugins/hy_v3/load
 engines/mlx/generate/generator.zig engines/mlx/spec/mtp_head_ref.zig sdk/ane/offload.zig
 sdk/blocks/attention/sparse_block/decode_cuda.zig sdk/quant/formats.zig engines/mlx/load/exl3_bank.zig
 sdk/kv/cache.zig"
-
-if [ "${1:-}" = "--check" ]; then
-  repo="${2:?mlx-serve checkout}"; ref="${3:?commit or tag}"
-  pin="$(tr -d '[:space:]' < "$dst/MLX_SERVE_COMMIT")"
-  paths=(); while read -r f; do paths+=("src/$f"); done < <(grep -v '^#' "$here/scripts/slice.txt"; for e in $EDGES; do echo "$e"; done)
-  changed="$(git -C "$repo" diff --name-only "$pin" "$ref" -- "${paths[@]}" src/kernels src/plugins/qwen4_exp/kernels)"
-  if [ -z "$changed" ]; then echo "pin holds: $ref changes nothing in the slice since ${pin:0:8}"; exit 0; fi
-  echo "sync due: $ref changes the slice since ${pin:0:8}:"; echo "$changed" | sed 's/^/  /'; exit 1
-fi
 
 repo="${1:?mlx-serve checkout}"
 sha="$(git -C "$repo" rev-parse HEAD)"
