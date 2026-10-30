@@ -20,9 +20,11 @@ const warmup = @import("src/direct/warmup.zig");
 const ple = @import("src/direct/ple.zig");
 const cost_profile = @import("src/mlx_serve/plugins/qwen4_exp/cost_profile.zig");
 const ev_plan = @import("src/mlx_serve/engines/mlx/spec/mtp/ev_plan.zig");
+const depth_bounds = @import("src/mlx_serve/engines/mlx/spec/mtp_depth_bounds.zig");
 const KVQuantConfig = @import("src/mlx_serve/engines/mlx/cache/kv_quant.zig").KVQuantConfig;
 const Drafter = @import("src/spec/drafter.zig").Drafter;
 const aux = @import("src/cache/aux.zig");
+const host_flags = @import("src/host_flags.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -114,6 +116,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         out.* = Verdict.refuse(.unsupported, "turboexl3_qwen38 needs an M5-class GPU (NAX)");
         return null;
     }
+    // The server's own flags this plugin follows (src/host_flags.zig), set before anything reads them.
+    host_flags.apply() catch |e| {
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_qwen38: " ++ @errorName(x)),
+        };
+        return null;
+    };
     const s = gpa.create(Served) catch {
         out.* = Verdict.refuse(.failed, "turboexl3_qwen38: out of memory");
         return null;
@@ -137,11 +146,12 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 
 /// The head's load-time work, as #1005's load does it when the head serves (`qwen4_build_draft_rerank`, then its eager
 /// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and each verify width's
-/// kernels compiled before any round is timed. The slots' KV is dense (`KVCache.init`).
+/// kernels, to the depth cap `--mtp-max-depth` resolves to, compiled before any round is timed. The slots' KV is dense
+/// (`KVCache.init`).
 fn armHead(m: *q4.Model) void {
     _ = mtp_head.qwen4BuildDraftRerank(&m.trunk);
     const kv = KVQuantConfig.dense;
-    const cap = ev_plan.resolveMtpDepthCapForProfile(0, cost_profile.qwen4G17CostProfileForKv(&m.trunk, kv));
+    const cap = ev_plan.resolveMtpDepthCapForProfile(depth_bounds.active.max, cost_profile.qwen4G17CostProfileForKv(&m.trunk, kv));
     warmup.warmupSpecVerify(&m.trunk, cap, kv) catch |e| log.warn("[turboexl3_qwen38] the verify warm-up failed ({s}): each width compiles in its first round\n", .{@errorName(e)});
 }
 
@@ -463,6 +473,8 @@ test {
     _ = config;
     // The MTP round's pure parts (`zig build mlx-free-test`): the verify's PLE lend and a request's [spec-stats] line.
     _ = @import("src/spec/drafter.zig");
+    // The server's flags as the plugin reads them (`zig build mlx-free-test`).
+    _ = @import("src/host_flags.zig");
     // #1005's trunk_quant block lookup, MLX-free (`zig build mlx-free-test`).
     _ = @import("src/mlx_serve/sdk/quant/block_test.zig");
     // #1005's EXL3 tests (`zig build gpu-test`, the server's MLX linked); mlx-free-test's filters leave them out.

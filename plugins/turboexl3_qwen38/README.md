@@ -15,8 +15,9 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load. MTP needs tw
   MTP round policy and shared types, cut to what the plugin's builds compile. scripts/prepare.sh writes it from mlx-serve
   at MLX_SERVE_REF and copies overlay/mlx_serve over it: the cut edges, and the files whose text at mlx-serve 1b3e624b
   (ddalcu/mlx-serve#1005's head) differs from the ref's. A build refuses a tree whose hash is not scripts/mlx_serve.sha256.
-- MTP drafts with the pack's own head (src/spec/drafter.zig). The server's `mtp` load setting reaches it; `--mtp-*`
-  flags do not.
+- MTP drafts with the pack's own head (src/spec/drafter.zig). The server's `mtp` load setting reaches it, and
+  src/host_flags.zig reads the server's `--mtp-min-depth` and `--mtp-max-depth` (and the old `--mtp-depth`) off its
+  arguments: equal values pin the depth every round drafts.
 
 ## Measured
 

@@ -74,11 +74,12 @@ fn wire(b: *std.Build, root: *std.Build.Module, dep: *std.Build.Dependency) void
 }
 
 /// The tests `mlx-free-test` runs rooted at the plugin, by name: the MTP round's pure parts (src/spec/drafter.zig),
-/// #1005's trunk_quant block lookup (block_test.zig), and the direct model's trellis n-gram table, its warm and the
-/// resident bill (src/direct). The kit's test step runs config.zig's and the EXL3 tests of the copies that build from
-/// there.
+/// the server's flags as the plugin reads them (src/host_flags.zig), #1005's trunk_quant block lookup
+/// (block_test.zig), and the direct model's trellis n-gram table, its warm and the resident bill (src/direct). The
+/// kit's test step runs config.zig's and the EXL3 tests of the copies that build from there.
 const mlx_free_filters = [_][]const u8{
     "drafter:",
+    "host flags:",
     "quant block: blocks are found under their keys",
     "direct ple:",
     "direct load: an EXL3 trunk pack warms",

@@ -33,6 +33,7 @@ const ev_plan = @import("../mlx_serve/engines/mlx/spec/mtp/ev_plan.zig");
 const ev_costs = @import("../mlx_serve/engines/mlx/spec/mtp/ev_costs.zig");
 const regime = @import("../mlx_serve/engines/mlx/spec/mtp/regime.zig");
 const depth = @import("../mlx_serve/engines/mlx/spec/mtp/depth.zig");
+const depth_bounds = @import("../mlx_serve/engines/mlx/spec/mtp_depth_bounds.zig");
 const spec_sampling = @import("../mlx_serve/engines/mlx/sampling/spec_sampling.zig");
 const generator = @import("../mlx_serve/engines/mlx/generate/generator.zig");
 const MtpHeadRef = @import("../mlx_serve/engines/mlx/spec/mtp_head_ref.zig").MtpHeadRef;
@@ -234,13 +235,13 @@ pub const Drafter = struct {
     }
 
     /// The request's policy, made at its first round as #1005's generate init makes it: the depth cap from the head's
-    /// cost profile (no `--mtp-max-depth` reaches a native drafter), the free cap, the profile's costs, and the depth
-    /// controller's start at depth 1, its floor with no `--mtp-min-depth`.
+    /// cost profile and `--mtp-max-depth` (src/host_flags.zig reads the server's), the free cap, the profile's costs,
+    /// and the depth controller's start at its floor, `--mtp-min-depth` (1 without it).
     fn policyOf(d: *Drafter, sl: *Slot, own: *const OwnSlot) *Generator {
         if (sl.gen) |*g| return g;
         const head: MtpHeadRef = .{ .qwen4 = &d.m.trunk };
         const profile = cost_profile.qwen4G17CostProfileForKv(&d.m.trunk, own.cache.config);
-        const cap = @min(ev_plan.resolveMtpDepthCapForProfile(0, profile), head.maxDepth());
+        const cap = @min(ev_plan.resolveMtpDepthCapForProfile(depth_bounds.active.max, profile), head.maxDepth());
         sl.gen = .{
             .xfm = &d.pm,
             .mtp = head,
@@ -248,9 +249,9 @@ pub const Drafter = struct {
             .prompt_ids_owned = sl.prompt.items,
             .model_has_mtp = true,
             .mtp_depth = cap,
-            .mtp_depth_free = if (d.pm.mtp_depth_free != 0) d.pm.mtp_depth_free else ev_plan.mtpDepthCapFree(0),
+            .mtp_depth_free = if (d.pm.mtp_depth_free != 0) d.pm.mtp_depth_free else ev_plan.mtpDepthCapFree(depth_bounds.active.max),
             .mtp_ev_costs = ev_costs.mtpEvCosts(profile),
-            .mtp_depth_current = 1,
+            .mtp_depth_current = depth_bounds.floorFor(depth_bounds.active, cap),
         };
         return &sl.gen.?;
     }
@@ -454,8 +455,9 @@ pub const Drafter = struct {
             }
         }
         if (g.spec_disabled_runtime or g.mtp_serial_left > 0 or g.mtp_serial_exit != .none) return null;
-        // Cross-request EV seed: the head's last healthy acceptance surface, so the plan starts warm.
-        if (g.mtp_ev_rounds == 0 and g.mtp_attempted == 0) {
+        // Cross-request EV seed: the head's last healthy acceptance surface, so the plan starts warm. A pinned depth
+        // never plans, so it takes none.
+        if (g.mtp_ev_rounds == 0 and g.mtp_attempted == 0 and regime.mtpPinnedDepth() == null) {
             if (g.mtp.?.evSeed()) |seed| {
                 g.mtp_ev_accept = seed.accept;
                 g.mtp_ev_m_lo_prev = @min(@max(seed.m_lo, 1), mtp_mod.MAX_DEPTH);
@@ -542,11 +544,13 @@ pub const Drafter = struct {
         return .{ .drafts = cat, .m = m };
     }
 
-    /// The lookup drafts a round from t1 takes (#1005's `mtpLookupChain`), into `out`: 0 = the head's chain.
+    /// The lookup drafts a round from t1 takes (#1005's `mtpLookupChain`), into `out`: 0 = the head's chain. A lookup
+    /// draft is held to `--mtp-max-depth`, and one shorter than `--mtp-min-depth` is none.
     fn lookupDrafts(g: *Generator, plan: MtpRoundPlan, t1: u32, out: *[max_rows]u32) !u32 {
+        const lookup_cap = depth_bounds.lookupCap(mtp_lookup.MAX_DRAFT_STRONG, depth_bounds.active);
         const k = try g.mtpLookupDrafts(gpa, plan, t1);
-        if (k == 0) return 0;
-        const got = (try g.mtpLookupIndex(gpa)).match(t1, mtp_lookup.MAX_DRAFT_STRONG).?;
+        if (k == 0 or k < depth_bounds.floorFor(depth_bounds.active, lookup_cap)) return 0;
+        const got = (try g.mtpLookupIndex(gpa)).match(t1, lookup_cap).?;
         @memcpy(out[0..k], got.draft[0..k]);
         return k;
     }
@@ -963,8 +967,9 @@ fn endRequest(sl: *Slot) void {
     var buf: [256]u8 = undefined;
     const line = specStatsLine(&buf, &g);
     if (line.len > 0) log.info("{s}", .{line});
+    // A pinned depth's surface is not one the policy chose: it seeds nothing.
     if (g.mtp) |head| {
-        if (!g.spec_disabled_runtime and g.mtp_attempted >= 8) head.setEvSeed(g.mtp_ev_accept, g.mtp_ev_m_lo_prev);
+        if (regime.mtpPinnedDepth() == null and !g.spec_disabled_runtime and g.mtp_attempted >= 8) head.setEvSeed(g.mtp_ev_accept, g.mtp_ev_m_lo_prev);
     }
     g.deinit(gpa);
 }
