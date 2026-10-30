@@ -5,7 +5,6 @@ engines/mlx/batched/layered.zig
 engines/mlx/cache/kv_quant.zig
 engines/mlx/compiled.zig
 engines/mlx/eval_cadence.zig
-engines/mlx/forward_ctx.zig
 engines/mlx/kv/cache.zig
 engines/mlx/layer_weights.zig
 engines/mlx/load/layers_layered.zig
@@ -45,7 +44,6 @@ plugins/qwen4_exp/qsa/pooled.zig
 plugins/qwen4_exp/qsa/sparse_attn.zig
 plugins/qwen4_exp/qwen4_exp.zig
 plugins/qwen4_exp/side_stream.zig
-plugins/qwen4_exp/trunk.zig
 plugins/qwen4_exp/trunk/formats.zig
 plugins/qwen4_exp/trunk/fusion.zig
 plugins/qwen4_exp/trunk/gdn.zig
@@ -81,7 +79,6 @@ sdk/blocks/moe/routing.zig
 sdk/blocks/moe/weights.zig
 sdk/blocks/qmm/lane_qmm.zig
 sdk/blocks/rope/mrope.zig
-sdk/config/model.zig
 sdk/quant/block.zig
 sdk/quant/block_test.zig
 sdk/quant/exl3/format.zig
@@ -94,11 +91,7 @@ sdk/util/io_util.zig
 sdk/util/system.zig
 sdk/weights/load.zig
 sdk/weights/resident.zig
-plugins/qwen4_exp/qsa/arms.zig
 sdk/blocks/rope/qk_norm_rope.zig
-sdk/blocks/rope/rope.zig
 engines/mlx/batched/row_axis_verify.zig
 sdk/weights/shard.zig
-sdk/spec/mtp_acceptance.zig
-sdk/weights/streamed.zig
 sdk/blocks/mlp/dense.zig

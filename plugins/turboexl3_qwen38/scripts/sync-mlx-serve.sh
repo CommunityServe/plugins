@@ -37,10 +37,10 @@ dst="$here/src/mlx_serve"
 # Ours, at the paths of the mlx-serve files they stand in for: the cut edges where the slice meets the engine, the host
 # and mlx-serve's own MLX layer (which this plugin replaces with mlx-c through the kit's `mlx_c`).
 EDGES="env.zig mlx/ffi.zig mlx/array.zig mlx/device.zig mlx/dtype.zig mlx/kernel_cache.zig mlx/kernels.zig sdk/util/log.zig
-engines/mlx/transformer.zig engines/mlx/cluster/distributed.zig engines/mlx/plugin/config.zig
-plugins/deepseek_v41/deepseek_v41.zig sdk/blocks/dit/w8a8.zig plugins/hy_v3/load.zig sdk/util/shared.zig
-engines/mlx/generate/generator.zig engines/mlx/spec/mtp_head_ref.zig sdk/ane/offload.zig sdk/quant/formats.zig
-engines/mlx/load/exl3_bank.zig sdk/kv/cache.zig"
+engines/mlx/transformer.zig engines/mlx/cluster/distributed.zig engines/mlx/plugin/config.zig sdk/blocks/dit/w8a8.zig
+plugins/hy_v3/load.zig sdk/util/shared.zig engines/mlx/generate/generator.zig engines/mlx/spec/mtp_head_ref.zig
+sdk/ane/offload.zig sdk/quant/formats.zig engines/mlx/load/exl3_bank.zig sdk/kv/cache.zig engines/mlx/forward_ctx.zig
+plugins/qwen4_exp/trunk.zig sdk/config/model.zig"
 
 repo="${1:?mlx-serve checkout}"
 sha="$(git -C "$repo" rev-parse HEAD)"

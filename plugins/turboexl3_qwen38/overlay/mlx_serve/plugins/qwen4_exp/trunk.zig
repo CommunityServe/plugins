@@ -1,9 +1,7 @@
-//! copied_from: src/plugins/qwen4_exp/trunk.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
-//! The qwen4_exp trunk module: the loaded weights (layers with their hyper-connection and PLE blocks, the final
-//! mixer, the MTP head), the n-gram state, and the per-model caches its forward keeps (QSA block constants and pooled
-//! rope, the compiled closures, quant params, decode requant copies, angle rows, the persistent batched GDN group).
-//! Its methods are the family's forward (`forward.zig`, `mtp.zig`, `ple.zig`, `hc.zig`, `qsa/`) and the trunk ops
-//! (`trunk/`).
+//! This plugin's own, in place of mlx-serve's `src/plugins/qwen4_exp/trunk.zig` (a cut edge of
+//! scripts/sync-mlx-serve.sh): the trunk with the fields the K packs' forward reads; its methods are mlx-serve's at
+//! 1b3e624b.
+
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../sdk/config/model.zig");
@@ -12,7 +10,6 @@ const mtp = @import("mtp.zig");
 const distributed_mod = @import("../../engines/mlx/cluster/distributed.zig");
 const MoeLayerWeights = @import("../../engines/mlx/layer_weights.zig").MoeLayerWeights;
 const PersistentSsmGroup = @import("../../engines/mlx/ssm/group.zig").PersistentSsmGroup;
-const VerifyLaps = @import("../../engines/mlx/batched/row_axis_verify.zig").VerifyLaps;
 const HcWeights = @import("weights.zig").HcWeights;
 const QsaPooledRope = @import("qsa/pooled.zig").QsaPooledRope;
 const QsaBlockConsts = @import("qsa/pooled.zig").QsaBlockConsts;
@@ -22,7 +19,6 @@ const QkAngleSlot = @import("../../sdk/blocks/rope/qk_norm_rope.zig").QkAngleSlo
 const DtypeCastCache = @import("../../mlx/dtype.zig").DtypeCastCache;
 const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
 pub const Trunk = struct {
-    /// Borrowed: its owner (the plugin's model, or the engine's legacy shell) frees it after the trunk.
     config: model.ModelConfig,
     s: mlx.mlx_stream,
     allocator: std.mem.Allocator,
@@ -32,52 +28,31 @@ pub const Trunk = struct {
     lm_head_w: mlx.mlx_array,
     lm_head_s: mlx.mlx_array,
     lm_head_b: mlx.mlx_array,
-    /// A ternary 2-bit pack: its projections read the 2-bit kernels (`trunk/linear.zig` `qmatmul`).
     ternary_2bit: bool = false,
-    /// The pack's quant formats bound at load (`trunk/formats.zig`): the trunk format's linears, the expert format's
-    /// banks, the numerics.
     formats: @import("trunk/formats.zig").Formats = .{},
     moe_layers: []MoeLayerWeights,
-    /// Arrays the loader built (transposed bf16, folded hyper-connection weights): freed with the trunk.
     moe_owned_bf16: []mlx.mlx_array = &.{},
-    /// The final hyper-connection read, in place of `model.norm`.
     qwen4_mixer: HcWeights,
-    /// The n-gram hash and the mmapped table (plus its GPU arm).
     qwen4: ?*qwen4_mod.Qwen4State = null,
-    /// The in-checkpoint MTP layer; null without one (or on a pipeline rank).
     qwen4_mtp: ?mtp.Qwen4Mtp = null,
-    /// Whose per-request state the head holds (`qwen4MtpActivate`).
     qwen4_mtp_owner: ?*mtp.Qwen4MtpState = null,
-    /// `[hidden]` ones for the weight-less RMS norms; 1.0 (bf16) for the dispatch probe; `rms_norm_eps` as f32.
     ones_hidden: mlx.mlx_array,
     one: mlx.mlx_array,
     rms_eps_arr: mlx.mlx_array,
-    /// YaRN: the rope denominators, the mscale vector, the host inverse frequencies; null on an unscaled rope.
     rope_freqs_yarn: ?mlx.mlx_array = null,
     yarn_mscale: ?mlx.mlx_array = null,
     yarn_inv_freq: ?[]const f64 = null,
     yarn_mscale_cast: DtypeCastCache = .{},
-    /// Run the residual streams in f32 (the fixture oracle's tighter bar).
     qwen4_stream_f32: bool = false,
     qsa_consts: QsaBlockConsts = .{},
     qsa_pooled_rope: QsaPooledRope = .{},
-    /// Bumped by every forward entry that can reach QSA; keys the per-forward QSA scratch.
     fwd_gen: u64 = 0,
-    /// Set while the wavefront builds a chunk: the stream the PLE layer's id read runs on (the CPU's), so it waits behind
-    /// neither half's GPU queue (`plePrepareIds`).
     ple_ids_stream: mlx.mlx_stream = .{ .ctx = null },
-    /// A prefill chunk's stream as built up to its PLE layer, borrowed while that layer runs: `pleKickOff` starts it on the
-    /// GPU once the ids are read, so those layers run under the host gather (the PLE prefetch).
     ple_kick: mlx.mlx_array = .{ .ctx = null },
-    /// Test meter: how many times `qsaScoreBank` built or extended its transposed operand.
-    qsa_score_bank_builds: usize = 0,
-    /// Pipeline rank 0: the worker holding the later layers; tensor rank 0: the worker holding the other expert slices.
     dist_peer: ?*distributed_mod.Peer = null,
     dist_tp: ?*distributed_mod.Peer = null,
     compiled_moe_routing: ?mlx.mlx_closure = null,
     compiled_gdn_gate: ?mlx.mlx_closure = null,
-    /// The hyper-connection elementwise tails, one kernel each: silu(down), mean(sigma(up)*normed), 2sigma(inject),
-    /// stream + out*inj.
     compiled_hc_silu: ?mlx.mlx_closure = null,
     compiled_hc_mix: ?mlx.mlx_closure = null,
     compiled_hc_inj: ?mlx.mlx_closure = null,
@@ -86,38 +61,20 @@ pub const Trunk = struct {
     gdn_q_scale: ?mlx.mlx_array = null,
     gdn_k_scale: ?mlx.mlx_array = null,
     gdn_eps: ?mlx.mlx_array = null,
-    /// A verify forward in flight: the recurrent layers keep each row's state for the partial-accept rollback.
     spec_capture_ssm: bool = false,
     bits_cache: BitsCache = .{},
-    /// Decode-only int8/nvfp4 copies of dense attention projections, by the weight's pointer (null = ineligible).
     attn_dq: std.AutoHashMapUnmanaged(usize, ?AttnDqCopy) = .empty,
     qk_angle_cache: [2]QkAngleSlot = .{ .{}, .{} },
-    /// The round-cost tracer's per-forward arm bits.
-    cost_trace_active: bool = false,
-    cost_attention: u8 = 0,
-    cost_moe: u8 = 0,
-    verify_laps: VerifyLaps = .{},
-    /// The joined `[1, sum(rows), V]` logits of the last grouped verify whose head ran once (released by the next).
     verify_joined_logits: mlx.mlx_array = .{ .ctx = null },
-    /// Layer stride for the decode async-eval ladder (0 = off) and the batched tick's.
     decode_async_ladder: u32 = 0,
     decode_async_ladder_qwen4: u32 = @import("forward.zig").QWEN4_DECODE_ASYNC_LADDER_DEFAULT,
     ssm_group: PersistentSsmGroup = .{},
-    /// Test seams (no env): `false` runs the per-tick merge/split and the per-slot KV append.
-    persistent_group_state_override: ?bool = null,
-    batched_kv_append_override: ?bool = null,
-    /// The MTP cost profile's trunk fingerprints (homogeneous affine-4/gs-64; the oQ4e mixed layout).
     mtp_uniform_affine_trunk: bool = false,
     mtp_oqe_affine_trunk: bool = false,
-    /// The fused paths' per-layer state (`trunk/fusion.zig`).
     fused: @import("trunk/fusion.zig").Scratch = .{},
-    // attention.zig
-    // forward.zig
     pub const QWEN4_DECODE_ASYNC_LADDER_DEFAULT = @import("forward.zig").QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
-    // hc.zig
     pub const compileQwen4Hc = @import("hc.zig").compileQwen4Hc;
     pub const HcRead = @import("hc.zig").HcRead;
-    // mtp.zig
     pub const HeadPlace = @import("mtp.zig").HeadPlace;
     pub const loadQwen4Mtp = @import("mtp.zig").loadQwen4Mtp;
     pub const qwen4BuildDraftRerank = @import("mtp.zig").qwen4BuildDraftRerank;
@@ -133,16 +90,10 @@ pub const Trunk = struct {
     pub const Qwen4MtpState = @import("mtp.zig").Qwen4MtpState;
     pub const qwen4MtpStateNew = @import("mtp.zig").qwen4MtpStateNew;
     pub const qwen4MtpTruncate = @import("mtp.zig").qwen4MtpTruncate;
-    // ple.zig
     pub const plePrefetchEnd = @import("ple.zig").plePrefetchEnd;
     pub const releasePlePending = @import("ple.zig").releasePlePending;
-    // qsa/decode_gather.zig
-    // qsa/indexer.zig
-    // qsa/pooled.zig
     pub const markQsaPooledRopeStale = @import("qsa/pooled.zig").markQsaPooledRopeStale;
-    // trunk/formats.zig
     pub const reordered = @import("trunk/formats.zig").reordered;
-    // trunk/linear.zig
     pub const qmatmul = @import("trunk/linear.zig").qmatmul;
     pub const lmHeadProject = @import("trunk/linear.zig").lmHeadProject;
     pub const quantParamsHinted = @import("trunk/linear.zig").quantParamsHinted;
@@ -153,18 +104,12 @@ pub const Trunk = struct {
     pub const computeGeglu = @import("trunk/linear.zig").computeGeglu;
     pub const embedding = @import("trunk/linear.zig").embedding;
     pub const lmHeadForeign = @import("trunk/linear.zig").lmHeadForeign;
-    // trunk/attn.zig
-    // trunk/gdn.zig
     pub const compileGdnGate = @import("trunk/gdn.zig").compileGdnGate;
-    // trunk/moe.zig
     pub const moeRoutingUncompiled = @import("trunk/moe.zig").moeRoutingUncompiled;
     pub const compileMoeRouting = @import("trunk/moe.zig").compileMoeRouting;
-    // trunk/verify.zig
-    // trunk/batched.zig
     pub const flushDeferredPleGroup = @import("ple.zig").flushDeferredPleGroup;
     pub const settleDeferredPle = @import("ple.zig").settleDeferredPle;
     pub const discardDeferredPle = @import("ple.zig").discardDeferredPle;
-    // trunk/warmup.zig
     pub const warmupSpecVerify = @import("trunk/warmup.zig").warmupSpecVerify;
     pub fn actDtype(self: *const Trunk) mlx.mlx_dtype {
         return self.config.actDtype();
