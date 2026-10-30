@@ -7,8 +7,8 @@ Serves the fully EXL3 Qwen3.8-Flash-Next packs K2 to K5 (OpensourceWTF/Qwen3.8-F
     plugins/turboexl3_qwen38/scripts/prepare.sh                      # generate src/mlx_serve/ (build.sh runs it)
     zig build gpu-test -Dmlx-lib=<dir>      # in the plugin's folder, against the server's MLX (libmlx, libmlxc)
 
-M5-class GPUs (NAX) only; any other GPU is refused by name at load. MTP needs two mlx-serve fixes, open in
-[ddalcu/mlx-serve#1017](https://github.com/ddalcu/mlx-serve/pull/1017); with `--no-mtp` it serves on mlx-serve main.
+M5-class GPUs (NAX) only; any other GPU is refused by name at load. MTP needs mlx-serve with
+[ddalcu/mlx-serve#1017](https://github.com/ddalcu/mlx-serve/pull/1017) (merged); without it, serve with `--no-mtp`.
 
 - src/direct is the model: one Qwen3.8 forward for these packs, with turboexl3 doing the EXL3 math.
 - src/mlx_serve (generated, not committed) holds the parts of mlx-serve the model calls: kernels, their launchers, the
@@ -30,4 +30,23 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load. MTP needs tw
 
 ## Measured
 
-(final window: to fill in)
+Apple M5 Max, 128 GB, macOS 27.0.1, served by mlx-serve main 7d52c147 (with #1017's two MTP fixes for MTP on). One
+17,743-token coding prompt, greedy, max_tokens 16,384. Cold prefill is the first request's prompt tok/s with nothing
+cached; decode is the second request's. MTP on is the adaptive policy, run A B B A over two seeds against
+ddalcu/mlx-serve#1005 (ca4648a3; its head 1b3e624b adds only a compile-time fold in a load check) on the same pack:
+means of two runs per side.
+
+| Pack | Decode, MTP off | Decode, MTP on: plugin / #1005 | Cold prefill, MTP on: plugin / #1005 |
+|---|---|---|---|
+| K2 | 65.0 | 118.2 / 116.4 | 2,740 / 2,725 |
+| K3 | 61.3 | 121.7 / 119.0 | 2,685 / 2,664 |
+| K4 | 60.0 | 126.0 / 122.0 | 2,645 / 2,662 |
+| K5 | 55.3 | 114.0 / 118.9, then 120.7 / 121.1 | 2,612 / 2,522, then 2,606 / 2,615 |
+
+- MTP off, the output is byte for byte #1005's on all four packs. So is it on K2 with `--kv-quant 8`, `--kv-quant 4`
+  and `--int8-qk` (a 1,801-token prompt), and after a restore from the disk prefix cache.
+- MTP on, the text differs from run to run on either side: the round policy plans from live timings. Pinned at one
+  depth it repeats, but the plugin's text and #1005's differ. K5 pinned at depth 4: plugin 122.8, #1005 119.1 tok/s.
+- K5 was run twice; the second run did not reproduce the first one's gap.
+
+Not measured: sampled requests, other prompts, concurrent requests, other Macs.
