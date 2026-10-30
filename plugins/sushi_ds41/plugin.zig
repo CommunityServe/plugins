@@ -12,6 +12,7 @@ pub const mlx = @import("src/sushi/mlx.zig");
 pub const log = @import("src/sushi/log.zig");
 pub const io_util = @import("src/sushi/io_util.zig");
 const dsv = @import("src/sushi/dsv41/dsv41_model.zig");
+const kernels = @import("src/sushi/dsv41/dsv41_kernels.zig");
 const dstream = @import("src/sushi/dsv41/dsv41_stream.zig");
 const source = @import("src/sushi/dsv41/dsv41_source.zig");
 const engram = @import("src/sushi/dsv41/dsv41_engram.zig");
@@ -23,7 +24,6 @@ const rows_policy = @import("src/sushi/dsv41/dspark_rows.zig");
 const borrow = @import("src/sushi/dsv41/dsv41_borrow.zig");
 const depth_bounds = @import("src/sushi/mtp_depth_bounds.zig");
 const vision_common = @import("src/sushi/vision_common.zig");
-const attn_nax = @import("src/attn_nax.zig");
 const index_nax = @import("src/index_nax.zig");
 const vision_key = @import("src/vision_key.zig");
 
@@ -194,8 +194,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.engine.warmCache() catch |e| log.warn("[sushi_ds41] expert cache warm failed: {s}\n", .{@errorName(e)});
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
-    const nax = attn_nax.fits(c.heads, c.head_dim, .bfloat16);
-    log.info("[sushi_ds41] wide-span attention: {s}\n", .{if (nax) "matmul2d (the M5's matrix units)" else "attnFused (simdgroup matrices)"});
+    dsv.setAttnNax(m.mdl, kernels.attn_nax_bar);
     const idx_nax = index_nax.fits(c.index_heads, c.index_head_dim, .bfloat16);
     log.info("[sushi_ds41] prefill index scores: {s}\n", .{if (idx_nax) "matmul2d (the M5's matrix units)" else "indexScoresTile (simdgroup matrices)"});
     // As sushi's server does: a synced per-stage `[dsv41-prof]` line per wide chunk, and with the verify profile per
@@ -353,7 +352,7 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows) !mlx
         // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
         // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
         // its decoder (`extendState`).
-        if (end < prefix and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
+        if (end < prefix and end - at > m.mdl.cfg.window and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
         if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
         at = end;
     }
@@ -409,7 +408,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 
 test {
     _ = config;
-    _ = attn_nax;
+    _ = index_nax;
 }
 
 // ── prefix cache ──

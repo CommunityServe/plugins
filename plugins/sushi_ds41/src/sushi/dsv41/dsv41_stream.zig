@@ -38,15 +38,35 @@ pub const Stream = struct {
     act: mlx.mlx_dtype,
     /// The slabs of the layer in flight, between `lease` and `release`.
     held: ?stream.Prepared = null,
+    /// Every expert of one layer, resident until `unpin`: its leases read no SSD.
+    pinned: ?Pinned = null,
+    pinned_leases: u64 = 0,
+
+    const Pinned = struct { layer: usize, prepared: stream.Prepared };
+
+    /// Reads all of `layer`'s experts once; a layer-major batch runs every window against them.
+    pub fn pin(self: *Stream, layer: usize) !void {
+        self.unpin();
+        const gpa = self.engine.allocator;
+        const all = try gpa.alloc(u16, self.cfg.experts);
+        defer gpa.free(all);
+        for (all, 0..) |*id, i| id.* = @intCast(i);
+        self.pinned = .{ .layer = layer, .prepared = try self.engine.prepareHost(@intCast(layer), all) };
+    }
+
+    pub fn unpin(self: *Stream) void {
+        if (self.pinned) |*p| p.prepared.deinit();
+        self.pinned = null;
+    }
 
     pub fn hook(self: *Stream) model.Experts.Hook {
         return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque };
     }
 
-    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?A) anyerror!A {
+    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?model.SharedOp) anyerror!A {
         const self: *Stream = @ptrCast(@alignCast(ctx));
         const y = try self.apply(sc, layer, x, idx, wts);
-        return if (shared) |sy| sc.add(y, try sc.astype(sy, .float32)) else y;
+        return if (shared) |op| sc.add(y, try sc.astype(try op.value(sc, x), .float32)) else y;
     }
 
     fn leaseOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, idx: A) anyerror!model.Experts.Lease {
@@ -71,15 +91,20 @@ pub const Stream = struct {
             if (id < 0 or id >= self.cfg.experts) return error.ExpertOutOfRange;
             h.* = @intCast(id);
         }
-        var fresh = try self.engine.prepareHost(@intCast(layer), host);
-        errdefer {
+        const pin_hit = if (self.pinned) |*p| p.layer == layer else false;
+        var fresh: ?stream.Prepared = if (pin_hit) null else try self.engine.prepareHost(@intCast(layer), host);
+        errdefer if (fresh) |*p| {
             _ = mlx.mlx_synchronize(sc.s);
-            fresh.deinit();
-        }
-        const prepared: *const stream.Prepared = &fresh;
+            p.deinit();
+        };
+        const prepared: *const stream.Prepared = if (fresh) |*p| p else &self.pinned.?.prepared;
         const slots = try gpa.alloc(i32, host.len);
         defer gpa.free(slots);
-        for (slots, prepared.remapped) |*s, r| s.* = r;
+        if (pin_hit) {
+            // `remapped` of a pinned layer is indexed by expert id.
+            for (slots, host) |*s, id| s.* = prepared.remapped[id];
+            self.pinned_leases += 1;
+        } else for (slots, prepared.remapped) |*s, r| s.* = r;
         const local = try sc.ints(slots, mlx.getShape(idx));
         const C = stream.quant.Component;
         const bank = struct {
@@ -192,7 +217,7 @@ pub const StqStream = struct {
         return self.engine.fill_ns_total + self.engine.copy_ns_total;
     }
 
-    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?A) anyerror!A {
+    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?model.SharedOp) anyerror!A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         return self.applyScored(sc, layer, x, idx, wts, logits, shared orelse return error.Dsv41StqNeedsSharedExpert);
     }
@@ -206,16 +231,16 @@ pub const StqStream = struct {
 
     /// The routed sum plus the shared expert's `shared`, f32 `[L, dim]`.
     pub fn apply(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A) !A {
-        return self.applyScored(sc, layer, x, idx, wts, .{ .ctx = null }, shared);
+        return self.applyScored(sc, layer, x, idx, wts, .{ .ctx = null }, .{ .array = shared });
     }
 
     /// `apply` with the router's `logits`, which a decode-width route's lossy pick (`stream.pick_tolerance`) reads.
-    pub fn applyScored(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: A) !A {
+    pub fn applyScored(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: model.SharedOp) !A {
         if (!mlx.streamIsGpu(sc.s)) return error.Dsv41StreamRequiresGpu;
         // A resident layer maps the picks to slots on the GPU: no host read, so the forward is never stalled on one.
         if (self.engine.residentRoute(@intCast(layer))) |rr| {
             const local = try sc.take(rr.map, try sc.astype(idx, .int32), 0);
-            return model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rr.bank, x, local, wts, .{ .array = shared });
+            return model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rr.bank, x, local, wts, shared);
         }
         const gpa = self.engine.allocator;
         var clock = stream.Clock.init();
@@ -250,7 +275,7 @@ pub const StqStream = struct {
         const local = try sc.ints(slots, mlx.getShape(idx));
         _ = clock.lap();
         // The caller evaluates the sum before a later layer can refill the union: the next layer's picks read it.
-        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, .{ .array = shared });
+        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared);
         self.engine.noteExpertCompute(@intCast(layer), clock.lap());
         return out;
     }
@@ -1095,6 +1120,55 @@ test "dsv41 stq: verify rows that decode each distinct expert once give the per-
     }
 }
 
+test "dsv41 stq: a wide chunk's shared expert riding the routed prefill launches gives the separate chain's logits and state, byte for byte (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var packs: [2]StqServed = undefined;
+    var rows: [2][]f32 = undefined;
+    var slots: [2][]model.Slot = undefined;
+    var folded: [2]usize = undefined;
+    var built: usize = 0;
+    defer for (0..built) |i| {
+        testing.allocator.free(rows[i]);
+        for (slots[i]) |*sl| model.freeSlot(sl);
+        testing.allocator.free(slots[i]);
+        packs[i].deinit();
+    };
+    for ([_]bool{ false, true }, 0..) |fold, i| {
+        try packs[i].init(dir, .bfloat16, true, false, 8, s);
+        packs[i].m.shared_fold = fold;
+        built += 1;
+        const before = exl3.rate_groups.prefillFoldedCount();
+        var all: std.ArrayList(f32) = .empty;
+        defer all.deinit(testing.allocator);
+        // Both chunks are wider than a decode row group.
+        for ([_][]const u32{ ids[0..20], ids[20..] }) |chunk| {
+            const lg = try model.extend(packs[i].m, chunk, .all);
+            defer _ = mlx.mlx_array_free(lg);
+            const h = try model.hostRows(&sc, lg);
+            defer testing.allocator.free(h);
+            try all.appendSlice(testing.allocator, h);
+        }
+        folded[i] = exl3.rate_groups.prefillFoldedCount() - before;
+        rows[i] = try all.toOwnedSlice(testing.allocator);
+        slots[i] = try testing.allocator.alloc(model.Slot, model.slotCount(packs[i].m));
+        @memset(slots[i], model.nil_slot);
+        try model.captureState(packs[i].m, slots[i]);
+    }
+    try testing.expect(ids.len - 20 > exl3.kernels.DECODE_ROWS_MAX);
+    try testing.expectEqual(@as(usize, 0), folded[0]);
+    try testing.expect(folded[1] > 0);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(rows[0]), std.mem.sliceAsBytes(rows[1]));
+    try model.expectSlotsBits(&sc, slots[0], slots[1]);
+}
+
 test "dsv41 stq: tile-major pools give the pack-order pools' bytes, through hits, misses, the union and prefill rows (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();
@@ -1535,7 +1609,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try stqDir();
     const model_mod = @import("../model.zig");
-    const scheduler_mod = @import("../scheduler.zig");
+    const model_load = @import("../model_load.zig");
     const Transformer = @import("../transformer.zig").Transformer;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1556,14 +1630,14 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     config.drop_expert = 3;
     try testing.expectEqual(@as(u32, 5), config.keptExperts());
     // The plan counts the dropped experts out of the union workspace and of the budget's fixed bill.
-    const full_plan = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &plain, root, 2 << 30, false, 0);
-    const cut_plan = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, root, 2 << 30, false, 0);
+    const full_plan = try model_load.planExpertStreamingWith(io, testing.allocator, &plain, root, 2 << 30, false, 0);
+    const cut_plan = try model_load.planExpertStreamingWith(io, testing.allocator, &config, root, 2 << 30, false, 0);
     // The tiny pack fits the budget whole, so the bill is the resident one: every kept expert and its meta table.
     try testing.expect(full_plan.cache.resident and cut_plan.cache.resident);
     try testing.expect(cut_plan.cache.cache_bytes < full_plan.cache.cache_bytes);
     try testing.expect(cut_plan.resolved.ledger.?.cache_bytes < full_plan.resolved.ledger.?.cache_bytes);
     // A pack without the list refuses before any weight loads.
-    try testing.expectError(error.ExpertDropRefused, scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, dir, 2 << 30, false, 0));
+    try testing.expectError(error.ExpertDropRefused, model_load.planExpertStreamingWith(io, testing.allocator, &config, dir, 2 << 30, false, 0));
 
     config.expert_streaming = true;
     config.expert_cache_bytes = 64 << 20;
@@ -1602,7 +1676,7 @@ test "dsv41 drop: a real STQ pack's headers and its usage file plan a drop of 8 
     const pack = std.mem.span(std.c.getenv("SUSHI_DSV41_REAL_PACK") orelse return error.SkipZigTest);
     const usage = std.mem.span(std.c.getenv("SUSHI_DSV41_REAL_USAGE") orelse return error.SkipZigTest);
     const model_mod = @import("../model.zig");
-    const scheduler_mod = @import("../scheduler.zig");
+    const model_load = @import("../model_load.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try linkPack(&tmp, pack);
@@ -1612,10 +1686,10 @@ test "dsv41 drop: a real STQ pack's headers and its usage file plan a drop of 8 
     defer testing.allocator.free(root);
     var config = try model_mod.parseConfig(io, testing.allocator, pack);
     defer config.deinit(testing.allocator);
-    const whole = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
+    const whole = try model_load.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
     for ([_]u16{ 8, 16 }) |n| {
         config.drop_expert = n;
-        const cut = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
+        const cut = try model_load.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
         const freed = if (whole.cache.resident) whole.cache.cache_bytes - cut.cache.cache_bytes else whole.cache.workspace_bytes - cut.cache.workspace_bytes;
         if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 drop {d}: resident {} -> {}, union workspace {d:.3} -> {d:.3} GB, expert cache {d:.3} -> {d:.3} GB, {d} -> {d} slots/layer\n", .{
             n,

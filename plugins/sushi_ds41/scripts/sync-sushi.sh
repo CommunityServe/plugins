@@ -2,15 +2,15 @@
 # Copies the DeepSeek-V4.1 slice of sushi into src/sushi/ in sushi's own folders (src/dsv41/, src/glm5/, src/exl3/), then
 # applies this repo's edits to it (patches/*.patch). Usage: scripts/sync-sushi.sh <sushi checkout>
 # The cut edges are ours and never overwritten: src/sushi/{model,transformer,status,scheduler,test_models,tokenizer,
-# dflash}.zig and src/sushi/dsv41/transient_peak.zig (the host's MLX has no transient-peak counters).
+# dflash,model_load}.zig and src/sushi/dsv41/transient_peak.zig (the host's MLX has no transient-peak counters).
 # scripts/sync-sushi.sh --check <sushi checkout> <ref>: does <ref> (a release tag or commit) change the slice since
 # SUSHI_COMMIT? Exit 0 when the pin holds, 1 with the changed files when a sync is due.
 set -euo pipefail
 plugin="$(cd "$(dirname "$0")/.." && pwd -P)"
 dst="$plugin/src/sushi"
 dsv41="dsv41_borrow dsv41_config dsv41_embed dsv41_engram dsv41_kernels dsv41_model dsv41_owned dsv41_qat dsv41_scope dsv41_source dsv41_stream dsv41_vision dspark_rows expert_usage"
-shared="vision_common dflash_policy spec_cost_gate mtp_depth_bounds expert_bf16_kernels expert_io expert_quant expert_stream io_util log mlx mlx_kernel_keys test_expect"
-cut="model transformer status scheduler test_models tokenizer dflash"
+shared="vision_common dflash_policy spec_cost_gate mtp_depth_bounds expert_bf16_kernels expert_io expert_quant expert_stream io_util log mlx mlx_kernel_keys nax_gate test_expect"
+cut="model transformer status scheduler test_models tokenizer dflash model_load"
 
 slice_paths() {
   local p

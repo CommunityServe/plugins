@@ -12,7 +12,6 @@ const cfg_mod = @import("dsv41_config.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
-const attn_nax = @import("../../attn_nax.zig");
 const index_nax = @import("../../index_nax.zig");
 const engram = @import("dsv41_engram.zig");
 const embed_ssd = @import("dsv41_embed.zig");
@@ -191,7 +190,7 @@ pub const Experts = union(enum) {
         ctx: *anyopaque,
         /// The routed sum (f32 `[L, dim]`) of normed `x` over router picks `idx` (`[L, k]`) weighted `wts`, plus `shared`
         /// (the shared expert's `[L, dim]`) added in f32 when given. `logits` are the router's (`Routes.logits`).
-        apply: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?A) anyerror!A,
+        apply: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?SharedOp) anyerror!A,
         /// The layer's picks `idx` (`[L, k]`) made readable as banks, with the ids as slots of those banks. The banks
         /// stay valid until `release`, which the caller calls once everything reading them is evaluated.
         lease: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, idx: A) anyerror!Lease,
@@ -553,6 +552,40 @@ pub const Trace = struct {
     }
 };
 
+/// The inputs a calibration capture reads off a forward, by the linears that consume them.
+pub const TapKind = enum {
+    /// attn_norm output: wq_a, wkv, the compressor projections and the indexer's weights projection.
+    attn_in,
+    /// q_norm output: wq_b and the indexer's wq_b.
+    q_lora,
+    /// The pooled, normed latent the indexer's key projection reads (index-key owners only).
+    index_latent,
+    /// The attention output after its fp8 round trip, `[L, o_groups, group_in]`: wo_a, one input per group.
+    wo_a_in,
+    /// The grouped projection's output `[L, o_groups * o_lora]`: wo_b.
+    wo_b_in,
+    /// ffn_norm output: the routed experts' gate and up, and the shared expert's.
+    ffn_in,
+    /// The shared expert's SwiGLU: its down projection.
+    shared_act,
+    /// The Engram rows `[L, cols * head_dim]`: the Engram wkv.
+    engram_in,
+    /// The final norm output, every row: the head.
+    head_in,
+    /// The mean of the hc copies entering a DSpark target layer `[L, dim]`: what the draft stages' main projection reads.
+    dspark_in,
+};
+
+/// Reads a forward without changing it. Handles are valid for the call only; a sink that keeps one copies it.
+pub const Tap = struct {
+    ctx: *anyopaque,
+    input: *const fn (ctx: *anyopaque, layer: usize, kind: TapKind, x: A) anyerror!void,
+    /// The router's picks `idx` (`[L, k]` int32 expert ids) and the weights `wts` (`[L, k]` f32) the layer applies.
+    routes: *const fn (ctx: *anyopaque, layer: usize, idx: A, wts: A) anyerror!void,
+    /// The routed experts' down-projection inputs `act` (`[n, inter]`, route weight applied) with the expert id of each row (`[n, 1]` int32).
+    expert_act: *const fn (ctx: *anyopaque, layer: usize, act: A, ids: A) anyerror!void,
+};
+
 /// Host wall time of a wide chunk per stage, each stage evaluated before the next is built (so graph building counts
 /// with the GPU work it queues). `routed` includes the expert fill the `[expert-stream]` line splits out.
 pub const Profile = struct {
@@ -579,16 +612,16 @@ pub const Profile = struct {
         try evalAll(xs);
         const now = std.Io.Timestamp.now(self.io, .boot);
         const into = if (self.decoder) &self.dec else &self.ns;
-        into[@intFromEnum(stage)] += @intCast(self.last.durationTo(now).nanoseconds);
+        into[@backingInt(stage)] += @intCast(self.last.durationTo(now).nanoseconds);
         self.last = now;
     }
 
     /// Moves the expert stream's host time (SSD reads, cache copies) out of the routed stage it was timed in.
     fn hostShare(self: *Profile, host_ns: u64) void {
         const into = if (self.decoder) &self.dec else &self.ns;
-        const moved = @min(host_ns, into[@intFromEnum(Stage.routed)]);
-        into[@intFromEnum(Stage.routed)] -= moved;
-        into[@intFromEnum(Stage.fill)] += moved;
+        const moved = @min(host_ns, into[@backingInt(Stage.routed)]);
+        into[@backingInt(Stage.routed)] -= moved;
+        into[@backingInt(Stage.fill)] += moved;
     }
 
     fn report(self: *Profile, rows: usize, p0: usize) void {
@@ -598,7 +631,7 @@ pub const Profile = struct {
             var total: u64 = 0;
             for (arr, 0..) |v, i| {
                 total += v;
-                w.print(" {s}={d:.1}", .{ @tagName(@as(Stage, @enumFromInt(i))), @as(f64, @floatFromInt(v)) / 1e6 }) catch {};
+                w.print(" {s}={d:.1}", .{ @tagName(@as(Stage, @fromBackingInt(@intCast(i)))), @as(f64, @floatFromInt(v)) / 1e6 }) catch {};
             }
             if (total > 0) log.info("[dsv41-prof{s}] pos={d} rows={d} total_ms={d:.1}{s}\n", .{ tag, p0, rows, @as(f64, @floatFromInt(total)) / 1e6, w.buffered() });
             arr.* = @splat(0);
@@ -643,12 +676,22 @@ pub const Model = struct {
     state_epoch: u64 = 0,
     /// Tests: named intermediates of a chunk.
     trace: ?*Trace = null,
+    /// A calibration capture's view of the linears' inputs.
+    tap: ?Tap = null,
     /// The fused Metal kernels of `dsv41_kernels.zig` serve where they apply; off, the op chains they replace
     /// run (the tests' reference arm). The kernels need the GPU stream either way.
     fused: bool = true,
     /// Wide spans take the f16 core (`kernels.attnWide`): faster, and f16 scores change the output, so it is off
     /// until a KLD run clears it.
     attn_f16: bool = false,
+    /// The fused attention kernel's products run on the matrix units where the GPU has them (`kernels.attnNaxFits`) and
+    /// the load's trial passed (`setAttnNax`); off, the SIMD kernel serves (the tests' oracle arm).
+    attn_nax: bool = true,
+    /// A wide span's attention kernel stores the heads as `wo_a` takes them; off, the op chain does (the tests' oracle).
+    attn_epilogue: bool = true,
+    /// A wide chunk's shared expert rides the routed prefill launches where the trellis chain takes it there; off, it runs
+    /// as a chain of its own (the tests' oracle).
+    shared_fold: bool = true,
     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
     decode_engram_ahead: bool = true,
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
@@ -657,6 +700,8 @@ pub const Model = struct {
     /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
     engram_ahead: ?*engram.Prefetch = null,
     engram_ahead_used: u64 = 0,
+    /// Prefill chunks that left state only (`extendState`).
+    state_only_used: u64 = 0,
     /// The next chunk's embedding rows, read from the SSD table while this one runs (`aheadEmbed`).
     embed_ahead: ?*embed_ssd.Ahead = null,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
@@ -1107,7 +1152,7 @@ fn fuseShared(m: *Model, lins: []const *Lin) !?exl3.linear.Shared {
     }
     var cat: [3]A = undefined;
     for (0..3) |k| {
-        if (try owned_mod.stack(parts[k][0..lins.len], @enumFromInt(k))) |stacked| {
+        if (try owned_mod.stack(parts[k][0..lins.len], @fromBackingInt(@intCast(k)))) |stacked| {
             m.built.stacks += mlx.mlx_array_size(stacked) * mlx.mlx_array_itemsize(stacked);
             cat[k] = try m.own(stacked);
             continue;
@@ -1211,8 +1256,8 @@ pub fn logMemory(m: *const Model) void {
     }.of;
     const a = memoryAudit(m) catch |e| return log.warn("[dsv41-mem] audit failed: {s}\n", .{@errorName(e)});
     log.info("[dsv41-mem] owned {d:.2} GB in {d} regions (built here: DSpark storage {d:.2}, f32 widenings {d:.2}, shared stacks {d:.2}), MLX-owned weights {d:.2} GB in {d} arrays ({d} of 1 MiB or more), refused {d}\n", .{
-        gb(model_mod.owned_bytes.load(.monotonic)), model_mod.ownedRegionCount(), gb(m.built.ragged), gb(m.built.widened), gb(m.built.stacks),
-        gb(a.mlx_bytes),                            a.mlx_arrays,                 a.mlx_large,         model_mod.refused_imports.load(.monotonic),
+        gb(model_mod.owned_bytes.load(.monotonic)), model_mod.ownedRegionCount(), gb(m.built.ragged), gb(m.built.widened),                        gb(m.built.stacks),
+        gb(a.mlx_bytes),                            a.mlx_arrays,                 a.mlx_large,        model_mod.refused_imports.load(.monotonic),
     });
 }
 
@@ -1319,11 +1364,15 @@ fn hcMixes(sc: *Scope, m: *const Model, x: A, hc: *const Hc) !qat_mod.Split {
 
 // ── attention ────────────────────────────────────────────────────────────
 
-fn posArray(sc: *Scope, first: usize, n: usize, step: usize) !A {
+pub fn posArray(sc: *Scope, first: usize, n: usize, step: usize) !A {
     const host = try sc.a.alloc(i32, n);
     defer sc.a.free(host);
     for (host, 0..) |*v, i| v.* = @intCast(first + i * step);
     return sc.ints(host, &.{ci(n)});
+}
+
+fn tapInput(m: *const Model, layer: usize, kind: TapKind, x: A) !void {
+    if (m.tap) |t| try t.input(t.ctx, layer, kind, x);
 }
 
 fn qatIf(sc: *Scope, m: *const Model, x: A, mode: qat_mod.Qat, group: usize) !A {
@@ -1372,7 +1421,7 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
         const hd = c.head_dim;
         const xf = try sc.astype(x, .float32);
         var proj: [2]A = undefined;
-        if (cw.shared != null and dim(xf, 0) <= exl3.kernels.PROJECT_ROWS_MAX)
+        if (cw.shared != null and dim(xf, 0) <= exl3.project_rows.PROJECT_ROWS_MAX)
             try sharedApply(sc, cw.shared.?, cw.wkv.stq.?.dec, xf, &proj)
         else
             proj = .{ try denseLin(sc, m, &cw.wkv, xf), try denseLin(sc, m, &cw.wgate.?, xf) };
@@ -1407,6 +1456,7 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
     const pos = try posArray(sc, g0 * r, groups, r);
     const rope = m.rope_yarn.freqs;
     if (ly.idx) |*iw| if (iw.wk) |*wk| {
+        try tapInput(m, li, .index_latent, latent);
         var k = try sc.rms(try wk.apply(sc, latent), iw.k_norm, c.eps);
         k = try ropeQ(sc, m, k, rope, pos, false, .fp4_ue8m0, null);
         try ls.idx_k.?.append(sc, k);
@@ -1808,6 +1858,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     const in = try attnIn(sc, m, ly, h);
     if (pf) |p| try p.mark(.attn_in, in[0..if (in[2].ctx != null) 3 else 2]);
     const qr = try sc.rms(in[0], ly.q_norm, c.eps);
+    try tapInput(m, li, .q_lora, qr);
     const q = try ropeQ(sc, m, try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(H), ci(hd) }), rope, pos, false, .none, null);
     if (pf) |p| try p.mark(.q, &.{ qr, q });
     const kv = try windowRow(sc, m, ly, in[1], rope, pos);
@@ -1843,9 +1894,11 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             .out_dt = m.act,
         });
         if (pf) |p| try p.mark(.core, &.{o});
-        return attnOut(sc, m, ly, o, m.qat_on);
+        return attnOut(sc, m, li, ly, o, m.qat_on);
     }
     const one_pass = fus and L > NARROW_ROWS and mlx.mlx_array_dtype(q) == .bfloat16 and kernels.attnFusedFits(H, hd);
+    // The kernel's store does attnOut's rotation, round trip and layout; the heads are no longer a tensor to trace.
+    const fold = one_pass and rd > 0 and m.attn_epilogue and m.trace == null and m.tap == null and kernels.attnEpilogueFits(H, hd, c.o_groups);
     const n_spans = (L + span - 1) / span;
     const heads = try sc.a.alloc(A, n_spans);
     defer sc.a.free(heads);
@@ -1886,7 +1939,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         }
         const K = if (picks.any()) dim(picks.topk, 1) else 0;
         const head = if (one_pass)
-            try fusedHeads(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks, scale, m.act)
+            try fusedHeads(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks, scale, m.act, if (fold) kernels.Epilogue{ .freqs = rope, .rd = rd, .pos0 = p0 + a, .qat = m.qat_on, .og = c.o_groups } else null, m.attn_nax and kernels.attnNaxFits(H, hd))
         else if (m.attn_f16 and fus and (m.act == .bfloat16 or m.act == .float16) and wk + K <= kernels.attn_softmax_max_cols)
             try kernels.attnWide(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks.comp_rows, picks.topk, scale, m.act)
         else
@@ -1902,21 +1955,19 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     }
     try ls.win.write(kv, p0, sc.s);
 
-    const out = try attnOut(sc, m, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false);
+    const out = if (fold)
+        try attnOutGrouped(sc, m, li, ly, try sc.concat(heads, 1))
+    else
+        try attnOut(sc, m, li, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false);
     if (pf) |p| try p.mark(.attn_out, &.{ out, ls.win.buf });
     return out;
 }
 
 /// `kernels.attnFused` over a span's `picks`: a packed store is decoded inside the kernel when `q` is the store's dtype.
-pub fn fusedHeads(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, picks: Picks, scale: f32, out_dt: mlx.mlx_dtype) !A {
-    const nax = attn_nax.fits(dim(q, 1), dim(q, 2), mlx.mlx_array_dtype(q));
-    const rows = picks.store orelse return if (nax)
-        attn_nax.attnFusedNax(sc, sink, q, keys_w, wp, window, picks.comp_rows, picks.topk, scale, out_dt)
-    else
-        kernels.attnFused(sc, sink, q, keys_w, wp, window, picks.comp_rows, picks.topk, scale, out_dt);
+pub fn fusedHeads(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, picks: Picks, scale: f32, out_dt: mlx.mlx_dtype, epi: ?kernels.Epilogue, nax: bool) !A {
+    const rows = picks.store orelse return kernels.attnFused(sc, sink, q, keys_w, wp, window, picks.comp_rows, picks.topk, scale, out_dt, epi, nax);
     const pk = rows.pack.?;
-    if (nax) return attn_nax.attnFusedNaxPacked(sc, sink, q, keys_w, wp, window, rows.buf, rows.sbuf, pk.mode, pk.group, picks.topk, scale, out_dt);
-    return kernels.attnFusedPacked(sc, sink, q, keys_w, wp, window, rows.buf, rows.sbuf, pk.mode, pk.group, picks.topk, scale, out_dt);
+    return kernels.attnFusedPacked(sc, sink, q, keys_w, wp, window, rows.buf, rows.sbuf, pk.mode, pk.group, picks.topk, scale, out_dt, epi, nax);
 }
 
 /// What a DSpark stage's block attends over: `keys`, its window of committed main rows, then the block's own rows.
@@ -1927,7 +1978,7 @@ pub const DsKeys = struct { keys: A, band: A = none, pos: A = none };
 /// The attention input's projections: wq_a, wkv and (none past the stacked bank) a ratio-1 compressor's wkv, from one
 /// launch at decode widths.
 fn attnIn(sc: *Scope, m: *const Model, ly: *const Layer, h: A) ![3]A {
-    if (ly.in_shared) |sh| if (dim(h, 0) <= exl3.kernels.PROJECT_ROWS_MAX) {
+    if (ly.in_shared) |sh| if (dim(h, 0) <= exl3.project_rows.PROJECT_ROWS_MAX) {
         var outs: [3]A = .{ none, none, none };
         try sharedApply(sc, sh, ly.wq_a.stq.?.dec, h, outs[0..sh.count]);
         return outs;
@@ -1947,24 +1998,31 @@ fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0:
     const pos = if (ds.pos.ctx != null) ds.pos else try posArray(sc, p0, B, 1);
     const in = try attnIn(sc, m, ly, h);
     const qr = try sc.rms(in[0], ly.q_norm, c.eps);
+    try tapInput(m, li, .q_lora, qr);
     const q = try ropeQ(sc, m, try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(B), ci(c.heads), ci(hd) }), rope, pos, false, .none, null);
     const keys = try sc.concat(&.{ ds.keys, try windowRow(sc, m, ly, in[1], rope, pos) }, 0);
     const band = if (ds.band.ctx != null) ds.band else try sc.ge(try sc.zeros(&.{ ci(B), ci(dim(keys, 0)) }, .float32), try sc.f(0));
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const heads = try attnCore(sc, ly.sink, q, keys, band, none, none, scale, m.act);
-    return attnOut(sc, m, ly, try ropeQ(sc, m, heads, rope, pos, true, .none, null), false);
+    return attnOut(sc, m, li, ly, try ropeQ(sc, m, heads, rope, pos, true, .none, null), false);
 }
 
 /// The heads `o` `[L, H, hd]` (already inverse-rotated) through the output projections; `rounded`: they already left
 /// the fp8 round trip (the decode kernels fold it in).
-fn attnOut(sc: *Scope, m: *const Model, ly: *const Layer, o: A, rounded: bool) !A {
+fn attnOut(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, o: A, rounded: bool) !A {
     const c = &m.cfg;
     const L = dim(o, 0);
     const og = c.o_groups;
     const gin = c.heads * c.head_dim / og;
     const grouped = try sc.reshape(o, &.{ ci(L), ci(og), ci(gin) });
     const ob = if (rounded) grouped else try qatIf(sc, m, grouped, .fp8_ue8m0, 32);
-    const obg = try sc.transpose(ob, &.{ 1, 0, 2 }); // [og, L, in]
+    try tapInput(m, li, .wo_a_in, ob);
+    return attnOutGrouped(sc, m, li, ly, try sc.transpose(ob, &.{ 1, 0, 2 }));
+}
+
+/// `attnOut` from the heads as `[og, L, in]`, rotated and rounded.
+fn attnOutGrouped(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, obg: A) !A {
+    const L = dim(obg, 1);
     const oa = if (ly.wo_a.stq) |q|
         try q.applyGrouped(sc, obg)
     else if (ly.wo_a.s.ctx == null)
@@ -1976,6 +2034,7 @@ fn attnOut(sc: *Scope, m: *const Model, ly: *const Layer, o: A, rounded: bool) !
         break :blk try sc.res(mlx.mlx_quantized_matmul(&ro, obg, ly.wo_a.w, ly.wo_a.s, none, true, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", sc.s), &ro);
     };
     const mid = try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 });
+    try tapInput(m, li, .wo_b_in, mid);
     return ly.wo_b.apply(sc, mid);
 }
 
@@ -2007,6 +2066,7 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !kernels.Routes 
         var r = try kernels.route(sc, logits, bias, K, norm, c.route_scale);
         r.logits = logits;
         try traceRoutes(m, li, logits, r);
+        try tapRoutes(sc, m, li, r);
         return r;
     }
     const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(ly.gate_w, .float32))); // [L, E]
@@ -2016,6 +2076,7 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !kernels.Routes 
     if (norm) wts = try sc.div(wts, try sc.add(try sc.sum(wts, -1, true), try sc.f(1e-20)));
     const r: kernels.Routes = .{ .idx = idx, .wts = try sc.mul(wts, try sc.f(c.route_scale)), .logits = logits };
     try traceRoutes(m, li, logits, r);
+    try tapRoutes(sc, m, li, r);
     return r;
 }
 
@@ -2025,6 +2086,10 @@ fn traceRoutes(m: *const Model, li: usize, logits: A, r: kernels.Routes) !void {
         try t.put("route_logits_{d}", .{li}, logits);
         try t.put("route_idx_{d}", .{li}, r.idx);
     }
+}
+
+fn tapRoutes(sc: *Scope, m: *const Model, li: usize, r: kernels.Routes) !void {
+    if (m.tap) |t| try t.routes(t.ctx, li, try sc.astype(r.idx, .int32), try sc.astype(r.wts, .float32));
 }
 
 /// The layer's banks for the picks `idx`: its stacked experts, or the slabs the expert stream leased (the caller
@@ -2059,7 +2124,7 @@ fn sharedQuant(ly: *const Layer) ?kernels.SharedLins {
 /// into `x1` by `sf`): the new stream, or null where they do not apply.
 fn ffnDecode(sc: *Scope, m: *const Model, li: usize, h: A, x1: A, sf: qat_mod.Split) !?A {
     const c = &m.cfg;
-    if (c.expert_dec != null or !fusedOn(sc, m) or dim(h, 0) != 1 or !kernels.moeDecodeFits(c.dim, c.moe_inter)) return null;
+    if (c.expert_dec != null or m.tap != null or !fusedOn(sc, m) or dim(h, 0) != 1 or !kernels.moeDecodeFits(c.dim, c.moe_inter)) return null;
     const sh = sharedQuant(&m.layers[li]) orelse return null;
     const r = try router(sc, m, li, h, none);
     const lease = try leaseBanks(sc, m, li, r.idx);
@@ -2094,6 +2159,10 @@ fn moeWide(sc: *Scope, m: *const Model, li: usize, h: A, r: kernels.Routes, sy: 
     const u = try gatherSorted(sc, xs, lease.banks.up, sidx);
     const w_sorted = try sc.take(try sc.reshape(r.wts, &.{ci(n)}), order, 0);
     const act = try kernels.moeAct(sc, g, u, w_sorted, c.swiglu_limit);
+    if (m.tap) |t| {
+        const global = try sc.take(try sc.reshape(try sc.astype(r.idx, .uint32), &.{ci(n)}), order, 0);
+        try t.expert_act(t.ctx, li, try sc.reshape(act, &.{ ci(n), ci(c.moe_inter) }), try sc.reshape(try sc.astype(global, .int32), &.{ ci(n), 1 }));
+    }
     const dn = try gatherSorted(sc, act, lease.banks.down, sidx);
     const out = try kernels.moeCombine(sc, try sc.reshape(dn, &.{ ci(n), ci(dim(h, 1)) }), inv, sy, k);
     try mlx.check(mlx.mlx_array_eval(out));
@@ -2106,18 +2175,28 @@ pub const SharedOp = union(enum) {
     array: A,
     layer: struct { m: *const Model, li: usize },
 
-    fn value(self: SharedOp, sc: *Scope, x: A) !A {
+    pub fn value(self: SharedOp, sc: *Scope, x: A) !A {
         return switch (self) {
             .array => |a| a,
-            .layer => |l| sharedExpert(sc, l.m, &l.m.layers[l.li], x),
+            .layer => |l| sharedExpert(sc, l.m, l.li, &l.m.layers[l.li], x),
         };
     }
 };
 
-fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+fn sharedBank(ly: *const Layer) ?exl3.rate_groups.SharedExpert {
     const q = [3]Stq{ ly.shared[0].stq orelse return null, ly.shared[1].stq orelse return null, ly.shared[2].stq orelse return null };
-    const se: exl3.rate_groups.SharedExpert = .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec };
+    return .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec };
+}
+
+fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+    const se = sharedBank(ly) orelse return null;
     const y = try exl3.rate_groups.moeDecodeClampedSharedFused(sc.s, x, rb, flat, scores, k, .float32, se, limit) orelse return null;
+    return try sc.keep(y);
+}
+
+fn prefillWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+    const se = sharedBank(ly) orelse return null;
+    const y = try exl3.rate_groups.moePrefillClampedSharedFused(sc.s, x, rb, flat, scores, k, limit, se) orelse return null;
     return try sc.keep(y);
 }
 
@@ -2141,6 +2220,9 @@ pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const e
         exl3.kernels.setDecodeParams(dec);
         return sc.reshape(try sc.keep(try exl3.rate_groups.moeDecodeClamped(sc.s, x, rb, flat, scores, k, .float32, sy, null, limit)), &.{ ci(L), ci(dim(x, 1)) });
     }
+    if (shared == .layer) {
+        if (try prefillWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k)) |y| return y;
+    }
     const sy = try shared.value(sc, x);
     exl3.kernels.setDecodeParams(dec);
     const y = try sc.astype(try sc.keep(try exl3.rate_groups.moePrefillClamped(sc.s, x, rb, flat, scores, k, limit)), .float32);
@@ -2163,7 +2245,7 @@ fn gatherSorted(sc: *Scope, x: A, b: Bank, sidx: A) !A {
 /// the clamped SwiGLU stays in f32 registers. Null where the chain does not apply.
 fn sharedFused(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !?A {
     const rows = dim(h, 0);
-    if (rows > exl3.kernels.DECODE_ROWS_MAX) return null;
+    if (m.tap != null or rows > exl3.kernels.DECODE_ROWS_MAX) return null;
     const q = [3]Stq{ ly.shared[0].stq orelse return null, ly.shared[1].stq orelse return null, ly.shared[2].stq orelse return null };
     const r: c_int = @intCast(rows);
     const zero_ids: [exl3.kernels.DECODE_ROWS_MAX]i32 = @splat(0);
@@ -2176,11 +2258,12 @@ fn sharedFused(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !?A {
     return try sc.reshape(y, &.{ r, ci(dim(h, 1)) });
 }
 
-fn sharedExpert(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !A {
+fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) !A {
     if (try sharedFused(sc, m, ly, h)) |y| return y;
     const g = try ly.shared[0].apply(sc, h);
     const u = try ly.shared[1].apply(sc, h);
     const act = try sc.astype(try clampedSwiglu(sc, g, u, m.cfg.swiglu_limit), m.act);
+    try tapInput(m, li, .shared_act, act);
     return ly.shared[2].apply(sc, act);
 }
 
@@ -2218,9 +2301,13 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
         // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
         const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
         if (early) try submit(r.idx);
-        const sy = try sharedExpert(sc, m, ly, h);
-        if (early) try submit(sy);
-        if (pf) |p| try p.mark(.shared, &.{sy});
+        // A wide chunk's shared expert rides the routed launches when the trellis chain takes it there.
+        const wide = m.tap == null and m.shared_fold and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX and ly.shared[0].stq != null;
+        const sy: SharedOp = if (wide) .{ .layer = .{ .m = m, .li = li } } else .{ .array = try sharedExpert(sc, m, li, ly, h) };
+        if (!wide) {
+            if (early) try submit(sy.array);
+            if (pf) |p| try p.mark(.shared, &.{sy.array});
+        }
         const host0 = if (pf != null and hk.host_ns != null) hk.host_ns.?(hk.ctx) else 0;
         const out = try sc.astype(try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, sy), m.act);
         if (pf) |p| {
@@ -2230,12 +2317,12 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
         try if (early) submit(out) else mlx.check(mlx.mlx_array_eval(out));
         return out;
     }
-    if (fusedOn(sc, m) and dim(h, 0) > 1 and c.dim % 8 == 0) return moeWide(sc, m, li, h, r, try sharedExpert(sc, m, ly, h));
+    if (fusedOn(sc, m) and dim(h, 0) > 1 and c.dim % 8 == 0) return moeWide(sc, m, li, h, r, try sharedExpert(sc, m, li, ly, h));
     const y = if (li >= c.layers) try routedSum(sc, c, m.act, h, m.dspark.?.banks[li - c.layers], r.idx, r.wts) else switch (m.experts) {
         .resident => |banks| try routedSum(sc, c, m.act, h, banks[li], r.idx, r.wts),
         .hook => |hk| try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, null),
     };
-    const sy = try sharedExpert(sc, m, ly, h);
+    const sy = try sharedExpert(sc, m, li, ly, h);
     return sc.astype(try sc.add(y, try sc.astype(sy, .float32)), m.act);
 }
 
@@ -2244,6 +2331,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
 /// normalized stream-key dot.
 fn engramApply(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A) !A {
     const wkv_in = try sc.astype(try sc.reshape(rows, &.{ ci(dim(x, 0)), -1 }), m.act);
+    try tapInput(m, e.layer, .engram_in, wkv_in);
     const kv = try e.wkv.apply(sc, wkv_in);
     if (fusedOn(sc, m) and dim(x, 0) <= NARROW_ROWS) return kernels.engramGate(sc, x, kv, e.qk, m.cfg.eps);
     return engramGateOps(sc, &m.cfg, e.qk, x, kv);
@@ -2328,6 +2416,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         const s = pa.mix.sp orelse qat_mod.Split{ .pre = pa.mix.z, .post = pa.mix.z, .comb = pa.mix.z };
         try p.mark(.hc_attn, &.{ h, s.pre, s.post, s.comb });
     }
+    try tapInput(m, li, .attn_in, h);
     if (m.trace) |t| {
         const sa = try pa.mix.split(sc, m);
         try t.put("hc_pre_{d}", .{li}, sa.pre);
@@ -2348,6 +2437,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     const sf = try pf.mix.split(sc, m);
     const h2 = pf.h;
     if (prof(m, dim(x, 0))) |p| try p.mark(.hc_ffn, &.{ h2, x1, sf.pre, sf.post, sf.comb });
+    try tapInput(m, li, .ffn_in, h2);
     if (m.trace) |t| try t.put("ffn_in_{d}", .{li}, h2);
     if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, sf)) |x2| return .{ .x = sc.out(x2), .pre = sc.out(sf.pre) };
     const y = blk: {
@@ -2643,13 +2733,25 @@ pub fn setFused(m: *Model, composed: bool) void {
     log.info("[dsv41] fused kernels {s}{s}, hc expand kernel {s}\n", .{ if (m.fused) "on" else "off", if (composed) " (diag)" else "", if (m.fused and kernels.hcExpandProbed()) "on" else "off" });
 }
 
+/// Keeps the matrix-unit attention arm only if its trial against the SIMD kernel at this model's head shape is within
+/// `bar` of the peak; a declined arm leaves the SIMD kernel serving.
+pub fn setAttnNax(m: *Model, bar: f64) void {
+    if (!m.attn_nax or !kernels.attnNaxFits(m.cfg.heads, m.cfg.head_dim)) {
+        m.attn_nax = false;
+        return;
+    }
+    m.attn_nax = kernels.attnNaxProbe(m.gpa, m.cfg.heads, m.cfg.head_dim, m.cfg.rope_dim, m.cfg.o_groups, bar);
+    if (m.attn_nax) log.info("[dsv41] attention kernel on the matrix units\n", .{}) else log.debug("[dsv41] attention kernel: the matrix-unit trial differs from the SIMD kernel, SIMD serves\n", .{});
+}
+
 pub fn setDsparkExact(m: *Model, on: bool) void {
     m.dspark_exact = on;
     if (m.dspark != null and !on) log.info("[dsv41] DSpark rounds sum by width (SUSHI_DSV41_DSPARK_EXACT=0): greedy text may differ with the round mix\n", .{});
 }
 
 /// One chunk of a request in flight: the residual streams between layers, the Engram rows and what layers hand
-/// down, over the state `st` the chunk extends. `extendSpan` runs every layer in turn.
+/// down, over the state `st` the chunk extends. `extendSpan` runs every layer in turn; a layer-major capture
+/// holds one `Pass` per window and runs layer `li` of each before any runs `li + 1`.
 pub const Pass = struct {
     st: *State,
     ids: []const u32,
@@ -2798,8 +2900,8 @@ pub fn readStart() u64 {
 
 pub fn readDone(site: ReadSite, t0: u64) void {
     if (!read_diag) return;
-    read_n[@intFromEnum(site)] += 1;
-    read_ns[@intFromEnum(site)] += readStart() -| t0;
+    read_n[@backingInt(site)] += 1;
+    read_ns[@backingInt(site)] += readStart() -| t0;
 }
 
 fn reportReads(L: usize) void {
@@ -3068,6 +3170,10 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
         p.x = nx;
         if (prof(m, L)) |pf| try pf.mark(.engram, &.{nx});
     }
+    if (m.tap != null and m.cfg.isDsparkTarget(li)) {
+        const mean = try sc.mean(p.x, 1, false);
+        try tapInput(m, li, .dspark_in, try sc.astype(mean, m.act));
+    }
     if (m.cfg.engram.layerAt(li)) |ei| if (ei + 1 == m.engrams.len) aheadEngram(m, p) catch {};
     const c = &m.cfg;
     // At decode widths a layer is submitted, not waited on: the next layer's router picks are the one host read.
@@ -3127,6 +3233,11 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
             defer readDone(.state, t0);
             try mlx.check(mlx.mlx_array_eval(v.mh));
         } else try commitMain(&msc, m, p.st, main_rows, p.p0, if (L > exl3.kernels.DECODE_ROWS_MAX) .wait else .lazy);
+    }
+    if (m.tap) |t| {
+        var tsc = Scope.init(m.gpa, m.s);
+        defer tsc.deinit();
+        try t.input(t.ctx, c.layers, .head_in, try tsc.rms(try hcCollapse(&tsc, p.x, p.cpre), m.norm, c.eps));
     }
     if (res.ctx == null) res = try headLogits(m, p, want);
     if (prof(m, L)) |pf| {
@@ -3259,7 +3370,13 @@ fn aheadEngram(m: *Model, p: *Pass) !void {
 /// Whether the pass's chunk runs the CED decoder over its last rows only: it does when it is wider than the window and
 /// `finishPass` will take the last row's logits.
 pub fn planCed(m: *const Model, p: *Pass, want: Want) void {
-    p.tail = cedRows(m, p.st, p.ids.len, want);
+    p.tail = cedTail(m, p.st, p.ids.len, want);
+}
+
+/// The rows of an `L`-row chunk the CED decoder runs over: its last `window` when the chunk is wider and wants the
+/// last row's logits (a verify block, all rows' logits and a calibration capture run every layer over every row).
+fn cedTail(m: *const Model, st: *const State, L: usize, want: Want) ?usize {
+    return if (m.tap != null) null else cedRows(m, st, L, want);
 }
 
 fn cedRows(m: *const Model, st: *const State, L: usize, want: Want) ?usize {
@@ -3268,19 +3385,36 @@ fn cedRows(m: *const Model, st: *const State, L: usize, want: Want) ?usize {
     return if (L > w) w else null;
 }
 
-/// The CED decoder's first layer `li` over every row of the pass: only its compressor, whose ratio-1 rows (and index
-/// keys) every later layer reads.
-fn cedCompress(sc: *Scope, m: *Model, p: *Pass, li: usize) !void {
-    const ly = &m.layers[li];
-    const pa = try hcPre(sc, m, p.x, null, p.cpre, &ly.hc_attn, ly.attn_norm);
-    try compress(sc, m, p.st, li, pa.h, p.p0, none);
+/// CED beside a pass that runs every layer over every row (a calibration capture): before the decoder's first layer,
+/// the pass's last `window` rows as a pass of their own, which the decoder layers then run after `p` (the compressor
+/// skipped, `p` ran it) and whose `finishPass` gives the CED prefill's last-row logits. Null where `p` does not replay.
+pub fn cedFork(m: *const Model, p: *const Pass, want: Want) !?Pass {
+    const L = p.ids.len;
+    const t = cedRows(m, p.st, L, want) orelse return null;
+    const gpa = m.gpa;
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const x = sc.out(try sc.slice(p.x, 0, L - t, L));
+    errdefer _ = mlx.mlx_array_free(x);
+    const pre = sc.out(try sc.slice(p.cpre, 0, L - t, L));
+    errdefer _ = mlx.mlx_array_free(pre);
+    const img = if (p.img.ctx != null) sc.out(try sc.slice(p.img, 0, L - t, L)) else none;
+    errdefer if (img.ctx != null) {
+        _ = mlx.mlx_array_free(img);
+    };
+    try evalAll(if (img.ctx != null) &.{ x, pre, img } else &.{ x, pre });
+    var sh = try Shared.init(gpa, (t + p.span - 1) / p.span);
+    errdefer sh.deinit(gpa);
+    sh.floor = p.p0 + L - t;
+    return .{ .st = p.st, .ids = p.ids[L - t ..], .p0 = p.p0 + L - t, .span = p.span, .rows = try gpa.alloc(u32, 0), .x = x, .cpre = pre, .sh = sh, .img = img };
 }
 
-/// A prompt chunk whose CED decoder tail nothing reads (patches/ced-state.patch): another chunk wider than the window
-/// follows it before the prompt's last token. The tail would only fill the decoder's and DSpark's window rings
-/// (`window` rows), and the next chunk's tail overwrites those rows before any query reads one: its band starts at its
-/// own first row (`cedReplay`). So the chunk runs the encoder layers and the split layer's compressor over every row,
-/// then stops: no decoder, no DSpark rows, no head. The prompt's state is the full pass's, bit for bit.
+/// A prompt chunk whose CED decoder tail nothing reads: another chunk wider than the window follows it in the same
+/// prefill. The tail would only fill the decoder's and the DSpark stages' window rings (`window` rows), and the next
+/// chunk's tail overwrites those rows before any query reads one: its band starts at its own first row (`cedReplay`).
+/// So the chunk runs the encoder layers and the split layer's compressor over every row, then stops: no decoder, no
+/// DSpark rows, no head. A caller that takes a restore point at this boundary, or whose next chunk is no wider than the
+/// window, must not use it: the rings it leaves are not the ones the window reads.
 pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows, ahead: []const u32) !void {
     const split = m.ced_split orelse return error.Dsv41NoCedSplit;
     errdefer m.dropAhead();
@@ -3304,7 +3438,20 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     try evalAll(ev.items);
     reportEngramWait(m, ids.len);
     st.n = pass.p0 + ids.len;
+    m.state_only_used += 1;
+    if (prof(m, ids.len)) |pf| {
+        pf.restart();
+        pf.report(ids.len, pass.p0);
+    }
     transient_peak.end(.prefill_chunk, ids.len);
+}
+
+/// The CED decoder's first layer `li` over every row of the pass: only its compressor, whose ratio-1 rows (and index
+/// keys) every later layer reads.
+fn cedCompress(sc: *Scope, m: *Model, p: *Pass, li: usize) !void {
+    const ly = &m.layers[li];
+    const pa = try hcPre(sc, m, p.x, null, p.cpre, &ly.hc_attn, ly.attn_norm);
+    try compress(sc, m, p.st, li, pa.h, p.p0, none);
 }
 
 /// CED: the decoder's first layer `li` compresses every row of the pass (the ratio-1 rows every later layer reads),
@@ -3489,8 +3636,8 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
 pub fn verify(m: *Model, ids: []const u32) !A {
     const st = try ensureState(m);
     if (st.verify != null) return error.Dsv41VerifyOpen;
-    exl3.kernels.rows_exact = m.dspark_exact;
-    defer exl3.kernels.rows_exact = false;
+    exl3.project_rows.rows_exact = m.dspark_exact;
+    defer exl3.project_rows.rows_exact = false;
     if (ids.len == 1) return extend(m, ids, .all);
     const nl = m.cfg.layers;
     var v: Verify = .{
@@ -4521,7 +4668,7 @@ fn continueFrom(m: *Model, sc: *Scope, ids: []const u32, p: usize) !Run {
     return run;
 }
 
-fn expectSlotsBits(sc: *Scope, want: []const Slot, got: []const Slot) !void {
+pub fn expectSlotsBits(sc: *Scope, want: []const Slot, got: []const Slot) !void {
     try testing.expectEqual(want.len, got.len);
     for (want, got) |x, y| for (x, y) |u, v| {
         try testing.expectEqual(u.ctx == null, v.ctx == null);
@@ -4651,7 +4798,6 @@ fn cedArm(m: *Model, sc: *Scope, ids: []const u32, chunks: []const usize, steps:
 test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are the full forward's bits, and the same prompt in other chunks gives the same state and logits (DSV41_TINY)" {
     try mlx.requireGpu();
 
-
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -4670,9 +4816,9 @@ test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are
     const split = m.ced_split orelse return error.TestUnexpectedResult;
     const w: usize = m.cfg.window;
     const st0 = try ensureState(m);
-    try testing.expectEqual(@as(?usize, null), cedRows(m, st0, w, .last));
-    try testing.expectEqual(@as(?usize, w), cedRows(m, st0, w + 1, .last));
-    try testing.expectEqual(@as(?usize, null), cedRows(m, st0, w + 1, .all));
+    try testing.expectEqual(@as(?usize, null), cedTail(m, st0, w, .last));
+    try testing.expectEqual(@as(?usize, w), cedTail(m, st0, w + 1, .last));
+    try testing.expectEqual(@as(?usize, null), cedTail(m, st0, w + 1, .all));
     const report = @import("../transformer.zig").diagEnvOn("SUSHI_DSV41_CED_REPORT");
     const N: usize = 40;
     const steps = ids.len - N;
@@ -4696,6 +4842,180 @@ test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are
             try testing.expect(d.err < 1e-4 and d.same_max);
         }
     }
+}
+
+/// `slots` of two states at position `n` agree bit for bit where a later pass can read them: a decoder layer's window
+/// ring keeps `ring_slack` rows no query reaches, which a state-only chunk leaves as an earlier pass wrote them.
+fn expectSlotsLive(sc: *Scope, m: *const Model, want: []const Slot, got: []const Slot, n: usize) !void {
+    const split = m.ced_split.?;
+    for (want, got, 0..) |x, y, i| {
+        if (i % 2 != 0 or i >= 2 * m.cfg.layers or i / 2 < split) {
+            try expectSlotsBits(sc, want[i..][0..1], got[i..][0..1]);
+            continue;
+        }
+        const cap = dim(x[0], 0);
+        const hx = try hostRows(sc, x[0]);
+        defer testing.allocator.free(hx);
+        const hy = try hostRows(sc, y[0]);
+        defer testing.allocator.free(hy);
+        const w = dim(x[0], 1);
+        for (n - m.cfg.window..n) |p| try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(hx[p % cap * w ..][0..w]), std.mem.sliceAsBytes(hy[p % cap * w ..][0..w]));
+        try expectSlotsBits(sc, &.{.{ none, x[1], x[2], x[3] }}, &.{.{ none, y[1], y[2], y[3] }});
+    }
+}
+
+const StateArm = struct {
+    last: []f32 = &.{},
+    run: Run = .{},
+    mid: []Slot = &.{},
+    mid_n: usize = 0,
+
+    fn deinit(self: *StateArm) void {
+        testing.allocator.free(self.last);
+        self.run.deinit();
+        for (self.mid) |*sl| freeSlot(sl);
+        testing.allocator.free(self.mid);
+    }
+};
+
+/// A prefill in `chunks` (a chunk with `skip` set leaves state only), then a one-row pass and `steps` decodes. The last
+/// chunk's logits, its state, and the rows after.
+fn stateArm(m: *Model, sc: *Scope, ids: []const u32, chunks: []const usize, skip: []const bool, steps: usize, vision: ?A, span: usize) !StateArm {
+    resetState(m);
+    var arm: StateArm = .{};
+    errdefer arm.deinit();
+    var at: usize = 0;
+    var consumed: usize = 0;
+    for (chunks, skip) |n, state_only| {
+        const chunk = ids[at..][0..n];
+        const vr: ?VisionRows = if (vision) |rows| .{ .rows = rows, .offset = consumed } else null;
+        if (state_only) {
+            try extendState(m, chunk, span, vr, &.{});
+        } else {
+            const lg = try extendVision(m, chunk, .last, span, vr);
+            defer _ = mlx.mlx_array_free(lg);
+            testing.allocator.free(arm.last);
+            arm.last = try hostRows(sc, lg);
+        }
+        consumed += imageRows(m, chunk);
+        at += n;
+    }
+    arm.mid = try testing.allocator.alloc(Slot, slotCount(m));
+    @memset(arm.mid, nil_slot);
+    try captureState(m, arm.mid);
+    arm.mid_n = at;
+    for (0..steps + 1) |i| {
+        const vr: ?VisionRows = if (vision) |rows| .{ .rows = rows, .offset = consumed } else null;
+        try arm.run.take(sc, try extendVision(m, ids[at + i ..][0..1], .last, span, vr));
+    }
+    arm.run.slots = try testing.allocator.alloc(Slot, slotCount(m));
+    @memset(arm.run.slots, nil_slot);
+    try captureState(m, arm.run.slots);
+    return arm;
+}
+
+fn expectArmsEqual(sc: *Scope, m: *const Model, want: *const StateArm, got: *const StateArm) !void {
+    try expectSlotsLive(sc, m, want.mid, got.mid, want.mid_n);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.last), std.mem.sliceAsBytes(got.last));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.run.rows.items), std.mem.sliceAsBytes(got.run.rows.items));
+    try expectSlotsLive(sc, m, want.run.slots, got.run.slots, want.mid_n + got.run.rows.items.len / m.cfg.vocab);
+}
+
+/// A tiny model whose window is wider than a decode-width pass, as the release's is: a replay of fewer rows reads the
+/// ring below its first row on the GPU (`attnDecode`), which the release never does.
+fn wideWindowModel(dir: []const u8, opts: Opts, s: S) !*Model {
+    const m = try tinyModel(dir, opts, s);
+    m.cfg.window = NARROW_ROWS + 4;
+    return m;
+}
+
+fn syntheticPrompt(ids: []const u32, n: usize) ![]u32 {
+    const out = try testing.allocator.alloc(u32, n);
+    for (out, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
+    return out;
+}
+
+test "dsv41 state-only chunks: a chunk another chunk wider than the window follows leaves the logits and state of the full pass (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const ids = try syntheticPrompt(base, 120);
+    defer testing.allocator.free(ids);
+    for ([_]bool{ false, true }) |spark| for ([_]bool{ true, false }) |qat| {
+        const m = try wideWindowModel(dir, .{ .act = .bfloat16, .qat = qat, .dspark = spark }, s);
+        defer m.deinit();
+        const w = m.cfg.window;
+        const plans = [_]struct { chunks: []const usize, skip: []const bool }{
+            .{ .chunks = &.{ 33, 29, 25 }, .skip = &.{ true, true, false } },
+            .{ .chunks = &.{ 22, 40, 21 }, .skip = &.{ false, true, false } },
+            .{ .chunks = &.{ w + 1, w + 1, w + 1, w + 1 }, .skip = &.{ true, true, true, false } },
+        };
+        const no_skip: [4]bool = @splat(false);
+        for (plans) |plan| {
+            var full = try stateArm(m, &sc, ids, plan.chunks, no_skip[0..plan.chunks.len], 3, null, SPAN);
+            defer full.deinit();
+            var lean = try stateArm(m, &sc, ids, plan.chunks, plan.skip, 3, null, SPAN);
+            defer lean.deinit();
+            try expectArmsEqual(&sc, m, &full, &lean);
+        }
+    };
+}
+
+test "dsv41 state-only chunks: skipping before a chunk the window covers leaves stale rows, which the logits show (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const ids = try syntheticPrompt(base, 120);
+    defer testing.allocator.free(ids);
+    const m = try wideWindowModel(dir, .{ .act = .bfloat16, .qat = true, .dspark = true }, s);
+    defer m.deinit();
+    const w = m.cfg.window;
+    // The second chunk has `window` rows: no replay, so its first rows read the ring the skipped chunk left stale.
+    const chunks = [_]usize{ 33, w };
+    var full = try stateArm(m, &sc, ids, &chunks, &.{ false, false }, 3, null, SPAN);
+    defer full.deinit();
+    var lean = try stateArm(m, &sc, ids, &chunks, &.{ true, false }, 3, null, SPAN);
+    defer lean.deinit();
+    try testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(full.last), std.mem.sliceAsBytes(lean.last)));
+}
+
+test "dsv41 state-only chunks: an image prompt cut by skipped chunks gives the logits and state of the full passes (DSV41_TINY)" {
+    const dir = try fixtureDir();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, cpu);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    exact_matmul = true;
+    defer exact_matmul = false;
+    const t = try visionTinyModel(dir, cpu);
+    defer t.m.deinit();
+    const m = t.m;
+    const ids = try testing.allocator.dupe(u32, base[0..TINY_S]);
+    defer testing.allocator.free(ids);
+    for (ids[5..15]) |*id| id.* = t.image_id;
+    const rows = try routerRows(&sc, m.cfg.dim, 10, 0x1a6e);
+    const chunks = [_]usize{ 14, 14, 9 };
+    var full = try stateArm(m, &sc, ids, &chunks, &.{ false, false, false }, 2, rows, 5);
+    defer full.deinit();
+    var lean = try stateArm(m, &sc, ids, &chunks, &.{ true, true, false }, 2, rows, 5);
+    defer lean.deinit();
+    try expectArmsEqual(&sc, m, &full, &lean);
 }
 
 test "dsv41 Engram: each table keeps a row cache of exactly the bytes the load bills (DSV41_TINY)" {
@@ -4976,13 +5296,16 @@ test "dsv41 fused attention: the one-pass kernel is no further from the f32 trut
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
         const truth = try sc_mod.hostF32(try attnCore(&cs, d.sink, d.q, d.keys, d.band, d.comp, d.topk, scale, .float32));
         const core = try sc_mod.hostF32(try attnCore(&sc, d.sink, d.q, d.keys, d.band, d.comp, d.topk, scale, .float32));
-        const fused = try sc_mod.hostF32(try kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .float32));
         const err_core = maxRelErr(core, truth);
-        const err_fused = maxRelErr(fused, truth);
-        errdefer std.debug.print("case {d}: core {e}, fused {e}\n", .{ ci_, err_core, err_fused });
-        // Without NAX the composed core's GEMMs are true f32 and sit near the kernel's own accumulation noise.
-        try testing.expect(err_fused <= err_core + NO_WORSE_F32_ULPS * 0x1p-23);
-        try testing.expect(err_fused < 3e-5);
+        for ([_]bool{ false, true }) |nax| {
+            if (nax and !kernels.attnNaxFits(c.H, c.hd)) continue;
+            const fused = try sc_mod.hostF32(try kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .float32, null, nax));
+            const err_fused = maxRelErr(fused, truth);
+            errdefer std.debug.print("case {d} nax {}: core {e}, fused {e}\n", .{ ci_, nax, err_core, err_fused });
+            // Without NAX the composed core's GEMMs are true f32 and sit near the kernel's own accumulation noise.
+            try testing.expect(err_fused <= err_core + NO_WORSE_F32_ULPS * 0x1p-23);
+            try testing.expect(err_fused < 3e-5);
+        }
     }
 }
 
@@ -5015,15 +5338,163 @@ test "dsv41 packed picks: the fused kernel reading the picked rows packed gives 
         var rows = try packedStore(&sc, d.comp);
         defer rows.deinit();
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
-        var heads: [2][]f32 = undefined;
-        for (&heads, [_]bool{ false, true }) |*h, raw| {
-            const picks = try packedPicks(&sc, &rows, d.topk, raw);
-            try testing.expectEqual(raw, picks.store != null);
-            h.* = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16));
+        for ([_]bool{ false, true }) |nax| {
+            if (nax and !kernels.attnNaxFits(c.H, c.hd)) continue;
+            var heads: [2][]f32 = undefined;
+            for (&heads, [_]bool{ false, true }) |*h, raw| {
+                const picks = try packedPicks(&sc, &rows, d.topk, raw);
+                try testing.expectEqual(raw, picks.store != null);
+                h.* = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16, null, nax));
+            }
+            defer for (heads) |h| testing.allocator.free(h);
+            errdefer std.debug.print("case {d} nax {}\n", .{ ci_, nax });
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(heads[0]), std.mem.sliceAsBytes(heads[1]));
         }
-        defer for (heads) |h| testing.allocator.free(h);
-        errdefer std.debug.print("case {d}\n", .{ci_});
-        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(heads[0]), std.mem.sliceAsBytes(heads[1]));
+    }
+}
+
+test "dsv41 attention epilogue: the kernel's store gives attnOut's rotated, fp8-rounded, grouped heads of the op chain, byte for byte (release span shapes, both row sources)" {
+    try mlx.requireGpu();
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    const cases = [_]struct { c: AttnCase, pos0: usize, qat: bool }{
+        .{ .c = .{ .L = 256, .wp = 127, .K = 512, .nc = 700 }, .pos0 = 30720, .qat = true },
+        .{ .c = .{ .L = 256, .wp = 127, .K = 512, .nc = 4096, .holes = false }, .pos0 = 0, .qat = true },
+        .{ .c = .{ .L = 128, .wp = 127, .K = 0, .nc = 0 }, .pos0 = 1048000, .qat = true },
+        .{ .c = .{ .L = 100, .wp = 63, .K = 512, .nc = 40 }, .pos0 = 777, .qat = false },
+        .{ .c = .{ .L = 17, .wp = 5, .K = 512, .nc = 9 }, .pos0 = 5, .qat = true },
+    };
+    const og = 8;
+    var f: [32]f32 = undefined;
+    qat_mod.invFreqs(&f, 64, 65536, 160000, 16, 32, 1);
+    for (cases, 0..) |t, ci_| {
+        const c = t.c;
+        var sc = Scope.init(testing.allocator, gpu);
+        defer sc.deinit();
+        const d = try attnCaseData(&sc, c, 0xe91 + ci_);
+        var rows = try packedStore(&sc, if (c.K > 0) d.comp else try sc.zeros(&.{ 2, 512 }, .bfloat16));
+        defer rows.deinit();
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
+        const freqs = try sc.floats(&f, &.{32});
+        const pos = try posArray(&sc, t.pos0, c.L, 1);
+        const epi: kernels.Epilogue = .{ .freqs = freqs, .rd = 64, .pos0 = t.pos0, .qat = t.qat, .og = og };
+        for ([_]bool{ false, true }) |nax| {
+            if (nax and !kernels.attnNaxFits(c.H, c.hd)) continue;
+            for ([_]bool{ false, true }) |raw| {
+                if (raw and c.K == 0) continue;
+                const picks: Picks = if (c.K > 0) try packedPicks(&sc, &rows, d.topk, raw) else .{};
+                const heads = try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16, null, nax);
+                const rot = try kernels.ropeTail(&sc, heads, freqs, pos, 64, true, .none, null);
+                const gin = c.H * c.hd / og;
+                const grouped = try sc.reshape(rot, &.{ ci(c.L), og, ci(gin) });
+                const rounded = if (t.qat) try qat_mod.qat(&sc, grouped, .fp8_ue8m0, 32) else grouped;
+                const want = try hostRows(&sc, try sc.contiguous(try sc.transpose(rounded, &.{ 1, 0, 2 })));
+                defer testing.allocator.free(want);
+                const got = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16, epi, nax));
+                defer testing.allocator.free(got);
+                errdefer std.debug.print("case {d} raw {} nax {}\n", .{ ci_, raw, nax });
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+                // The comparison sees a rotation by the wrong position.
+                var off = epi;
+                off.pos0 += 1;
+                const bad = try hostRows(&sc, try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, picks, scale, .bfloat16, off, nax));
+                defer testing.allocator.free(bad);
+                try testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(bad)));
+            }
+        }
+    }
+}
+
+test "dsv41 attention NAX trial: the release head shape passes it, and a trial outside its bar declines the arm so the SIMD kernel serves" {
+    try mlx.requireGpu();
+    if (!mlx.streamIsGpu(mlx.gpuStream()) or !kernels.attnNaxFits(64, 512)) return error.SkipZigTest;
+    try testing.expect(kernels.attnNaxProbe(testing.allocator, 64, 512, 64, 8, kernels.attn_nax_bar));
+    try testing.expect(!kernels.attnNaxProbe(testing.allocator, 64, 512, 64, 8, 0));
+    // a head shape the kernel does not serve is declined without a launch
+    try testing.expect(!kernels.attnNaxProbe(testing.allocator, 8, 512, 64, 8, kernels.attn_nax_bar));
+
+    const dir = try epiFixtureDir();
+    const m = try tinyModel(dir, .{ .act = .bfloat16, .qat = true }, mlx.gpuStream());
+    defer m.deinit();
+    try testing.expect(m.attn_nax);
+    setAttnNax(m, 0);
+    try testing.expect(!m.attn_nax);
+    // a declined arm stays declined
+    setAttnNax(m, kernels.attn_nax_bar);
+    try testing.expect(!m.attn_nax);
+}
+
+fn epiFixtureDir() ![]const u8 {
+    return std.mem.span(std.c.getenv("DSV41_EPI_TINY") orelse return error.SkipZigTest);
+}
+
+test "dsv41 attention epilogue: a prefill on the kernel's store gives the op chain's logits and state, byte for byte (DSV41_EPI_TINY)" {
+    try mlx.requireGpu();
+    const dir = try epiFixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    for ([_]bool{ true, false }) |qat| {
+        const m = try tinyModel(dir, .{ .act = .bfloat16, .qat = qat }, s);
+        defer m.deinit();
+        try testing.expect(kernels.attnEpilogueFits(m.cfg.heads, m.cfg.head_dim, m.cfg.o_groups));
+        for ([_]bool{ false, true }) |nax| {
+            if (nax and !kernels.attnNaxFits(m.cfg.heads, m.cfg.head_dim)) continue;
+            m.attn_nax = nax;
+            var runs: [2]Run = .{ .{}, .{} };
+            defer for (&runs) |*r| r.deinit();
+            for ([_]bool{ false, true }, &runs) |epi, *r| {
+                m.attn_epilogue = epi;
+                resetState(m);
+                // wider than a verify block, so every chunk is a wide span; the second starts past the first's window
+                try r.take(&sc, try extendSpan(m, ids[0..20], .all, 16));
+                try r.take(&sc, try extendSpan(m, ids[20..TINY_S], .all, 16));
+                r.slots = try testing.allocator.alloc(Slot, slotCount(m));
+                @memset(r.slots, nil_slot);
+                try captureState(m, r.slots);
+            }
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(runs[0].rows.items), std.mem.sliceAsBytes(runs[1].rows.items));
+            try expectSlotsBits(&sc, runs[0].slots, runs[1].slots);
+        }
+    }
+}
+
+test "dsv41 hc mix tile: a prefill on the release tile gives the previous tile's logits and state, byte for byte (DSV41_TINY)" {
+    try mlx.requireGpu();
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    const release = kernels.hc_mix_tile;
+    defer kernels.hc_mix_tile = release;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |act| {
+        const m = try tinyModel(dir, .{ .act = act, .qat = false }, s);
+        defer m.deinit();
+        try testing.expect(m.fused and m.cfg.dim % 32 == 0 and m.cfg.hc_mult == 4);
+        var runs: [2]Run = .{ .{}, .{} };
+        defer for (&runs) |*r| r.deinit();
+        for ([_]kernels.HcMixTile{ .{ .rows = 4, .cols = 6 }, release }, &runs) |tile, *r| {
+            kernels.hc_mix_tile = tile;
+            resetState(m);
+            // wider than a verify block, so every chunk takes the wide stage
+            try r.take(&sc, try extendSpan(m, ids[0..20], .all, 16));
+            try r.take(&sc, try extendSpan(m, ids[20..TINY_S], .all, 16));
+            r.slots = try testing.allocator.alloc(Slot, slotCount(m));
+            @memset(r.slots, nil_slot);
+            try captureState(m, r.slots);
+        }
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(runs[0].rows.items), std.mem.sliceAsBytes(runs[1].rows.items));
+        try expectSlotsBits(&sc, runs[0].slots, runs[1].slots);
     }
 }
 

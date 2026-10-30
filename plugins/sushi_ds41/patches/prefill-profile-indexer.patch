@@ -1,8 +1,8 @@
 diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
-index 1442d98..5d50517 100644
+index 8ec9edb..d27a763 100644
 --- a/src/sushi/dsv41/dsv41_model.zig
 +++ b/src/sushi/dsv41/dsv41_model.zig
-@@ -1866,8 +1866,15 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
+@@ -1919,8 +1919,15 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
  
          const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si, one_pass);
          if (pf) |p| {

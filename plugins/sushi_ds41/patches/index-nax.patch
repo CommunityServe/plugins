@@ -1,16 +1,56 @@
+diff --git a/src/sushi/dsv41/dsv41_kernels.zig b/src/sushi/dsv41/dsv41_kernels.zig
+index d61baea..39cb26b 100644
+--- a/src/sushi/dsv41/dsv41_kernels.zig
++++ b/src/sushi/dsv41/dsv41_kernels.zig
+@@ -20,7 +20,7 @@ const TDtype = struct { name: [*:0]const u8, dt: mlx.mlx_dtype };
+ const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
+ 
+ /// A kernel's source and signature; the pipeline is built on first use.
+-const Def = struct {
++pub const Def = struct {
+     name: [*:0]const u8,
+     ins: []const [*:0]const u8,
+     outs: []const [*:0]const u8,
+@@ -31,7 +31,7 @@ const Def = struct {
+ 
+ const Grid = [3]usize;
+ 
+-fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid: Grid, tg: Grid, ints: []const Tmpl, dts: []const TDtype, result: []A) !void {
++pub fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid: Grid, tg: Grid, ints: []const Tmpl, dts: []const TDtype, result: []A) !void {
+     const k = try qat_mod.kernelNew(&def.built, def.name, def.ins, def.outs, def.source, def.header);
+     const cfg = mlx.mlx_fast_metal_kernel_config_new();
+     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+@@ -43,7 +43,7 @@ fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid:
+     try qat_mod.applyKernel(sc, k, inputs, cfg, result);
+ }
+ 
+-fn f32Const(sc: *Scope, vals: []const f32) !A {
++pub fn f32Const(sc: *Scope, vals: []const f32) !A {
+     return sc.floats(vals, &.{ci(vals.len)});
+ }
+ 
+@@ -1148,7 +1148,7 @@ const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
+ /// holds a 16 x 16 fragment as 8 elements, rows `dsv41_nax_r` (lane, i) and columns `dsv41_nax_c` (lane, i), four
+ /// contiguous columns a row. `dsv41_nax_mma` runs one 16 x N x KK multiply-accumulate on register fragments (one of N and
+ /// KK is 32): `a` is 16 x KK, `b` KK x N, a dimension of 32 two consecutive 16-wide fragments.
+-const ATTN_NAX_HEADER =
++pub const ATTN_NAX_HEADER =
+     \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+     \\inline short dsv41_nax_r(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 4) | ((short(lane) >> 1) & 3)) + (i >> 2) * 8; }
+     \\inline short dsv41_nax_c(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 2) | (short(lane) & 1)) * 4 + (i & 3); }
 diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
-index 5d50517..879e9ad 100644
+index d27a763..364f131 100644
 --- a/src/sushi/dsv41/dsv41_model.zig
 +++ b/src/sushi/dsv41/dsv41_model.zig
-@@ -13,6 +13,7 @@ const sc_mod = @import("dsv41_scope.zig");
+@@ -12,6 +12,7 @@ const cfg_mod = @import("dsv41_config.zig");
+ const sc_mod = @import("dsv41_scope.zig");
  const qat_mod = @import("dsv41_qat.zig");
  const kernels = @import("dsv41_kernels.zig");
- const attn_nax = @import("../../attn_nax.zig");
 +const index_nax = @import("../../index_nax.zig");
  const engram = @import("dsv41_engram.zig");
  const embed_ssd = @import("dsv41_embed.zig");
  const source = @import("dsv41_source.zig");
-@@ -1474,6 +1475,13 @@ fn candidatePicks(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A,
+@@ -1524,6 +1525,13 @@ fn candidatePicks(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A,
      return .{ .chosen = chosen, .reach = try sc.op2(mlx.mlx_greater, try sc.takeAlong(blocks, chosen, -1), ninf) };
  }
  
@@ -24,7 +64,7 @@ index 5d50517..879e9ad 100644
  /// The indexer's scores `[Ls, nb]` of `q` (f32 `[Ls, ih, ihd]`) against `keys`: sum over heads of the weight (the
  /// projection `w` times `wscale`) times relu(q . k), -inf past the groups a query sees. A kernel for a few rows, the
  /// matrix kernel for a wide block, else the op chain over key tiles.
-@@ -1484,7 +1492,7 @@ pub fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32
+@@ -1534,7 +1542,7 @@ pub fn indexScores(sc: *Scope, m: *const Model, q: A, keys: A, w: A, wscale: f32
      const ihd = dim(q, 2);
      if (fusedOn(sc, m) and nb > 0) {
          if (Ls <= NARROW_ROWS and ih * ihd <= 8192) return kernels.indexScores(sc, q, keys, w, wscale, p0, r);
@@ -33,7 +73,7 @@ index 5d50517..879e9ad 100644
      }
      const weights = try sc.mul(try sc.astype(w, .float32), try sc.f(wscale));
      const keysf = try sc.astype(keys, .float32);
-@@ -1555,7 +1563,7 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
+@@ -1605,7 +1613,7 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
          const t1 = @min(nb, t0 + tile);
          var ts = Scope.init(sc.a, sc.s);
          defer ts.deinit();
