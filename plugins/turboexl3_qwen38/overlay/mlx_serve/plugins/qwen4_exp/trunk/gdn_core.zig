@@ -4,13 +4,6 @@
 //! packed prework runs a threadgroup per (row, head slot); `recur` (kernels/gdn_core_recur.metal) is the pipelined
 //! kernel with its block and threadgroup sizes as template ints. Decode, verify and the stock route's short calls
 //! (T < 64) never take them.
-
 const mlx = @import("../../../mlx/ffi.zig");
-
-
-
-
 pub const RecurOut = struct { y: mlx.mlx_array, state: mlx.mlx_array };
-
 // ── tests ──
-

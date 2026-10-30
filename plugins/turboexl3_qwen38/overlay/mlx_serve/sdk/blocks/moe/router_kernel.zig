@@ -1,9 +1,7 @@
 //! copied_from: src/sdk/blocks/moe/router_kernel.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! sdk/blocks/moe/router_kernel.
 //! Owns RouterMode, ROUTER_MAX_EXPERTS, moeRouterSource, ROUTER_SOURCES, ROUTER_NAMES, router_kernels, and 13 more.
-
 const mlx = @import("../../../mlx/ffi.zig");
-
 // ── Fused MoE router (top-K selection + weight normalization in ONE kernel) ──
 //
 // The op chains above are ~11 dispatches each — sigmoid/softmax, bias add,
@@ -33,13 +31,10 @@ const mlx = @import("../../../mlx/ffi.zig");
 //
 // Engagement is LOGGED, never
 // inferred — a declined kernel is output-identical to the chain.
-
 /// Largest expert count the kernel will stage in threadgroup memory. The
 /// sigmoid arm keeps two f32 planes (key + raw weight), so 2048 experts is
 /// 16 KiB of the 32 KiB budget.
 pub const ROUTER_MAX_EXPERTS: c_int = 2048;
-
-
 /// Everything the cached kernel config bakes in. A mismatch re-arms it.
 /// Full-shape component for cached metal-kernel config keys. A cached config
 /// bakes the OUTPUT SHAPES (and grid) of the call that built it, so the key
@@ -61,11 +56,7 @@ pub const ShapeKey = struct {
         return key;
     }
 };
-
-
-
 /// The shared-expert gate's logit, folded into the softmax router: `x` [rows * gate_k] and the flat
 /// weight vector `w` [gate_k], one logit per row.
 pub const RouterGate = struct { x: mlx.mlx_array, w: mlx.mlx_array };
-
 // ── tests ──

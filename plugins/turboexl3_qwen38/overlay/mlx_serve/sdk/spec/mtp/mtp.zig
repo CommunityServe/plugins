@@ -27,14 +27,11 @@
 //!
 //! Everything MTP-specific lives in this file plus `Generator.nextMtp`
 //! (src/engines/mlx/generate.zig); deleting the feature is removing those two.
-
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const weights_mod = @import("../../blocks/moe/weights.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
-
 const draft_fuse = @import("draft_fuse.zig");
-
 /// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
 /// round-v2 rebuild made rejected drafts ~free (scalar-anchor rollback + the
 /// 3-bit draft-only lm_head replaced the old full trunk re-forward): the old
@@ -49,7 +46,6 @@ const draft_fuse = @import("draft_fuse.zig");
 /// controller demotes/promotes within [1, configured].
 pub const DEFAULT_DEPTH: u32 = 3;
 pub const MAX_DEPTH: u32 = 8;
-
 /// Per-silicon adaptive depth cap for machines on the `.generic` cost
 /// surface. The cap is a MACHINE measurement, so each row is one, never
 /// interpolated between chips; an unmeasured chip keeps the default row.
@@ -65,7 +61,6 @@ pub const MAX_DEPTH: u32 = 8;
 /// boot probe's cost ladder, which cannot see acceptance or the extension sync
 /// — see `generate.mtpDepthCapResolved`.
 pub const DepthCap = struct { cap: u32, label: []const u8, measured: bool = false };
-
 pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
     if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro", .measured = true };
     // Base M4 (tester report, Qwen3.5-9B-MTPLX 6-bit, 16 GB):
@@ -90,7 +85,6 @@ pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
         std.mem.indexOf(u8, chip, "M5 Ultra") == null) return .{ .cap = 4, .label = "m5", .measured = true };
     return .{ .cap = default_cap, .label = "default" };
 }
-
 /// Exact full-round cost surfaces known to the adaptive MTP controller.
 /// Selection is based on runtime tensor geometry, never a model/repository
 /// name. `generic` retains the conservative M1-M4 surface and auto cap.
@@ -105,22 +99,18 @@ pub const MtpCostProfile = enum {
     g17_nax_qwen4_q4_gs64,
     g17_nax_qwen4_mixed_4_8_gs64,
 };
-
-
 /// One linear: quantized (w packed u32, s/b bf16) when `s.ctx != null`,
 /// otherwise a pre-transposed bf16 weight `[in, out]` for plain matmul.
 pub const QLinear = struct {
     w: mlx.mlx_array,
     s: mlx.mlx_array,
     b: mlx.mlx_array,
-
     pub fn deinit(self: *QLinear) void {
         _ = mlx.mlx_array_free(self.w);
         _ = mlx.mlx_array_free(self.s);
         _ = mlx.mlx_array_free(self.b);
     }
 };
-
 /// MTP MLP: dense SwiGLU (0.8B/27B-class sidecars) or the sparse MoE of a
 /// qwen3_5_moe trunk (35B-A3B-class sidecars: router `mlp.gate` + packed
 /// `switch_mlp` experts + shared expert + shared-expert gate). The MoE arm
@@ -135,7 +125,6 @@ const MtpMlp = union(enum) {
         down: QLinear,
     },
     moe: weights_mod.MoeMlpWeights,
-
     fn deinit(self: *MtpMlp) void {
         switch (self.*) {
             .dense => |*d| {
@@ -162,16 +151,13 @@ const MtpMlp = union(enum) {
         }
     }
 };
-
 /// Which head shape the sidecar loaded as. Everything the shapes share reads
 /// the same fields; the few forks (attention gate, QK norms, MLP kind) key here
 /// or on `eh_proj`.
 pub const Layout = enum { qwen, hy3 };
-
 pub const MtpModel = struct {
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
-
     /// Quant params for the MTP layer's own linears — inferred from tensor
     /// geometry at load (sidecars are often quantized differently from the
     /// trunk, e.g. group 32 over a group-64 trunk, or 8-bit over 4-bit).
@@ -182,7 +168,6 @@ pub const MtpModel = struct {
     /// (`params_mod.quantParamsFromGeometry`) and handed to every
     /// `mlx_quantized_matmul` — passing "affine" over fp8 scales throws.
     quant_mode: QuantMode = .affine,
-
     /// Qwen heads' concat projection (empty for Hy3). Dense bf16 ships
     /// pre-transposed `[2H, H]` for plain matmul; a checkpoint that ships it
     /// QUANTIZED (avlp12 Alis) keeps `(w, scales, biases)` verbatim — packed
@@ -207,7 +192,6 @@ pub const MtpModel = struct {
     o: QLinear,
     mlp: MtpMlp,
     layout: Layout = .qwen,
-
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
     /// bind time (`DRAFT_HEAD_BITS`).
     /// Only draft steps project through it — VERIFICATION always uses the
@@ -216,7 +200,6 @@ pub const MtpModel = struct {
     draft_head: ?QLinear = null,
     draft_head_bits: u32 = 0,
     draft_head_group: u32 = 0,
-
     /// Draft-rerank scheme: a coarse 2-bit/gs64
     /// requant of the trunk lm_head; greedy drafts shortlist its top-32 and
     /// re-score them through the trunk head's own rows (`draftSelect`). When
@@ -224,7 +207,6 @@ pub const MtpModel = struct {
     /// back to the trunk head.
     rerank_coarse: ?RerankCoarse = null,
     rerank_logged: bool = false,
-
     /// Cross-request EV controller seed (inference thread only, like every
     /// mutable field here): the last HEALTHY request's per-index acceptance
     /// EMAs + base depth, written by `Generator.deinit`, consumed by the
@@ -234,7 +216,6 @@ pub const MtpModel = struct {
     /// learned surface from round 1. Never written by disabled/short runs.
     ev_seed_accept: ?[MAX_DEPTH]f32 = null,
     ev_seed_m_lo: u32 = 1,
-
     pub fn deinit(self: *MtpModel) void {
         if (self.rerank_coarse) |*rc| rc.deinit();
         if (self.draft_head) |*dh| dh.deinit();
@@ -253,9 +234,7 @@ pub const MtpModel = struct {
         self.o.deinit();
         self.mlp.deinit();
     }
-
 };
-
 // ── Draft rerank: the head-agnostic half ──
 //
 // Nothing in this scheme is MTP-head-shaped. It reads the TARGET's lm_head
@@ -268,13 +247,11 @@ pub const MtpModel = struct {
 // On the sidecar that is the head's own post-norm hidden; on qwen4_exp it is
 // the MIXER output, NOT the pre-mixer stream the head hands back as
 // `hidden_next`.
-
 /// Coarse-head width AT BUILD TIME (0 disables the build). A coarser head is fewer bytes and a longer tail of
 /// shortlist misses, and a miss costs acceptance, never output. The width a head is READ at is a property of its
 /// packed weights (`RerankCoarse.bits`): packed geometry implies K, so a read at another width reads a different
 /// vocab entirely.
 pub const DRAFT_HEAD_BITS: u32 = 3;
-
 /// A BUILT coarse readout head: the packed weights plus the geometry they
 /// were packed with. Both live together because `mlx_quantized_matmul` needs
 /// all three and only the build knows them.
@@ -290,32 +267,26 @@ pub const RerankCoarse = struct {
     /// shortlist's `rows` (a dense proposal row's width) stays `rows`, the vocab.
     sub: ?QLinear = null,
     sub_rows: c_int = 0,
-
     pub const Readout = struct { q: QLinear, rows: c_int };
-
     /// The coarse rows a single-row draft reads: the vocab subset when one is built, else the whole head.
     pub fn readout(self: *const RerankCoarse) Readout {
         if (self.sub) |q| return .{ .q = q, .rows = self.sub_rows };
         return .{ .q = self.q, .rows = self.rows };
     }
-
     pub fn deinit(self: *RerankCoarse) void {
         self.q.deinit();
         if (self.exact) |*e| e.deinit();
         if (self.sub) |*e| e.deinit();
     }
 };
-
 /// Width of a trunk format head's re-score copy (`RerankCoarse.exact`).
 pub const RERANK_EXACT_BITS: u32 = 8;
-
 /// The vocab subset a trunk format head's single-row drafts read (`withVocabSubset`), on a vocab of DRAFT_VOCAB_MIN ids
 /// or more: the first 96 Ki ids. A byte-level BPE vocab numbers its merges most frequent first, so these carry nearly
 /// all text; a draft never proposes a later id and the verify reads the full head, so it costs acceptance, never
 /// output.
 pub const DRAFT_VOCAB_ROWS: c_int = 98304;
 pub const DRAFT_VOCAB_MIN: c_int = 131072;
-
 /// Resident bytes of a coarse head over `rows` x `hidden` at `bits`/gs64:
 /// packed weights plus bf16 scales AND biases. Reported at build so the log
 /// line carries the number the change is claiming.
@@ -326,7 +297,6 @@ pub fn rerankCoarseBytes(rows: c_int, hidden: c_int, bits: u32) u64 {
     const groups = h / 64;
     return packed_bytes + 2 * (r * groups * 2);
 }
-
 /// The exact re-scored shortlist behind every rerank draft: the coarse head's
 /// top-32 candidate ids plus their trunk-head logits. A greedy draft is the
 /// argmax over `exact`; a sampled draft is drawn from the filtered softmax over
@@ -338,30 +308,22 @@ pub const Shortlist = struct {
     exact: mlx.mlx_array,
     /// The head's vocab rows — the width a dense proposal row must have.
     rows: c_int,
-
     pub fn deinit(self: *Shortlist) void {
         _ = mlx.mlx_array_free(self.cands);
         _ = mlx.mlx_array_free(self.exact);
     }
 };
-
-
-
-
 /// Load a `<prefix>.{weight,scales?,biases?}` triple raw (no transpose) —
 /// the shape the trunk's gather/qmatmul paths expect for MoE tensors.
 const MoeTriple = struct {
     w: mlx.mlx_array,
     s: mlx.mlx_array,
     b: mlx.mlx_array,
-
     fn deinit(self: *MoeTriple) void {
         for ([_]mlx.mlx_array{ self.w, self.s, self.b }) |a| _ = mlx.mlx_array_free(a);
     }
 };
-
 // ── Forward ──
-
 /// Outputs of the pre-rope half of the MTP layer. All arrays owned.
 const FrontOut = struct {
     q_t: mlx.mlx_array, // [1, H, L, D] normed, pre-rope
@@ -369,7 +331,6 @@ const FrontOut = struct {
     v_t: mlx.mlx_array, // [1, Hkv, L, D]
     gate: mlx.mlx_array, // [1, L, H, D] raw output gate (pre-sigmoid, strided split view)
     x: mlx.mlx_array, // [1, L, H] fc output — the residual input
-
     fn deinit(self: *FrontOut) void {
         _ = mlx.mlx_array_free(self.q_t);
         _ = mlx.mlx_array_free(self.k_t);
@@ -378,7 +339,6 @@ const FrontOut = struct {
         _ = mlx.mlx_array_free(self.x);
     }
 };
-
 // ── Draft-rerank shortlist (port of the mlx.fast challenge draft-rerank
 // scheme, submission 942e5ab2 in mlx.fast-qwen-3.8-mtp-challenge) ──
 //
@@ -395,26 +355,17 @@ const FrontOut = struct {
 // above every number, -0.0 == +0.0). Real values never map to 0, so the
 // zero-initialized empty slots below can never be selected while a
 // simdgroup still has real candidates (guaranteed by rows >= TILES*TG).
-
 // Stage 1: TILES threadgroups partition [0, RC); each emits its local top 32
 // as (ordinal, index) pairs — TILES * 32 candidates. Selection is 32 rounds
 // of simd_max over per-thread slots with a `taken` bitmask (hence the
 // PER_THREAD <= 32 static_assert), then one simdgroup reduces the
 // threadgroup's per-simd lists the same way.
-
 // Stage 2: one threadgroup reduces the TILES*32 candidates to the final 32
 // ids (written ascending by (value, index) — consumers are order-blind).
-
-
-
 // ── Tests ──
-
 test {
     _ = draft_fuse;
 }
-
 // Test-only: run the negFraction threshold on a single 1-D norm array.
-
 // Test-only: fold only when the single array reads as delta-encoded.
-
 // Test-only: max |a-b| over all elements.

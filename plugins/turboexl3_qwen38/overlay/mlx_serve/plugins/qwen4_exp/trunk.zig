@@ -4,7 +4,6 @@
 //! rope, the compiled closures, quant params, decode requant copies, angle rows, the persistent batched GDN group).
 //! Its methods are the family's forward (`forward.zig`, `mtp.zig`, `ple.zig`, `hc.zig`, `qsa/`) and the trunk ops
 //! (`trunk/`).
-
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../sdk/config/model.zig");
@@ -22,13 +21,11 @@ const AttnDqCopy = @import("../../sdk/blocks/attention/decode_attn_quant.zig").A
 const QkAngleSlot = @import("../../sdk/blocks/rope/qk_norm_rope.zig").QkAngleSlot;
 const DtypeCastCache = @import("../../mlx/dtype.zig").DtypeCastCache;
 const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
-
 pub const Trunk = struct {
     /// Borrowed: its owner (the plugin's model, or the engine's legacy shell) frees it after the trunk.
     config: model.ModelConfig,
     s: mlx.mlx_stream,
     allocator: std.mem.Allocator,
-
     emb_w: mlx.mlx_array,
     emb_s: mlx.mlx_array,
     emb_b: mlx.mlx_array,
@@ -51,7 +48,6 @@ pub const Trunk = struct {
     qwen4_mtp: ?mtp.Qwen4Mtp = null,
     /// Whose per-request state the head holds (`qwen4MtpActivate`).
     qwen4_mtp_owner: ?*mtp.Qwen4MtpState = null,
-
     /// `[hidden]` ones for the weight-less RMS norms; 1.0 (bf16) for the dispatch probe; `rms_norm_eps` as f32.
     ones_hidden: mlx.mlx_array,
     one: mlx.mlx_array,
@@ -61,7 +57,6 @@ pub const Trunk = struct {
     yarn_mscale: ?mlx.mlx_array = null,
     yarn_inv_freq: ?[]const f64 = null,
     yarn_mscale_cast: DtypeCastCache = .{},
-
     /// Run the residual streams in f32 (the fixture oracle's tighter bar).
     qwen4_stream_f32: bool = false,
     qsa_consts: QsaBlockConsts = .{},
@@ -79,7 +74,6 @@ pub const Trunk = struct {
     /// Pipeline rank 0: the worker holding the later layers; tensor rank 0: the worker holding the other expert slices.
     dist_peer: ?*distributed_mod.Peer = null,
     dist_tp: ?*distributed_mod.Peer = null,
-
     compiled_moe_routing: ?mlx.mlx_closure = null,
     compiled_gdn_gate: ?mlx.mlx_closure = null,
     /// The hyper-connection elementwise tails, one kernel each: silu(down), mean(sigma(up)*normed), 2sigma(inject),
@@ -117,8 +111,6 @@ pub const Trunk = struct {
     mtp_oqe_affine_trunk: bool = false,
     /// The fused paths' per-layer state (`trunk/fusion.zig`).
     fused: @import("trunk/fusion.zig").Scratch = .{},
-
-
     // attention.zig
     // forward.zig
     pub const QWEN4_DECODE_ASYNC_LADDER_DEFAULT = @import("forward.zig").QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
@@ -174,15 +166,12 @@ pub const Trunk = struct {
     pub const discardDeferredPle = @import("ple.zig").discardDeferredPle;
     // trunk/warmup.zig
     pub const warmupSpecVerify = @import("trunk/warmup.zig").warmupSpecVerify;
-
     pub fn actDtype(self: *const Trunk) mlx.mlx_dtype {
         return self.config.actDtype();
     }
-
     pub fn ssmStateDtype(self: *const Trunk) mlx.mlx_dtype {
         return self.config.ssmStateDtype();
     }
-
     /// The compiled routing, GDN gate and hyper-connection closures the forward reads.
     pub fn prepare(self: *Trunk) void {
         if (mlx.noGpuBackend()) return;
@@ -190,7 +179,6 @@ pub const Trunk = struct {
         if (self.config.linear_num_key_heads > 0) self.compileGdnGate();
         self.compileQwen4Hc();
     }
-
     pub fn deinit(self: *Trunk) void {
         if (self.verify_joined_logits.ctx != null) _ = mlx.mlx_array_free(self.verify_joined_logits);
         lane_qmm.release(@intFromPtr(self));

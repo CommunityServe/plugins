@@ -1,11 +1,9 @@
 //! copied_from: src/sdk/blocks/gdn/gated_delta_net.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! sdk/blocks/gdn/gated_delta_net.
 //! Owns LinearAttnWeights, GdnProj, and 1 more.
-
 const mlx = @import("../../../mlx/ffi.zig");
 const QW = @import("../linear/fused_rows.zig").QW;
 const FusedRows = @import("../linear/fused_rows.zig").FusedRows;
-
 pub const LinearAttnWeights = struct {
     // For separate projections (qwen3_5_moe): qkv=QKV, z=Z, a=A, b=B
     // For combined projections (qwen3_next): qkv=QKVZ, b=BA, z/a unused
@@ -36,9 +34,7 @@ pub const LinearAttnWeights = struct {
     qkv_parts: [3]QW = .{ .{}, .{}, .{} },
     /// bf16 in_proj_a / in_proj_b joined at load (qwen4_exp `trunk/gdn_ab.zig`): `a_w` / `b_w` are views of it.
     ab: GdnAb = .{},
-
 };
-
 /// A GDN layer's joined bf16 a / b: `w` the transposed view [hidden, n] of the row-major buffer [a | 0 | b] (null-ctx:
 /// not joined), b's first column `b_off`, the parts' widths.
 pub const GdnAb = struct {
@@ -47,6 +43,4 @@ pub const GdnAb = struct {
     b_off: c_int = 0,
     widths: [2]c_int = .{ 0, 0 },
 };
-
 // ── GatedDeltaNet (linear attention layers) ──
-

@@ -1,5 +1,6 @@
 turboexl3_qwen38 vendors third-party code below. Each copy is unchanged but for the edits scripts/sync-mlx-serve.sh makes,
-listed at its top. It builds against the mlx-serve plugin kit and turboexl3 (build.zig.zon, by URL and hash).
+listed at its top; among them, the copies' blank lines are taken out. It builds against the mlx-serve plugin kit and
+turboexl3 (build.zig.zon, by URL and hash).
 
 --------------------------------------------------------------------------------
 mlx-serve

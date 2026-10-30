@@ -15,8 +15,6 @@ const Generator = @import("../../generate/generator.zig").Generator;
 const MAX_ROUND_DRAFTS = @import("../mtp_head_ref.zig").MAX_ROUND_DRAFTS;
 const MtpRoundPlan = @import("ev_plan.zig").MtpRoundPlan;
 const deinit = @import("../../generate/generator.zig").Generator.deinit;
-
-
 /// Qwen native-MTP speculative round. Structure mirrors `nextDrafter`
 /// (same verify invariant: cache.step = prompt_len + emitted, t1 NOT in
 /// cache on entry, verify input `[t1, draft[0..m-1]]`, bonus from row m,
@@ -42,7 +40,6 @@ pub const MtpHistStash = struct {
     /// The whole verify row `[t1, drafts[0..m]]` and its `[1, 1+m, H]` hiddens, for a
     /// padded append (`mtpPaddedHistory`); `ids`/`hidden` are its first `n` rows.
     pad: ?struct { ids: mlx.mlx_array, hidden: mlx.mlx_array, rows: usize } = null,
-
     pub fn deinit(self: *MtpHistStash) void {
         _ = mlx.mlx_array_free(self.ids);
         _ = mlx.mlx_array_free(self.hidden);
@@ -52,7 +49,6 @@ pub const MtpHistStash = struct {
         }
     }
 };
-
 /// One round's lazily-built MTP draft chain — the Phase 0/1 state that
 /// cross-round pre-drafting (`mtpMaybePreDraft`) moves into the PREVIOUS
 /// round's tail. Owns every handle it holds; `deinit` frees whatever was
@@ -95,7 +91,6 @@ pub const MtpPreDraft = struct {
     /// forward reads it instead of `embedding` + `rmsNorm`, and only while it is that step's predecessor's.
     en_next: ?mlx.mlx_array = null,
     en_step: u32 = 0,
-
     pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
         _ = mlx.mlx_array_free(self.t1_arr);
         if (self.place) |p| _ = mlx.mlx_array_free(p.live_end);
@@ -113,15 +108,12 @@ pub const MtpPreDraft = struct {
         if (self.en_next) |e| _ = mlx.mlx_array_free(e);
         allocator.free(self.drafts);
     }
-
 };
-
 /// Prompt lookup may stand in for the MTP chain (the test seam's false keeps the chain).
 pub var mtp_lookup_override: ?bool = null;
 pub fn mtpLookupEnabled() bool {
     return mtp_lookup_override orelse true;
 }
-
 /// End a round that stays out of the cost table. The regime clock runs from
 /// the last observed round, so an unobserved round must end the interval too.
 pub fn mtpRoundUntimed(self: *Generator) void {
@@ -129,7 +121,6 @@ pub fn mtpRoundUntimed(self: *Generator) void {
     self.mtp_serial_clock = null;
     self.mtp_serial_warm = 0;
 }
-
 /// Price a lookup round into the table's lookup row: the wall since the previous round
 /// ended, the quantity the width grid stores. No sample before the regime clock runs.
 pub fn mtpLookupObserve(self: *Generator, drafts: u32, tokens: u32) void {
@@ -137,7 +128,6 @@ pub fn mtpLookupObserve(self: *Generator, drafts: u32, tokens: u32) void {
     const ms = @as(f32, @floatFromInt(c.read())) / @as(f32, std.time.ns_per_ms);
     _ = self.xfm.round_cost.observeLookup(drafts, self.mtpKvLen(), ms, @floatFromInt(tokens), self.spec_cost_solo);
 }
-
 /// What this machine measured for an MTP round at `width` and for each lookup size.
 pub fn mtpLookupCosts(self: *const Generator, width: u32) mtp_lookup.Costs {
     const t = &self.xfm.round_cost;
@@ -147,7 +137,6 @@ pub fn mtpLookupCosts(self: *const Generator, width: u32) mtp_lookup.Costs {
     for (&costs.lookup_ms, 0..) |*ms, k| ms.* = t.lookupMs(@intCast(k), bucket);
     return costs;
 }
-
 /// Count a round's accepted drafts toward its kind and that kind's EMA.
 pub fn mtpRoundAcceptObserve(self: *Generator, lookup: bool, drafted: u32, accepted: u32) void {
     if (lookup) {
@@ -160,7 +149,6 @@ pub fn mtpRoundAcceptObserve(self: *Generator, lookup: bool, drafted: u32, accep
         self.mtp_lookup_ema = mtp_lookup.driftStep(self.mtp_lookup_ema);
     }
 }
-
 /// The committed-token index, synced to `generated_ids`.
 pub fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_lookup.Index {
     if (self.mtp_lookup_idx == null) {
@@ -175,7 +163,6 @@ pub fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_look
     self.mtp_lookup_gen = gen.len;
     return &self.mtp_lookup_idx.?;
 }
-
 /// A chain of the context's continuation after `t1`, or null when the gate
 /// prefers the MTP head. Single-stream rounds only.
 /// How many context-continuation drafts the lookup gate takes after `t1`; 0 = the MTP head.
@@ -188,38 +175,28 @@ pub fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: Mtp
     const got = idx.match(t1, lookup_cap);
     return mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, self.mtpLookupCosts(plan.m_lo));
 }
-
 /// Round N's accept decision as lazy arrays: `a` (0-d int32) drafts accepted, the next
 /// `t1` (`[1]` int32) and the next `h_prev` (`[1,1,H]`), all before any host read.
 pub const MtpLazyVerdict = struct {
     a: mlx.mlx_array,
     t1: mlx.mlx_array,
     h_prev: mlx.mlx_array,
-
     pub fn deinit(self: *MtpLazyVerdict) void {
         _ = mlx.mlx_array_free(self.a);
         _ = mlx.mlx_array_free(self.t1);
         _ = mlx.mlx_array_free(self.h_prev);
     }
 };
-
-
-
-
 // ── tests ──
-
-
 /// A loaded qwen4_exp pack and a byte tokenizer for generator-level lazy pre-draft runs.
 const LazyRig = struct {
     config: model_mod.ModelConfig,
     xfm: Transformer,
     tok: Tokenizer,
-
     fn deinit(rig: *LazyRig, a: std.mem.Allocator) void {
         rig.tok.deinit();
         rig.xfm.deinit();
         rig.config.deinit(a);
         a.destroy(rig);
     }
-
 };

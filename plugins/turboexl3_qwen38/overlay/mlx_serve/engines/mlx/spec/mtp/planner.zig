@@ -23,8 +23,6 @@ const mtpPinnedDepth = @import("regime.zig").mtpPinnedDepth;
 const mtpPlanInBounds = @import("regime.zig").mtpPlanInBounds;
 const mtpRegimeExplorePeriod = @import("regime.zig").mtpRegimeExplorePeriod;
 const mtpRegimeForce = @import("regime.zig").mtpRegimeForce;
-
-
 pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
     if (mtpPinnedDepth()) |pinned| {
         const d = @min(pinned, self.mtp_depth);
@@ -114,7 +112,6 @@ pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
     }
     return plan;
 }
-
 /// The single-chunk plan a width trial runs. Built from a scalar on
 /// purpose: `plan = .{ .m_lo = plan.m_lo + 1, .m_hi = plan.m_lo + 1 }`
 /// reads the already-written m_lo for m_hi (result-location aliasing)
@@ -122,7 +119,6 @@ pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
 pub fn mtpWidthTrialPlan(width: u32) MtpRoundPlan {
     return .{ .m_lo = width, .m_hi = width, .tau_ln = 0.0, .width_trial = true };
 }
-
 /// Which width a trial measures: the plan's own base when the bucket
 /// the plan reads has not measured it, else an unmeasured m_lo+1 under
 /// any shape, else a periodic m_lo+1 on single-chunk plans. Null =
@@ -152,18 +148,15 @@ pub fn mtpWidthTrialTarget(t: *const round_cost.Table, kv_len: u32, plan: MtpRou
     if (plan.m_hi == plan.m_lo) return up;
     return null;
 }
-
 /// Width-trial schedule: same shape as the regime's (explicit
 /// trial_end/next_trial, a 2-round block — transition then measurement),
 /// idempotent per round because `mtpRoundPlan` has two call sites.
 pub const MtpWidthTrial = round_cost.TrialSchedule;
-
 /// `reread` is the layout's answer (`round_cost.schedulePeriodReread`): every layout re-reads
 /// the period so a cold bucket cannot inherit a neighbour's date.
 pub fn mtpWidthTrialForce(t: *MtpWidthTrial, round_idx: u32, period: u32, reread: bool) bool {
     return t.force(round_idx, period, reread);
 }
-
 /// Rounds between width trials: the regime's drag rule on the measured
 /// ms/tok gap between m_lo+1 and m_lo (a width G worse, tried once in
 /// G/DRAG rounds, costs ~DRAG of throughput); the default period while
@@ -178,7 +171,6 @@ pub fn mtpWidthTrialPeriod(t: *const round_cost.Table, kv_len: u32, m_lo: u32) u
     if (t.msPerTok(m_lo + 1, b) == null and !t.clearlyWorse(m_lo + 1, m_lo, b)) return round_cost.EXPLORE_PERIOD_COLD;
     return round_cost.trialPeriod(t.msPerTok(m_lo, b), t.rawMsPerTok(m_lo + 1, b));
 }
-
 /// Probe period when the plan's tokens come from the acceptance EMAs: the same drag rule,
 /// over the EV rates of m_lo and m_lo+1. The probe is what refreshes `a[m_lo]`, so a stale
 /// estimate shortens its own period as soon as the shallower indices move.
@@ -194,7 +186,6 @@ pub fn mtpProbePeriod(a: []const f32, src: MtpCostSource, m_lo: u32) u32 {
     const up = src.roundCost(m_lo + 1, false) / mtpEvExpectedTokens(a, m_lo + 1);
     return round_cost.trialPeriod(here, up);
 }
-
 /// Track the only evidence that can justify sticky-disable: whether the
 /// first draft landed while the EV base depth was exactly one. Wider base
 /// rounds reset the probation window, and later extension misses do not
@@ -213,20 +204,17 @@ pub fn mtpFloorDisableObserve(
         window_idx.* = 0;
         return null;
     }
-
     const idx = window_idx.* % MTP_DEPTH_WINDOW;
     drafted_window[idx] = 1;
     accepted_window[idx] = @intFromBool(accepted > 0);
     window_idx.* += 1;
     const n = @min(window_idx.*, MTP_DEPTH_WINDOW);
     if (n < MTP_DEPTH_WINDOW) return null;
-
     var accepted_sum: u32 = 0;
     var i: u32 = 0;
     while (i < n) : (i += 1) accepted_sum += accepted_window[i];
     return @as(f32, @floatFromInt(accepted_sum)) / @as(f32, @floatFromInt(n));
 }
-
 /// EV-mode per-round update: EMAs always; during warmup the legacy
 /// windowed controller keeps running (today's behavior while EMAs fill);
 /// post-warmup only the sticky disable floor is checked — EV owns depth.
@@ -260,6 +248,4 @@ pub fn updateMtpEvRound(self: *Generator, drafted: u32, accepted: u32) void {
         self.spec_disable_reason = .acceptance;
     }
 }
-
 // ── tests ──
-

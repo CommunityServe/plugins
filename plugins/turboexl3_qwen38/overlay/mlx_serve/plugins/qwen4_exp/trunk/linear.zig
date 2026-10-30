@@ -4,7 +4,6 @@
 //! copied_from: sdk/blocks/linear/qmatmul.zig, sdk/blocks/linear/verify_projection.zig, sdk/blocks/attention/proj.zig,
 //! sdk/blocks/norms/rms.zig, sdk/blocks/mlp/{activations,dense}.zig, sdk/blocks/embedding.zig, sdk/vision/splice.zig
 //! (the qwen4_exp arms: no Hadamard, ternary, row-exact, GGUF, grouped-norm or Gemma activation paths).
-
 const mlx = @import("../../../mlx/ffi.zig");
 const sushi_pack = @import("../../../sdk/quant/exl3/sushi_pack.zig");
 const decode_attn_quant = @import("../../../sdk/blocks/attention/decode_attn_quant.zig");
@@ -18,7 +17,6 @@ const computeQuantParams = @import("../../../sdk/quant/params.zig").computeQuant
 const qmatmulBits = @import("../../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
 const qmv2 = @import("../../../sdk/blocks/qmm/qmv2.zig");
 const qmv_nax2 = @import("../../../sdk/blocks/qmm/qmv_nax2.zig");
-
 pub inline fn qmatmul(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
     // A linear the pack's trunk format loaded (`trunk/formats.zig`) runs through that format.
     if (self.formats.linearOf(w)) |fw| return self.formats.matmul(fw, x, self.s);
@@ -31,7 +29,6 @@ pub inline fn qmatmul(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc
     }
     return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
 }
-
 /// The logits projection: a dense bf16 head is `[vocab, hidden]`, projected through a transposed view.
 pub inline fn lmHeadProject(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
     if (self.lm_head_s.ctx == null) {
@@ -43,7 +40,6 @@ pub inline fn lmHeadProject(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array
     }
     return self.qmatmul(x, self.lm_head_w, self.lm_head_s, self.lm_head_b);
 }
-
 /// Per-weight (bits, group_size, mode), cached by the scales array; `in_dim` pins an override's geometry.
 pub inline fn quantParamsHinted(self: *const Trunk, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
     const key_raw = sc.ctx orelse return .{
@@ -72,7 +68,6 @@ pub inline fn quantParamsHinted(self: *const Trunk, w: mlx.mlx_array, sc: mlx.ml
     }
     return computeQuantParams(.of(&self.config), w, sc, in_dim);
 }
-
 /// Attention projection with the decode-only requant (`batch == 1 and !is_prefill`: serial decode and verify).
 pub inline fn attnProj(self: *Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, decode_shape: bool, layer: u32) !mlx.mlx_array {
     if (decode_shape and sc.ctx == null and decode_attn_quant.decodeAttnQuantEnabled()) {
@@ -82,13 +77,11 @@ pub inline fn attnProj(self: *Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx
     }
     return self.qmatmul(x, w, sc, bi);
 }
-
 pub inline fn rmsNorm(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
     var result = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_rms_norm(&result, x, w, self.config.rms_norm_eps, self.s));
     return result;
 }
-
 pub fn silu(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);

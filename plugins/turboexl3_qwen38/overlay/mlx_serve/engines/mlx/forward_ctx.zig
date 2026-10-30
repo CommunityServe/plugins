@@ -1,7 +1,6 @@
 //! copied_from: src/engines/mlx/forward_ctx.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! engines/mlx/forward_ctx.
 //! Owns SpecTree, CaptureLayers, ForwardCtx.
-
 const mlx = @import("../../mlx/ffi.zig");
 const HeadPlace = @import("../../plugins/qwen4_exp/mtp.zig").HeadPlace;
 const abi = @import("mlx_serve").abi.plugin;
@@ -10,7 +9,6 @@ const PlePending = @import("../../plugins/qwen4_exp/ple.zig").PlePending;
 const QsaArmCounts = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaArmCounts;
 const KVCache = @import("kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("ssm/entry.zig").SSMCacheEntry;
-
 /// A draft tree's verify rows: row w sits at position offset + depth[w], and
 /// its keys and recurrence follow its ancestors.
 pub const SpecTree = struct {
@@ -18,9 +16,7 @@ pub const SpecTree = struct {
     /// row's conv-input sources.
     parents: mlx.mlx_array,
     attn: row_attn.Tree,
-
 };
-
 // ── Forward context ──
 //
 // Routes per-request mutable state (KV cache, MoE seq offset, SSM entries,
@@ -41,7 +37,6 @@ pub const CaptureLayers = struct {
     /// handles (init with `mlx_array_new`, free after use).
     out: []mlx.mlx_array,
 };
-
 pub const ForwardCtx = struct {
     cache: *KVCache,
     /// A later pipeline rank's input: the previous rank's hyper-connection stream, in place of tokens.
@@ -189,5 +184,4 @@ pub const ForwardCtx = struct {
     /// forward left owed (`plugin/settle.zig`).
     plugin_slot: u32 = 0,
     plugin_owed: abi.Owed = .none,
-
 };

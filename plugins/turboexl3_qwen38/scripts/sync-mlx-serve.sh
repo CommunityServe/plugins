@@ -24,7 +24,8 @@
 #   - every named test but #1005's EXL3 tests taken out, with the comment lines right above it: a copy keeps the named
 #     tests a gpu-test or mlx-free-test filter in build.zig picks, and every unnamed `test {}` block;
 #   - the functions and declarations scripts/cut.txt names taken out, with their `///` lines: what no build of the
-#     plugin compiles or names (a member as Container.name). A name the copy lacks stops the sync.
+#     plugin compiles or names (a member as Container.name). A name the copy lacks stops the sync;
+#   - blank lines taken out, but one between two lines of multiline strings, which would join them.
 # Files in EDGES are this plugin's own, at the paths of the mlx-serve files they stand in for, and never overwritten.
 # Every other file a copy imports gets a stand-in: an empty file, so the import resolves while nothing of it is used
 # (a use is a compile error, never a silent difference). Zig loads every file a file imports, used or not, so a file
@@ -255,6 +256,18 @@ def cut_names(f, text):
             drop.add(b + 1)
     return "\n".join(l for k, l in enumerate(lines) if k not in drop), len(found)
 cut_out = 0
+def strip_blanks(text):
+    """`text` without its blank lines, but one between two lines of multiline strings, which would join them."""
+    lines, out = text.split("\n"), []
+    for i, l in enumerate(lines):
+        if l.strip() == "":
+            before = next((x for x in reversed(out) if x.strip()), "")
+            after = next((x for x in lines[i + 1:] if x.strip()), "")
+            if before.lstrip().startswith("\\\\") and after.lstrip().startswith("\\\\"):
+                out.append(l)
+            continue
+        out.append(l)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 for f in files:
     if overlay is not None and (overlay / f).is_file():
         # Ours, already as a copy is written: kept as it is, its imports still name what the slice needs.
@@ -298,6 +311,7 @@ for f in files:
     tests_out += n
     text, n = cut_names(f, text)
     cut_out += n
+    text = strip_blanks(text)
     out = dst / f
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(f"//! copied_from: src/{f}@{sha}\n" + text)
@@ -346,6 +360,7 @@ else:
     qsrc = qsrc.replace('const std = @import("std");', 'const std = @import("std");\nconst kit_quant = @import("mlx_serve").abi.quant;', 1)
     qsrc, n = strip_tests("abi/quant.zig", qsrc, lambda name: any(x in name for x in test_filters))
     tests_out += n
+    qsrc = strip_blanks(qsrc)
     (dst / "abi").mkdir(parents=True, exist_ok=True)
     (dst / "abi/quant.zig").write_text(f"//! copied_from: src/abi/quant.zig@{sha}\n" + qsrc)
     print(f"abi/quant.zig: {len(same)} declarations re-exported from the kit ({', '.join(sorted(same))}); its own: {', '.join(sorted(set(mine) - set(same)))}")

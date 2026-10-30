@@ -8,8 +8,6 @@ const Generator = @import("../../generate/generator.zig").Generator;
 const MTP_EV_WARMUP_ROUNDS = @import("depth.zig").MTP_EV_WARMUP_ROUNDS;
 const mtpLowAcceptStreak = @import("adaptive.zig").mtpLowAcceptStreak;
 const mtpRegimeObserve = @import("regime.zig").mtpRegimeObserve;
-
-
 /// Minimum kv separation before two anchors can identify B. Below it the
 /// difference is dominated by round-to-round noise, not by the KV read.
 /// Round-end bookkeeping shared by the full- and partial-accept paths:
@@ -33,7 +31,6 @@ pub fn mtpExactDepth(self: *Generator, cap: u32) u32 {
     return if (self.xfm.mtp_depth_rounds % MTP_EXACT_PROBE == 0) 3 - best else best;
 }
 pub const MTP_EXACT_PROBE = 64;
-
 /// This request's first-draft acceptance: its own counts over a prior of
 /// MTP_EXACT_PRIOR_ROUNDS rounds at the model's rate. A second draft is
 /// kept about as often as a first on the same text, so it stands for both.
@@ -43,7 +40,6 @@ pub fn mtpExactAcceptance(self: *const Generator) f32 {
     return (kept + MTP_EXACT_PRIOR_ROUNDS * self.xfm.mtp_depth_acc) / (tried + MTP_EXACT_PRIOR_ROUNDS);
 }
 pub const MTP_EXACT_PRIOR_ROUNDS = 8;
-
 /// `m` drafts, `accepted` kept. A round's cost is the wall time since the
 /// previous round ended: everything a round adds to the request, streaming included.
 pub fn mtpExactObserve(self: *Generator, m: u32, accepted: u32) void {
@@ -59,7 +55,6 @@ pub fn mtpExactObserve(self: *Generator, m: u32, accepted: u32) void {
     self.mtp_kept += @intFromBool(accepted >= 1);
     self.xfm.mtp_depth_acc += 0.02 * (@as(f32, @floatFromInt(@intFromBool(accepted >= 1))) - self.xfm.mtp_depth_acc);
 }
-
 pub fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool, m_lo: u32, width_trial: bool, round_ms: f32) void {
     if (self.mtpEvFixOn()) self.mtp_ev_fix.wall_ms = 0;
     if (self.mtp_serial_accept) self.mtpExactObserve(m, tokens - 1);
@@ -100,7 +95,6 @@ pub fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool
     }
     self.specObserveRound(m, wall, tok, ev_planned and !two_chunk, shape_changed);
 }
-
 /// Feed the model's round-cost table (`Transformer.round_cost`, shared
 /// by every request and both block decoders). Width = drafts this round
 /// (0 = serial). The previous width is tracked on EVERY round so the

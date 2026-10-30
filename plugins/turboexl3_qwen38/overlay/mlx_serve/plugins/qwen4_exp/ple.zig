@@ -1,10 +1,8 @@
 //! copied_from: src/plugins/qwen4_exp/ple.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! The n-gram PLE layer: the host gather or GPU kernel into a deferred leaf (`ple_defer`, `flushDeferredPle`), the
 //! gated value injection and its dilated causal conv, the per-slot history, and the spec capture and rollback.
-
 const mlx = @import("../../mlx/ffi.zig");
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-
 pub const PlePending = struct {
     emb: mlx.mlx_array,
     token_ids: mlx.mlx_array,
@@ -20,8 +18,6 @@ pub const PlePending = struct {
     /// GPU arm: `emb` is the kernel's output, not a leaf; only the history is owed.
     gpu: bool = false,
 };
-
-
 // ── the PLE layer's elementwise tail in four launches ──
 //
 // Between its MLX projections, norms, gate sum and conv, the chain is 18 elementwise launches on the layer's critical
@@ -31,10 +27,5 @@ pub const PlePending = struct {
 // the concat's copy, and the two unary chains (the gate's seven ops, MLX's sigmoid) read from tables of MLX's own
 // results over every 16-bit pattern, so no transcendental is re-spelled. Pack-independent: the same bf16 operands on
 // any qwen4 pack, so it serves every one.
-
-
-
-
 // ── tests ──
-
 // ── qwen4 PLE: the GPU arm against the host gather (synthetic table, no model) ──

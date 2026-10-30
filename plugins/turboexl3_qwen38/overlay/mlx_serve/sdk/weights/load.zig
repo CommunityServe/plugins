@@ -1,11 +1,9 @@
 //! copied_from: src/sdk/weights/load.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! A pack's safetensors read into a `Weights` map: every shard the index names (or one file), with the tensors a load
 //! leaves out dropped and f16 side tensors and 1-D tables narrowed to the bf16 activations they meet.
-
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const affineParamsFromGeometry = @import("../quant/params.zig").affineParamsFromGeometry;
-
 /// A tiny affine-quantized tensor rewritten as the dense `[out, in]` a dense
 /// checkpoint ships (untransposed), so the paths keyed on the dense layout
 /// (hc prefill, the fused HC read, the softmax_gate fold) serve it too.
@@ -21,5 +19,4 @@ pub fn dequantizeSmall(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array
     sc.* = mlx.mlx_array_new();
     bi.* = mlx.mlx_array_new();
 }
-
 // ── tests ──

@@ -7,16 +7,11 @@ const exl3 = @import("../quant/exl3/format.zig");
 const distributed = @import("../../engines/mlx/cluster/distributed.zig");
 const kv_quant_mod = @import("../blocks/attention/kv_quant.zig");
 const mtp_acceptance_mod = @import("../spec/mtp_acceptance.zig");
-
 pub const HiddenAct = @import("../blocks/mlp/activations.zig").HiddenAct;
-
 /// Upper bound on a vision tower's per-layer type table (muse ships 50).
 pub const MAX_VISION_LAYERS = 64;
-
 pub const QuantMode = @import("../quant/params.zig").QuantMode;
-
 pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
-
 /// Sentence-transformers pooling operation for embedding requests (issue
 /// #116): masked mean over real positions, the CLS token (position 0), or the
 /// last real (non-padding) token. Every mode is followed by L2 normalization.
@@ -24,13 +19,9 @@ pub const PoolingMode = enum {
     mean,
     cls,
     last_token,
-
 };
-
 pub const Qwen4NormConvention = enum { delta, folded };
-
 pub const Llama3Rope = @import("../blocks/rope/rope.zig").Llama3Rope;
-
 /// `thinker_config.audio_config` of a Qwen3-ASR pack (mlx-audio's `AudioEncoderConfig`).
 pub const QwenAudioConfig = struct {
     d_model: u32 = 1024,
@@ -45,7 +36,6 @@ pub const QwenAudioConfig = struct {
     n_window_infer: u32 = 800,
     output_dim: u32 = 2048,
 };
-
 /// Qwen3-ForcedAligner: the trunk's head classifies each `<timestamp>` row
 /// into steps of `step_ms` (src/plugins/qwen3_asr/forced_align.zig).
 pub const ForcedAlignerConfig = struct {
@@ -54,12 +44,10 @@ pub const ForcedAlignerConfig = struct {
     /// `support_languages`, as `transcription.languageBit`s.
     languages: u32 = 0,
 };
-
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
     weight_prefix: []const u8 = "language_model.model",
-
     // Core dimensions
     vocab_size: u32 = 262208,
     hidden_size: u32 = 3840,
@@ -80,7 +68,6 @@ pub const ModelConfig = struct {
     norm_groups: u32 = 1,
     /// Prism Hadamard packs: every `<linear>.signs` weight reads `H_block(signs * x)` (rht.zig); 0 = none.
     hadamard_block: u32 = 0,
-
     // RoPE
     rope_theta: f32 = 1000000.0,
     rope_local_base_freq: f32 = 10000.0,
@@ -88,21 +75,17 @@ pub const ModelConfig = struct {
     rope_proportional: bool = false, // Gemma 4: full attention uses proportional RoPE
     rope_proportional_factor: f32 = 1.0,
     rope_llama3: ?Llama3Rope = null,
-
     // Sliding window attention
     has_sliding_window: bool = true,
     sliding_window: u32 = 1024,
     sliding_window_pattern: u32 = 6,
-
     // Quantization. 0 = dense bf16 (config.json has no "quantization" key);
     // quantized checkpoints always set this from that key (see parseConfig).
     quant_bits: u32 = 0,
     quant_group_size: u32 = 64,
     quant_mode: QuantMode = .affine,
-
     // Attention scale: 1/sqrt(query_pre_attn_scalar) for Gemma, 1/sqrt(head_dim) for others
     query_pre_attn_scalar: u32 = 256,
-
     // Architectural differences between model families
     tie_word_embeddings: bool = false,
     hidden_act: HiddenAct = .gelu_approx,
@@ -126,7 +109,6 @@ pub const ModelConfig = struct {
     swiglu_alpha: f32 = 1.702,
     /// GLM-5-Next's form under the same limit: silu(min(gate, limit)) * clip(up, ±limit).
     swiglu_clamp: bool = false,
-
     // MoE
     num_experts: u32 = 0,
     num_experts_per_tok: u32 = 0,
@@ -150,13 +132,11 @@ pub const ModelConfig = struct {
     // Laguna: MoE router logit soft-capping (tanh). 0 = off (the shipped
     // Laguna-S-2.1 checkpoint sets moe_router_logit_softcapping: 0.0).
     moe_router_logit_softcapping: f32 = 0.0,
-
     // Grouped ("noaux_tc") expert routing: split the biased scores into
     // moe_n_group equal groups, keep the moe_topk_group best by their top-2
     // sum, then take the global top-k inside the survivors. 1/1 = ungrouped.
     moe_n_group: u32 = 1,
     moe_topk_group: u32 = 1,
-
     // Linear attention (GatedDeltaNet)
     linear_num_key_heads: u32 = 0,
     linear_num_value_heads: u32 = 0,
@@ -165,7 +145,6 @@ pub const ModelConfig = struct {
     linear_conv_kernel_dim: u32 = 4,
     /// Set at parse for qwen4_exp (`gdnStateF32Enabled`); read through `ssmStateDtype`.
     ssm_state_f32: bool = false,
-
     // KDA (Kimi Delta Attention, bailing_hybrid) variations on the
     // GatedDeltaNet recurrence:
     //   - the forget gate is PER CHANNEL ([B,T,H,Dk]) rather than per head, so
@@ -178,7 +157,6 @@ pub const ModelConfig = struct {
     kda_vector_gate: bool = false,
     kda_gate_lower_bound: f32 = 0.0, // 0 = plain -exp(A_log)·softplus form
     kda_sigmoid_out_gate: bool = false,
-
     // Multi-head Latent Attention (bailing_hybrid's full-attention layers,
     // DeepSeek-V3 shape): low-rank Q (q_a_proj → q_a_layernorm → q_b_proj) and
     // a single compressed KV latent (kv_a_proj_with_mqa → kv_lora_rank latent
@@ -206,7 +184,6 @@ pub const ModelConfig = struct {
     // RoPE rotates ADJACENT PAIRS (x[2i], x[2i+1]) instead of halves — mlx's
     // `traditional` rope. Set by rope_interleave.
     rope_interleaved_pairs: bool = false,
-
     // Hybrid attention
     full_attention_interval: u32 = 0,
     // Hybrid archs: layers at or past this index are ALWAYS full
@@ -223,7 +200,6 @@ pub const ModelConfig = struct {
     dist_shard: ?distributed.Shard = null,
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
-
     // Qwen4-Exp (Qwen3.8-Flash-Next): gated residual streams ("hyper
     // connections", hc_count x hidden wide), a hashed n-gram embedding
     // injected at ONE layer (PLE), and Qwen Sparse Attention (indexer-selected
@@ -266,7 +242,6 @@ pub const ModelConfig = struct {
     /// weights, an mlx-stream pack (`glm_stream`) loads from it, and an `expert_bank`
     /// pack streams its experts from it. Set by `parseConfig`.
     pack_dir: ?[]const u8 = null,
-
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
     // softplus(fp32) → per-head scalar × attn output (reshaped [..,H,D]) before
     // o_proj. Distinct from attn_output_gate (qwen3-next sigmoid + doubled
@@ -276,7 +251,6 @@ pub const ModelConfig = struct {
     // KV heads uniform at num_key_value_heads). 0 = uniform num_attention_heads.
     num_attention_heads_per_layer: [128]u32 = @splat(0),
     has_per_layer_heads: bool = false,
-
     // MuseGlimmer (muse_glimmer): weight-less shared QK RMS-norm with Q scaled
     // by qk_scale_factor (folded into attnScale — a scalar commutes through
     // RoPE and QK^T), elementwise sigmoid attention output gate from a
@@ -296,7 +270,6 @@ pub const ModelConfig = struct {
     attn_gate_headwise: bool = false, // the gate is ONE scalar per head (g_proj [heads, hidden])
     attn_fused_qkv: bool = false, // checkpoint ships self_attn.q_k_v_proj = [q | k | v] rows
     layer_no_rope: [128]bool = @splat(false),
-
     // Laguna YaRN RoPE (full-attention layers only; sliding layers use default
     // RoPE at rope_local_base_freq). rope_yarn gates the freqs + mscale
     // precompute at model load; the sliding/full split is by isGlobalLayer.
@@ -309,7 +282,6 @@ pub const ModelConfig = struct {
     /// HF's `truncate` (default true): floor/ceil the ramp correction bounds to
     /// whole dims. Only the flat-`rope_parameters` readers set it.
     yarn_truncate: bool = true,
-
     // Inkling (inkling_mm_model, Thinking Machines Inkling Small). NO RoPE:
     // position = the RelativeLogits bias (per-layer wr_du → [heads, d_rel]
     // relative states × a learned [d_rel, extent] profile bank → additive bias
@@ -328,7 +300,6 @@ pub const ModelConfig = struct {
     logits_mup_width_multiplier: f32 = 1.0,
     // Slice logits to the first N rows (vocab padding; 0 = full vocab).
     unpadded_vocab_size: u32 = 0,
-
     // DeepSeek V4 Flash (deepseek_v4). MQA over ONE head_dim-wide latent
     // (num_key_value_heads == 1): low-rank Q (wq_a → q_norm → wq_b, then an
     // UNWEIGHTED per-head RMS), grouped low-rank O (o_groups slabs of
@@ -379,7 +350,6 @@ pub const ModelConfig = struct {
     dsv4_dspark_markov_rank: u32 = 0,
     dsv4_dspark_target_layers: [8]u8 = @splat(0),
     dsv4_n_dspark_target_layers: u32 = 0,
-
     // DeepSeek-V4.1 (deepseek_v41) on top of the dsv4_* block: only the
     // `kv_sources` layers compress KV and only the `index_sources` run an
     // indexer; every other compressed layer reads the latest source at or
@@ -409,12 +379,10 @@ pub const ModelConfig = struct {
     /// A GLM-5.3 pack (`glm_moe_dsa`, its routed experts in an `experts.bin` bank): mlx-stream serves it
     /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
     glm_stream: bool = false,
-
     // BERT encoder-only
     is_encoder_only: bool = false,
     layer_norm_eps: f32 = 1e-12,
     type_vocab_size: u32 = 0,
-
     /// Sentence-transformers pooling for /v1/embeddings (issue #116). null =
     /// no explicit signal → masked mean (the historical behavior, correct for
     /// MiniLM-class BERTs and EmbeddingGemma). Set from config.json
@@ -424,16 +392,13 @@ pub const ModelConfig = struct {
     /// capability WITHOUT flipping `is_encoder_only` — the forward stays the
     /// arch's own causal pass.
     pooling_mode: ?PoolingMode = null,
-
     // Bidirectional-attention embedding models (EmbeddingGemma): a decoder
     // arch (gemma3_text) trained as an encoder. Implies is_encoder_only.
     use_bidirectional_attention: bool = false,
     // BOS id from config.json (embedding models wrap inputs <bos>…<eos>).
     bos_token_id: ?u32 = null,
-
     // Context length from config.json (0 = unknown)
     max_position_embeddings: u32 = 0,
-
     /// Auto-context, FROZEN at model-load time (`server.pinAutoContext`).
     /// 0 = not pinned yet.
     ///
@@ -444,7 +409,6 @@ pub const ModelConfig = struct {
     /// so it has to hold still for the model's whole residency. Explicit
     /// `--ctx-size` still wins over this.
     pinned_context: u32 = 0,
-
     /// Per-model settings from `model-settings.json`, set at the load
     /// construction site. `ctx_override` 0 = the process `--ctx-size`/auto;
     /// `kv_quant_override` null = the process `--kv-quant`; `mtp_override`
@@ -477,7 +441,6 @@ pub const ModelConfig = struct {
     row_exact_covered: bool = false,
     /// A DFlash drafter is bound (`DflashModel.bind`): its block tree needs exact verify rows.
     dflash_bound: bool = false,
-
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
     /// launch/base chunk.
@@ -491,11 +454,9 @@ pub const ModelConfig = struct {
     /// `generate.effectivePrefillChunk` all read THIS field, so the bill and the
     /// forward can never disagree. Explicit `--prefill-chunk` still wins.
     pinned_prefill_chunk: u32 = 0,
-
     // Stop tokens (populated from config.json)
     eos_token_ids: [8]u32 = @splat(0),
     num_eos_tokens: u32 = 0,
-
     // Model-author sampling recommendations from generation_config.json
     // (e.g. Qwen 3.6: temp 1.0 / top_p 0.95 / top_k 20; Gemma 4: top_k 64).
     // null = the file or key is absent. Used as defaults for request fields
@@ -506,17 +467,14 @@ pub const ModelConfig = struct {
     gen_top_p: ?f32 = null,
     gen_top_k: ?u32 = null,
     gen_min_p: ?f32 = null,
-
     // The checkpoint's OWN thinking default, from generation_config.json's
     // `default_chat_template_kwargs.enable_thinking`. null = the file or key
     // is absent. Read by `defaultEnableThinking` for requests that name no
     // thinking preference; an explicit request value still outranks it.
     gen_enable_thinking: ?bool = null,
-
     // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
     has_explicit_layer_types: bool = false,
     layer_is_global: [128]bool = @splat(false),
-
     // Vision encoder (Gemma 4 SigLIP)
     has_vision: bool = false,
     /// EmbeddingGemma 2's processors (`processor_config.json`): soft tokens per image and per video FRAME, and
@@ -541,7 +499,6 @@ pub const ModelConfig = struct {
     image_token_id: u32 = 0, // 0 = no image token
     boi_token_id: u32 = 0, // beginning of image
     eoi_token_id: u32 = 0, // end of image
-
     // Gemma 4 12B "unified" (encoder-free) multimodal. Instead of the SigLIP
     // transformer tower, vision is a single patch embedder
     // (LN → Dense → LN → +factorized 2D posemb → LN → RMSNorm → Linear) and
@@ -561,7 +518,6 @@ pub const ModelConfig = struct {
     qwen_audio: ?QwenAudioConfig = null,
     /// Set on Qwen3-ForcedAligner, the ASR shape with a timestamp head.
     forced_aligner: ?ForcedAlignerConfig = null,
-
     // Qwen3.5/3.6 vision (Qwen3-VL ViT). Distinct from the Gemma SigLIP fields
     // above: Qwen ships a fused-qkv ViT with a patch merger, and the text trunk
     // uses INTERLEAVED M-RoPE (image tokens get 2D grid positions). Populated in
@@ -626,7 +582,6 @@ pub const ModelConfig = struct {
     glmv_swiglu_limit: f32 = 10.0,
     glmv_min_image_tokens: u32 = 16,
     glmv_max_image_tokens: u32 = 8000,
-
     // DeepSeek-V4.1 vision tower (src/plugins/deepseek_v41/vision.zig): the release's `vision_config`, on top of the
     // generic vision_* geometry. `dv_max_wh_ratio` 0 = no cap (the release's null).
     dsv41_vision: bool = false,
@@ -660,7 +615,6 @@ pub const ModelConfig = struct {
     video_token_id: u32 = 0,
     vision_start_token_id: u32 = 0,
     vision_end_token_id: u32 = 0,
-
     // Gemma 4: dual head dimensions and KV sharing
     global_head_dim: u32 = 0, // 0 = same as head_dim
     v_head_dim: u32 = 0, // 0 = same as the layer's head_dim (MiMo: K 192 / V 128)
@@ -673,13 +627,11 @@ pub const ModelConfig = struct {
     has_v_norm: bool = false, // parameter-free RMS norm on values
     // Gemma 4 (31B): full_attention layers share V with K (no v_proj stored)
     attention_k_eq_v: bool = false,
-
     // Hybrid layers (LFM2, Nemotron-H): per-layer type dispatch
     has_hybrid_layers: bool = false,
     layer_block_types: [128]LayerBlockType = @splat(.attention),
     has_embedding_norm: bool = false, // LFM2: RMS norm applied to embeddings
     has_final_norm: bool = true, // false for LFM2 (no model.norm.weight)
-
     // LFM2 gated convolution
     lfm_conv_kernel: u32 = 3,
     /// LFM2.5-8B-A1B (`lfm2_moe`): the hybrid trunk's per-layer MLP is a
@@ -690,7 +642,6 @@ pub const ModelConfig = struct {
     /// First N layers keep a DENSE feed-forward; the rest are MoE.
     num_dense_layers: u32 = 0,
     lfm_conv_dim: u32 = 0, // 0 = hidden_size
-
     // Mamba2 SSM (Nemotron-H)
     mamba_num_heads: u32 = 0,
     mamba_head_dim: u32 = 0,
@@ -702,7 +653,6 @@ pub const ModelConfig = struct {
     time_step_max: f32 = std.math.inf(f32),
     mamba_chunk_size: u32 = 256,
     mamba_mlp_act: HiddenAct = .relu_sq, // Nemotron-H MLP uses ReLU^2
-
     /// The PLE's layer among this process's layers; null when another pipeline rank holds it.
     /// `ple_layer_idx` stays the checkpoint's absolute index (it names the n-gram shards).
     pub fn pleLocalLayer(self: *const ModelConfig) ?u32 {
@@ -712,92 +662,76 @@ pub const ModelConfig = struct {
         if (abs < st or abs - st >= self.num_hidden_layers) return null;
         return abs - st;
     }
-
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
         if (self.full_attention_interval == 0) return false;
         if (self.linear_attn_tail_from != 0 and layer_idx >= self.linear_attn_tail_from) return false;
         return ((layer_idx + 1) % self.full_attention_interval) != 0;
     }
-
     /// Activation dtype: f16 for a Prism Hadamard pack (its own contract: f16
     /// activations over f16 scales), bf16 everywhere else.
     pub fn actDtype(self: *const ModelConfig) mlx.mlx_dtype {
         return if (self.hadamard_block > 0) .float16 else .bfloat16;
     }
-
     /// GatedDeltaNet recurrent state dtype, which the decay gate is computed in too:
     /// f32 where the reference runtime keeps it (Hadamard packs, GLM-5, qwen4_exp),
     /// since a gate near one rounds to 1.0 in bf16 and that head stops forgetting.
     pub fn ssmStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
         return if (self.hadamard_block > 0 or self.isGlm5() or self.ssm_state_f32) .float32 else .bfloat16;
     }
-
     pub fn rowExactArch(self: *const ModelConfig) bool {
         if (self.caps().exact_drafted) return true;
         return std.mem.startsWith(u8, self.model_type, "qwen3_5") and !self.isMoe() and self.hadamard_block == 0;
     }
-
     pub fn isGlm5(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "glm5_next");
     }
-
     pub fn isDsv41(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }
-
     pub fn isMimo(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
-
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.caps().moe or self.num_experts > 0;
     }
-
     /// The model's caps: its plugin's when served, else what the legacy parse declares.
     pub fn caps(self: *const ModelConfig) abi.Caps {
         return if (self.plugin) |b| b.parsed.caps else self.legacy.caps;
     }
-
     /// True when the full-attention layers are Multi-head Latent Attention
     /// (compressed KV latent + low-rank Q), not plain GQA projections.
     pub fn isMla(self: *const ModelConfig) bool {
         return self.mla_kv_lora_rank > 0;
     }
-
     /// MLA query/key head dim = the non-positional part plus the rope part.
     /// This — not head_dim — is what the attention scale and the cached K's
     /// last dim are measured in.
     pub fn mlaQkHeadDim(self: *const ModelConfig) u32 {
         return self.mla_qk_nope_head_dim + self.mla_qk_rope_head_dim;
     }
-
     /// Epsilon of the per-head q/k RMS norm in the linear-attention prework. GLM's reference
     /// normalizes with fla's l2norm (1e-6 on the SUM of squares), which is 1e-6/dk on the mean;
     /// its post-conv keys are small enough that 1e-6 on the mean shrank them ~2%.
     pub fn gdnQkNormEps(self: *const ModelConfig) f32 {
         return if (self.isGlm5()) 1e-6 / @as(f32, @floatFromInt(self.linear_key_head_dim)) else 1e-6;
     }
-
     /// Qwen3.8-Flash-Next (`qwen4_exp`): the qwen3_5 GDN + MoE trunk wrapped
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
     pub fn isQwen4(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
     }
-
     /// The long-context blast-radius predicate: every long-context mechanism (KV
     /// reservation, pad-waste cap, checkpoint thinning, admission terms, chunk bar) was
     /// measured on qwen4_exp only, so they are opt-in by arch. Never hand-roll it at a site.
     pub fn longCtxGated(self: *const ModelConfig) bool {
         return self.caps().long_ctx;
     }
-
     /// True when the trunk uses the Gemma 4 layer structure (dual FFN with
     /// shared-expert branch, sigma-MoE router, 7 norms, layer_scalar, v_norm,
     /// proportional RoPE on full layers).
     pub fn isGemma4Layers(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "gemma4");
     }
-
     /// The head width the PREFILL SCORE tensor is actually built at. Normally
     /// `head_dim`, but an arch can score at a different width than it stores
     /// values at (an MLA q.k can contract over nope+rope widths while
@@ -817,7 +751,6 @@ pub const ModelConfig = struct {
         if (self.isMla()) return self.mlaQkHeadDim();
         return self.head_dim;
     }
-
     /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
     /// `parseConfig`, and `drafter_override`); everything else is plain data or a borrowed slice. Every
     /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
@@ -833,8 +766,6 @@ pub const ModelConfig = struct {
         self.plugin = null;
     }
 };
-
-
 /// True when the layer loop installed the PLE on exactly the layer the config names. A negative
 /// index asks for no PLE (the MTP head's own layer) and is satisfied by a loop that installed none.
 pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
@@ -844,15 +775,9 @@ pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
     for (has_ple, 0..) |p, i| if (p != (i == want)) return false;
     return true;
 }
-
-
 // Optional config nulls have the same fallback and precedence as omitted keys.
-
 pub const Weights = @import("../weights/resident.zig").Weights;
-
-
 // ── Tests ──
-
 // ── qwen4_exp YaRN context extension (262144 → 1048576) ──────────────────
 //
 // Both documents below are the SHIPPED checkpoint's text config (Qwen3.8-Flash-

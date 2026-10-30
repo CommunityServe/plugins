@@ -8,10 +8,6 @@
 //! f32 accumulation order differs. On an EXL3 trunk pack (`readTrunk`), from two rows up a threadgroup applies its
 //! weight loads to several rows (the multi-row launches), and a dense bf16 read at hc 4 takes decode3's pair; a row's
 //! bytes are the one-row launches' in every case.
-
-
-
-
 /// decode3's kernel shape (none changes a byte, they place work): down rows a simdgroup computes in turn, rows per down
 /// threadgroup, simdgroups (columns) per up threadgroup, the up weights unpacked once for every row, the weights' loads
 /// issued first.
@@ -22,5 +18,3 @@ pub const D3_WH: c_int = 1;
 pub const D3_LF: c_int = 0;
 /// Simdgroups of decode3's down threadgroup: 256 threads, the norm's layout.
 pub const D3_SGD: c_int = 8;
-
-

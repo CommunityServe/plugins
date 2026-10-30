@@ -1,14 +1,11 @@
 //! copied_from: src/engines/mlx/ssm/entry.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! engines/mlx/ssm/entry.
 //! Owns SSMCacheEntry, arrayBytes, qsaRawKeyBytes, ssmEntryBytes, SSMCacheEntrySnapshot, ssmSnapshot, and 7 more.
-
 const qwen4_mod = @import("../../../plugins/qwen4_exp/qwen4_exp.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("../../../sdk/blocks/gdn/decode.zig");
 const PersistentSsmGroup = @import("group.zig").PersistentSsmGroup;
-
 // ── SSM Cache (for GatedDeltaNet linear attention layers) ──
-
 pub const SSMCacheEntry = struct {
     conv_state: mlx.mlx_array, // [B, kernel-1, conv_dim]
     ssm_state: mlx.mlx_array, // [B, Hv, Dv, Dk]
@@ -79,7 +76,6 @@ pub const SSMCacheEntry = struct {
     /// member whose gen moved. Read only from the entries, never from a ctx copy.
     member_gen: u64 = 0,
 };
-
 /// SSM snapshot value. Holds clones of conv_state and ssm_state via refcount —
 /// the underlying buffer is shared with the source entry, but the snapshot
 /// owns its own array handles and frees them on deinit. Used for
@@ -100,7 +96,6 @@ pub const SSMCacheEntrySnapshot = struct {
     ple_prev: [qwen4_mod.MAX_NGRAM_SIZE]u32 = @splat(0),
     ple_prev_valid: bool = false,
 };
-
 pub fn ssmSnapshotDeinit(snap: *SSMCacheEntrySnapshot) void {
     _ = mlx.mlx_array_free(snap.conv_state);
     _ = mlx.mlx_array_free(snap.ssm_state);
@@ -109,7 +104,6 @@ pub fn ssmSnapshotDeinit(snap: *SSMCacheEntrySnapshot) void {
     snap.aux_state = .{ .ctx = null };
     snap.qsa_pooled = .{ .ctx = null };
 }
-
 /// Free the transient PLD spec-decode capture buffers on an SSM entry
 /// (`spec_state_seq` / `spec_conv_input`). Idempotent — safe to call on an
 /// entry that never captured. Called at the end of every `nextPld` round and
@@ -134,5 +128,4 @@ pub fn ssmFreeSpecCapture(entry: *SSMCacheEntry) void {
     }
     entry.spec_ple_len = 0;
 }
-
 // ── tests ──

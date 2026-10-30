@@ -5,7 +5,6 @@
 //! runs the layer's SwiGLU (`swiglu`). A claimant is `sdk/quant/formats.zig`'s `claimantAmong`, over the built-in
 //! formats and turboexl3's table (linked in, build.zig.zon): the built-in EXL3 table is Sushi's (banks only), and
 //! turboexl3's outranks it on the blocks it claims. Also the numerics the trunk's reordering paths read.
-
 const std = @import("std");
 const abi = @import("../../../abi/quant.zig");
 const host_abi = @import("mlx_serve").abi.host;
@@ -16,16 +15,13 @@ const formats = @import("../../../sdk/quant/formats.zig");
 const quant_resident = @import("../../../sdk/quant/resident.zig");
 const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
 const Trunk = @import("../trunk.zig").Trunk;
-
 /// The arithmetic the trunk's own paths run in. `exact`: no path that reorders a sum (the reference). `reordered`: the
 /// paths that do.
 pub const Numerics = enum { exact, reordered };
-
 /// The numerics: reordered on the profile (the configuration the reordered paths were measured on), exact elsewhere.
 pub fn numericsFor(profile: bool) Numerics {
     return if (profile) .reordered else .exact;
 }
-
 /// What the load hands the formats beside the map: the pack's config text, its format blocks and the host table.
 pub const Pack = struct {
     config_json: []const u8 = "{}",
@@ -35,7 +31,6 @@ pub const Pack = struct {
     host: ?*const host_abi.Host = null,
     model_dir: []const u8 = "",
 };
-
 pub const Formats = struct {
     /// The format of the trunk's linears and of the routed banks; null where they are the trunk's own.
     trunk: ?*const abi.QuantTable = null,
@@ -49,7 +44,6 @@ pub const Formats = struct {
     profile: bool = false,
     /// The bytes the trunk format keeps resident for this model (`armTrunkResident`; 0: per-call decode).
     resident_bytes: u64 = 0,
-
     pub fn deinit(self: *Formats, a: std.mem.Allocator) void {
         if (self.trunk) |t| {
             // The kept matrices first: they are keyed by the weights' handles.
@@ -68,19 +62,16 @@ pub const Formats = struct {
         self.banks.deinit(a);
         self.* = .{};
     }
-
     /// The trunk format's weight for the map's `.weight` array `w`; null for a linear the trunk runs itself.
     pub fn linearOf(self: *const Formats, w: mlx.mlx_array) ?*const abi.Weight {
         if (self.linears.count() == 0) return null;
         return self.linears.getPtr(@intFromPtr(w.ctx));
     }
-
     /// The expert format's banks of the MoE block `mw`; null for banks the trunk runs itself.
     pub fn banksOf(self: *const Formats, mw: *const MoeMlpWeights) ?*const [3]abi.Weight {
         if (self.banks.count() == 0) return null;
         return self.banks.getPtr(@intFromPtr(mw.switch_gate_w.ctx));
     }
-
     /// `x @ W^T` through the trunk format.
     pub fn matmul(self: *const Formats, w: *const abi.Weight, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
         const t = self.trunk orelse return error.TrunkFormatMissing;
@@ -92,7 +83,6 @@ pub const Formats = struct {
         }
         return .{ .ctx = out.ctx };
     }
-
     /// The routed SwiGLU of `x` [B, S, D] through banks `b`'s experts `inds` [B, S, K], weighted by `scores`.
     pub fn swiglu(self: *const Formats, b: *const [3]abi.Weight, x: mlx.mlx_array, inds: mlx.mlx_array, scores: mlx.mlx_array, opts: abi.Swiglu, s: mlx.mlx_stream) !mlx.mlx_array {
         const t = self.experts orelse return error.ExpertFormatMissing;
@@ -105,12 +95,10 @@ pub const Formats = struct {
         return .{ .ctx = out.ctx };
     }
 };
-
 /// The reordered numerics: a path that reorders a sum may run.
 pub fn reordered(self: *const Trunk) bool {
     return self.formats.numerics == .reordered;
 }
-
 /// One load's formats while they are open: `begin` claims and opens them and loads the trunk's linears, `banks` loads
 /// one MoE layer's routed banks, `end` closes them (the weights outlive it, in `formats`). Stays at its address while
 /// open: the load contexts point into it.
@@ -120,7 +108,6 @@ pub const Loading = struct {
     src: abi.Source,
     trunk_ctx: ?abi.LoadCtx = null,
     experts_ctx: ?abi.LoadCtx = null,
-
     /// Refused by name: a format block nobody claims, a format that refuses it, a linear or bank it does not serve.
     pub fn begin(self: *Loading, a: std.mem.Allocator, config: *const model.ModelConfig, weights: *const model.Weights, pack: Pack, s: mlx.mlx_stream) !void {
         self.* = .{ .a = a, .src = .{ .ctx = @constCast(weights), .get = tensorOf } };
@@ -159,7 +146,6 @@ pub const Loading = struct {
             if (f.experts) |t| t.name.slice() else "their affine banks",
         });
     }
-
     /// Layer `layer`'s banks under `<prefix>.layers.<layer>.mlp.switch_mlp` through the expert format (none: nothing);
     /// `hidden` / `inter` pin their widths (0: unchecked).
     pub fn banks(self: *Loading, prefix: []const u8, layer: u32, mw: *const MoeMlpWeights, hidden: u32, inter: u32) !void {
@@ -182,7 +168,6 @@ pub const Loading = struct {
         }
         slot.value_ptr.* = out;
     }
-
     /// Closes the open formats; their weights stay in `formats`.
     pub fn end(self: *Loading) void {
         if (self.trunk_ctx) |*c| self.formats.trunk.?.close(c);
@@ -190,12 +175,10 @@ pub const Loading = struct {
         self.trunk_ctx = null;
         self.experts_ctx = null;
     }
-
     fn abort(self: *Loading) void {
         self.end();
         self.formats.deinit(self.a);
     }
-
     fn open(self: *Loading, slot: *?abi.LoadCtx, t: *const abi.QuantTable, block_json: []const u8, pack: Pack, s: mlx.mlx_stream, comptime key: []const u8) !void {
         slot.* = .{
             .model_dir = abi.Str.of(pack.model_dir),
@@ -211,7 +194,6 @@ pub const Loading = struct {
         log.err("[qwen4] {s} refuses the pack's " ++ key ++ " block ({s})\n", .{ t.name.slice(), v.why.slice() });
         return error.QuantFormatRefused;
     }
-
     /// Every `.weight` in neither of MLX's encodings, through the trunk format; the count.
     fn loadLinears(self: *Loading, t: *const abi.QuantTable, weights: *const model.Weights) !u32 {
         var n: u32 = 0;
@@ -240,12 +222,10 @@ pub const Loading = struct {
         return n;
     }
 };
-
 /// The quant tables the trunk weighs beside the built-in formats: turboexl3's, linked in (build.zig.zon). Tests swap
 /// their own in.
 var extra_tables: []const *const abi.QuantTable = &linked_tables;
 const linked_tables = [_]*const abi.QuantTable{&@import("turboexl3_table").table};
-
 /// The claimant of the pack's `key` block among `extra` and the built-ins, refused by name when nobody claims it.
 fn claimed(extra: []const *const abi.QuantTable, block_json: []const u8, config_json: []const u8, comptime key: []const u8) !*const abi.QuantTable {
     const got = formats.claimantAmong(extra, block_json, config_json) catch {
@@ -257,7 +237,6 @@ fn claimed(extra: []const *const abi.QuantTable, block_json: []const u8, config_
         return error.QuantFormatUnclaimed;
     };
 }
-
 /// MLX's own encodings of a `.weight`: a float table, or the uint32 words of MLX's quantized modes.
 fn mlxEncoded(w: mlx.mlx_array) bool {
     return switch (mlx.mlx_array_dtype(w)) {
@@ -265,12 +244,10 @@ fn mlxEncoded(w: mlx.mlx_array) bool {
         else => false,
     };
 }
-
 fn tensorOf(ctx: ?*anyopaque, name: abi.Str) callconv(.c) abi.Array {
     const w: *const model.Weights = @ptrCast(@alignCast(ctx.?));
     return .{ .ctx = (w.get(name.slice()) orelse return .{}).ctx };
 }
-
 fn rowsOf(x: mlx.mlx_array) usize {
     const sh = mlx.getShape(x);
     var rows: usize = 1;
@@ -279,11 +256,8 @@ fn rowsOf(x: mlx.mlx_array) usize {
     }
     return rows;
 }
-
 // ── tests ──
-
 const testing = std.testing;
-
 /// A quant table as the trunk reads it: it claims a `"fake"` block, loads any linear but one named `bad` (a
 /// new handle on the map's array) and returns `x` from its matmul.
 const Fake = struct {
@@ -315,18 +289,15 @@ const Fake = struct {
     }
     const table: abi.QuantTable = .{ .name = abi.Str.of("fake"), .claims = &claims, .validate = undefined, .bill = undefined, .open = &open, .close = &close, .load_tensor = &loadTensor, .load_bank = undefined, .release = &release, .matmul = &matmul, .moe = undefined };
 };
-
 fn putZeros(w: *model.Weights, name: []const u8, dt: mlx.mlx_dtype, shape: []const c_int) !void {
     var a = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, mlx.mlx_default_cpu_stream_new()));
     try w.put(name, a);
 }
-
 test "qwen4_exp formats: the numerics are reordered on the EXL3 trunk profile and exact elsewhere" {
     try testing.expectEqual(Numerics.reordered, numericsFor(true));
     try testing.expectEqual(Numerics.exact, numericsFor(false));
 }
-
 test "qwen4_exp formats: an unclaimed trunk block, a linear its format refuses and a pack without the block are refused by name" {
     var w = model.Weights.init(testing.allocator);
     defer w.deinit();

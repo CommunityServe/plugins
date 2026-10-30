@@ -1,14 +1,12 @@
 //! copied_from: src/plugins/qwen4_exp/hc.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! Hyper-connection streams: the compiled read/write callbacks (`compileQwen4Hc`), the stand-ins, `HcRead`, and the
 //! grouped RMS norm over the `hc` streams.
-
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const closureIn = @import("../../engines/mlx/compiled.zig").closureIn;
 const closureOut = @import("../../engines/mlx/compiled.zig").closureOut;
 const scalarOf = @import("../../engines/mlx/load/weights.zig").scalarOf;
 const Trunk = @import("trunk.zig").Trunk;
-
 /// qwen4_exp: compile the four hyper-connection elementwise tails. An EXL3 trunk pack's load also says whether its rows
 /// take the prefill kernels.
 pub fn compileQwen4Hc(self: *Trunk) void {
@@ -32,7 +30,6 @@ pub fn compileQwen4Hc(self: *Trunk) void {
     if (n > 0) log.info("[qwen4] hyper-connection tails compiled ({d}/4 kernels)\n", .{n});
     if (self.config.trunk_format and self.moe_layers.len > 0) if (self.moe_layers[0].hc_attn) |*w| @import("load.zig").sayHcPrefillAtLoad(w);
 }
-
 pub fn hcSiluCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Trunk = @ptrCast(@alignCast(payload.?));
     const x = closureIn(input, 0) orelse return -1;
@@ -40,7 +37,6 @@ pub fn hcSiluCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, p
     const y = self.silu(x) catch return -1;
     return closureOut(res, y);
 }
-
 pub fn hcMixCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Trunk = @ptrCast(@alignCast(payload.?));
     const up4 = closureIn(input, 0) orelse return -1;
@@ -57,7 +53,6 @@ pub fn hcMixCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, pa
     if (mlx.mlx_mean_axis(&mixed, prod, 2, false, self.s) != 0) return -1;
     return closureOut(res, mixed);
 }
-
 pub fn hcInjCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Trunk = @ptrCast(@alignCast(payload.?));
     const x = closureIn(input, 0) orelse return -1;
@@ -71,7 +66,6 @@ pub fn hcInjCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, pa
     if (mlx.mlx_multiply(&g, sig, two, self.s) != 0) return -1;
     return closureOut(res, g);
 }
-
 pub fn hcWriteCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Trunk = @ptrCast(@alignCast(payload.?));
     const stream4 = closureIn(input, 0) orelse return -1;
@@ -87,11 +81,8 @@ pub fn hcWriteCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, 
     if (mlx.mlx_add(&next, stream4, add4, self.s) != 0) return -1;
     return closureOut(res, next);
 }
-
 // ── MoE forward pass (Qwen3.5 + Gemma 4) ──
-
 // ── qwen4_exp (Qwen3.8-Flash-Next) ──
-
 pub const HcRead = struct {
     mixed: mlx.mlx_array, // [B, S, hidden]
     inj: mlx.mlx_array, // [B, S, hc, 1] (null-ctx on the mixer)
@@ -100,6 +91,4 @@ pub const HcRead = struct {
         if (self.inj.ctx != null) _ = mlx.mlx_array_free(self.inj);
     }
 };
-
 // ── tests ──
-

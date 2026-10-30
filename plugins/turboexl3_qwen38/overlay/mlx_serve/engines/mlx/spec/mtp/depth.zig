@@ -3,8 +3,6 @@
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const log = @import("../../../../sdk/util/log.zig");
 const Generator = @import("../../generate/generator.zig").Generator;
-
-
 // ── MTP adaptive depth ──
 // Unlike the drafter's binary gate, the MTP head has a useful fallback
 // BETWEEN "full depth" and "off": depth 1. Measured on Qwen3.6-27B
@@ -32,7 +30,6 @@ pub const MTP_PROMOTE_ABOVE: f32 = 0.60; // per-draft rate below configured dept
 // bare AR (24-26 tok/s vs oMLX's 41-47, which never fully disables).
 pub const MTP_DISABLE_BELOW: f32 = 0.20; // per-draft rate at depth 1 → disable (sticky)
 pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked after a demotion
-
 // ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
 // Drafts for a stochastic target are SAMPLED from a fixed sharper
 // distribution (constants mirror oMLX's _DRAFT_SAMPLER_*: their comment —
@@ -43,7 +40,6 @@ pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked afte
 // target's filtered p for ANY proposal q (pinned by the toy-vocab
 // exactness test); q only moves the ACCEPTANCE RATE, which is why the
 // draft head's quantization never affects correctness.
-
 /// Pure depth-policy step. `rate` is the windowed per-draft acceptance
 /// probability. Returns the new depth; 0 means "disable speculation".
 pub fn mtpNextDepth(current: u32, configured: u32, rate: f32) u32 {
@@ -52,7 +48,6 @@ pub fn mtpNextDepth(current: u32, configured: u32, rate: f32) u32 {
     if (current < configured and rate > MTP_PROMOTE_ABOVE) return current + 1;
     return current;
 }
-
 /// Confidence-gated depth decision. Demoting is cheap (still
 /// speculating) so it reacts on a small sample; DISABLING is sticky and
 /// PROMOTING raises verify cost, so both require more evidence. A
@@ -66,7 +61,6 @@ pub fn mtpDepthDecision(current: u32, configured: u32, rate: f32, window_rounds:
     if (next_depth > current and (window_rounds < 8 or promote_blocked)) return current;
     return next_depth;
 }
-
 /// Windowed adaptive-depth update, called once per nextMtp round with
 /// that round's (drafted, accepted) counts.
 pub fn updateMtpDepth(self: *Generator, drafted: u32, accepted: u32) void {
@@ -109,7 +103,6 @@ pub fn updateMtpDepth(self: *Generator, drafted: u32, accepted: u32) void {
     self.mtp_window_idx = 0;
     self.mtp_price.reset();
 }
-
 // ── MTP EV (expected-value) adaptive controller ──
 // Fixed-depth drafting is the warm-decode ceiling: at ~77% per-draft the
 // marginal chain decays with index, so one global depth wastes verify
@@ -122,7 +115,6 @@ pub fn updateMtpDepth(self: *Generator, drafted: u32, accepted: u32) void {
 // CONSIDER extension pay the one bounded chunk-A sync; when the plan
 // collapses to m_lo == m_hi the round is byte-identical in shape to the
 // fixed-depth path (no confidence graph, no sync).
-
 /// Default depth cap when `--mtp-max-depth` is not passed (0 = auto) and the
 /// EV controller is active. 6 keeps the verify forward at seq 1+6 = 7,
 /// the split-K verify-qmm kernel's ceiling on M1-M4. Eligible M5/G17
@@ -162,6 +154,4 @@ pub const MTP_EV_TAU_MAX: f32 = 0.95;
 /// keeps fully-cold EMAs collapsed on every cost profile (cold best_r:
 /// generic 1.00, G17-NAX 1.07/1.08).
 pub const MTP_EV_EXPLORE_MIN_R: f32 = 1.10;
-
 // ── tests ──
-

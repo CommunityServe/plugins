@@ -1,11 +1,9 @@
 //! copied_from: src/sdk/quant/block_test.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! `block.zig`'s tests, out of its import graph: a plugin unit that reaches `block.zig` never compiles them.
-
 const block_mod = @import("block.zig");
 const std = @import("std");
 const blocksOf = block_mod.blocksOf;
 const testing = std.testing;
-
 test "quant block: blocks are found under their keys; a config without one has none" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

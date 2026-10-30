@@ -11,7 +11,6 @@ const MtpEvCosts = @import("ev_costs.zig").MtpEvCosts;
 const MtpRoundPlan = @import("ev_plan.zig").MtpRoundPlan;
 const mtpEvExpectedTokens = @import("ev_plan.zig").mtpEvExpectedTokens;
 const MTP_EV_COST_BETA = @import("regime.zig").MTP_EV_COST_BETA;
-
 /// What two-chunk rounds cost and returned on this model (`Transformer.mtp_ev_fix`), fed by solo rounds of kept plans.
 /// It lives on the model like `round_cost`, so the warm-up's measurements price the next request from its first round.
 pub const Model = struct {
@@ -31,7 +30,6 @@ pub const Model = struct {
     /// The first collapse to one chunk is logged once per model.
     logged: bool = false,
 };
-
 /// This request's record (`Generator.mtp_ev_fix`).
 pub const Request = struct {
     /// Two-chunk plans priced, and how many of them became one chunk (`[spec-stats] ev_fix`).
@@ -41,7 +39,6 @@ pub const Request = struct {
     /// two rounds before it), else 0. Written by `mtpRoundEndObserve`, read by `mtpEvFixObserve`.
     wall_ms: f32 = 0,
 };
-
 /// What a priced plan reads besides the acceptance EMAs and the cost source.
 pub const Inputs = struct {
     /// One boundary in the cost source's floor units (`boundaryCost`).
@@ -50,16 +47,12 @@ pub const Inputs = struct {
     gain_ratio: f32 = 1.0,
     fire_ratio: f32 = 1.0,
 };
-
 /// Steady two-chunk rounds the realized excess needs before it replaces the read as the boundary's price.
 pub const EXCESS_MIN: u32 = 8;
-
 /// Ideal-gate evidence the realized ratios start from: a gate that extends on the wrong rounds prices itself out over
 /// a few rounds, not on one unlucky one.
 pub const PRIOR: f32 = 2.0;
-
 pub const Ratios = struct { gain: f32, fire: f32 };
-
 /// The boundary's price in ms: the realized excess once steady rounds measured it (floored at 0), else the read as the
 /// round sees it, else null (never measured).
 pub fn boundaryMs(st: Model) ?f32 {
@@ -67,7 +60,6 @@ pub fn boundaryMs(st: Model) ?f32 {
     if (st.read_ms > 0) return st.read_ms;
     return null;
 }
-
 /// The boundary in floor units: ms through the table's own scale, else through this request's round (an m_lo round
 /// costs T(m_lo)); the cost profile's `sync` until a considered round has measured one.
 pub fn boundaryCost(costs: MtpEvCosts, src: MtpCostSource, boundary_ms: ?f32, round_ms: f32, m_lo: u32) f32 {
@@ -76,7 +68,6 @@ pub fn boundaryCost(costs: MtpEvCosts, src: MtpCostSource, boundary_ms: ?f32, ro
     if (round_ms > 0) return ms / round_ms * src.roundCost(m_lo, false);
     return costs.sync;
 }
-
 /// Fold one steady two-chunk round's excess: a running mean over the first rounds (one noisy round must not seed an
 /// EMA), MTP_EV_COST_BETA after.
 pub fn excessFold(st: *Model, excess_ms: f32) void {
@@ -85,7 +76,6 @@ pub fn excessFold(st: *Model, excess_ms: f32) void {
     st.excess_ms += beta * (excess_ms - st.excess_ms);
     st.excess_n +|= 1;
 }
-
 /// The gate's realized yield against the ideal gate's promise. The yield is capped at 1; the firing rate is not (a
 /// gate that fires on failed chunks pays the extension more often).
 pub fn ratios(st: Model) Ratios {
@@ -95,7 +85,6 @@ pub fn ratios(st: Model) Ratios {
         .fire = @max((st.fire_real + k) / (st.fire_ideal + k), 0.0),
     };
 }
-
 /// Fold one round of a kept two-chunk plan (decay MTP_EV_COST_BETA). `drafted > m_lo` means the gate fired; the
 /// extension's tokens are the accepted drafts past m_lo.
 pub fn fold(st: *Model, plan: MtpRoundPlan, drafted: u32, accepted: u32) void {
@@ -109,7 +98,6 @@ pub fn fold(st: *Model, plan: MtpRoundPlan, drafted: u32, accepted: u32) void {
     st.fire_real = st.fire_real * keep + @as(f32, if (fired) 1.0 else 0.0);
     st.fire_ideal = st.fire_ideal * keep + plan.fire_ideal;
 }
-
 /// Keep `plan`'s two chunks only when they beat every single chunk from m_lo to min(m_hi, m_lo_max), valued at the
 /// ideal gate scaled by the realized ratios; else the best of those single chunks, the standing base kept unless a
 /// challenger beats it by the switch margin. A kept plan carries the ideal gate's promise to the round end.
@@ -155,12 +143,10 @@ pub fn gate(plan: MtpRoundPlan, a: []const f32, src: MtpCostSource, m_lo_max: u3
     }
     return .{ .m_lo = best_w, .m_hi = best_w, .tau_ln = 0.0 };
 }
-
 /// This request's head prices its two-chunk plans (`MtpHeadRef.exl3Profile`).
 pub fn mtpEvFixOn(self: *const Generator) bool {
     return if (self.mtp) |h| h.exl3Profile() else false;
 }
-
 /// `gate` on this round's base plan with the model's measurements: the boundary in floor units through the plan's own
 /// cost source, and the gate's realized yield.
 pub fn mtpEvFixPlan(self: *Generator, plan: MtpRoundPlan, cap: u32, src: MtpCostSource) MtpRoundPlan {
@@ -186,9 +172,7 @@ pub fn mtpEvFixPlan(self: *Generator, plan: MtpRoundPlan, cap: u32, src: MtpCost
     }
     return gated;
 }
-
 var ev_fix_said = false;
-
 /// Round end of a kept two-chunk plan, solo rounds only. Runs after `mtpRoundEndObserve`: two-chunk rounds never feed
 /// the table, so its single chunk at the drafted width is this round's counterfactual.
 pub fn mtpEvFixObserve(self: *Generator, plan: MtpRoundPlan, drafted: u32, accepted: u32) void {
@@ -200,6 +184,4 @@ pub fn mtpEvFixObserve(self: *Generator, plan: MtpRoundPlan, drafted: u32, accep
         if (t.measuredMs(drafted, t.bucketOf(self.mtpKvLen()))) |single_ms| excessFold(st, self.mtp_ev_fix.wall_ms - single_ms);
     }
 }
-
 // ── tests ──
-

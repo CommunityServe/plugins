@@ -1,7 +1,6 @@
 //! copied_from: src/plugins/qwen4_exp/mtp.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! qwen4_exp's MTP head (`Qwen4Mtp`, `Qwen4MtpState` swapped onto the module): its load, forward over the pre-mixer
 //! stream, QSA layer, history capture and rollback, the draft rerank, and the head-graph meters.
-
 const std = @import("std");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -20,8 +19,6 @@ const loadHcWeights = @import("load.zig").loadHcWeights;
 const QsaHeadMarkSet = @import("qsa/history.zig").QsaHeadMarkSet;
 const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
 const HcWeights = @import("weights.zig").HcWeights;
-
-
 /// qwen4_exp MTP head (vLLM #53896 / SGLang #36497 `residual_linear_shared`):
 ///   x = fc_hidden(rms_{4H}(stream)) per stream + fc_embedding(rms_H(embed))
 ///   → one full-attention decoder layer (own hc/QSA/MoE) → mixer → lm_head.
@@ -72,7 +69,6 @@ pub const Qwen4Mtp = struct {
     rerank: ?mtp_mod.RerankCoarse = null,
     rerank_logged: bool = false,
     rerank_tried: bool = false,
-
     /// Frees what the loader built and the head's per-request state.
     pub fn deinit(m: *Qwen4Mtp, a: std.mem.Allocator) void {
         for (m.owned) |arr| _ = mlx.mlx_array_free(arr);
@@ -85,14 +81,12 @@ pub const Qwen4Mtp = struct {
         if (m.rerank) |*rc| rc.deinit();
     }
 };
-
 /// The prefix of the MTP head's weights the pack ships (`<prefix>.fc_hidden` and its layer), or null.
 pub fn headPrefix(weights: *const Weights) ?[]const u8 {
     if (weights.get("language_model.mtp.fc_hidden.weight") != null) return "language_model.mtp";
     if (weights.get("mtp.fc_hidden.weight") != null) return "mtp";
     return null;
 }
-
 /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
 pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
     const mtp_prefix = headPrefix(weights) orelse return null;
@@ -146,7 +140,6 @@ pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: 
         .entry = entry,
     };
 }
-
 /// The head's PER-REQUEST half. Every request owns one and installs it on the
 /// module (`qwen4MtpActivate`) before any head operation; the module's own copy
 /// is whatever the last owner swapped out.
@@ -156,13 +149,11 @@ pub const Qwen4MtpState = struct {
     seq_offset: usize = 0,
     qsa_marks: QsaHeadMarkSet = .{},
     pos_base: c_int = -1,
-
     pub const Meta = struct {
         stash_len: usize,
         origin: c_int,
         cache_step: usize,
     };
-
     pub fn meta(self: *const Qwen4MtpState) Meta {
         return .{
             .stash_len = self.seq_offset,
@@ -170,20 +161,17 @@ pub const Qwen4MtpState = struct {
             .cache_step = self.cache.step,
         };
     }
-
     pub fn restoreMeta(self: *Qwen4MtpState, m: Meta) void {
         self.seq_offset = m.stash_len;
         self.pos_base = m.origin;
         self.cache.step = m.cache_step;
     }
-
     pub fn deinit(self: *Qwen4MtpState) void {
         self.cache.deinit();
         ssmFreeQsaState(&self.entry);
         self.qsa_marks.deinit();
     }
 };
-
 /// Pointers to one head's live runtime. The tick holds N of these without a module swap.
 pub const Qwen4MtpLive = struct {
     cache: *KVCache,
@@ -192,7 +180,6 @@ pub const Qwen4MtpLive = struct {
     pos_base: *c_int,
     qsa_marks: *QsaHeadMarkSet,
 };
-
 /// MTP draft logits: `stream_prev` `[B,S,hc*H]` is the trunk's pre-mixer
 /// stream at positions p.., `token_ids` `[B,S]` the tokens at p+1.., and
 /// `pos_offset` = p+1 of the first row (the draft query's own position).
@@ -208,17 +195,14 @@ pub const Qwen4MtpOut = struct {
     stream: mlx.mlx_array,
     mixed: mlx.mlx_array = .{ .ctx = null },
 };
-
 /// Owns the rows built so far, so a failure part-way frees exactly them.
 pub const Qwen4MtpOutBuf = struct {
     items: []Qwen4MtpOut,
     built: usize = 0,
     allocator: std.mem.Allocator,
-
     fn init(allocator: std.mem.Allocator, n: usize) !Qwen4MtpOutBuf {
         return .{ .items = try allocator.alloc(Qwen4MtpOut, n), .allocator = allocator };
     }
-
     fn deinit(self: *Qwen4MtpOutBuf) void {
         for (self.items[0..self.built]) |o| {
             if (o.logits.ctx != null) _ = mlx.mlx_array_free(o.logits);
@@ -227,9 +211,7 @@ pub const Qwen4MtpOutBuf = struct {
         }
         self.allocator.free(self.items);
     }
-
 };
-
 /// What `qwen4MtpForward` owes its caller past the head's own layer. The
 /// mixer read + the 248320-wide lm_head run over whatever rows `stream`
 /// carries, so a caller that consumes ONE row says so instead of paying
@@ -251,7 +233,6 @@ pub const Qwen4MtpProject = enum {
     /// never runs. `logits` comes back null; `stream` is the last row.
     mixed_last_row,
 };
-
 /// A draft row written past a padded history append. Key slots `[live_end, dead_end)`
 /// are dead history rows: hidden from its attention and its QSA block selection. The
 /// row ropes at `live_end + (slot - dead_end)`, the position it would hold with no pad.
@@ -260,7 +241,6 @@ pub const HeadPlace = struct {
     live_end: mlx.mlx_array,
     dead_end: c_int,
 };
-
 /// Test hook: layer-0 intermediates of the qwen4 forward (fixture bisect).
 pub const Qwen4Trace = struct {
     mixed_attn: mlx.mlx_array = .{ .ctx = null },
@@ -279,22 +259,18 @@ pub const Qwen4Trace = struct {
         }
     }
 };
-
 // ── tests ──
-
 /// A loaded qwen4_exp pack for the head tests; heap-held because the Trunk keeps a pointer to the weights.
 const Qwen4HeadRig = struct {
     config: model_mod.ModelConfig,
     weights: model_mod.Weights,
     xfm: Trunk,
-
     fn deinit(rig: *Qwen4HeadRig, alloc: std.mem.Allocator) void {
         rig.xfm.deinit();
         rig.weights.deinit();
         if (rig.config.ngram_table_path) |p| alloc.free(p);
         alloc.destroy(rig);
     }
-
     /// `n` seeded pre-mixer stream rows `[1,n,hc*H]`.
     fn stream(rig: *Qwen4HeadRig, seed: u64, n: c_int) !mlx.mlx_array {
         const width: c_int = @intCast(rig.config.hc_count * rig.config.hidden_size);
@@ -305,5 +281,4 @@ const Qwen4HeadRig = struct {
         try mlx.check(mlx.mlx_random_normal(&out, &[_]c_int{ 1, n, width }, 3, .bfloat16, 0, 1, key, rig.xfm.s));
         return out;
     }
-
 };

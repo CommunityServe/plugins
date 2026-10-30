@@ -13,25 +13,21 @@
 //! `"bits":"16"`) for bit-exact PLE lookups. A fully EXL3 pack names its own
 //! file (`ngram_table.file`): `exl3_ngram_trellis` rows, K-bit MUL1 trellis
 //! rings decoded on the host, plus a per-head bias the pack's shards hold.
-
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 const log = @import("../../sdk/util/log.zig");
 const ple_gpu = @import("ple_gpu.zig");
 const embedded_ple = @import("ple_table.zig");
-
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;
 const SPLITMIX_M1: u64 = 0xBF58476D1CE4E5B9;
 const SPLITMIX_M2: u64 = 0x94D049BB133111EB;
 const PRIME_1: u64 = 10007;
-
 fn splitmix64(v0: u64) u64 {
     var v = v0 +% SPLITMIX_GAMMA;
     v = (v ^ (v >> 30)) *% SPLITMIX_M1;
     v = (v ^ (v >> 27)) *% SPLITMIX_M2;
     return v ^ (v >> 31);
 }
-
 fn isPrime(v: u64) bool {
     if (v < 2) return false;
     if (v % 2 == 0) return v == 2;
@@ -41,7 +37,6 @@ fn isPrime(v: u64) bool {
     }
     return true;
 }
-
 fn nthPrimeAfter(start: u64, count: u32) u64 {
     var p = start;
     for (0..count) |_| {
@@ -50,11 +45,9 @@ fn nthPrimeAfter(start: u64, count: u32) u64 {
     }
     return p;
 }
-
 /// Config-driven bounds; `model.validateQwen4Config` refuses a checkpoint past them at load.
 pub const MAX_HEADS = 32;
 pub const MAX_NGRAM_SIZE = 8;
-
 /// Everything `Qwen4ExpTextNGramEmbedding.__init__` derives from the config.
 pub const NgramHash = struct {
     ngram_size: u32,
@@ -65,7 +58,6 @@ pub const NgramHash = struct {
     vocab: [MAX_HEADS]i64,
     offsets: [MAX_HEADS]i64,
     total_rows: u64,
-
     /// `ple_layer_index` is the PLE's ordinal among the config's injection points (0 for the
     /// one we support). Fallible: every bound writes a fixed array.
     pub fn init(unigram_vocab: u32, ngram_size: u32, heads_per_ngram: u32, vocab_base: u64, divisor: u64, seed: u64, ple_layer_index: u32, eos: u32) !NgramHash {
@@ -102,9 +94,7 @@ pub const NgramHash = struct {
         h.total_rows = (total + divisor - 1) / divisor * divisor;
         return h;
     }
-
 };
-
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const WarmState = struct {
     /// What the background page-cache warm has read so far, and the table's total size. Published
@@ -116,8 +106,6 @@ pub const warm_shared = @import("../../sdk/util/shared.zig").Shared(WarmState, "
 pub inline fn warmBytes() *WarmState {
     return warm_shared.get();
 }
-
-
 pub const NgramTable = struct {
     map: []align(std.heap.page_size_min) const u8,
     rows: u64,
@@ -152,7 +140,6 @@ pub const NgramTable = struct {
     head_bias: ?[]f32 = null,
     /// The PLE prefetch's readers (`prefetchBegin`): a trellis table's prefill rows, read ahead of their gathers.
     ahead: ?*Ahead = null,
-
     pub fn open(path: []const u8) !NgramTable {
         if (comptime @import("builtin").os.tag == .windows) return error.NgramTableUnsupportedOnWindows;
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -177,7 +164,6 @@ pub const NgramTable = struct {
         if (t.trellis_k != 0 and t.pool != null) t.ahead = Ahead.create() catch null;
         return t;
     }
-
     /// Widths `mx.quantize` packs and `dequantRow` unpacks, plus 16 = raw
     /// BF16 rows (no scales/biases; `row` copies them out converted to f32).
     fn bitsSupported(bits: u32) bool {
@@ -186,9 +172,7 @@ pub const NgramTable = struct {
             else => false,
         };
     }
-
     const HeaderRegion = embedded_ple.HeaderRegion;
-
     /// One header entry, every access checked and the region proven to hold exactly
     /// `rows x cols x elem` bytes inside the mapping.
     fn headerRegion(
@@ -207,10 +191,8 @@ pub const NgramTable = struct {
         if (r.cols > std.math.maxInt(u32) or r.rows > std.math.maxInt(u32)) return error.NgramTableRegion;
         return r;
     }
-
     /// Absent `format` stamp is accepted once, loudly; a different format is a refusal.
     var stamp_warned: bool = false;
-
     pub fn parse(map: []align(std.heap.page_size_min) const u8, header: []const u8, data_off: usize) !NgramTable {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
@@ -234,7 +216,6 @@ pub const NgramTable = struct {
         const bits: u32 = std.fmt.parseInt(u32, bits_v.string, 10) catch return error.NgramTableHeader;
         const gs: u32 = std.fmt.parseInt(u32, gs_v.string, 10) catch return error.NgramTableHeader;
         if (!bitsSupported(bits)) return error.NgramTableBits;
-
         // Raw BF16 mode: one `weight` BF16 [rows, dim] region, no
         // scales/biases. `wcols`/`scols` stay 0; only `row`'s raw arm reads it.
         if (bits == 16) {
@@ -253,20 +234,16 @@ pub const NgramTable = struct {
                 .scols = 0,
             };
         }
-
         if (gs == 0 or gs > 1024) return error.NgramTableBits;
-
         const w = try headerRegion(obj, "weight", "U32", 4, map.len, data_off);
         const sc = try headerRegion(obj, "scales", "BF16", 2, map.len, data_off);
         const bi = try headerRegion(obj, "biases", "BF16", 2, map.len, data_off);
         // The three regions describe the same rows and may not overlap.
         if (sc.rows != w.rows or bi.rows != w.rows or sc.cols != bi.cols) return error.NgramTableRegion;
         if (w.overlaps(sc) or w.overlaps(bi) or sc.overlaps(bi)) return error.NgramTableRegion;
-
         const dim: u64 = sc.cols * gs;
         if (dim > std.math.maxInt(u32)) return error.NgramTableRegion;
         if (dim * bits != w.cols * 32) return error.NgramTableHeader;
-
         return .{
             .map = map,
             .rows = w.rows,
@@ -280,7 +257,6 @@ pub const NgramTable = struct {
             .scols = @intCast(sc.cols),
         };
     }
-
     /// The `exl3_ngram_trellis` format: one I16 tensor [rows, 1 + dim*K/16] whose row is the ring's f16 scale and then
     /// its dim*K-bit stream (stream bits [i*K, (i+1)*K) are symbol i). Metadata: `K` 2..8, `row_dim`, codebook MUL1.
     fn parseTrellis(map: []align(std.heap.page_size_min) const u8, obj: std.json.ObjectMap, meta: std.json.ObjectMap, data_off: usize) !NgramTable {
@@ -315,7 +291,6 @@ pub const NgramTable = struct {
             .trellis_k = K,
         };
     }
-
     pub fn close(self: *NgramTable) void {
         // The readers pread through `fd`: joined before it closes.
         if (self.ahead) |a| a.destroy();
@@ -339,12 +314,9 @@ pub const NgramTable = struct {
             self.embedded = null;
         } else if (!self.gpu_owns_map and !(comptime @import("builtin").os.tag == .windows)) std.posix.munmap(self.map); // never mapped on Windows
     }
-
 };
-
 /// The widest trellis ring a table may have: the decode's stack buffers.
 const max_trellis_dim = 1024;
-
 /// Persistent gather workers. Every row's three regions are one SSD read on
 /// the cold 32 GB table (~100 us), 48 per token: serial mmap faults were ~5 ms
 /// of every decode step, 16 fault threads ~0.7 ms, and more threads got SLOWER
@@ -384,12 +356,10 @@ const PrefetchPool = struct {
     /// The trellis decode's engagement line has been said (inference thread only).
     trellis_said: bool = false,
     threads: [N]std.Thread = undefined,
-
     fn destroy(self: *PrefetchPool) void {
         self.shutdown(N);
         std.heap.page_allocator.destroy(self);
     }
-
     fn shutdown(self: *PrefetchPool, started: usize) void {
         const io = std.Io.Threaded.global_single_threaded.io();
         self.mu.lockUncancelable(io);
@@ -398,24 +368,14 @@ const PrefetchPool = struct {
         self.mu.unlock(io);
         for (self.threads[0..started]) |t| t.join();
     }
-
     const Job = enum { pread, trellis, trellis_cold };
-
 };
-
-
-
 // ── The PLE prefetch: a prefill's trellis rows, read ahead of its gathers ──
-
 /// Segments one gather can see; its rows past them are read the plain way.
 const AHEAD_VIEW_SEGS: usize = 8;
 const AHEAD_READERS: usize = 32;
 const AH_NO_SEG: usize = std.math.maxInt(usize);
-
-
-
 pub const AheadGeometry = struct { seg_tokens: usize, seg_rows: usize, n_segs: usize, slots: usize, bytes: usize };
-
 const AheadSlot = struct {
     /// The segment published here, or AH_NO_SEG (empty, or being planned). Under `Ahead.mu`.
     seg: usize = AH_NO_SEG,
@@ -427,7 +387,6 @@ const AheadSlot = struct {
     /// `[seg_rows][nb]` staged bytes; a row's are written by the reader that claimed it, before it stores AH_STAGED.
     bytes: []u8,
 };
-
 /// One prefill's plan and staging ring, from `prefetchBegin` to `prefetchEnd`: page-allocator memory bounded by the
 /// budget, plus the prompt's ids.
 const AheadSession = struct {
@@ -479,7 +438,6 @@ const AheadSession = struct {
     rows_mem: []i64 = &.{},
     state_mem: []std.atomic.Value(u8) = &.{},
     bytes_mem: []u8 = &.{},
-
     fn deinit(s: *AheadSession) void {
         const pa = std.heap.page_allocator;
         pa.free(s.slots);
@@ -489,7 +447,6 @@ const AheadSession = struct {
         pa.free(s.tokens);
         pa.destroy(s);
     }
-
     /// The request's summary (`Ahead.end`), at debug level.
     fn report(s: *const AheadSession) void {
         const mb = @as(f64, @floatFromInt(s.bytes_mem.len + s.rows_mem.len * @sizeOf(i64) + s.state_mem.len)) / 1048576.0;
@@ -498,7 +455,6 @@ const AheadSession = struct {
         });
     }
 };
-
 /// One gather's window on the open session, resolved under `Ahead.mu` by `beginGather`: the segments it sees cannot be
 /// replanned before `endGather`. The pool's workers call `take` concurrently.
 const AheadView = struct {
@@ -514,9 +470,7 @@ const AheadView = struct {
     hits: std.atomic.Value(u64) = .init(0),
     waits: std.atomic.Value(u64) = .init(0),
     gave_up: std.atomic.Value(u64) = .init(0),
-
 };
-
 /// The prefetch's readers and the open session (at most one: the running prefill's), for a trellis table: the prompt's
 /// rows are planned (`planRows`) and `pread` in position order into a bounded ring of segments while earlier chunks run;
 /// a gather takes a staged row only where its planned id is the one it asks for (`AheadView.take`), so the output is the
@@ -531,7 +485,6 @@ const Ahead = struct {
     open: std.atomic.Value(bool) = .init(false),
     n_threads: usize = 0,
     threads: [AHEAD_READERS]std.Thread = undefined,
-
     fn shutdown(self: *Ahead, started: usize) void {
         const io = std.Io.Threaded.global_single_threaded.io();
         self.mu.lockUncancelable(io);
@@ -540,13 +493,11 @@ const Ahead = struct {
         self.mu.unlock(io);
         for (self.threads[0..started]) |t| t.join();
     }
-
     fn destroy(self: *Ahead) void {
         self.end();
         self.shutdown(self.n_threads);
         std.heap.page_allocator.destroy(self);
     }
-
     /// Stops and frees the open session, if any: each reader finishes the row it is reading, a running gather completes.
     fn end(self: *Ahead) void {
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -564,15 +515,10 @@ const Ahead = struct {
         s.report();
         s.deinit();
     }
-
 };
-
-
 const CalibrationPhase = enum { load, warmed };
 const Calibration = struct { serial_ns: u64 = 0, pool_ns: u64 = 0, phase: CalibrationPhase = .load };
-
 // ── tests ──
-
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
 /// the mmapped table. Non-null on `Trunk.qwen4` ⇒ the arch is served
 /// serially with speculation off (`ownsModuleDecodeState`), which is what
@@ -583,11 +529,9 @@ pub const Qwen4State = struct {
     table: NgramTable,
     /// The table as one no-copy GPU buffer; null = the host gather serves every forward.
     gpu: ?ple_gpu.Table = null,
-
     pub fn deinit(self: *Qwen4State) void {
         self.table.close();
         if (self.gpu) |g| g.release();
         self.gpu = null;
     }
 };
-
