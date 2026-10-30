@@ -19,7 +19,8 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load. MTP needs tw
   src/host_flags.zig reads the server's `--mtp-min-depth` and `--mtp-max-depth` (and the old `--mtp-depth`) off its
   arguments: equal values pin the depth every round drafts. It also reads `--max-mtp-ctx` (no drafting past that
   context), `--mtp-history-window` (a long prompt's head history from its last positions only) and `--warmup-eager` /
-  `--no-warmup-eager` (the verify warm-up at load), as the built-in Qwen3.8 takes them.
+  `--no-warmup-eager` (whether the startup load of `--model` warms the verify widths), as the built-in Qwen3.8 takes
+  them.
 
 ## Measured
 

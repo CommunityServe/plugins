@@ -9,7 +9,9 @@
 //! prompt chunk's rows with the prompt's tokens after them (`resume_prompt` hands the prompt in), as #1005's prefill
 //! appends each chunk; the last row's stream waits as `last` for the token after it. As in #1005, a prompt chunk before
 //! the window `--mtp-history-window` keeps adds none (the history starts late, at the head's next position), nor does
-//! anything a request past `--max-mtp-ctx` forwards.
+//! anything a request past `--max-mtp-ctx` forwards. A request the engine runs no round for never drafts: the engine
+//! drafts from a request's first tick, so a one-row forward past the prompt before any round ends the history and frees
+//! the head's state. Its prompt's history is built all the same: nothing says which requests draft before the prefill.
 //!
 //! A round from t1 at `pos` runs the plan #1005's policy makes for it: the context's own continuation when the lookup
 //! gate prefers it, else the head's chain to the plan's base depth (the first step from `last` and t1, each next from the
@@ -78,6 +80,8 @@ const Slot = struct {
     base: u64 = 0,
     /// The history holds every committed row so far: rounds draft.
     synced: bool,
+    /// The engine ran a round (`step`, `verify`) for this request: it drafts.
+    drafts: bool = false,
     /// The request's round policy, from its first round (#1005's per-request state).
     gen: ?Generator = null,
     /// Committed ids the engine's own forwards left on the device, read into `gen.generated_ids` at the next round.
@@ -247,6 +251,19 @@ pub const Drafter = struct {
         sl.from = 0;
         sl.base = 0;
         sl.synced = true;
+        sl.drafts = false;
+    }
+
+    /// A request that decodes plain: its history ends, the head's state is freed, and no round of it drafts.
+    fn quiet(d: *Drafter, sl: *Slot) !void {
+        const t = &d.m.trunk;
+        const fresh = try mtp_head.qwen4MtpStateNew(t);
+        endRequest(sl);
+        mtp_head.qwen4MtpRelease(t, &sl.st);
+        sl.st.deinit();
+        sl.st = fresh;
+        setLast(sl, .{ .ctx = null });
+        sl.synced = false;
     }
 
     /// The request's policy, made at its first round as #1005's generate init makes it: the depth cap from the head's
@@ -286,11 +303,13 @@ pub const Drafter = struct {
         sl.from = if (mtp_mod.mtpCtxWithinLimit(d.max_mtp_ctx, ids.len)) historyFrom(ids.len, at, d.mtp_history_window) else std.math.maxInt(u64);
     }
 
-    /// Whether slot `id`'s forward of `n` rows at `pos` adds rows to its history, so `follow` reads its streams: not
-    /// one that ends at or before the history's start (`from`), unless it starts the slot over.
+    /// Whether slot `id`'s forward of `n` rows at `pos` adds rows to its history, so `follow` reads its streams: one that
+    /// starts the slot over, else one on a whole history (`synced`, at `next`) that ends past the history's start
+    /// (`from`), unless it is a request decoding plain (`decodesPlain`).
     pub fn takes(d: *const Drafter, id: u32, pos: u64, n: u32) bool {
-        const sl = d.slots.get(id) orelse return true;
-        return pos + n > sl.from or (pos == 0 and sl.next != 0);
+        const sl = d.slots.get(id) orelse return pos == 0;
+        if (pos == 0 and sl.next != 0) return true;
+        return sl.synced and pos == sl.next and pos + n > sl.from and !decodesPlain(sl, pos, n);
     }
 
     /// A slot's head history at a prompt boundary, copied (`aux.Snap.head`): its KV rows, its own QSA state, where its
@@ -366,6 +385,7 @@ pub const Drafter = struct {
         sl.from = 0;
         sl.base = if (head) |h| restoredBase(n, h.meta) else 0;
         sl.synced = head != null;
+        sl.drafts = false;
     }
 
     /// After slot `id`'s forward of `n` rows at `pos` (their ids `ids` on the host, else `ids_dev` on the device) with
@@ -379,6 +399,7 @@ pub const Drafter = struct {
             sl.synced = false;
             return;
         }
+        if (decodesPlain(sl, pos, n)) return d.quiet(sl);
         // Before the history's start: no rows, and the next row takes the head's next position.
         if (pos + n <= sl.from) {
             sl.next = pos + n;
@@ -463,6 +484,7 @@ pub const Drafter = struct {
     /// The request's policy brought up to t1: the ids the engine's own forwards committed read into its generated
     /// tokens, and its budget (`accept_cap` drafts may still be kept). Null when the slot's history cannot draft.
     fn policyAt(d: *Drafter, id: u32, pos: u64, cap: u32) !?*Generator {
+        if (d.slots.get(id)) |s| s.drafts = true;
         const sl = d.ready(id, pos) orelse return null;
         const own = ownOf(d.m, id) orelse return null;
         const g = d.policyOf(sl, own);
@@ -1047,6 +1069,13 @@ fn historyFrom(len: u64, at: u64, window: usize) u64 {
     const prefix = len -| at -| 1;
     if (window == 0 or prefix <= mtp_mod.HISTORY_WINDOW_THRESHOLD) return 0;
     return at + prefix - @min(window, prefix);
+}
+
+/// Whether the engine's forward of `n` rows at `pos` is a one-row decode past the prompt for a request it has run no
+/// round for: one that never drafts. The engine runs a drafting request's first round at its first tick, where a
+/// forced span (a thinking budget's close) comes in one forward of several rows.
+fn decodesPlain(sl: *const Slot, pos: u64, n: u32) bool {
+    return !sl.drafts and n == 1 and sl.prompt.items.len > 0 and pos >= sl.prompt.items.len;
 }
 
 /// The `base` of a history restored at `n` with the head state `meta`: row n takes the head's next position, after its

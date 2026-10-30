@@ -123,6 +123,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    const eager = host_flags.warmsAt(flags, ctx.model_dir.slice());
     const s = gpa.create(Served) catch {
         out.* = Verdict.refuse(.failed, "turboexl3_qwen38: out of memory");
         return null;
@@ -138,19 +139,22 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // A pack without a head, or a server whose `mtp` setting is off: no rounds and no head history.
     if (s.drafter.has() and (q4.mtpSetting(ctx.settings_json.slice()) orelse true)) {
         s.mtp = true;
-        armHead(m, flags.warmup_eager);
+        armHead(m, eager);
         s.drafter.warmTwoChunk() catch |e| log.warn("[turboexl3_qwen38] the two-chunk warm-up failed ({s}): the first boundary is timed cold\n", .{@errorName(e)});
     }
     return s;
 }
 
 /// The head's load-time work, as #1005's load does it when the head serves (`qwen4_build_draft_rerank`, then its eager
-/// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and with `eager` (the
-/// server's eager warm-up, on unless `--no-warmup-eager`) each verify width's kernels, to the depth cap
+/// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and where the server's
+/// eager warm-up reaches the load (`eager`, `host_flags.warmsAt`) each verify width's kernels, to the depth cap
 /// `--mtp-max-depth` resolves to, compiled before any round is timed. The slots' KV is dense (`KVCache.init`).
 fn armHead(m: *q4.Model, eager: bool) void {
     _ = mtp_head.qwen4BuildDraftRerank(&m.trunk);
-    if (!eager) return;
+    if (!eager) {
+        log.info("[turboexl3_qwen38] --no-warmup-eager: no verify warm-up at load; each width compiles in its first round\n", .{});
+        return;
+    }
     const kv = KVQuantConfig.dense;
     const cap = ev_plan.resolveMtpDepthCapForProfile(depth_bounds.active.max, cost_profile.qwen4G17CostProfileForKv(&m.trunk, kv));
     warmup.warmupSpecVerify(&m.trunk, cap, kv) catch |e| log.warn("[turboexl3_qwen38] the verify warm-up failed ({s}): each width compiles in its first round\n", .{@errorName(e)});
@@ -169,8 +173,8 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 
 /// The host's slot caches are its engine's types, which this dylib's copies must never read as theirs: each slot runs
 /// on the state the model keeps for its id (`Caps.owns_decode_state`, `slot_state`). A forward's streams also extend
-/// the slot's MTP history; a forward whose rows join none (`Drafter.takes`) computes none, as #1005 captures no hidden
-/// for a prompt chunk before its history window.
+/// the slot's MTP history; a forward whose rows join none (`Drafter.takes`: a prompt chunk before the history window, a
+/// request that never drafts) computes none, as #1005 captures no hidden where it keeps no history.
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const s = served(mp);
     var own = f.*;

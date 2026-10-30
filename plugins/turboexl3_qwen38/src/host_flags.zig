@@ -16,8 +16,10 @@ pub const Flags = struct {
     max_mtp_ctx: u32 = 0,
     /// `--mtp-history-window`: a long prefill's head history covers its last this many positions; 0 = all of them.
     mtp_history_window: usize = 0,
-    /// `--warmup-eager` / `--no-warmup-eager`: the load warms the verify widths.
+    /// `--warmup-eager` / `--no-warmup-eager`: the server's startup load warms (`warmsAt`).
     warmup_eager: bool = true,
+    /// `--model`: the model the server loads at its start, the one load the warm-up flags reach.
+    model: ?[]const u8 = null,
 
     /// The draft-depth range as the server's configure sets it from `--mtp-min-depth` and `--mtp-max-depth`, checked
     /// as its main checks it; null when neither is named.
@@ -39,6 +41,7 @@ const known = .{
     .{ .name = "--mtp-history-window", .field = "mtp_history_window", .value = positions },
     .{ .name = "--warmup-eager", .field = "warmup_eager", .set = true },
     .{ .name = "--no-warmup-eager", .field = "warmup_eager", .set = false },
+    .{ .name = "--model", .field = "model", .value = modelDir },
 };
 
 /// A draft depth: an integer in 1..MAX_DEPTH.
@@ -59,6 +62,11 @@ fn tokens(text: []const u8) std.fmt.ParseIntError!u32 {
 /// `--mtp-history-window`'s position count, as the server's main reads it.
 fn positions(text: []const u8) std.fmt.ParseIntError!usize {
     return std.fmt.parseInt(usize, text, 10);
+}
+
+/// `--model`'s directory, as the server's main takes it: the text itself, which its startup load hands the plugin.
+fn modelDir(text: []const u8) error{}![]const u8 {
+    return text;
 }
 
 /// A flag whose value the server refuses, and that value.
@@ -115,9 +123,20 @@ pub fn apply() !Flags {
     }
     if (f.max_mtp_ctx != 0) log.info("[turboexl3_qwen38] MTP stops drafting past {d} context tokens\n", .{f.max_mtp_ctx});
     if (f.mtp_history_window != 0) log.info("[turboexl3_qwen38] MTP head history: the last {d} positions of a prefill past {d}\n", .{ f.mtp_history_window, mtp_mod.HISTORY_WINDOW_THRESHOLD });
-    if (!f.warmup_eager) log.info("[turboexl3_qwen38] no verify warm-up at load: each width compiles in its first round\n", .{});
     return f;
 }
+
+/// Whether the server's eager warm-up reaches this plugin's load of `model_dir`, as the server decides it: its startup
+/// load (this process's first, of the model `--model` names) warms unless `--no-warmup-eager`, the one load its main
+/// hands the flag; every other load (on demand, a headless server's) warms.
+pub fn warmsAt(f: Flags, model_dir: []const u8) bool {
+    defer loaded = true;
+    const startup = !loaded and f.model != null and std.mem.eql(u8, f.model.?, model_dir);
+    return f.warmup_eager or !startup;
+}
+
+/// This process has loaded the plugin before (`warmsAt`): any later load is one the server makes on demand.
+var loaded = false;
 
 test "host flags: the depth flags take what the server takes" {
     const testing = std.testing;
@@ -142,11 +161,12 @@ test "host flags: the context ceiling, the history window and the warm-up take w
     const testing = std.testing;
     var bad: Bad = .{};
     // None named: the server's defaults.
-    try testing.expectEqual(Flags{}, try parse(&.{ "mlx-serve", "serve", "--model", "/m" }, &bad));
+    try testing.expectEqual(Flags{}, try parse(&.{ "mlx-serve", "serve", "--port", "8080" }, &bad));
     // A warm-up flag takes no value, so the flag after it still parses; the one named last wins.
     const f = try parse(&.{ "mlx-serve", "--no-warmup-eager", "--max-mtp-ctx", "32768", "--mtp-history-window", "8192" }, &bad);
     try testing.expectEqual(Flags{ .max_mtp_ctx = 32768, .mtp_history_window = 8192, .warmup_eager = false }, f);
     try testing.expect((try parse(&.{ "mlx-serve", "--no-warmup-eager", "--warmup-eager" }, &bad)).warmup_eager);
+    try testing.expectEqualStrings("/m/k3", (try parse(&.{ "mlx-serve", "--model", "/m/k3", "--no-warmup-eager" }, &bad)).model.?);
     // What the server refuses: a count that is not one, one past its type, a flag without a value.
     try testing.expectError(error.InvalidCharacter, parse(&.{ "mlx-serve", "--max-mtp-ctx", "32k" }, &bad));
     try testing.expectEqualStrings("--max-mtp-ctx", bad.flag);
