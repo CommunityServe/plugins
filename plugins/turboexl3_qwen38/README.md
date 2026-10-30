@@ -5,7 +5,7 @@ mlx-serve's own Qwen3.8 code. Claims only `qwen4_exp` packs whose config has a `
 Qwen3.8 pack (iQ-MLX, expert-only EXL3 such as Sushi's) keeps the built-in plugin.
 
     scripts/build.sh turboexl3_qwen38                                # from the repo root: tests, then ReleaseFast
-    plugins/turboexl3_qwen38/scripts/sync-mlx-serve.sh <checkout>    # refresh src/mlx_serve/ from mlx-serve
+    plugins/turboexl3_qwen38/scripts/prepare.sh                      # generate src/mlx_serve/ (build.sh runs it)
     plugins/turboexl3_qwen38/scripts/sync-mlx-serve.sh --check <checkout> <ref>  # exit 0 = keep the pin
     zig build gpu-test -Dmlx-lib=<dir>      # in the plugin's folder: #1005's kernel contract and GPU tests, against
                                             # the server's MLX (<dir> holds its libmlx.dylib and libmlxc.dylib)
@@ -26,12 +26,13 @@ latched MLX error's text (the copies retry a smaller threadgroup on it; an M5 Ma
 depth for a native drafter (`--mtp-depth` does not reach the plugin), and a forced-close hook (#1005 commits a thinking
 budget's close through the MTP head; the plugin can once the host calls it).
 
-- The load and forward are mlx-serve's own `qwen4_exp` (#1005's, copied to `src/mlx_serve/` by
-  `scripts/sync-mlx-serve.sh`), over mlx-c through the kit's `mlx_c`; each slot runs on state the model keeps itself.
-  The copy is cut to what the plugin's builds compile (the dylib, `zig build test`, mlx-free-test, gpu-test), as those
-  builds' symbols and the compiler's errors show it: a file with no such code is an empty stand-in, and a test none of
-  them runs, or a function none of them compiles (`scripts/cut-functions.txt`), is left out: `src/mlx_serve/` holds
-  87,046 lines, 164,603 before the cut.
+- The load and forward are mlx-serve's own `qwen4_exp` (#1005's), over mlx-c through the kit's `mlx_c`; each slot runs on
+  state the model keeps itself. `src/mlx_serve/` is generated (git-ignored) by `scripts/prepare.sh`: the slice of mlx-serve
+  at `MLX_SERVE_REF` that the plugin's builds compile (`scripts/sync-mlx-serve.sh`, `scripts/slice.txt`), with `overlay/mlx_serve/`
+  over it. The overlay is what is not mlx-serve's text at that ref: the cut edges where the slice meets the engine and the
+  host, the files #1005 changed or added, and the quant ABI it extends. Every other file follows mlx-serve when the pin
+  moves. The slice is cut to what the builds compile: a file with no such code is an empty stand-in, and a test none of them
+  runs, or a function none of them compiles (`scripts/cut-functions.txt`), is left out.
 - MTP: the pack's head drafts as the model's native drafter (`src/spec/drafter.zig`) under #1005's own round policy,
   copied: a prompt-lookup run when the context repeats, else the head's chain at the depth #1005's EV planner picks
   (two-chunk plans priced for EXL3), with the next round's drafts dispatched at each greedy round's tail; one trunk

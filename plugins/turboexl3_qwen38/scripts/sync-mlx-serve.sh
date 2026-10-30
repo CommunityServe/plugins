@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Copies the slice of mlx-serve this plugin runs (scripts/slice.txt) into src/mlx_serve/, at the same paths as in
-# mlx-serve's src/, so their relative imports hold, with the Metal kernels they embed.
-# Usage: scripts/sync-mlx-serve.sh <mlx-serve checkout>
+# Generates src/mlx_serve/ (git-ignored): the slice of mlx-serve this plugin runs (scripts/slice.txt), at the same paths as
+# in mlx-serve's src/ so their relative imports hold, with the Metal kernels they embed. scripts/prepare.sh runs it.
+# Usage: OVERLAY=<overlay/mlx_serve> scripts/sync-mlx-serve.sh <mlx-serve checkout at MLX_SERVE_REF>
+# OVERLAY holds what is not mlx-serve's text at that ref: the cut edges (EDGES), the files ddalcu/mlx-serve#1005 changed
+# (as this script wrote them from its head), its new files and abi/quant.zig. A slice file the overlay has is kept as
+# the overlay has it; everything else is written from the checkout, so it follows mlx-serve. prepare.sh then copies
+# the overlay over the result.
 # The copies are unchanged but for the edits below, made here and nowhere else:
 #   - a `//! copied_from: src/<path>@<sha>` first line;
 #   - the imports of what the plugin kit ships (abi, the SDK's plugin helpers and root, generation, the test fixture)
@@ -73,6 +77,7 @@ REGISTRY_AREAS="$(echo $REGISTRY_AREAS)" MODULE_STAND_INS="$(echo $MODULE_STAND_
 import os, pathlib, re, sys
 repo, sha, dst, slice_file, edges = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3]), sys.argv[4], set(sys.argv[6:])
 modules = sys.argv[5].split()
+overlay = pathlib.Path(os.environ["OVERLAY"]) if os.environ.get("OVERLAY") else None
 files = [l.strip() for l in open(slice_file) if l.strip() and not l.startswith("#")]
 if edges & set(files):
     sys.exit(f"a cut edge is also in the slice: {sorted(edges & set(files))}")
@@ -216,6 +221,18 @@ def cut_functions(f, text):
     return "\n".join(l for k, l in enumerate(lines) if k not in drop), len(found)
 fns_out = 0
 for f in files:
+    if overlay is not None and (overlay / f).is_file():
+        # Ours, already as a copy is written: kept as it is, its imports still name what the slice needs.
+        text = (overlay / f).read_text()
+        out = dst / f
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text)
+        for m in imp.finditer(text):
+            wanted.add(os.path.normpath(os.path.join(os.path.dirname(f), m.group(1))))
+        for m in kernel_text.finditer(text):
+            if (repo / "src" / m.group(1)).is_file():
+                kernels.add(m.group(1))
+        continue
     text = (repo / "src" / f).read_text()
     def to_kit(m):
         t = os.path.normpath(os.path.join(os.path.dirname(f), m.group(1)))
@@ -278,20 +295,26 @@ def decls(text):
             i += 1
         out[m.group(1)] = (m.start(), i + 1, "".join(body))
     return out
-qsrc = (repo / "src/abi/quant.zig").read_text()
+if overlay is not None and (overlay / "abi/quant.zig").is_file():
+    (dst / "abi").mkdir(parents=True, exist_ok=True)
+    (dst / "abi/quant.zig").write_text((overlay / "abi/quant.zig").read_text())
+    qsrc = None
+else:
+    qsrc = (repo / "src/abi/quant.zig").read_text()
 kq = decls((kit_dir / "src/abi/quant.zig").read_text())
-mine = decls(qsrc)
-same = sorted((name for name in mine if name in kq and kq[name][2] == mine[name][2]), key=lambda k: -mine[k][0])
-for name in same:
-    a, b, _ = mine[name]
-    qsrc = qsrc[:a] + f"pub const {name} = kit_quant.{name};" + qsrc[b:]
-qsrc = qsrc.replace('@import("host.zig")', '@import("mlx_serve").abi.host').replace('@import("common.zig")', '@import("mlx_serve").abi.common')
-qsrc = qsrc.replace('const std = @import("std");', 'const std = @import("std");\nconst kit_quant = @import("mlx_serve").abi.quant;', 1)
-qsrc, n = strip_tests("abi/quant.zig", qsrc, lambda name: any(x in name for x in test_filters))
-tests_out += n
-(dst / "abi").mkdir(parents=True, exist_ok=True)
-(dst / "abi/quant.zig").write_text(f"//! copied_from: src/abi/quant.zig@{sha}\n" + qsrc)
-print(f"abi/quant.zig: {len(same)} declarations re-exported from the kit ({', '.join(sorted(same))}); its own: {', '.join(sorted(set(mine) - set(same)))}")
+if qsrc is not None:
+    mine = decls(qsrc)
+    same = sorted((name for name in mine if name in kq and kq[name][2] == mine[name][2]), key=lambda k: -mine[k][0])
+    for name in same:
+        a, b, _ = mine[name]
+        qsrc = qsrc[:a] + f"pub const {name} = kit_quant.{name};" + qsrc[b:]
+    qsrc = qsrc.replace('@import("host.zig")', '@import("mlx_serve").abi.host').replace('@import("common.zig")', '@import("mlx_serve").abi.common')
+    qsrc = qsrc.replace('const std = @import("std");', 'const std = @import("std");\nconst kit_quant = @import("mlx_serve").abi.quant;', 1)
+    qsrc, n = strip_tests("abi/quant.zig", qsrc, lambda name: any(x in name for x in test_filters))
+    tests_out += n
+    (dst / "abi").mkdir(parents=True, exist_ok=True)
+    (dst / "abi/quant.zig").write_text(f"//! copied_from: src/abi/quant.zig@{sha}\n" + qsrc)
+    print(f"abi/quant.zig: {len(same)} declarations re-exported from the kit ({', '.join(sorted(same))}); its own: {', '.join(sorted(set(mine) - set(same)))}")
 # The cut edges' own imports resolve the same way.
 for e in edges:
     for m in imp.finditer((dst / e).read_text()):

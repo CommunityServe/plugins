@@ -13,6 +13,7 @@
   "fixture": "none",
   "fixture_reason": "A fully EXL3 pack has no small form: the conformance suite needs a tiny pack the plugin can load.",
   "test_step": "mlx-free-test",
+  "prepare": "scripts/prepare.sh",
   "maintainers": ["davidtai"],
   "license": "MIT"
 }

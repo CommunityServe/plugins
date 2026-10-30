@@ -22,6 +22,9 @@ for n in "${names[@]}"; do
   echo "── $n"
   # The plugin's own MLX-free tests: the kit's `test` step, or the step plugin.json names as "test_step".
   step="$(sed -n 's/.*"test_step": *"\([^"]*\)".*/\1/p' "$dir/plugin.json" 2>/dev/null | head -1)"
+  # A plugin that generates part of its source (plugin.json's "prepare": a script path in its folder) does it first.
+  prepare="$(sed -n 's/.*"prepare": *"\([^"]*\)".*/\1/p' "$dir/plugin.json" 2>/dev/null | head -1)"
+  if [ -n "$prepare" ] && ! (cd "$dir" && bash "$prepare"); then failed+=("$n"); continue; fi
   if (cd "$dir" && "$ZIG" build "${step:-test}" && "$ZIG" build -Doptimize=ReleaseFast); then
     echo "   built $dir/zig-out/lib/lib$n.dylib"
   else
