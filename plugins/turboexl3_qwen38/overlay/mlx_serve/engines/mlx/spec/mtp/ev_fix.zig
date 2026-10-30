@@ -203,5 +203,3 @@ pub fn mtpEvFixObserve(self: *Generator, plan: MtpRoundPlan, drafted: u32, accep
 
 // ── tests ──
 
-const testing = std.testing;
-const Transformer = @import("../../transformer.zig").Transformer;

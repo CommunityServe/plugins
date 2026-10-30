@@ -30,15 +30,9 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const mrope = @import("../../vision/mrope.zig");
-const axisView = @import("../../../mlx/array.zig").axisView;
-const cache_mod = @import("../../kv/cache.zig");
 const weights_mod = @import("../../blocks/moe/weights.zig");
-const log = @import("../../util/log.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 
-const KVCache = cache_mod.KVCache;
-const Weights = @import("../../weights/resident.zig").Weights;
 const draft_fuse = @import("draft_fuse.zig");
 
 /// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
@@ -385,15 +379,6 @@ const FrontOut = struct {
     }
 };
 
-pub const Lane = struct {
-    cache: *KVCache,
-    /// One int32 id, may be lazy.
-    id: mlx.mlx_array,
-    /// `[1, 1, H]`.
-    hidden: mlx.mlx_array,
-    rope_offset: c_int,
-};
-
 // ── Draft-rerank shortlist (port of the mlx.fast challenge draft-rerank
 // scheme, submission 942e5ab2 in mlx.fast-qwen-3.8-mtp-challenge) ──
 //
@@ -423,8 +408,6 @@ pub const Lane = struct {
 
 
 // ── Tests ──
-
-const testing = std.testing;
 
 test {
     _ = draft_fuse;

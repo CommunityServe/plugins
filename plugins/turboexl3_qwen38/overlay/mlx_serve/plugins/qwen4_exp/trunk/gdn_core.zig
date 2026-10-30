@@ -5,13 +5,7 @@
 //! kernel with its block and threadgroup sizes as template ints. Decode, verify and the stock route's short calls
 //! (T < 64) never take them.
 
-const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../sdk/util/log.zig");
-const decode_fused = @import("../../../sdk/blocks/gdn/decode_fused.zig");
-const sigmoidTableFor = @import("../../../sdk/blocks/mlp/fused_activations.zig").sigmoidTableFor;
-const GdnPrework = decode_fused.GdnPrework;
-const GdnPreworkArgs = decode_fused.GdnPreworkArgs;
 
 
 
@@ -20,5 +14,3 @@ pub const RecurOut = struct { y: mlx.mlx_array, state: mlx.mlx_array };
 
 // ── tests ──
 
-const testing = std.testing;
-const kernels = @import("../../../sdk/blocks/gdn/kernels.zig");

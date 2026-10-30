@@ -5,12 +5,6 @@
 const qwen4_mod = @import("../../../plugins/qwen4_exp/qwen4_exp.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("../../../sdk/blocks/gdn/decode.zig");
-const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
-const plePrevAfterAccept = @import("../../../plugins/qwen4_exp/ple.zig").plePrevAfterAccept;
-const qsaHistoryRows = @import("../../../plugins/qwen4_exp/qsa/checkpoint.zig").qsaHistoryRows;
-const qsaResliceToKeep = @import("../../../plugins/qwen4_exp/qsa/history.zig").qsaResliceToKeep;
-const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
-const truncatePooled = @import("../../../plugins/qwen4_exp/qsa/history.zig").truncatePooled;
 const PersistentSsmGroup = @import("group.zig").PersistentSsmGroup;
 
 // ── SSM Cache (for GatedDeltaNet linear attention layers) ──

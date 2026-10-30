@@ -2,28 +2,8 @@
 //! The n-gram PLE layer: the host gather or GPU kernel into a deferred leaf (`ple_defer`, `flushDeferredPle`), the
 //! gated value injection and its dilated causal conv, the per-slot history, and the spec capture and rollback.
 
-const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const exl3 = @import("../../sdk/quant/exl3/format.zig");
-const log = @import("../../sdk/util/log.zig");
-const ModelConfig = @import("../../sdk/config/model.zig").ModelConfig;
-const MAX_BATCH_ROWS = @import("../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
-const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
-const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
-const testing = @import("../../engines/mlx/kv/cache.zig").testing;
-const scalarOf = @import("../../engines/mlx/load/weights.zig").scalarOf;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const splitSpecCaptures = @import("../../engines/mlx/ssm/entry.zig").splitSpecCaptures;
-const ssmFreeSpecCapture = @import("../../engines/mlx/ssm/entry.zig").ssmFreeSpecCapture;
-const ssmRollbackFromCapture = @import("../../engines/mlx/ssm/entry.zig").ssmRollbackFromCapture;
-const Trunk = @import("trunk.zig").Trunk;
-const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
-const Qwen4TestSlot = @import("forward.zig").Qwen4TestSlot;
-const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
-const PleWeights = @import("weights.zig").PleWeights;
-const cachedScalarInt = @import("../../sdk/blocks/linear/verify_qmm.zig").cachedScalarInt;
-const sigmoidTableFor = @import("../../sdk/blocks/mlp/fused_activations.zig").sigmoidTableFor;
-const ShapeKey = @import("../../sdk/blocks/moe/router_kernel.zig").ShapeKey;
 
 pub const PlePending = struct {
     emb: mlx.mlx_array,

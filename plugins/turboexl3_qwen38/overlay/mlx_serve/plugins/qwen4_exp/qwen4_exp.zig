@@ -573,8 +573,6 @@ const Calibration = struct { serial_ns: u64 = 0, pool_ns: u64 = 0, phase: Calibr
 
 // ── tests ──
 
-const testing = std.testing;
-
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
 /// the mmapped table. Non-null on `Trunk.qwen4` ⇒ the arch is served
 /// serially with speculation off (`ownsModuleDecodeState`), which is what

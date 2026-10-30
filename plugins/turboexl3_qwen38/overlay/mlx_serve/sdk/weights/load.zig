@@ -3,12 +3,8 @@
 //! leaves out dropped and f16 side tensors and 1-D tables narrowed to the bf16 activations they meet.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../util/log.zig");
-const resident = @import("resident.zig");
 const affineParamsFromGeometry = @import("../quant/params.zig").affineParamsFromGeometry;
-pub const Weights = resident.Weights;
 
 /// A tiny affine-quantized tensor rewritten as the dense `[out, in]` a dense
 /// checkpoint ships (untransposed), so the paths keyed on the dense layout
@@ -27,5 +23,3 @@ pub fn dequantizeSmall(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array
 }
 
 // ── tests ──
-
-const testing = std.testing;

@@ -5,36 +5,11 @@
 //! (`normInv`, `fuseDownNorm`, `rwDown`, `upMixNorm`, `rwUpMix`); the up + mix in registers (`readUpMix`). Each
 //! declines (null) where it does not replay MLX's chain, and the caller runs the chain.
 
-const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const device = @import("../../../mlx/device.zig");
-const kernelSource = @import("../../../mlx/kernels.zig").source;
-const log = @import("../../util/log.zig");
-const lane_qmm = @import("../qmm/lane_qmm.zig");
 
 // ── launches ──
 
-pub const Kernel = enum { nax_down, nax_upmix, fuse_down, fuse_down_norm, fuse_upmix, norm_inv, read_down, read_upmix, rw_down, rw_upmix };
-const n_kernels = @typeInfo(Kernel).@"enum".field_names.len;
 
-/// The header a kernel sits on: MLX's steel NAX headers, then each layer of the read's helpers one file more.
-pub const Header = enum { none, nax, fuse, read };
-
-var kernel_headers: [3]?[:0]const u8 = @splat(null);
-
-pub fn header(h: Header) ![:0]const u8 {
-    if (h == .none) return "";
-    var base: [:0]const u8 = try lane_qmm.prefillHeader();
-    inline for (.{ Header.nax, Header.fuse, Header.read }, .{ "nax", "fuse", "read" }, 0..) |layer, file, i| {
-        if (kernel_headers[i] == null) kernel_headers[i] = try std.mem.concatWithSentinel(std.heap.c_allocator, u8, &.{ base, kernelSource("kernels/hc/hc_prefill_" ++ file ++ ".metal") }, 0);
-        base = kernel_headers[i].?;
-        if (h == layer) return base;
-    }
-    unreachable;
-}
-
-/// Launches served, by kernel (the tests' proof that a path engaged).
-pub var served: [n_kernels]u64 = @splat(0);
 
 // ── plans: tiles of the hc read's geometry (hc 4 x 2560, rank 320); none changes a bit ──
 
@@ -74,9 +49,4 @@ pub const NormInv = struct {
 
 // ── tests ──
 
-const testing = std.testing;
 
-
-fn nax() bool {
-    return !mlx.noGpuBackend() and !mlx.virtualGpu() and device.naxAvailable();
-}

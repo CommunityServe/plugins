@@ -5,7 +5,6 @@ const std = @import("std");
 const log = @import("../../../../sdk/util/log.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const round_cost = @import("../round_cost.zig");
-const testing = std.testing;
 const Generator = @import("../../generate/generator.zig").Generator;
 const MTP_DEPTH_WINDOW = @import("depth.zig").MTP_DEPTH_WINDOW;
 const MTP_DISABLE_BELOW = @import("depth.zig").MTP_DISABLE_BELOW;

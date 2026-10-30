@@ -4,17 +4,7 @@
 //! trunk format's `indexer` entry), the placed row's mask (a placed MTP draft row's bounded select and its key
 //! visibility in one mask launch) and the ring rebuild (the key ring's in one launch).
 
-const std = @import("std");
-const abi = @import("../../../abi/quant.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../sdk/util/log.zig");
-const Trunk = @import("../trunk.zig").Trunk;
-const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
-const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
-const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const Blocks = @import("../../../sdk/blocks/attention/sparse_block/params.zig").Blocks;
-const QSA_RING_ROWS = @import("history.zig").QSA_RING_ROWS;
-const pooled = @import("pooled.zig");
 
 // ── the indexer epilogue ──
 
@@ -46,5 +36,3 @@ pub const PoolPlan = struct { nb_cached: c_int, ln: c_int, held: c_int };
 
 
 // ── tests ──
-
-const testing = std.testing;

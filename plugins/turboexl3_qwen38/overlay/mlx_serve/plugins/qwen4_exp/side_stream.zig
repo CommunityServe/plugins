@@ -9,9 +9,6 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const shared = @import("../../sdk/util/shared.zig");
-const MoeMlpWeights = @import("../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
-const lastDim = @import("../../engines/mlx/load/weights.zig").lastDim;
-const qmatmulBits = @import("../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
 const Trunk = @import("trunk.zig").Trunk;
 
 /// Calls recorded on the side stream (the tests' proof that a part engaged).

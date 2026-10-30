@@ -10,7 +10,3 @@ pub const Overlay = struct {
         _ = a;
     }
 };
-
-pub fn nax() bool {
-    return @import("../../../mlx/device.zig").naxAvailable();
-}

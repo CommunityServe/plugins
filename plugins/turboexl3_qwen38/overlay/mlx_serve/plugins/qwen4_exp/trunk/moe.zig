@@ -5,26 +5,12 @@
 //! copied_from: sdk/blocks/moe/{moe,decode,experts,routing}.zig (the qwen4_exp arms: no GLM decode, Hy3 sigmoid
 //! routing, sigma-MoE scales, clamped SwiGLU, ungated shared expert or fp32 logit select).
 
-const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
-const profile = @import("../../../engines/mlx/diag/profile.zig");
 const Trunk = @import("../trunk.zig").Trunk;
-const MAX_BATCH_ROWS = @import("../../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
-const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
-const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
-const QuantParams = @import("../../../sdk/quant/params.zig").QuantParams;
-const QuantMode = @FieldType(QuantParams, "mode");
-const qmatmulBits = @import("../../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
-const verifyQmmNaxAvailable = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
-const swigluFusedEnabled = @import("../../../sdk/blocks/mlp/fused_activations.zig").swigluFusedEnabled;
-const swigluSigTable = @import("../../../sdk/blocks/mlp/fused_activations.zig").swigluSigTable;
-const router_kernel = @import("../../../sdk/blocks/moe/router_kernel.zig");
-const RouterGate = router_kernel.RouterGate;
 const routing = @import("../../../sdk/blocks/moe/routing.zig");
 const MoeRouting = routing.MoeRouting;
 const moeRoutingChain = routing.moeRoutingChain;
-const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
 
 /// Reference implementation of the MoE routing chain (used both as fallback
 /// and as the body the compiled closure traces). Returns owned `inds` +

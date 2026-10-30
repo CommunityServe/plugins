@@ -9,17 +9,7 @@
 //!   are per row with the whole chunk's template arguments, and MLX's GEMM runs the whole call's kernel at every piece's
 //!   row count (`gemmSame`), so every row keeps its bytes.
 
-const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../sdk/util/log.zig");
-const abi = @import("../../../abi/quant.zig");
-const kernels = @import("../../../sdk/blocks/gdn/kernels.zig");
-const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
-const sigmoidTableFor = @import("../../../sdk/blocks/mlp/fused_activations.zig").sigmoidTableFor;
-const Trunk = @import("../trunk.zig").Trunk;
-const LinearAttnWeights = @import("../../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
-const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const SideStream = @import("../side_stream.zig").SideStream;
 
 // ── the format's parts (`abi.QuantTable`'s `linear_*` entries) ──
 
@@ -44,5 +34,3 @@ pub const Plan = struct { n: usize, start: [MAX_PIECES + 1]c_int };
 
 
 // ── tests ──
-
-const testing = std.testing;

@@ -1,15 +1,7 @@
 //! copied_from: src/plugins/qwen4_exp/qsa/sparse_attn.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! QSA sparse attention over the selected blocks (`qsaSparseAttn`): the tile, row and slot kernels and their merge.
 
-const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../sdk/util/log.zig");
-const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
-const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
-const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
-const DenseKVView = @import("../../../sdk/blocks/attention/kv_view.zig").DenseKVView;
-const ShapeKey = @import("../../../sdk/blocks/moe/router_kernel.zig").ShapeKey;
-const QsaArmCounts = @import("arms.zig").QsaArmCounts;
 
 // ── Fused sparse attention at verify widths and batched decode (msv_attn_qsa256_q) ──
 //

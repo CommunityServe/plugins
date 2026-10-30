@@ -3,11 +3,8 @@
 //! Owns LinearAttnWeights, GdnProj, and 1 more.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../util/log.zig");
 const QW = @import("../linear/fused_rows.zig").QW;
-const scalarOf = @import("../../../mlx/array.zig").scalarOf;
 const FusedRows = @import("../linear/fused_rows.zig").FusedRows;
-const GdnPrework = @import("decode_fused.zig").GdnPrework;
 
 pub const LinearAttnWeights = struct {
     // For separate projections (qwen3_5_moe): qkv=QKV, z=Z, a=A, b=B

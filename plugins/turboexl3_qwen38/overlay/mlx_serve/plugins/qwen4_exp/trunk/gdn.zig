@@ -7,21 +7,12 @@
 //! copied_from: sdk/blocks/gdn/{gated_delta_net,gate}.zig, sdk/blocks/conv/conv1d_cache.zig (the qwen4_exp arms: no
 //! combined projection, KDA, low-rank gates, Hadamard, ANE or spec-tree paths).
 
-const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const gdn_decode = @import("../../../sdk/blocks/gdn/decode.zig");
-const decode_fused = @import("../../../sdk/blocks/gdn/decode_fused.zig");
 const Trunk = @import("../trunk.zig").Trunk;
-const LinearAttnWeights = @import("../../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
-const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const PREFILL_EVAL_MIN_SEQ = @import("../../../engines/mlx/eval_cadence.zig").PREFILL_EVAL_MIN_SEQ;
-const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
-const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const gdnGateChain = @import("../../../sdk/blocks/gdn/gate.zig").gdnGateChain;
 const gdnChainGateDtype = @import("../../../sdk/blocks/gdn/gate.zig").gdnChainGateDtype;
-const GdnPrework = decode_fused.GdnPrework;
-const kernels = @import("../../../sdk/blocks/gdn/kernels.zig");
 
 /// Compile the GatedDeltaNet gating chain (astype→exp→add→astype→exp→log1p→
 /// multiply→negative→exp→astype, ~10 dispatches) into one fused kernel.

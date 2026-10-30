@@ -2,21 +2,12 @@
 //! scripts/sync-mlx-serve.sh): the engine's Thunderbolt cluster. This plugin serves one Mac, so nothing is planned and
 //! no peer exists: the copies' cluster branches never run.
 
-const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
-const mlx = @import("../../../mlx/ffi.zig");
 
 pub const LayerSpan = @import("../../../sdk/weights/shard.zig").LayerSpan;
 pub const Shard = @import("../../../sdk/weights/shard.zig").Shard;
 
-pub const Part = union(enum) { span: LayerSpan, shard: Shard, remote: LayerSpan };
 /// A cluster peer, which never exists here (`peer` is null, so is every trunk's `dist_peer` and `dist_tp`): its calls
 /// refuse by name.
 pub const Peer = struct {
 
 };
-
-pub fn planFor(model_dir: []const u8, config: *const ModelConfig) !?Part {
-    _ = model_dir;
-    _ = config;
-    return null;
-}

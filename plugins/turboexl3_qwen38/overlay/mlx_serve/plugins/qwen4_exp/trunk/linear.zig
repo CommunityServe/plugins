@@ -5,18 +5,12 @@
 //! sdk/blocks/norms/rms.zig, sdk/blocks/mlp/{activations,dense}.zig, sdk/blocks/embedding.zig, sdk/vision/splice.zig
 //! (the qwen4_exp arms: no Hadamard, ternary, row-exact, GGUF, grouped-norm or Gemma activation paths).
 
-const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../sdk/util/log.zig");
 const sushi_pack = @import("../../../sdk/quant/exl3/sushi_pack.zig");
 const decode_attn_quant = @import("../../../sdk/blocks/attention/decode_attn_quant.zig");
 const Trunk = @import("../trunk.zig").Trunk;
-const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
-const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
-const MAX_BATCH_ROWS = @import("../../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
 const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
 const transposeBf16Weight = @import("../../../engines/mlx/load/weights.zig").transposeBf16Weight;
-const concatAxis0 = @import("../../../mlx/array.zig").concatAxis0;
 const BITS_CACHE_CAP = @import("../../../sdk/quant/params.zig").BITS_CACHE_CAP;
 const BitsCache = @import("../../../sdk/quant/params.zig").BitsCache;
 const QuantParams = @import("../../../sdk/quant/params.zig").QuantParams;
@@ -24,9 +18,6 @@ const computeQuantParams = @import("../../../sdk/quant/params.zig").computeQuant
 const qmatmulBits = @import("../../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
 const qmv2 = @import("../../../sdk/blocks/qmm/qmv2.zig");
 const qmv_nax2 = @import("../../../sdk/blocks/qmm/qmv_nax2.zig");
-const FUSED_ROWS_MAX_M = @import("../../../sdk/blocks/linear/fused_rows.zig").FUSED_ROWS_MAX_M;
-const AttnDqCopy = decode_attn_quant.AttnDqCopy;
-const fusedSwiGLU = @import("../../../sdk/blocks/mlp/fused_activations.zig").fusedSwiGLU;
 
 pub inline fn qmatmul(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
     // A linear the pack's trunk format loaded (`trunk/formats.zig`) runs through that format.

@@ -2,21 +2,12 @@
 //! Hyper-connection streams: the compiled read/write callbacks (`compileQwen4Hc`), the stand-ins, `HcRead`, and the
 //! grouped RMS norm over the `hc` streams.
 
-const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
-const ple = @import("ple.zig");
-const applyClosure = @import("../../engines/mlx/compiled.zig").applyClosure;
 const closureIn = @import("../../engines/mlx/compiled.zig").closureIn;
 const closureOut = @import("../../engines/mlx/compiled.zig").closureOut;
 const scalarOf = @import("../../engines/mlx/load/weights.zig").scalarOf;
 const Trunk = @import("trunk.zig").Trunk;
-const QuantParams = @import("../../sdk/quant/params.zig").QuantParams;
-const HC_FUSED_MAX_ROWS = @import("hc_fused.zig").HC_FUSED_MAX_ROWS;
-const HcFusedOut = @import("hc_fused.zig").HcFusedOut;
-const HcPending = @import("hc_fused.zig").HcPending;
-const HcWeights = @import("weights.zig").HcWeights;
-const PleWeights = @import("weights.zig").PleWeights;
 
 /// qwen4_exp: compile the four hyper-connection elementwise tails. An EXL3 trunk pack's load also says whether its rows
 /// take the prefill kernels.
@@ -112,4 +103,3 @@ pub const HcRead = struct {
 
 // ── tests ──
 
-const testing = std.testing;

@@ -2,13 +2,7 @@
 //! Hyper-connection reads and writes fused into custom kernels (the deferred write folded into the next read, the
 //! prefill-width pending write), with their kill switches.
 
-const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
-const testing = @import("../../engines/mlx/kv/cache.zig").testing;
-const Trunk = @import("trunk.zig").Trunk;
-const qmatmulBits = @import("../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
-const HcWeights = @import("weights.zig").HcWeights;
 
 // ── qwen4_exp fused hyper-connection READ at decode and verify width ──
 // The read is two launches (down, then up/mix) in hc_decode2.zig for 1..HC_FUSED_MAX_ROWS rows; anything outside its

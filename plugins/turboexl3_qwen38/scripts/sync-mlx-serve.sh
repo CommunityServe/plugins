@@ -38,9 +38,8 @@ dst="$here/src/mlx_serve"
 EDGES="env.zig mlx/ffi.zig mlx/array.zig mlx/device.zig mlx/dtype.zig mlx/kernel_cache.zig mlx/kernels.zig sdk/util/log.zig
 engines/mlx/transformer.zig engines/mlx/cluster/distributed.zig engines/mlx/plugin/config.zig
 plugins/deepseek_v41/deepseek_v41.zig sdk/blocks/dit/w8a8.zig plugins/hy_v3/load.zig sdk/util/shared.zig
-engines/mlx/generate/generator.zig engines/mlx/spec/mtp_head_ref.zig sdk/ane/offload.zig
-sdk/blocks/attention/sparse_block/decode_cuda.zig sdk/quant/formats.zig engines/mlx/load/exl3_bank.zig
-sdk/kv/cache.zig"
+engines/mlx/generate/generator.zig engines/mlx/spec/mtp_head_ref.zig sdk/ane/offload.zig sdk/quant/formats.zig
+engines/mlx/load/exl3_bank.zig sdk/kv/cache.zig"
 
 repo="${1:?mlx-serve checkout}"
 sha="$(git -C "$repo" rev-parse HEAD)"
@@ -243,6 +242,14 @@ def cut_names(f, text):
     for _, a, b in found:
         while a > 0 and lines[a - 1].lstrip().startswith("///"):
             a -= 1
+        # a doc comment stands for the declaration below it across blank lines too
+        k = a
+        while k > 0 and lines[k - 1].strip() == "":
+            k -= 1
+        if k < a and k > 0 and lines[k - 1].lstrip().startswith("///"):
+            a = k
+            while a > 0 and lines[a - 1].lstrip().startswith("///"):
+                a -= 1
         drop.update(range(a, b + 1))
         if b + 1 < len(lines) and lines[b + 1] == "" and a > 0 and lines[a - 1] == "":
             drop.add(b + 1)

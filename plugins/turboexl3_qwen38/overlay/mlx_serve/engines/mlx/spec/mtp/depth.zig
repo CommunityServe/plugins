@@ -1,14 +1,8 @@
 //! copied_from: src/engines/mlx/spec/mtp/depth.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 //! MTP draft depth and proposal policy (greedy tail, draft temperature, depth decisions).
 const depth_bounds = @import("../mtp_depth_bounds.zig");
-const std = @import("std");
-const mlx = @import("../../../../mlx/ffi.zig");
-const transformer_mod = @import("../../transformer.zig");
 const log = @import("../../../../sdk/util/log.zig");
-const Transformer = transformer_mod.Transformer;
-const testing = std.testing;
 const Generator = @import("../../generate/generator.zig").Generator;
-const MtpHeadRef = @import("../mtp_head_ref.zig").MtpHeadRef;
 
 
 // ── MTP adaptive depth ──

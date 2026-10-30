@@ -11,14 +11,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const Trunk = @import("../trunk.zig").Trunk;
 const Formats = @import("formats.zig").Formats;
-const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
-const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
-const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
-const MoeRouting = @import("../../../sdk/blocks/moe/routing.zig").MoeRouting;
-const DenseKVView = @import("../../../sdk/blocks/attention/kv_view.zig").DenseKVView;
-const lastDim = @import("../../../mlx/array.zig").lastDim;
-const qmatmulBits = @import("../../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
 
 /// The rows the decode merges serve: decode and verify rows.
 pub const decode_rows_max: c_int = 16;
@@ -204,5 +196,3 @@ pub fn callSharedSwiglu(self: *Trunk, banks: *const [3]abi.Weight, expert_x: mlx
 }
 
 // ── tests ──
-
-const testing = std.testing;

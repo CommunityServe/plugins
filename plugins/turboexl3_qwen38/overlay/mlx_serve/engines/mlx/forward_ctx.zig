@@ -2,7 +2,6 @@
 //! engines/mlx/forward_ctx.
 //! Owns SpecTree, CaptureLayers, ForwardCtx.
 
-const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const HeadPlace = @import("../../plugins/qwen4_exp/mtp.zig").HeadPlace;
 const abi = @import("mlx_serve").abi.plugin;
@@ -11,7 +10,6 @@ const PlePending = @import("../../plugins/qwen4_exp/ple.zig").PlePending;
 const QsaArmCounts = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaArmCounts;
 const KVCache = @import("kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("ssm/entry.zig").SSMCacheEntry;
-const Transformer = @import("transformer.zig").Transformer;
 
 /// A draft tree's verify rows: row w sits at position offset + depth[w], and
 /// its keys and recurrence follow its ancestors.

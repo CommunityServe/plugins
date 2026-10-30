@@ -5,4 +5,3 @@ const cache = @import("../../../direct/cache.zig");
 
 pub const KVCache = cache.KVCache;
 pub const KVCacheEntry = cache.KVCacheEntry;
-pub const KVCacheSnapshot = cache.KVCacheSnapshot;

@@ -78,8 +78,6 @@ pub const mlx_dtype = enum(c_int) {
     complex64 = c.MLX_COMPLEX64,
 };
 
-pub const mlx_device_type = enum(c_int) { cpu = c.MLX_CPU, gpu = c.MLX_GPU };
-
 pub const mlx_optional_int = extern struct {
     value: c_int = 0,
     has_value: bool = false,

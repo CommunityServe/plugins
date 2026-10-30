@@ -3,10 +3,7 @@
 
 const block_mod = @import("block.zig");
 const std = @import("std");
-const abi = @import("../../abi/quant.zig");
-const Verdict = abi.Verdict;
 const blocksOf = block_mod.blocksOf;
-const builtins = block_mod.builtins;
 const testing = std.testing;
 
 test "quant block: blocks are found under their keys; a config without one has none" {

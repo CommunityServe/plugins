@@ -2,12 +2,7 @@
 //! sdk/blocks/moe/router_kernel.
 //! Owns RouterMode, ROUTER_MAX_EXPERTS, moeRouterSource, ROUTER_SOURCES, ROUTER_NAMES, router_kernels, and 13 more.
 
-const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../util/log.zig");
-const testing = std.testing;
-const MoeRouting = @import("routing.zig").MoeRouting;
-const moeRoutingChain = @import("routing.zig").moeRoutingChain;
 
 // ── Fused MoE router (top-K selection + weight normalization in ONE kernel) ──
 //

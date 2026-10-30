@@ -39,11 +39,6 @@ pub fn int(comptime name: @EnumLiteral(), comptime T: type, default: T) T {
     return default;
 }
 
-pub fn float(comptime name: @EnumLiteral(), default: f32) f32 {
-    _ = name;
-    return default;
-}
-
 pub fn byName(name: [*:0]const u8) ?[*:0]const u8 {
     _ = name;
     return null;

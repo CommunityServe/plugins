@@ -1,8 +1,6 @@
 //! copied_from: src/sdk/config/model.zig@1b3e624b6cf44c6092c51683bd353ad70bd9718d
 const std = @import("std");
-const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../util/log.zig");
 const plugin_config = @import("../../engines/mlx/plugin/config.zig");
 const abi = @import("mlx_serve").abi.plugin;
 const exl3 = @import("../quant/exl3/format.zig");
@@ -854,8 +852,6 @@ pub const Weights = @import("../weights/resident.zig").Weights;
 
 
 // ── Tests ──
-
-const testing = std.testing;
 
 // ── qwen4_exp YaRN context extension (262144 → 1048576) ──────────────────
 //
