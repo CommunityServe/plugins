@@ -567,8 +567,8 @@ fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const F
     }
 
     // Picks for the gather arms (decode and verify rows, prefill past the gather's floor) and for a solo decode row at
-    // every kv.
-    if (attn_core.qsaWantsBlocks(batch, kv, seq_len) or (solo and seq_len == 1)) {
+    // every kv on a dense cache (an affine one's takes the mask below the floor).
+    if (attn_core.qsaWantsBlocks(batch, kv, seq_len) or (solo and seq_len == 1 and ctx.cache.config.scheme == .off)) {
         if (ctx.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_blocks);
         ctx.qsa_blocks = .{ .ctx = null };
         ctx.qsa_blocks = try qsaSelectBlocks(self, q_rope, entry.qsa_pooled, offset, seq_len, nb, block_topk);

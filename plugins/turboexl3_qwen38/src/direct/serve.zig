@@ -19,6 +19,7 @@ const config = @import("config.zig");
 const load_mod = @import("load.zig");
 const state = @import("cache.zig");
 const KVCache = state.KVCache;
+const KVQuantConfig = @import("../mlx_serve/sdk/blocks/attention/kv_quant.zig").KVQuantConfig;
 const SSMCacheEntry = state.SSMCacheEntry;
 const fwd = @import("model.zig");
 const ple = @import("ple.zig");
@@ -54,8 +55,8 @@ const OwnSlot = struct {
     ssm: []SSMCacheEntry,
     pos: u64 = 0,
 
-    fn init(id: u32, layers: u32) !OwnSlot {
-        var cache = try KVCache.init(gpa, layers);
+    fn init(id: u32, layers: u32, kv: KVQuantConfig) !OwnSlot {
+        var cache = try KVCache.initWithConfig(gpa, layers, kv);
         errdefer cache.deinit();
         const ssm = try gpa.alloc(SSMCacheEntry, layers);
         const gen = state.nextSsmMemberGen();
@@ -75,11 +76,12 @@ const OwnSlot = struct {
     }
 };
 
-/// What a slot id carries between forwards: the n-gram PLE work a `defer_host` forward left owed, and the entries its
-/// last forward ran on (a batched group may hold them).
+/// What a slot id carries between forwards: the n-gram PLE work a `defer_host` forward left owed, the entries its last
+/// forward ran on (a batched group may hold them), and whether its request reads an affine cache fused (`kv_attn_fused`).
 const Rec = struct {
     pending: ?q4ple.PlePending = null,
     ssm: ?[]SSMCacheEntry = null,
+    kv_attn_fused: bool = false,
 };
 
 pub const Model = struct {
@@ -89,6 +91,8 @@ pub const Model = struct {
     /// The cache a settle-only context names (it reads no cache).
     scratch: KVCache,
     caps: abi.Caps,
+    /// The slots' KV scheme, as the server's load resolves it (src/host_flags.zig).
+    kv: KVQuantConfig = KVQuantConfig.dense,
     own: std.ArrayList(OwnSlot) = .empty,
     recs: std.AutoHashMapUnmanaged(u32, Rec) = .empty,
 
@@ -107,13 +111,24 @@ pub const Model = struct {
         for (m.own.items) |*o| if (o.id == id) {
             if (pos == 0) {
                 o.deinit(&m.trunk);
-                o.* = try OwnSlot.init(id, m.cfg.num_hidden_layers);
+                o.* = try OwnSlot.init(id, m.cfg.num_hidden_layers, m.kv);
             } else if (o.pos != pos) return error.PositionDoesNotFollow;
             return o;
         };
         if (pos != 0) return error.PositionDoesNotFollow;
-        try m.own.append(gpa, try OwnSlot.init(id, m.cfg.num_hidden_layers));
+        try m.own.append(gpa, try OwnSlot.init(id, m.cfg.num_hidden_layers, m.kv));
         return &m.own.items[m.own.items.len - 1];
+    }
+
+    /// Whether slot `id`'s request reads its affine cache fused below the QSA budget (its prompt's, `handPrompt`).
+    pub fn setKvAttnFused(m: *Model, id: u32, fused: bool) !void {
+        (try m.rec(id)).kv_attn_fused = fused;
+    }
+
+    /// Row `i`'s slot's read mode (`slotOf`'s id).
+    fn fusedOf(m: *Model, f: *const abi.Forward, i: usize) bool {
+        const r = m.recs.get(if (f.slots.len > i) f.slots.slice()[i] else @intCast(i)) orelse return false;
+        return r.kv_attn_fused;
     }
 };
 
@@ -284,6 +299,7 @@ fn runOne(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
         .ple_defer = f.defer_host,
         .ple_pending = r.pending,
         .ple_ids_src = if (lend) |e| e.ple_ids_src else null,
+        .kv_attn_fused = r.kv_attn_fused,
     };
     r.pending = null;
     defer r.pending = ctx.ple_pending;
@@ -327,7 +343,7 @@ fn runBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     for (0..n) |i| {
         own[i] = try slotOf(m, f, i);
         offsets[i] = f.positions.slice()[i];
-        ctxs[i] = .{ .cache = &own[i].cache, .moe_seq_offset = &offsets[i], .ssm_entries = own[i].ssm, .capture_hidden = null, .vision_embeddings = null };
+        ctxs[i] = .{ .cache = &own[i].cache, .moe_seq_offset = &offsets[i], .ssm_entries = own[i].ssm, .capture_hidden = null, .vision_embeddings = null, .kv_attn_fused = m.fusedOf(f, i) };
         ptrs[i] = &ctxs[i];
     }
     var rows: [MAX_BATCH_ROWS]Array = undefined;
@@ -388,7 +404,7 @@ fn runBatchedVerify(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !voi
     for (0..n) |i| {
         own[i] = try slotOf(m, f, i);
         offsets[i] = f.positions.slice()[i];
-        ctxs[i] = .{ .cache = &own[i].cache, .moe_seq_offset = &offsets[i], .ssm_entries = own[i].ssm, .capture_hidden = null, .vision_embeddings = null };
+        ctxs[i] = .{ .cache = &own[i].cache, .moe_seq_offset = &offsets[i], .ssm_entries = own[i].ssm, .capture_hidden = null, .vision_embeddings = null, .kv_attn_fused = m.fusedOf(f, i) };
         ptrs[i] = &ctxs[i];
     }
     var last = mlx.mlx_array_new();

@@ -135,6 +135,16 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     const m: *q4.Model = @ptrCast(@alignCast(mp));
     s.* = .{ .m = m, .drafter = Drafter.init(m), .mtp = false };
+    // The slots' KV scheme as the server's load resolves it, and the head's: dense, or with `--mtp-head-kv-quant` the
+    // trunk's (#1005's `qwen4MtpHeadKvConfig`).
+    m.kv = host_flags.kvQuantFor(ctx.model_dir.slice());
+    if (m.kv.scheme == .affine) log.info("[turboexl3_qwen38] KV cache affine {d}-bit, group {d}\n", .{ m.kv.bits, m.kv.group_size });
+    if (host_flags.flags.mtp_head_kv_quant) if (m.trunk.qwen4_mtp) |*hd| hd.cache.reinit(@intCast(hd.cache.entries.len), m.kv) catch |e| {
+        q4.unload(mp);
+        gpa.destroy(s);
+        out.* = Verdict.named(.failed, @errorName(e));
+        return null;
+    };
     // A pack without a head, or a server whose `mtp` setting is off: no rounds and no head history.
     if (s.drafter.has() and (q4.mtpSetting(ctx.settings_json.slice()) orelse true)) {
         s.mtp = true;
@@ -146,11 +156,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 
 /// The head's load-time work, as #1005's load does it when the head serves (`qwen4_build_draft_rerank`, then its eager
 /// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and each verify width's
-/// kernels, to the depth cap `--mtp-max-depth` resolves to, compiled before any round is timed. The slots' KV is dense
-/// (`KVCache.init`).
+/// kernels, to the depth cap `--mtp-max-depth` resolves to, compiled before any round is timed, on slots of the
+/// `--kv-quant` scheme (the flag's, as #1005's warm-up takes it).
 fn armHead(m: *q4.Model) void {
     _ = mtp_head.qwen4BuildDraftRerank(&m.trunk);
-    const kv = KVQuantConfig.dense;
+    const kv = host_flags.flags.kv_quant orelse KVQuantConfig.dense;
     const cap = ev_plan.resolveMtpDepthCapForProfile(depth_bounds.active.max, cost_profile.qwen4G17CostProfileForKv(&m.trunk, kv));
     warmup.warmupSpecVerify(&m.trunk, cap, kv) catch |e| log.warn("[turboexl3_qwen38] the verify warm-up failed ({s}): each width compiles in its first round\n", .{@errorName(e)});
 }
@@ -271,6 +281,7 @@ fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: ab
 /// A prompt's prefill from `at`: its ids pair the MTP history's chunk-final rows with the token after them, and the
 /// prefill reads its PLE rows ahead.
 fn handPrompt(s: *Served, slot: u32, prompt: []const u32, at: u64) void {
+    s.m.setKvAttnFused(slot, host_flags.kvAttnFused(s.m.kv.scheme, prompt.len)) catch |e| log.warn("[turboexl3_qwen38] slot {d}: the KV read mode not kept ({s})\n", .{ slot, @errorName(e) });
     if (s.mtp) s.drafter.prompt(slot, prompt, at) catch |e| log.warn("[turboexl3_qwen38] slot {d}: prompt not kept ({s})\n", .{ slot, @errorName(e) });
     plePrefetch(s, slot, prompt, at);
 }

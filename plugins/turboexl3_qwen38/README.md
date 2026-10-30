@@ -20,6 +20,8 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load. MTP needs tw
   arguments: equal values pin the depth every round drafts.
 - `--int8-qk`, read the same way, runs a dense prefill block of 64 rows or more (below the QSA budget) on int8 Q and K,
   as the built-in does (lossy).
+- `--kv-quant 4` or `8` (a model's `kv_quant` in ~/.mlx-serve/model-settings.json first), `--kv-attn-mode` and
+  `--mtp-head-kv-quant`, read the same way, keep the KV cache affine (group 64) and read it as the built-in does.
 
 ## Measured
 

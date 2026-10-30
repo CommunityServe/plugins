@@ -57,6 +57,7 @@ sdk/blocks/attention/attn256.zig
 sdk/blocks/attention/decode_attn_quant.zig
 sdk/blocks/attention/gates.zig
 sdk/blocks/attention/kv_quant.zig
+sdk/blocks/attention/kv_quant_attn.zig
 sdk/blocks/attention/kv_view.zig
 sdk/blocks/attention/sparse_block/params.zig
 sdk/blocks/attention/sparse_block/score.zig

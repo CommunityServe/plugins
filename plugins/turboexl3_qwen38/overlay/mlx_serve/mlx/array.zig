@@ -8,6 +8,17 @@ const mlx = @import("ffi.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
 
+/// The rows `idx` of `src` along `axis`, contiguous (dequantize misreads a strided take).
+pub fn takeContig(s: Stream, src: Array, idx: Array, axis: c_int) !Array {
+    var view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(view);
+    try mlx.check(mlx.mlx_take_axis(&view, src, idx, axis, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_contiguous(&out, view, false, s));
+    return out;
+}
+
 /// A copy of `x` that owns its buffer (`x + 0` in `x`'s dtype): a view's source can be freed once it is evaluated.
 pub fn materializedOwnedCopy(s: Stream, x: Array) !Array {
     var zero = mlx.mlx_array_new();

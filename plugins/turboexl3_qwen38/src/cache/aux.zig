@@ -103,7 +103,7 @@ pub fn kvBytes(snap: *const KVCacheSnapshot) u64 {
     var total: u64 = 0;
     for (snap.entries) |e| {
         if (!e.initialized) continue;
-        inline for (.{ e.keys, e.values }) |a| {
+        inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |a| {
             if (a.ctx != null) total += @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
         }
     }

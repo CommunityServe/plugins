@@ -166,7 +166,7 @@ fn submit(x: *const Half, entry: ?*const SSMCacheEntry, kv: ?*const KVCacheEntry
         }
     }
     if (kv) |k| if (k.initialized) {
-        inline for (.{ "keys", "values" }) |name| {
+        inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" }) |name| {
             if (@field(k, name).ctx != null) _ = mlx.mlx_vector_array_append_value(vec, @field(k, name));
         }
     };

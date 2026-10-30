@@ -1,4 +1,4 @@
-//! The direct model's per-slot state: the attention layers' KV cache (dense, grown in place), each layer's recurrent
+//! The direct model's per-slot state: the attention layers' KV cache (dense or affine, grown in place), each layer's recurrent
 //! entry with the verify's capture and partial-accept rollback, the batched tick's merged group, and the prefix cache's
 //! checkpoints. The KV types are this file's, which the copies take through the sdk/kv/cache.zig edge; the recurrent
 //! entry, its snapshot and checkpoint and the group stay the copies' types (`ForwardCtx` and the QSA history hold them),
@@ -8,7 +8,8 @@ const std = @import("std");
 const mlx = @import("../mlx_serve/mlx/ffi.zig");
 const materializedOwnedCopy = @import("../mlx_serve/mlx/array.zig").materializedOwnedCopy;
 const concatAxis0 = @import("../mlx_serve/mlx/array.zig").concatAxis0;
-const KVQuantConfig = @import("../mlx_serve/sdk/blocks/attention/kv_quant.zig").KVQuantConfig;
+const kv_quant = @import("../mlx_serve/sdk/blocks/attention/kv_quant.zig");
+const KVQuantConfig = kv_quant.KVQuantConfig;
 const DenseKVView = @import("../mlx_serve/sdk/blocks/attention/kv_view.zig").DenseKVView;
 const MAX_BATCH_ROWS = @import("../mlx_serve/engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
 const ForwardCtx = @import("../mlx_serve/engines/mlx/forward_ctx.zig").ForwardCtx;
@@ -71,26 +72,43 @@ fn rows3(s: mlx.mlx_stream, x: mlx.mlx_array, from: c_int, to: c_int) !mlx.mlx_a
 // ── KV cache (the attention layers) ──
 
 pub const KVCacheEntry = struct {
-    keys: mlx.mlx_array, // [B, H, capacity, D]
+    /// Dense: K and V `[B, H, capacity, D]`. Affine: their packed codes `[B, H, capacity, D * bits / 32]` (uint32), and
+    /// each row's scales and biases `[B, H, capacity, D / group_size]` (null on a dense cache).
+    keys: mlx.mlx_array,
     values: mlx.mlx_array,
-    /// The buffers' first `offset` rows, which attention reads.
+    keys_scales: mlx.mlx_array,
+    keys_biases: mlx.mlx_array,
+    values_scales: mlx.mlx_array,
+    values_biases: mlx.mlx_array,
+    /// Each buffer's first `offset` rows, which attention reads.
     key_view: mlx.mlx_array,
     value_view: mlx.mlx_array,
+    key_scales_view: mlx.mlx_array,
+    key_biases_view: mlx.mlx_array,
+    value_scales_view: mlx.mlx_array,
+    value_biases_view: mlx.mlx_array,
     offset: usize,
     initialized: bool,
 };
 
+/// An entry's buffers, and their views in the same order.
+const buffers = .{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" };
+const view_names = .{ "key_view", "value_view", "key_scales_view", "key_biases_view", "value_scales_view", "value_biases_view" };
+
 fn newEntry() KVCacheEntry {
-    return .{ .keys = mlx.mlx_array_new(), .values = mlx.mlx_array_new(), .key_view = mlx.mlx_array_new(), .value_view = mlx.mlx_array_new(), .offset = 0, .initialized = false };
+    var e: KVCacheEntry = undefined;
+    inline for (buffers ++ view_names) |f| @field(e, f) = mlx.mlx_array_new();
+    e.offset = 0;
+    e.initialized = false;
+    return e;
 }
 
 fn freeEntry(e: *KVCacheEntry) void {
-    inline for (.{ e.keys, e.values, e.key_view, e.value_view }) |a| _ = mlx.mlx_array_free(a);
+    inline for (buffers ++ view_names) |f| _ = mlx.mlx_array_free(@field(e, f));
 }
 
 fn dropViews(e: *KVCacheEntry) void {
-    replace(&e.key_view, mlx.mlx_array_new());
-    replace(&e.value_view, mlx.mlx_array_new());
+    inline for (view_names) |f| replace(&@field(e, f), mlx.mlx_array_new());
 }
 
 /// The first `rows` rows (axis 2) of the 4-D `x` (a view).
@@ -109,22 +127,20 @@ fn setView(s: mlx.mlx_stream, v: *mlx.mlx_array, buf: mlx.mlx_array, rows: usize
 }
 
 fn rebuild(e: *KVCacheEntry, s: mlx.mlx_stream) !void {
-    try setView(s, &e.key_view, e.keys, e.offset);
-    try setView(s, &e.value_view, e.values, e.offset);
+    inline for (buffers, 0..) |b, i| if (@field(e, b).ctx != null) try setView(s, &@field(e, view_names[i]), @field(e, b), e.offset);
 }
 
 pub const KVCache = struct {
     entries: []KVCacheEntry,
     step: usize, // absolute sequence position
     allocator: std.mem.Allocator,
-    config: KVQuantConfig, // dense: `initWithConfig` refuses the rest
+    config: KVQuantConfig,
 
     pub fn init(allocator: std.mem.Allocator, num_layers: u32) !KVCache {
         return initWithConfig(allocator, num_layers, KVQuantConfig.dense);
     }
 
     pub fn initWithConfig(allocator: std.mem.Allocator, num_layers: u32, config: KVQuantConfig) !KVCache {
-        if (config.scheme != .off) return error.DirectModelKvIsDense;
         const entries = try allocator.alloc(KVCacheEntry, num_layers);
         for (entries) |*e| e.* = newEntry();
         return .{ .entries = entries, .step = 0, .allocator = allocator, .config = config };
@@ -133,6 +149,13 @@ pub const KVCache = struct {
     pub fn deinit(self: *KVCache) void {
         for (self.entries) |*e| freeEntry(e);
         self.allocator.free(self.entries);
+    }
+
+    /// This cache built over, empty, under `config`: the new one first, so a failure leaves the old one whole.
+    pub fn reinit(self: *KVCache, num_layers: u32, config: KVQuantConfig) !void {
+        const fresh = try initWithConfig(self.allocator, num_layers, config);
+        self.deinit();
+        self.* = fresh;
     }
 
     /// A second owner of every layer's buffers (refcount-shared, no copy; the views are left out).
@@ -166,8 +189,7 @@ pub const KVCache = struct {
         dst.offset = src.offset;
         dst.initialized = src.initialized;
         if (!src.initialized) return;
-        dst.keys = try ref(src.keys);
-        dst.values = try ref(src.values);
+        inline for (buffers) |b| @field(dst, b) = try ref(@field(src, b));
     }
 
     const chunk_step = 256;
@@ -183,33 +205,71 @@ pub const KVCache = struct {
         return (target + chunk_step - 1) / chunk_step * chunk_step;
     }
 
-    /// The layer's new K/V rows `[B, H, rows, D]` written at its offset, and its views. The K packs have no sliding
-    /// window: a tail span (`max_seq`) is refused.
+    /// The layer's new K/V rows `[B, H, rows, D]` written at its offset, and its views: an affine cache stores them
+    /// quantized and reads them dequantized. The K packs have no sliding window: a tail span (`max_seq`) is refused.
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
         if (max_seq != 0) return error.DirectModelKvHasNoWindow;
         const e = &self.entries[layer];
-        // The views go first: their references would keep the write from donating the buffer.
-        dropViews(e);
-        const sh = mlx.getShape(new_k);
-        const rows: usize = @intCast(sh[2]);
-        if (!e.initialized or e.offset + rows > bufferCapacity(e.keys)) {
-            const kept: usize = if (e.initialized) e.offset else 0;
-            const cap = nextCapacity(if (e.initialized) bufferCapacity(e.keys) else 0, kept + rows);
-            const dtype = mlx.mlx_array_dtype(new_k);
-            try grow(s, &e.keys, cap, kept, sh[0], sh[1], sh[3], dtype);
-            try grow(s, &e.values, cap, kept, sh[0], sh[1], mlx.getShape(new_v)[3], dtype);
-            e.initialized = true;
+        if (self.config.scheme == .affine) {
+            const c = self.config;
+            var kq = try kv_quant.quantizeAffine(s, new_k, c.group_size, c.bits);
+            defer kq.deinit();
+            var vq = try kv_quant.quantizeAffine(s, new_v, c.group_size, c.bits);
+            defer vq.deinit();
+            try self.write(e, layer, s, &.{ kq.q, vq.q, kq.scales, kq.biases, vq.scales, vq.biases });
+            return self.affineView(e, s);
         }
-        try writeAt(s, &e.keys, e.offset, new_k);
-        try writeAt(s, &e.values, e.offset, new_v);
-        e.offset += rows;
-        if (layer == 0) self.step += rows;
-        try rebuild(e, s);
+        try self.write(e, layer, s, &.{ new_k, new_v });
         return .{ .k = e.key_view, .v = e.value_view, .owned = false };
     }
 
-    /// Each slot's row of the stacked K/V `[N, H, rows, D]` written into its own cache. A dense cache has no batched
-    /// arm, so `use_batched` changes nothing.
+    /// The layer's new rows, one array `[B, H, rows, last]` per buffer in `buffers`' order, written at its offset (the
+    /// buffers grown in lockstep where they are full, each at its rows' dtype and width), then its views.
+    fn write(self: *KVCache, e: *KVCacheEntry, layer: u32, s: mlx.mlx_stream, rows: []const mlx.mlx_array) !void {
+        // The views go first: their references would keep the write from donating the buffer.
+        dropViews(e);
+        const n: usize = @intCast(mlx.getShape(rows[0])[2]);
+        if (!e.initialized or e.offset + n > bufferCapacity(e.keys)) {
+            const kept: usize = if (e.initialized) e.offset else 0;
+            const cap = nextCapacity(if (e.initialized) bufferCapacity(e.keys) else 0, kept + n);
+            inline for (buffers, 0..) |b, i| if (i < rows.len) {
+                const sh = mlx.getShape(rows[i]);
+                try grow(s, &@field(e, b), cap, kept, sh[0], sh[1], sh[3], mlx.mlx_array_dtype(rows[i]));
+            };
+            e.initialized = true;
+        }
+        inline for (buffers, 0..) |b, i| if (i < rows.len) try writeAt(s, &@field(e, b), e.offset, rows[i]);
+        e.offset += n;
+        if (layer == 0) self.step += n;
+        try rebuild(e, s);
+    }
+
+    /// An affine layer's read: K and V dequantized from the views (owned; lazy, so paid only where attention reads
+    /// them), the packed triples borrowed beside them for the kernels that read those.
+    fn affineView(self: *const KVCache, e: *const KVCacheEntry, s: mlx.mlx_stream) !DenseKVView {
+        const c = self.config;
+        const k = try kv_quant.dequantizeAffine(s, e.key_view, e.key_scales_view, e.key_biases_view, c.group_size, c.bits);
+        errdefer _ = mlx.mlx_array_free(k);
+        const v = try kv_quant.dequantizeAffine(s, e.value_view, e.value_scales_view, e.value_biases_view, c.group_size, c.bits);
+        return .{
+            .k = k,
+            .v = v,
+            .owned = true,
+            .k_triple_q = e.key_view,
+            .k_triple_scales = e.key_scales_view,
+            .k_triple_biases = e.key_biases_view,
+            .v_triple_q = e.value_view,
+            .v_triple_scales = e.value_scales_view,
+            .v_triple_biases = e.value_biases_view,
+            .has_quant_triple = true,
+            .bits = c.bits,
+            .group_size = c.group_size,
+            .kv_cap = @intCast(bufferCapacity(e.keys)),
+        };
+    }
+
+    /// Each slot's row of the stacked K/V `[N, H, rows, D]` written into its own cache. An 8-bit affine group (with
+    /// `use_batched`) quantizes the stacked rows once and writes each slot's row of the codes.
     pub fn appendFromStacked(
         stacked_k: mlx.mlx_array,
         stacked_v: mlx.mlx_array,
@@ -219,20 +279,42 @@ pub const KVCache = struct {
         max_seq: u32,
         use_batched: bool,
     ) !void {
-        _ = use_batched;
+        if (use_batched and caches.len > 0 and caches[0].config.scheme == .affine and caches[0].config.bits == 8) {
+            if (max_seq != 0) return error.DirectModelKvHasNoWindow;
+            const c = caches[0].config;
+            var kq = try kv_quant.quantizeAffine(s, stacked_k, c.group_size, c.bits);
+            defer kq.deinit();
+            var vq = try kv_quant.quantizeAffine(s, stacked_v, c.group_size, c.bits);
+            defer vq.deinit();
+            for (caches, 0..) |cache, i| {
+                var rows: [6]mlx.mlx_array = undefined;
+                var n: usize = 0;
+                defer for (rows[0..n]) |r| {
+                    _ = mlx.mlx_array_free(r);
+                };
+                for ([_]mlx.mlx_array{ kq.q, vq.q, kq.scales, kq.biases, vq.scales, vq.biases }) |x| {
+                    rows[n] = try ssmAxisView(s, x, 0, i);
+                    n += 1;
+                }
+                try cache.write(&cache.entries[layer], layer, s, &rows);
+            }
+            return;
+        }
         for (caches, 0..) |cache, i| {
             const k = try ssmAxisView(s, stacked_k, 0, i);
             defer _ = mlx.mlx_array_free(k);
             const v = try ssmAxisView(s, stacked_v, 0, i);
             defer _ = mlx.mlx_array_free(v);
-            _ = try cache.update(layer, k, v, s, max_seq);
+            var view = try cache.update(layer, k, v, s, max_seq);
+            view.deinit();
         }
     }
 
-    /// The layer's K/V views; a restored entry's are rebuilt first.
+    /// The layer's K/V views (dequantized on an affine cache); a restored entry's are rebuilt first.
     pub fn denseView(self: *KVCache, layer: u32, s: mlx.mlx_stream) !DenseKVView {
         const e = &self.entries[layer];
         if (e.initialized and e.key_view.ctx == null) try rebuild(e, s);
+        if (self.config.scheme == .affine and e.initialized) return self.affineView(e, s);
         return .{ .k = e.key_view, .v = e.value_view, .owned = false };
     }
 
@@ -313,10 +395,10 @@ pub const KVCacheSnapshot = struct {
             dst.initialized = src.initialized;
             dst.offset = @min(src.offset, len);
             if (!src.initialized) continue;
-            dst.keys = try trimRows(s, src.keys, dst.offset);
-            dst.values = try trimRows(s, src.values, dst.offset);
-            _ = mlx.mlx_vector_array_append_value(vec, dst.keys);
-            _ = mlx.mlx_vector_array_append_value(vec, dst.values);
+            inline for (buffers) |b| if (@field(src, b).ctx != null) {
+                @field(dst, b) = try trimRows(s, @field(src, b), dst.offset);
+                _ = mlx.mlx_vector_array_append_value(vec, @field(dst, b));
+            };
         }
         if (mlx.mlx_vector_array_size(vec) > 0) _ = mlx.mlx_eval(vec);
         return .{ .entries = out, .step = @min(self.step, len), .allocator = self.allocator };

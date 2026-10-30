@@ -38,6 +38,7 @@ pub const ForwardCtx = struct {
     mrope_cos_cur: ?mlx.mlx_array = null,
     qsa_mask: mlx.mlx_array = .{ .ctx = null },
     qsa_blocks: mlx.mlx_array = .{ .ctx = null },
+    kv_attn_fused: bool = false,
     key_pad_mask: ?mlx.mlx_array = null,
     skip_lm_head: bool = false,
     batch_slots: ?[]const *ForwardCtx = null,

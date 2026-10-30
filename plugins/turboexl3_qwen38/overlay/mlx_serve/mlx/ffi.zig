@@ -453,6 +453,9 @@ pub fn mlx_logsumexp_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: 
 pub fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int {
     return c.mlx_matmul(res, a, b, s);
 }
+pub fn mlx_max_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int {
+    return c.mlx_max_axis(res, a, axis, keepdims, s);
+}
 pub fn mlx_maximum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int {
     return c.mlx_maximum(res, a, b, s);
 }

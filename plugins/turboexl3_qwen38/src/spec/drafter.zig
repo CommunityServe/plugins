@@ -1081,7 +1081,7 @@ fn queueHistory(t: *Trunk) !void {
     const m = &(t.qwen4_mtp orelse return);
     const vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vec);
-    for (m.cache.entries) |e| if (e.initialized) for ([_]Array{ e.keys, e.values }) |a| if (a.ctx != null) {
+    for (m.cache.entries) |e| if (e.initialized) for ([_]Array{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |a| if (a.ctx != null) {
         _ = mlx.mlx_vector_array_append_value(vec, a);
     };
     const q = &m.entry;
