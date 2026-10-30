@@ -8,10 +8,16 @@ const depth_bounds = @import("mlx_serve/engines/mlx/spec/mtp_depth_bounds.zig");
 const mtp_mod = @import("mlx_serve/sdk/spec/mtp/mtp.zig");
 const log = @import("mlx_serve/sdk/util/log.zig");
 
-/// What the flags say: null where the process names none.
+/// What the flags say: where the process names none, a depth is null and every other field the server's default.
 pub const Flags = struct {
     mtp_min_depth: ?u32 = null,
     mtp_max_depth: ?u32 = null,
+    /// `--max-mtp-ctx`: no round drafts past this many context tokens; 0 = no ceiling.
+    max_mtp_ctx: u32 = 0,
+    /// `--mtp-history-window`: a long prefill's head history covers its last this many positions; 0 = all of them.
+    mtp_history_window: usize = 0,
+    /// `--warmup-eager` / `--no-warmup-eager`: the load warms the verify widths.
+    warmup_eager: bool = true,
 
     /// The draft-depth range as the server's configure sets it from `--mtp-min-depth` and `--mtp-max-depth`, checked
     /// as its main checks it; null when neither is named.
@@ -24,11 +30,15 @@ pub const Flags = struct {
 };
 
 /// The flags this plugin reads, one line each: the server's spelling, the `Flags` field it sets, and how its value
-/// parses. A flag named twice keeps its last value, as the server's parse does.
+/// parses, or what a flag without a value sets. A flag named twice keeps its last value, as the server's parse does.
 const known = .{
     .{ .name = "--mtp-min-depth", .field = "mtp_min_depth", .value = depth },
     .{ .name = "--mtp-max-depth", .field = "mtp_max_depth", .value = depth },
     .{ .name = "--mtp-depth", .field = "mtp_max_depth", .value = oldDepth },
+    .{ .name = "--max-mtp-ctx", .field = "max_mtp_ctx", .value = tokens },
+    .{ .name = "--mtp-history-window", .field = "mtp_history_window", .value = positions },
+    .{ .name = "--warmup-eager", .field = "warmup_eager", .set = true },
+    .{ .name = "--no-warmup-eager", .field = "warmup_eager", .set = false },
 };
 
 /// A draft depth: an integer in 1..MAX_DEPTH.
@@ -41,6 +51,16 @@ fn oldDepth(text: []const u8) error{NotADepth}!u32 {
     return depth_bounds.parseClamped(text, mtp_mod.MAX_DEPTH);
 }
 
+/// `--max-mtp-ctx`'s token count, as the server's main reads it.
+fn tokens(text: []const u8) std.fmt.ParseIntError!u32 {
+    return std.fmt.parseInt(u32, text, 10);
+}
+
+/// `--mtp-history-window`'s position count, as the server's main reads it.
+fn positions(text: []const u8) std.fmt.ParseIntError!usize {
+    return std.fmt.parseInt(usize, text, 10);
+}
+
 /// A flag whose value the server refuses, and that value.
 pub const Bad = struct { flag: []const u8 = "", value: []const u8 = "" };
 
@@ -51,12 +71,16 @@ pub fn parse(args: []const [*:0]const u8, bad: *Bad) !Flags {
     while (i < args.len) : (i += 1) {
         const arg = std.mem.span(args[i]);
         inline for (known) |k| if (std.mem.eql(u8, arg, k.name)) {
-            i += 1;
-            const text: []const u8 = if (i < args.len) std.mem.span(args[i]) else "";
-            @field(out, k.field) = k.value(text) catch |e| {
-                bad.* = .{ .flag = k.name, .value = text };
-                return e;
-            };
+            if (@hasField(@TypeOf(k), "set")) {
+                @field(out, k.field) = k.set;
+            } else {
+                i += 1;
+                const text: []const u8 = if (i < args.len) std.mem.span(args[i]) else "";
+                @field(out, k.field) = k.value(text) catch |e| {
+                    bad.* = .{ .flag = k.name, .value = text };
+                    return e;
+                };
+            }
             break;
         };
     }
@@ -67,8 +91,9 @@ extern "c" fn _NSGetArgc() *const c_int;
 extern "c" fn _NSGetArgv() *const [*]const [*:0]const u8;
 
 /// What the server's flags set in this plugin: the MTP round policy's depth range (`depth_bounds.active`), with one line
-/// when a depth flag is named. A value the server refuses fails here by name, with a line naming the flag.
-pub fn apply() !void {
+/// when a depth flag is named, and the rest for the load to hand on, with one line for each that changes what the
+/// plugin does. A value the server refuses fails here by name, with a line naming the flag.
+pub fn apply() !Flags {
     var bad: Bad = .{};
     const f = parse(_NSGetArgv().*[0..@intCast(_NSGetArgc().*)], &bad) catch |e| {
         log.err("[turboexl3_qwen38] {s} '{s}' is not a value the server takes ({s})\n", .{ bad.flag, bad.value, @errorName(e) });
@@ -78,15 +103,20 @@ pub fn apply() !void {
         log.err("[turboexl3_qwen38] --mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ f.mtp_min_depth.?, f.mtp_max_depth.? });
         return e;
     };
-    const b = bounds orelse return;
-    depth_bounds.active = b;
-    if (b.pinned()) |n| {
-        log.info("[turboexl3_qwen38] MTP depth pinned to {d}\n", .{n});
-    } else if (b.max != 0) {
-        log.info("[turboexl3_qwen38] MTP depth bounded {d}..{d}\n", .{ b.min, b.max });
-    } else {
-        log.info("[turboexl3_qwen38] MTP depth bounded {d}..its adaptive cap\n", .{b.min});
+    if (bounds) |b| {
+        depth_bounds.active = b;
+        if (b.pinned()) |n| {
+            log.info("[turboexl3_qwen38] MTP depth pinned to {d}\n", .{n});
+        } else if (b.max != 0) {
+            log.info("[turboexl3_qwen38] MTP depth bounded {d}..{d}\n", .{ b.min, b.max });
+        } else {
+            log.info("[turboexl3_qwen38] MTP depth bounded {d}..its adaptive cap\n", .{b.min});
+        }
     }
+    if (f.max_mtp_ctx != 0) log.info("[turboexl3_qwen38] MTP stops drafting past {d} context tokens\n", .{f.max_mtp_ctx});
+    if (f.mtp_history_window != 0) log.info("[turboexl3_qwen38] MTP head history: the last {d} positions of a prefill past {d}\n", .{ f.mtp_history_window, mtp_mod.HISTORY_WINDOW_THRESHOLD });
+    if (!f.warmup_eager) log.info("[turboexl3_qwen38] no verify warm-up at load: each width compiles in its first round\n", .{});
+    return f;
 }
 
 test "host flags: the depth flags take what the server takes" {
@@ -106,4 +136,21 @@ test "host flags: the depth flags take what the server takes" {
     try testing.expectEqualStrings("--mtp-min-depth", bad.flag);
     try testing.expectError(error.NotADepth, parse(&.{ "mlx-serve", "--mtp-max-depth" }, &bad));
     try testing.expectError(error.MinAboveMax, (try parse(&.{ "mlx-serve", "--mtp-min-depth", "5", "--mtp-max-depth", "4" }, &bad)).depthBounds());
+}
+
+test "host flags: the context ceiling, the history window and the warm-up take what the server takes" {
+    const testing = std.testing;
+    var bad: Bad = .{};
+    // None named: the server's defaults.
+    try testing.expectEqual(Flags{}, try parse(&.{ "mlx-serve", "serve", "--model", "/m" }, &bad));
+    // A warm-up flag takes no value, so the flag after it still parses; the one named last wins.
+    const f = try parse(&.{ "mlx-serve", "--no-warmup-eager", "--max-mtp-ctx", "32768", "--mtp-history-window", "8192" }, &bad);
+    try testing.expectEqual(Flags{ .max_mtp_ctx = 32768, .mtp_history_window = 8192, .warmup_eager = false }, f);
+    try testing.expect((try parse(&.{ "mlx-serve", "--no-warmup-eager", "--warmup-eager" }, &bad)).warmup_eager);
+    // What the server refuses: a count that is not one, one past its type, a flag without a value.
+    try testing.expectError(error.InvalidCharacter, parse(&.{ "mlx-serve", "--max-mtp-ctx", "32k" }, &bad));
+    try testing.expectEqualStrings("--max-mtp-ctx", bad.flag);
+    try testing.expectError(error.Overflow, parse(&.{ "mlx-serve", "--max-mtp-ctx", "4294967296" }, &bad));
+    try testing.expectError(error.InvalidCharacter, parse(&.{ "mlx-serve", "--mtp-history-window" }, &bad));
+    try testing.expectEqualStrings("--mtp-history-window", bad.flag);
 }

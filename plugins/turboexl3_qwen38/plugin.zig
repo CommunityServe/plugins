@@ -117,7 +117,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     }
     // The server's own flags this plugin follows (src/host_flags.zig), set before anything reads them.
-    host_flags.apply() catch |e| {
+    const flags = host_flags.apply() catch |e| {
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_qwen38: " ++ @errorName(x)),
         };
@@ -134,22 +134,23 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     const m: *q4.Model = @ptrCast(@alignCast(mp));
-    s.* = .{ .m = m, .drafter = Drafter.init(m), .mtp = false };
+    s.* = .{ .m = m, .drafter = Drafter.init(m, flags.max_mtp_ctx, flags.mtp_history_window), .mtp = false };
     // A pack without a head, or a server whose `mtp` setting is off: no rounds and no head history.
     if (s.drafter.has() and (q4.mtpSetting(ctx.settings_json.slice()) orelse true)) {
         s.mtp = true;
-        armHead(m);
+        armHead(m, flags.warmup_eager);
         s.drafter.warmTwoChunk() catch |e| log.warn("[turboexl3_qwen38] the two-chunk warm-up failed ({s}): the first boundary is timed cold\n", .{@errorName(e)});
     }
     return s;
 }
 
 /// The head's load-time work, as #1005's load does it when the head serves (`qwen4_build_draft_rerank`, then its eager
-/// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and each verify width's
-/// kernels, to the depth cap `--mtp-max-depth` resolves to, compiled before any round is timed. The slots' KV is dense
-/// (`KVCache.init`).
-fn armHead(m: *q4.Model) void {
+/// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and with `eager` (the
+/// server's eager warm-up, on unless `--no-warmup-eager`) each verify width's kernels, to the depth cap
+/// `--mtp-max-depth` resolves to, compiled before any round is timed. The slots' KV is dense (`KVCache.init`).
+fn armHead(m: *q4.Model, eager: bool) void {
     _ = mtp_head.qwen4BuildDraftRerank(&m.trunk);
+    if (!eager) return;
     const kv = KVQuantConfig.dense;
     const cap = ev_plan.resolveMtpDepthCapForProfile(depth_bounds.active.max, cost_profile.qwen4G17CostProfileForKv(&m.trunk, kv));
     warmup.warmupSpecVerify(&m.trunk, cap, kv) catch |e| log.warn("[turboexl3_qwen38] the verify warm-up failed ({s}): each width compiles in its first round\n", .{@errorName(e)});
@@ -168,14 +169,15 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 
 /// The host's slot caches are its engine's types, which this dylib's copies must never read as theirs: each slot runs
 /// on the state the model keeps for its id (`Caps.owns_decode_state`, `slot_state`). A forward's streams also extend
-/// the slot's MTP history.
+/// the slot's MTP history; a forward whose rows join none (`Drafter.takes`) computes none, as #1005 captures no hidden
+/// for a prompt chunk before its history window.
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const s = served(mp);
     var own = f.*;
     own.cache_ops = null;
     own.caches = .{};
     const follow = s.mtp and f.mode != .verify and f.logits != .none and f.embeds.ctx == null;
-    if (follow) own.want_hidden = true;
+    if (follow and (f.positions.len > 1 or s.drafter.takes(slotOf(f), posOf(f), f.rows))) own.want_hidden = true;
     captureAt(s, f);
     const v = q4.forward(s.m, &own, out);
     // The prefill's last forward, or a failed one, ends its read-ahead.
@@ -203,16 +205,22 @@ fn captureAt(s: *Served, f: *const abi.Forward) void {
     };
 }
 
-/// Each slot's rows of a forward into its MTP history: one slot's `rows`, or one row per slot of a batched forward.
+/// A one-slot forward's slot id and first position.
+fn slotOf(f: *const abi.Forward) u32 {
+    return if (f.slots.len > 0) f.slots.slice()[0] else 0;
+}
+
+fn posOf(f: *const abi.Forward) u64 {
+    return if (f.positions.len > 0) f.positions.slice()[0] else 0;
+}
+
+/// Each slot's rows of a forward into its MTP history: one slot's `rows` (its streams null when it takes none), or one
+/// row per slot of a batched forward.
 fn followForward(s: *Served, f: *const abi.Forward, streams: mlx.mlx_array) !void {
-    if (streams.ctx == null) return error.NoStreams;
     const slots = @max(f.positions.len, 1);
     const ids_dev: mlx.mlx_array = .{ .ctx = f.ids.ctx };
-    if (slots == 1) {
-        const id: u32 = if (f.slots.len > 0) f.slots.slice()[0] else 0;
-        const pos: u64 = if (f.positions.len > 0) f.positions.slice()[0] else 0;
-        return s.drafter.follow(id, pos, f.rows, f.tokens.slice(), ids_dev, streams, true);
-    }
+    if (slots == 1) return s.drafter.follow(slotOf(f), posOf(f), f.rows, f.tokens.slice(), ids_dev, streams, true);
+    if (streams.ctx == null) return error.NoStreams;
     const st = s.m.trunk.s;
     for (0..slots) |i| {
         const id: u32 = if (f.slots.len > i) f.slots.slice()[i] else @intCast(i);
