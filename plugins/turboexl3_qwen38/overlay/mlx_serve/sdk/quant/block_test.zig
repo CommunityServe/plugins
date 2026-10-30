@@ -7,10 +7,6 @@ const abi = @import("../../abi/quant.zig");
 const Verdict = abi.Verdict;
 const blocksOf = block_mod.blocksOf;
 const builtins = block_mod.builtins;
-const claimant = block_mod.claimant;
-const declared = block_mod.declared;
-const hadamardBlock = block_mod.hadamardBlock;
-const registry = @import("../../plugins/registry.zig");
 const testing = std.testing;
 
 test "quant block: blocks are found under their keys; a config without one has none" {

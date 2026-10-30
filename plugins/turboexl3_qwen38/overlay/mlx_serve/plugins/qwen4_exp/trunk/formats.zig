@@ -283,7 +283,6 @@ fn rowsOf(x: mlx.mlx_array) usize {
 // ── tests ──
 
 const testing = std.testing;
-const exl3_format = @import("../../../sdk/quant/exl3/format.zig");
 
 /// A quant table as the trunk reads it: it claims a `"fake"` block, loads any linear but one named `bad` (a
 /// new handle on the map's array) and returns `x` from its matmul.
@@ -317,30 +316,33 @@ const Fake = struct {
     const table: abi.QuantTable = .{ .name = abi.Str.of("fake"), .claims = &claims, .validate = undefined, .bill = undefined, .open = &open, .close = &close, .load_tensor = &loadTensor, .load_bank = undefined, .release = &release, .matmul = &matmul, .moe = undefined };
 };
 
-/// Claims every block at `by_marker`, as turboexl3 claims an EXL3 pack's.
-const Marker = struct {
-    fn claims(_: abi.Str, _: abi.Str) callconv(.c) abi.Claim {
-        return .by_marker;
-    }
-    const table: abi.QuantTable = .{ .name = abi.Str.of("marker"), .claims = &claims, .validate = undefined, .bill = undefined, .open = undefined, .close = undefined, .load_tensor = undefined, .load_bank = undefined, .release = undefined, .matmul = undefined, .moe = undefined };
-};
+fn putZeros(w: *model.Weights, name: []const u8, dt: mlx.mlx_dtype, shape: []const c_int) !void {
+    var a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, mlx.mlx_default_cpu_stream_new()));
+    try w.put(name, a);
+}
 
-/// `Fake` with the resident entries: each weight takes `per` bytes.
-const Keep = struct {
-    const per: u64 = 1024;
-    var last: usize = 0;
-    var dropped = false;
+test "qwen4_exp formats: the numerics are reordered on the EXL3 trunk profile and exact elsewhere" {
+    try testing.expectEqual(Numerics.reordered, numericsFor(true));
+    try testing.expectEqual(Numerics.exact, numericsFor(false));
+}
 
-    fn resident(ws: abi.Span(abi.Weight), room: u64, _: abi.Stream, bytes: *u64) callconv(.c) abi.Verdict {
-        last = ws.len;
-        bytes.* = ws.len * per;
-        if (ws.len == 0) dropped = true;
-        if (room != 0 and bytes.* > room) return abi.Verdict.refuse(.too_large, "FakeRoom");
-        return .ok;
-    }
-    const table: abi.QuantTable = blk: {
-        var t = Fake.table;
-        t.resident = &resident;
-        break :blk t;
-    };
-};
+test "qwen4_exp formats: an unclaimed trunk block, a linear its format refuses and a pack without the block are refused by name" {
+    var w = model.Weights.init(testing.allocator);
+    defer w.deinit();
+    try putZeros(&w, "m.q.weight", .uint16, &.{ 8, 8, 32 });
+    const s = mlx.mlx_default_cpu_stream_new();
+    const config: model.ModelConfig = .{ .trunk_format = true };
+    var ld: Loading = undefined;
+    const saved = extra_tables;
+    defer extra_tables = saved;
+    extra_tables = &.{};
+    try testing.expectError(error.QuantFormatUnclaimed, ld.begin(testing.allocator, &config, &w, .{ .trunk_quant = "{\"format\":\"fake\"}" }, s));
+    try testing.expectError(error.TrunkFormatBlockMissing, ld.begin(testing.allocator, &config, &w, .{}, s));
+    extra_tables = &.{&Fake.table};
+    try putZeros(&w, "m.bad.weight", .uint16, &.{ 8, 8, 32 });
+    try testing.expectError(error.TrunkLinearUnserved, ld.begin(testing.allocator, &config, &w, .{ .trunk_quant = "{\"format\":\"fake\"}" }, s));
+    var none = model.Weights.init(testing.allocator);
+    defer none.deinit();
+    try testing.expectError(error.TrunkFormatHasNoLinears, ld.begin(testing.allocator, &config, &none, .{ .trunk_quant = "{\"format\":\"fake\"}" }, s));
+}

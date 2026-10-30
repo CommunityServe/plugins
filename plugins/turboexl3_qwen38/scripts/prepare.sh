@@ -6,7 +6,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 root="$(cd "$here/../.." && pwd)"
 ref="$(tr -d '[:space:]' < "$root/MLX_SERVE_REF")"
-stamp="$ref $(cat "$here/scripts/sync-mlx-serve.sh" "$here/scripts/slice.txt" "$here/scripts/cut-functions.txt" | shasum | cut -c1-16) $(cd "$here/overlay" && find . -type f | sort | xargs shasum | shasum | cut -c1-16)"
+stamp="$ref $(cat "$here/scripts/sync-mlx-serve.sh" "$here/scripts/slice.txt" "$here/scripts/cut.txt" | shasum | cut -c1-16) $(cd "$here/overlay" && find . -type f | sort | xargs shasum | shasum | cut -c1-16)"
 dst="$here/src/mlx_serve"
 if [ -f "$dst/.generated" ] && [ "$(cat "$dst/.generated")" = "$stamp" ]; then exit 0; fi
 src="$("$root/scripts/fetch-source.sh")"

@@ -101,11 +101,6 @@ pub fn d3Blocks(rows: c_int, most: c_int) [2]c_int {
     return .{ @divFloor(rows + n - 1, n), n };
 }
 
-pub var rows_override: ?c_int = null;
-/// Widest read the two launches serve (the verify widths and batched slots).
-pub fn maxRows() c_int {
-    return rows_override orelse 16;
-}
 
 /// Values per pack the HC kernels read: one word at 2/4/8 bits, 8 values in BITS bytes at 3/5/6.
 pub fn packValues(bits: u32) ?c_int {
@@ -262,10 +257,6 @@ fn decode3Serves(pair: ?[2]mlx.mlx_fast_metal_kernel_config, dw: mlx.mlx_array, 
 /// unfused chain). `dw` [R, K/vpw] and `uw` [K, R/vpw] are the packed projections with
 /// scales and biases in x's dtype, `iw` the dense [K, hc] inject weight or null-ctx.
 pub const read = Reader(false).read;
-
-/// `read` on an EXL3 trunk pack (`trunk_format`): from two rows up the multi-row launches, and decode3's pair where its
-/// geometry fits (`decode3Fits`).
-pub const readTrunk = Reader(true).read;
 
 /// The read written once for both: `exl3` adds the EXL3 trunk's launches. Each version arms its own configs.
 fn Reader(comptime exl3: bool) type {

@@ -5,31 +5,25 @@ const std = @import("std");
 const log = @import("../../../../sdk/util/log.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const round_cost = @import("../round_cost.zig");
-const group_cost = @import("../mtp_group_cost.zig");
-const group_planner = @import("../mtp_group_planner.zig");
 const testing = std.testing;
 const Generator = @import("../../generate/generator.zig").Generator;
 const MTP_DEPTH_WINDOW = @import("depth.zig").MTP_DEPTH_WINDOW;
 const MTP_DISABLE_BELOW = @import("depth.zig").MTP_DISABLE_BELOW;
 const MTP_EV_EMA_BETA = @import("depth.zig").MTP_EV_EMA_BETA;
 const MTP_EV_WARMUP_ROUNDS = @import("depth.zig").MTP_EV_WARMUP_ROUNDS;
-const MTP_EXT_DRY_ROUNDS = @import("regime.zig").MTP_EXT_DRY_ROUNDS;
 const MtpCostSource = @import("ev_plan.zig").MtpCostSource;
 const MtpRoundPlan = @import("ev_plan.zig").MtpRoundPlan;
-const MtpTrace = @import("trace.zig").MtpTrace;
 const mtpBasePlan = @import("ev_plan.zig").mtpBasePlan;
 const mtpDepthPolicy = @import("ev_plan.zig").mtpDepthPolicy;
 const mtpDepthPolicyFor = @import("ev_plan.zig").mtpDepthPolicyFor;
 const mtpEvExpectedTokens = @import("ev_plan.zig").mtpEvExpectedTokens;
 const mtpEvObserve = @import("ev_plan.zig").mtpEvObserve;
-const mtpEvTestGenerator = @import("ev_plan.zig").mtpEvTestGenerator;
 const mtpExtDryAllows = @import("regime.zig").mtpExtDryAllows;
 const mtpExtDryThresholdFor = @import("regime.zig").mtpExtDryThresholdFor;
 const mtpPinnedDepth = @import("regime.zig").mtpPinnedDepth;
 const mtpPlanInBounds = @import("regime.zig").mtpPlanInBounds;
 const mtpRegimeExplorePeriod = @import("regime.zig").mtpRegimeExplorePeriod;
 const mtpRegimeForce = @import("regime.zig").mtpRegimeForce;
-const mtpTraceEnabled = @import("trace.zig").mtpTraceEnabled;
 
 
 pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {

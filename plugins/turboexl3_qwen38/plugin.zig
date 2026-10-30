@@ -1,22 +1,23 @@
-//! turboexl3_qwen38: turboderp's fully EXL3 Qwen3.8-Flash packs (K2 to K5) through turboexl3, on mlx-serve's own
-//! Qwen3.8 code (`src/mlx_serve/`, copied by scripts/sync-mlx-serve.sh): the built-in `qwen4_exp`'s load and forward,
-//! on state the plugin keeps for each slot (the host's caches are its own types), and its MTP head as the native
-//! drafter (src/spec/drafter.zig). The built-in keeps every other pack.
+//! turboexl3_qwen38: the Qwen3.8-Flash-Next EXL3 packs K2 to K5 on M5-class GPUs. The model is the direct one in
+//! src/direct, turboexl3 runs its EXL3 math, and the pack's MTP head is the native drafter (src/spec/drafter.zig).
 
 const std = @import("std");
 const kit = @import("mlx_serve");
 const abi = kit.abi.plugin;
 pub const config = @import("config.zig");
-/// What the modules of their own (turboexl3's `sdk`, Sushi's `sushi_exl3`) read through this root (`mlx_host`): the
-/// plugin's mlx-c layer, its log, env and io_util, the quant ABI the copies and turboexl3's table share, and its globals.
+/// The plugin's mlx-c layer, log, env and io_util, the quant ABI the copies and turboexl3's table share, and its
+/// globals; turboexl3's `sdk` reads the layer, the ABI and the globals through this root (`mlx_host`).
 pub const mlx = @import("src/mlx_serve/mlx/ffi.zig");
 pub const log = @import("src/mlx_serve/sdk/util/log.zig");
 pub const env = @import("src/mlx_serve/env.zig");
 pub const io_util = @import("src/mlx_serve/sdk/util/io_util.zig");
 pub const quant_abi = @import("src/mlx_serve/abi/quant.zig");
 pub const shared = @import("src/mlx_serve/sdk/util/shared.zig");
-const q4 = @import("src/mlx_serve/plugins/qwen4_exp/plugin.zig");
-const q4_bill = @import("src/mlx_serve/plugins/qwen4_exp/bill.zig");
+const device = @import("src/mlx_serve/mlx/device.zig");
+const q4 = @import("src/direct/serve.zig");
+const mtp_head = @import("src/direct/mtp_head.zig");
+const warmup = @import("src/direct/warmup.zig");
+const ple = @import("src/direct/ple.zig");
 const cost_profile = @import("src/mlx_serve/plugins/qwen4_exp/cost_profile.zig");
 const ev_plan = @import("src/mlx_serve/engines/mlx/spec/mtp/ev_plan.zig");
 const KVQuantConfig = @import("src/mlx_serve/engines/mlx/cache/kv_quant.zig").KVQuantConfig;
@@ -37,14 +38,13 @@ pub const table = abi.ModelTable{
     .claims = config.claims,
     .parse = &config.parse,
     .free_parsed = &config.freeParsed,
-    .bill = &q4_bill.bill,
+    .bill = &q4.bill,
     .load = &load,
     .unload = &unload,
     .forward = &forward,
     .forward_settle = &forwardSettle,
     .release_slot = &releaseSlot,
     .activate_slot = &activateSlot,
-    .meters = &meters,
     .cache = &.{ .layout = &q4.layout, .aux = &aux_hooks, .resume_prompt = &resumePrompt },
     .spec = &.{ .native_drafter = &native_drafter },
     .weights = &.{ .keep_key = &keepNone, .resident_bytes = &q4.residentBill },
@@ -109,6 +109,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     mlx.bind(h);
+    if (!device.naxPresent()) {
+        log.err("[turboexl3_qwen38] turboexl3_qwen38 needs an M5-class GPU (NAX)\n", .{});
+        out.* = Verdict.refuse(.unsupported, "turboexl3_qwen38 needs an M5-class GPU (NAX)");
+        return null;
+    }
     const s = gpa.create(Served) catch {
         out.* = Verdict.refuse(.failed, "turboexl3_qwen38: out of memory");
         return null;
@@ -120,14 +125,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     const m: *q4.Model = @ptrCast(@alignCast(mp));
-    s.* = .{ .m = m, .drafter = Drafter.init(m, &ctx.parsed.shell), .mtp = false };
-    if (!s.drafter.has()) {
-        log.info("[turboexl3_qwen38] the pack has no MTP head: rounds draft nothing\n", .{});
-    } else if (mtpSetting(ctx.settings_json.slice()) orelse true) {
+    s.* = .{ .m = m, .drafter = Drafter.init(m), .mtp = false };
+    // A pack without a head, or a server whose `mtp` setting is off: no rounds and no head history.
+    if (s.drafter.has() and (q4.mtpSetting(ctx.settings_json.slice()) orelse true)) {
         s.mtp = true;
         armHead(m);
         s.drafter.warmTwoChunk() catch |e| log.warn("[turboexl3_qwen38] the two-chunk warm-up failed ({s}): the first boundary is timed cold\n", .{@errorName(e)});
-    } else log.info("[turboexl3_qwen38] MTP off for this server (its mtp setting): no head history\n", .{});
+    }
     return s;
 }
 
@@ -135,19 +139,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 /// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and each verify width's
 /// kernels compiled before any round is timed. The slots' KV is dense (`KVCache.init`).
 fn armHead(m: *q4.Model) void {
-    _ = m.trunk.qwen4BuildDraftRerank();
+    _ = mtp_head.qwen4BuildDraftRerank(&m.trunk);
     const kv = KVQuantConfig.dense;
     const cap = ev_plan.resolveMtpDepthCapForProfile(0, cost_profile.qwen4G17CostProfileForKv(&m.trunk, kv));
-    m.trunk.warmupSpecVerify(cap, kv) catch |e| log.warn("[turboexl3_qwen38] the verify warm-up failed ({s}): each width compiles in its first round\n", .{@errorName(e)});
-}
-
-/// `mtp` as the load settings state it (`--no-mtp` and a model's own setting); null = the default (on).
-fn mtpSetting(settings_json: []const u8) ?bool {
-    if (settings_json.len == 0) return null;
-    const S = struct { mtp: ?bool = null };
-    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
-    defer parsed.deinit();
-    return parsed.value.mtp;
+    warmup.warmupSpecVerify(&m.trunk, cap, kv) catch |e| log.warn("[turboexl3_qwen38] the verify warm-up failed ({s}): each width compiles in its first round\n", .{@errorName(e)});
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {
@@ -166,8 +161,6 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 /// the slot's MTP history.
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const s = served(mp);
-    // A forward of the engine's own between two rounds (a forced commit) leaves no room for a pre-drafted chain.
-    s.drafter.dropPre();
     var own = f.*;
     own.cache_ops = null;
     own.caches = .{};
@@ -255,10 +248,6 @@ fn activateSlot(mp: *anyopaque, slot: u32) callconv(.c) Verdict {
     return .ok;
 }
 
-fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
-    q4.meters(served(mp).m, slot, out);
-}
-
 /// The prefix cache's module path (`CacheHooks.aux`) hands each prompt in through `begin_prompt`; this one is the
 /// server's other path, which it takes for a model with no aux binding: every prompt prefills cold.
 fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
@@ -293,7 +282,7 @@ fn plePrefetch(s: *Served, slot: u32, prompt: []const u32, at: u64) void {
             if (l >= own.ssm.len) return;
             if (own.ssm[l].ple_prev_valid) prev = own.ssm[l].ple_prev;
         }
-        st.table.prefetchBegin(&st.hash, prev[0 .. st.hash.ngram_size - 1], prompt[@intCast(at)..], at);
+        ple.prefetchBegin(&st.table, &st.hash, prev[0 .. st.hash.ngram_size - 1], prompt[@intCast(at)..], at);
         s.ple = .{ .slot = slot, .end = prompt.len };
         return;
     };
@@ -441,7 +430,7 @@ fn auxImportArrays(_: *anyopaque, _: abi.Span(u32), _: abi.Str, _: abi.Span(abi.
 fn pleEnd(s: *Served) void {
     if (s.ple == null) return;
     s.ple = null;
-    s.m.trunk.plePrefetchEnd();
+    ple.plePrefetchEnd(&s.m.trunk);
 }
 
 fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
@@ -472,10 +461,15 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 
 test {
     _ = config;
-    // The MTP round's pure parts (`zig build mlx-free-test`): the verify's PLE lend and a request's [spec-stats] lines.
+    // The MTP round's pure parts (`zig build mlx-free-test`): the verify's PLE lend and a request's [spec-stats] line.
     _ = @import("src/spec/drafter.zig");
-    // #1005's trunk_quant block lookup, MLX-free (`zig build mlx-free-test`; the file holds mlx-serve's others too).
+    // #1005's trunk_quant block lookup, MLX-free (`zig build mlx-free-test`).
     _ = @import("src/mlx_serve/sdk/quant/block_test.zig");
-    // #1005's GPU tests (`zig build gpu-test`, the server's MLX linked); mlx-free-test's filters leave them out.
+    // #1005's EXL3 tests (`zig build gpu-test`, the server's MLX linked); mlx-free-test's filters leave them out.
     _ = @import("src/gpu_tests.zig");
+    // The direct model's own: the trellis n-gram table, its warm and the resident bill (mlx-free-test), the table's
+    // head bias (gpu-test).
+    _ = @import("src/direct/ple.zig");
+    _ = @import("src/direct/load.zig");
+    _ = @import("src/direct/serve.zig");
 }

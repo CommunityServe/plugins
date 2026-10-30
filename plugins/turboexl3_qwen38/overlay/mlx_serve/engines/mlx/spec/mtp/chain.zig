@@ -3,34 +3,22 @@
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const HeadPlace = @import("../../../../plugins/qwen4_exp/mtp.zig").HeadPlace;
 const std = @import("std");
-const env = @import("../../../../env.zig");
 const mlx = @import("../../../../mlx/ffi.zig");
 const transformer_mod = @import("../../transformer.zig");
 const tokenizer_mod = @import("../../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../../sdk/config/model.zig");
 const log = @import("../../../../sdk/util/log.zig");
 const mtp_lookup = @import("../mtp_lookup.zig");
-const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
-const mtp_acceptance = @import("../../../../sdk/spec/mtp_acceptance.zig");
 const group_planner = @import("../mtp_group_planner.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
 const KVCache = transformer_mod.KVCache;
 const testing = std.testing;
-const CommittedArgmax = @import("../verify.zig").CommittedArgmax;
 const Generator = @import("../../generate/generator.zig").Generator;
 const MAX_ROUND_DRAFTS = @import("../mtp_head_ref.zig").MAX_ROUND_DRAFTS;
-const MtpGraphFn = @import("../tree.zig").MtpGraphFn;
 const MtpRoundPlan = @import("ev_plan.zig").MtpRoundPlan;
-const MtpRoundState = @import("round.zig").MtpRoundState;
-const SamplingParams = @import("../../sampling/params.zig").SamplingParams;
 const deinit = @import("../../generate/generator.zig").Generator.deinit;
-const isEosId = @import("../../../../sdk/request/stops.zig").isEosId;
-const mtpBatchedExactGraph = @import("batched_graph.zig").mtpBatchedExactGraph;
-const mtpChainDispatch = @import("chain_build.zig").mtpChainDispatch;
-const mtpPredraftEnabled = @import("trace.zig").mtpPredraftEnabled;
-const sampleTokenLazy = @import("../../sampling/lazy.zig").sampleTokenLazy;
 
 
 /// Qwen native-MTP speculative round. Structure mirrors `nextDrafter`
@@ -219,53 +207,11 @@ pub const MtpLazyVerdict = struct {
     }
 };
 
-/// What decides whether round N+1's chain is built from round N's lazy results.
-pub const LazyGate = struct {
-    enabled: bool,
-    greedy: bool,
-    solo: bool,
-    padded: bool,
-    lookup_round: bool,
-    planner_owned: bool,
-    spec_live: bool,
-    /// A full accept still leaves budget for another round. Without one the chain
-    /// would be dispatched and thrown away, and a head failure would fail a finished request.
-    successor: bool,
-};
 
-/// The test seam's false keeps the pre-draft at the round's tail, after the host read.
-pub var mtp_lazy_predraft_override: ?bool = null;
 
-/// Test seam: discard every lazy chain, as a lookup pick does.
-pub var mtp_lazy_force_discard: bool = false;
-/// Test seam: fail the round right after its lazy chain is dispatched.
-pub var mtp_lazy_fail_after_dispatch: bool = false;
-
-/// The test seam's false keeps the merged `1 + accepted` history step.
-pub var mtp_padded_head_override: ?bool = null;
 
 // ── tests ──
 
-
-pub const MtpChainTestSlot = struct {
-    cache: KVCache,
-    off: usize = 0,
-    entries: []transformer_mod.SSMCacheEntry,
-    gen: ?Generator = null,
-
-    pub fn deinit(slot: *@This(), a: std.mem.Allocator) void {
-        if (slot.gen) |*g| g.deinit(a);
-        for (slot.entries) |*e| {
-            _ = mlx.mlx_array_free(e.conv_state);
-            _ = mlx.mlx_array_free(e.ssm_state);
-            transformer_mod.ssmFreeQsaState(e);
-        }
-        a.free(slot.entries);
-        slot.cache.deinit();
-        a.destroy(slot);
-    }
-
-};
 
 /// A loaded qwen4_exp pack and a byte tokenizer for generator-level lazy pre-draft runs.
 const LazyRig = struct {
@@ -279,7 +225,5 @@ const LazyRig = struct {
         rig.config.deinit(a);
         a.destroy(rig);
     }
-
-    const Run = struct { ids: []u32, built: u32, kept: u32, lookup_rounds: u64, completion: u32, residue: bool };
 
 };

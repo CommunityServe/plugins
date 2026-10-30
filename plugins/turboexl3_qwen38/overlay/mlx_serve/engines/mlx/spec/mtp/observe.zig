@@ -9,7 +9,6 @@ const Generator = @import("../../generate/generator.zig").Generator;
 const MTP_EV_WARMUP_ROUNDS = @import("depth.zig").MTP_EV_WARMUP_ROUNDS;
 const MtpCostSource = @import("ev_plan.zig").MtpCostSource;
 const mtpLowAcceptStreak = @import("adaptive.zig").mtpLowAcceptStreak;
-const mtpProbePeriod = @import("planner.zig").mtpProbePeriod;
 const mtpRegimeObserve = @import("regime.zig").mtpRegimeObserve;
 
 

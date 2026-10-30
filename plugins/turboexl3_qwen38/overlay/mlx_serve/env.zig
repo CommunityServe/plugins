@@ -44,26 +44,9 @@ pub fn float(comptime name: @EnumLiteral(), default: f32) f32 {
     return default;
 }
 
-pub fn onCached(cache: *?bool, comptime name: @EnumLiteral()) bool {
-    _ = name;
-    cache.* = false;
-    return false;
-}
-
 pub fn byName(name: [*:0]const u8) ?[*:0]const u8 {
     _ = name;
     return null;
-}
-
-pub fn diagAny(comptime prefix: []const u8) bool {
-    _ = prefix;
-    return false;
-}
-
-/// mlx-serve's reading of a raw value (the copies pass `get`'s, always null here): set and not starting with `0`.
-pub fn onValue(raw: ?[*:0]const u8) bool {
-    const v = std.mem.span(raw orelse return false);
-    return v.len == 0 or v[0] != '0';
 }
 
 test "no variable is a lever: one set in the process environment reads as unset" {

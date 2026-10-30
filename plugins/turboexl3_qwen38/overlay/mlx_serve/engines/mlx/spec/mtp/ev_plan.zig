@@ -2,10 +2,8 @@
 //! MTP EV round planning: depth caps, cost sources, depth policy.
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
-const env = @import("../../../../env.zig");
 const transformer_mod = @import("../../transformer.zig");
 const log = @import("../../../../sdk/util/log.zig");
-const io_util = @import("../../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const round_cost = @import("../round_cost.zig");
 const ane_mod = @import("../../../../sdk/ane/offload.zig");

@@ -8,17 +8,6 @@ const mlx = @import("ffi.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
 
-/// `src` gathered at `idx` along `axis`, made contiguous.
-pub fn takeContig(s: Stream, src: Array, idx: Array, axis: c_int) !Array {
-    var taken = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(taken);
-    try mlx.check(mlx.mlx_take_axis(&taken, src, idx, axis, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_contiguous(&out, taken, false, s));
-    return out;
-}
-
 /// A copy of `x` that owns its buffer (`x + 0` in `x`'s dtype): a view's source can be freed once it is evaluated.
 pub fn materializedOwnedCopy(s: Stream, x: Array) !Array {
     var zero = mlx.mlx_array_new();
@@ -45,14 +34,6 @@ pub fn concatAxis0(s: Stream, parts: []const Array) !Array {
 
 pub fn concatAxis1(s: Stream, parts: []const Array) !Array {
     return concat(s, parts, 1);
-}
-
-/// `parts` stacked on axis 0 and evaluated.
-pub fn concatRows(parts: []const Array, s: Stream) !Array {
-    const out = try concat(s, parts, 0);
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_array_eval(out));
-    return out;
 }
 
 /// Index `i` of `axis`, the axis kept (a view).
@@ -126,13 +107,4 @@ pub fn splitPackedGateUp(arr: Array, s: Stream) !struct { gate: Array, up: Array
     errdefer _ = mlx.mlx_array_free(up);
     try mlx.check(mlx.mlx_contiguous(&up, up_view, false, s));
     return .{ .gate = gate, .up = up };
-}
-
-/// Columns `start..stop` of a `[A, B, C]` array (a view).
-pub fn sliceLastDim(arr: Array, start: c_int, stop: c_int, s: Stream) !Array {
-    const sh = mlx.getShape(arr);
-    if (sh.len != 3) return error.BadShape;
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&out, arr, &[_]c_int{ 0, 0, start }, 3, &[_]c_int{ sh[0], sh[1], stop }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-    return out;
 }

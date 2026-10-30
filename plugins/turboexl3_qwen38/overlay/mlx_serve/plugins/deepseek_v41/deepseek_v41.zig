@@ -7,9 +7,4 @@ pub const Pair = struct {
     hi: usize,
     worker: bool,
 
-    pub fn holds(p: Pair, li: usize) bool {
-        _ = p;
-        _ = li;
-        return false;
-    }
 };

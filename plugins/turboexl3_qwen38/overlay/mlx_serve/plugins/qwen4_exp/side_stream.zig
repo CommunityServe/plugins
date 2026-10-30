@@ -111,38 +111,38 @@ pub fn newStream(on: mlx.mlx_stream) ?mlx.mlx_stream {
     return if (st.ctx != null) st else null;
 }
 
-/// `moeAddGatedShared` where the `shared` part takes the call: the shared expert, its gate's logit, sigmoid and product
-/// on the side stream beside the routed launches, the Add that joins the routed sum on the trunk's stream (one fence
-/// back). Its ops on its operands, so its bytes.
-pub fn addGatedShared(t: *Trunk, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
-    const rows = SideStream.rowsOf(expert_x);
-    const side = SideStream.forPart(.shared, t, rows) orelse return t.moeAddGatedShared(expert_sum, expert_x, mw, null);
-    const main = t.s;
-    const gated = blk: {
-        t.s = side;
-        defer t.s = main;
-        const down = (try t.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
-        defer _ = mlx.mlx_array_free(down);
-        const seg_w = mw.shared_expert_gate_w.?;
-        const seg_qp = t.quantParamsHinted(seg_w, mw.shared_expert_gate_s.?, lastDim(expert_x));
-        const logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, side);
-        defer _ = mlx.mlx_array_free(logit);
-        var sig = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sig);
-        try mlx.check(mlx.mlx_sigmoid(&sig, logit, side));
-        var g = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(g);
-        try mlx.check(mlx.mlx_multiply(&g, sig, down, side));
-        break :blk g;
-    };
-    defer _ = mlx.mlx_array_free(gated);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_add(&out, expert_sum, gated, main));
-    SideStream.note("shared", rows);
-    return out;
-}
-
 // ── tests ──
 
 const testing = std.testing;
+
+test "side stream: a part takes a call only on an EXL3 trunk at a prefill width, per trunk; the stream is made once" {
+    defer {
+        SideStream.override = null;
+        SideStream.min_rows_override = null;
+    }
+    const gpu = mlx.gpuStream();
+    // an MLX trunk and an EXL3 trunk in one process: each keeps its own parts, whichever loaded last
+    var plain: Trunk = undefined;
+    plain.s = gpu;
+    plain.formats = .{};
+    var exl3: Trunk = undefined;
+    exl3.s = gpu;
+    exl3.formats = .{ .profile = true };
+    try testing.expectEqual(SideStream.Parts{}, SideStream.active(&plain));
+    try testing.expectEqual(SideStream.Parts{ .shared = true, .gdnz = true }, SideStream.active(&exl3));
+    try testing.expect(SideStream.forPart(.shared, &plain, 8192) == null);
+    try testing.expect(SideStream.forPart(.gdnz, &plain, 8192) == null);
+    try testing.expect(SideStream.forPart(.shared, &exl3, SideStream.MIN_ROWS - 1) == null);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    exl3.s = cpu;
+    try testing.expect(SideStream.forPart(.gdnz, &exl3, 8192) == null);
+    exl3.s = gpu;
+    SideStream.override = .{ .gdnz = true };
+    try testing.expect(SideStream.forPart(.shared, &exl3, 8192) == null);
+    if (!mlx.streamIsGpu(gpu)) return;
+    const side = SideStream.forPart(.gdnz, &exl3, 8192) orelse return error.SideStreamMissing;
+    try testing.expect(!mlx.mlx_stream_equal(side, gpu));
+    const again = SideStream.forPart(.gdnz, &exl3, SideStream.MIN_ROWS) orelse return error.SideStreamMissing;
+    try testing.expect(mlx.mlx_stream_equal(side, again));
+}

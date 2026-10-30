@@ -6,8 +6,6 @@
 //! captures, so one that captured only `T` and `init` would be one type, and one storage, for every name of that type.
 //! turboexl3's `Global` takes this `Shared` too (the plugin's turboexl3 `sdk` hands it over), for the same reason.
 
-pub const in_unit = false;
-
 pub fn Shared(comptime T: type, comptime name: []const u8, comptime init: T) type {
     return struct {
         pub const global_name = name;

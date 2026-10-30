@@ -68,9 +68,7 @@ pub const Generator = struct {
     mtp_window_idx: u32 = 0,
     mtp_rounds_since_switch: u32 = 0,
     mtp_promote_cooldown: u32 = 0,
-    mtp_drafted_tokens: u64 = 0,
     mtp_lookup_rounds: u64 = 0,
-    mtp_lookup_drafted: u64 = 0,
     mtp_lookup_accepted: u64 = 0,
     mtp_lookup_idx: ?mtp_lookup.Index = null,
     mtp_lookup_gen: usize = 0,
@@ -78,7 +76,6 @@ pub const Generator = struct {
     mtp_round_ema: f32 = 0,
     mtp_after_lookup: bool = false,
     mtp_lookup_streak: bool = false,
-    mtp_ext_rounds: u64 = 0,
     mtp_ext_dry_streak: u32 = 0,
     mtp_ext_cooldown: u32 = 0,
     mtp_ev_accept: [mtp_mod.MAX_DEPTH]f32 = @splat(depth.MTP_EV_PRIOR),
@@ -104,7 +101,6 @@ pub const Generator = struct {
     spec_disabled_runtime: bool = false,
     spec_disable_reason: SpecDisableReason = .none,
     mtp_adaptive: adaptive.MtpAdaptive = .{},
-    mtp_head_released: bool = false,
     mtp_price: adaptive.MtpPriceWindow = .{},
     mtp_serial_left: u32 = 0,
     mtp_low_accept: u32 = 0,
@@ -116,14 +112,7 @@ pub const Generator = struct {
     mtp_cycle_watch: ?io_util.Stopwatch = null,
     mtp_kept: u32 = 0,
     mtp_tried: u32 = 0,
-    /// Rounds whose partial accept rolled the recurrent state back from the verify's capture (`[spec-stats]`).
-    partial_rounds: u64 = 0,
-    /// Lazy pre-drafts built, and the ones the host's read kept for the next round (`[spec-stats] lazy=`).
-    mtp_lazy_built: u32 = 0,
-    mtp_lazy_kept: u32 = 0,
 
-    pub const MTP_DEPTH_WINDOW = depth.MTP_DEPTH_WINDOW;
-    pub const MTP_EV_PRIOR = depth.MTP_EV_PRIOR;
     pub const mtpChainLogConf = ev_plan.mtpChainLogConf;
 
     // The policy's methods, the copies' own.

@@ -60,11 +60,6 @@ pub fn declared(a: std.mem.Allocator, block_json: []const u8) Declared {
     return d;
 }
 
-/// An NVIDIA ModelOpt block (`quant_method: modelopt`).
-pub fn isModelOpt(block_json: []const u8) bool {
-    return methodIs(.of(block_json), "modelopt");
-}
-
 /// The Hadamard block every listed module rotates by (Prism's `modules[].block`); null when there is no such list
 /// or the modules disagree.
 pub fn hadamardBlock(a: std.mem.Allocator, config_json: []const u8) ?u32 {

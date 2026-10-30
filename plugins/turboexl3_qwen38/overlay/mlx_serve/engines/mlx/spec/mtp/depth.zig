@@ -2,20 +2,13 @@
 //! MTP draft depth and proposal policy (greedy tail, draft temperature, depth decisions).
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
-const env = @import("../../../../env.zig");
 const mlx = @import("../../../../mlx/ffi.zig");
 const transformer_mod = @import("../../transformer.zig");
-const model_mod = @import("../../../../sdk/config/model.zig");
 const log = @import("../../../../sdk/util/log.zig");
-const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const Transformer = transformer_mod.Transformer;
 const testing = std.testing;
 const Generator = @import("../../generate/generator.zig").Generator;
 const MtpHeadRef = @import("../mtp_head_ref.zig").MtpHeadRef;
-const SamplingParams = @import("../../sampling/params.zig").SamplingParams;
-const logitsStepProposal = @import("../../sampling/spec_sampling.zig").logitsStepProposal;
-const proposalTestRead = @import("../../sampling/spec_sampling.zig").proposalTestRead;
-const shortlistStepProposal = @import("../../sampling/spec_sampling.zig").shortlistStepProposal;
 
 
 // ── MTP adaptive depth ──
@@ -46,11 +39,6 @@ pub const MTP_PROMOTE_ABOVE: f32 = 0.60; // per-draft rate below configured dept
 pub const MTP_DISABLE_BELOW: f32 = 0.20; // per-draft rate at depth 1 → disable (sticky)
 pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked after a demotion
 
-/// Target temperature at or below which the GREEDY proposal still wins:
-/// the argmax accepts with `p_target[argmax]`, high only while the target
-/// row is sharp. Measured crossover between 0.3 and 0.7 on Flash Next.
-pub const MTP_SAMPLED_PROPOSAL_MIN_TEMP: f32 = 0.5;
-
 // ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
 // Drafts for a stochastic target are SAMPLED from a fixed sharper
 // distribution (constants mirror oMLX's _DRAFT_SAMPLER_*: their comment —
@@ -61,11 +49,6 @@ pub const MTP_SAMPLED_PROPOSAL_MIN_TEMP: f32 = 0.5;
 // target's filtered p for ANY proposal q (pinned by the toy-vocab
 // exactness test); q only moves the ACCEPTANCE RATE, which is why the
 // draft head's quantization never affects correctness.
-pub const MTP_DRAFT_TEMP: f32 = 0.6;
-pub const MTP_DRAFT_TOP_P: f32 = 0.95;
-pub const MTP_DRAFT_TOP_K: u32 = 20;
-
-var head_greedy_said = false;
 
 /// Pure depth-policy step. `rate` is the windowed per-draft acceptance
 /// probability. Returns the new depth; 0 means "disable speculation".
@@ -155,12 +138,6 @@ pub fn updateMtpDepth(self: *Generator, drafted: u32, accepted: u32) void {
 /// it on chips whose verify-width cliff was measured (M1 Pro: 4).
 pub const MTP_ADAPTIVE_DEFAULT_CAP: u32 = 6;
 pub const MTP_ADAPTIVE_NAX_CAP: u32 = 8;
-/// Fraction by which a width's cost-per-position may exceed the running
-/// best before the measured ladder calls it past the cliff. 5% is well
-/// inside the gap the tile cliff opens (the M4 ladder turns up 12% at
-/// width 8) and well outside probe rep-to-rep noise, which is bounded
-/// below by keeping the MIN of the reps.
-pub const MTP_CLIFF_TOLERANCE: f32 = 0.05;
 /// One-shot guard for the per-silicon cap log (the row is a property of
 /// the machine, so it is worth saying once per process, not per request).
 pub var mtp_depth_cap_logged: bool = false;

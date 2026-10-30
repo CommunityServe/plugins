@@ -204,10 +204,4 @@ pub fn mtpEvFixObserve(self: *Generator, plan: MtpRoundPlan, drafted: u32, accep
 // ── tests ──
 
 const testing = std.testing;
-const depth_bounds = @import("../mtp_depth_bounds.zig");
-const ev_plan = @import("ev_plan.zig");
 const Transformer = @import("../../transformer.zig").Transformer;
-const Qwen4Trunk = @import("../../../../plugins/qwen4_exp/trunk.zig").Trunk;
-
-/// Per-index conditional acceptance at cap 3.
-const fix_accept = [_]f32{ 0.88, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85 };

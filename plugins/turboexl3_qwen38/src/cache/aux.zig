@@ -10,14 +10,13 @@
 
 const std = @import("std");
 const mlx = @import("../mlx_serve/mlx/ffi.zig");
-const q4 = @import("../mlx_serve/plugins/qwen4_exp/plugin.zig");
-const kv_cache = @import("../mlx_serve/sdk/kv/cache.zig");
-const checkpoint = @import("../mlx_serve/engines/mlx/ssm/checkpoint.zig");
+const q4 = @import("../direct/serve.zig");
+const state = @import("../direct/cache.zig");
 const qsa_checkpoint = @import("../mlx_serve/plugins/qwen4_exp/qsa/checkpoint.zig");
 const Drafter = @import("../spec/drafter.zig").Drafter;
 
-const KVCacheSnapshot = kv_cache.KVCacheSnapshot;
-const SSMCheckpoint = checkpoint.SSMCheckpoint;
+const KVCacheSnapshot = state.KVCacheSnapshot;
+const SSMCheckpoint = state.SSMCheckpoint;
 const OwnSlot = @typeInfo(@FieldType(@FieldType(q4.Model, "own"), "items")).pointer.child;
 const gpa = std.heap.c_allocator;
 
@@ -39,7 +38,7 @@ pub const Snap = struct {
 
     /// Resident bytes, every held array counted once.
     pub fn bytes(sn: *const Snap) u64 {
-        var total = kvBytes(&sn.kv) + checkpoint.ssmCheckpointBytes(&sn.ssm);
+        var total = kvBytes(&sn.kv) + state.ssmCheckpointBytes(&sn.ssm);
         if (sn.head) |*h| total += h.bytes();
         return total;
     }
@@ -60,7 +59,7 @@ pub fn capture(m: *q4.Model, d: *Drafter, id: u32, n: u64, ids: []const u32) !*S
     defer shared.deinit();
     var kv = try shared.trimmedCopy(@intCast(n), s);
     errdefer kv.deinit();
-    var cps = [1]SSMCheckpoint{try checkpoint.captureSsmCheckpoint(gpa, own.ssm, @intCast(n), s)};
+    var cps = [1]SSMCheckpoint{try state.captureSsmCheckpoint(gpa, own.ssm, @intCast(n), s)};
     errdefer cps[0].deinit(gpa);
     try qsa_checkpoint.attachQsaHistoryToLatest(&cps, own.ssm, s);
     var head = try d.headSnap(id, n);
@@ -78,7 +77,7 @@ pub fn restore(m: *q4.Model, d: *Drafter, id: u32, sn: *const Snap) !void {
     const own = try m.ownSlot(id, 0);
     errdefer own.pos = 0;
     try own.cache.restore(&sn.kv);
-    try checkpoint.restoreSsmCheckpoint(own.ssm, &sn.ssm);
+    try state.restoreSsmCheckpoint(own.ssm, &sn.ssm);
     own.pos = sn.n;
     try d.headRestore(id, sn.n, if (sn.head) |*h| h else null);
 }
@@ -88,7 +87,7 @@ pub fn clone(sn: *const Snap) !*Snap {
     const s = mlx.gpuStream();
     var kv = try sn.kv.trimmedCopy(@intCast(sn.n), s);
     errdefer kv.deinit();
-    var ssm = try checkpoint.shareSsmCheckpoint(gpa, &sn.ssm);
+    var ssm = try state.shareSsmCheckpoint(gpa, &sn.ssm);
     errdefer ssm.deinit(gpa);
     var head = if (sn.head) |*h| try h.clone() else null;
     errdefer if (head) |*h| h.deinit();
@@ -104,7 +103,7 @@ pub fn kvBytes(snap: *const KVCacheSnapshot) u64 {
     var total: u64 = 0;
     for (snap.entries) |e| {
         if (!e.initialized) continue;
-        inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |a| {
+        inline for (.{ e.keys, e.values }) |a| {
             if (a.ctx != null) total += @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
         }
     }

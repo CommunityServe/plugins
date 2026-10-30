@@ -192,6 +192,4 @@ pub const ForwardCtx = struct {
     plugin_slot: u32 = 0,
     plugin_owed: abi.Owed = .none,
 
-    /// The shell's own sequence (`defaultCtx`, rebuilt per call): one id across its forwards.
-    pub const shell_slot: u32 = std.math.maxInt(u32);
 };

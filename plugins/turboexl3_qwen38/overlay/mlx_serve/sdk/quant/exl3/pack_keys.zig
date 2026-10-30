@@ -46,16 +46,3 @@ test "pack keys: trunk_quant is a format's block or nothing" {
     try testing.expect(try hasTrunkQuant(try rootOf(a, "{\"trunk_quant\":{\"format\":\"exl3\",\"codebook\":\"mul1\",\"window\":16}}")));
     try testing.expectError(error.TrunkQuantNotAnObject, hasTrunkQuant(try rootOf(a, "{\"trunk_quant\":\"exl3\"}")));
 }
-
-test "pack keys: the n-gram table's file is a name inside the pack" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try testing.expect(try ngramTableFile(try rootOf(a, "{}")) == null);
-    try testing.expect(try ngramTableFile(try rootOf(a, "{\"ngram_table\":{\"format\":\"exl3_ngram_trellis\"}}")) == null);
-    try testing.expectEqualStrings("ngram_embedding.safetensors", (try ngramTableFile(try rootOf(a, "{\"ngram_table\":{\"file\":\"ngram_embedding.safetensors\",\"k\":6}}"))).?);
-    for ([_][]const u8{ "\"\"", "\"/etc/x\"", "\"../x.bin\"", "7" }) |bad| {
-        const json = try std.fmt.allocPrint(a, "{{\"ngram_table\":{{\"file\":{s}}}}}", .{bad});
-        try testing.expectError(error.InvalidNgramTableFile, ngramTableFile(try rootOf(a, json)));
-    }
-}

@@ -120,237 +120,62 @@ pub const Trunk = struct {
     /// The fused paths' per-layer state (`trunk/fusion.zig`).
     fused: @import("trunk/fusion.zig").Scratch = .{},
 
-    pub var qwen4_trace: ?*mtp.Qwen4Trace = null;
-    pub var qsa_engaged_logged: bool = false;
 
     // attention.zig
-    pub const qwen4AttnProjected = @import("attention.zig").qwen4AttnProjected;
-    pub const qwen4AttnWith = @import("attention.zig").qwen4AttnWith;
     // forward.zig
-    pub const forwardQwen4Stream = @import("forward.zig").forwardQwen4Stream;
-    pub const forwardQwen4VerifyRows = @import("forward.zig").forwardQwen4VerifyRows;
-    pub const forwardQwen4With = @import("forward.zig").forwardQwen4With;
     pub const QWEN4_DECODE_ASYNC_LADDER_DEFAULT = @import("forward.zig").QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
-    pub const qwen4VerifyRowsEligible = @import("forward.zig").qwen4VerifyRowsEligible;
     // hc.zig
-    pub const addVerifyPle = @import("hc.zig").addVerifyPle;
     pub const compileQwen4Hc = @import("hc.zig").compileQwen4Hc;
-    pub const hcFlush = @import("hc.zig").hcFlush;
-    pub const hcGroupNorm = @import("hc.zig").hcGroupNorm;
-    pub const hcInjCallback = @import("hc.zig").hcInjCallback;
-    pub const hcMixCallback = @import("hc.zig").hcMixCallback;
-    pub const hcRead = @import("hc.zig").hcRead;
     pub const HcRead = @import("hc.zig").HcRead;
-    pub const hcReadFusedFor = @import("hc.zig").hcReadFusedFor;
-    pub const hcReadNormed = @import("hc.zig").hcReadNormed;
-    pub const hcReadPending = @import("hc.zig").hcReadPending;
-    pub const hcReadStandin = @import("hc.zig").hcReadStandin;
-    pub const hcReadVerifyRows = @import("hc.zig").hcReadVerifyRows;
-    pub const hcSiluCallback = @import("hc.zig").hcSiluCallback;
-    pub const hcWrite = @import("hc.zig").hcWrite;
-    pub const hcWriteCallback = @import("hc.zig").hcWriteCallback;
-    pub const hcWriteOrDefer = @import("hc.zig").hcWriteOrDefer;
     // mtp.zig
     pub const HeadPlace = @import("mtp.zig").HeadPlace;
     pub const loadQwen4Mtp = @import("mtp.zig").loadQwen4Mtp;
-    pub const mtpHeadForceBatched = @import("mtp.zig").mtpHeadForceBatched;
-    pub const mtpMoeRows = @import("mtp.zig").mtpMoeRows;
-    pub const mtpPadSeq = @import("mtp.zig").mtpPadSeq;
     pub const qwen4BuildDraftRerank = @import("mtp.zig").qwen4BuildDraftRerank;
     pub const qwen4DraftRerankReady = @import("mtp.zig").qwen4DraftRerankReady;
     pub const qwen4DraftSelect = @import("mtp.zig").qwen4DraftSelect;
-    pub const qwen4DraftSelectBatched = @import("mtp.zig").qwen4DraftSelectBatched;
-    pub const qwen4DraftShortlist = @import("mtp.zig").qwen4DraftShortlist;
-    pub const qwen4DraftShortlistsBatched = @import("mtp.zig").qwen4DraftShortlistsBatched;
     pub const qwen4MtpActivate = @import("mtp.zig").qwen4MtpActivate;
-    pub const qwen4MtpAdopt = @import("mtp.zig").qwen4MtpAdopt;
-    pub const qwen4MtpAdvance = @import("mtp.zig").qwen4MtpAdvance;
-    pub const qwen4MtpApplyKvQuant = @import("mtp.zig").qwen4MtpApplyKvQuant;
-    pub const Qwen4MtpBatchRow = @import("mtp.zig").Qwen4MtpBatchRow;
     pub const qwen4MtpForward = @import("mtp.zig").qwen4MtpForward;
-    pub const qwen4MtpForwardBatched = @import("mtp.zig").qwen4MtpForwardBatched;
-    pub const qwen4MtpForwardLive = @import("mtp.zig").qwen4MtpForwardLive;
     pub const qwen4MtpForwardOn = @import("mtp.zig").qwen4MtpForwardOn;
-    pub const qwen4MtpForwardPlaced = @import("mtp.zig").qwen4MtpForwardPlaced;
-    pub const qwen4MtpForwardPlacedOn = @import("mtp.zig").qwen4MtpForwardPlacedOn;
     pub const Qwen4MtpLive = @import("mtp.zig").Qwen4MtpLive;
-    pub const qwen4MtpLiveModule = @import("mtp.zig").qwen4MtpLiveModule;
-    pub const qwen4MtpLiveState = @import("mtp.zig").qwen4MtpLiveState;
-    pub const qwen4MtpMarkQsaLeftover = @import("mtp.zig").qwen4MtpMarkQsaLeftover;
-    pub const qwen4MtpMarks = @import("mtp.zig").qwen4MtpMarks;
     pub const Qwen4MtpOut = @import("mtp.zig").Qwen4MtpOut;
-    pub const Qwen4MtpOutBuf = @import("mtp.zig").Qwen4MtpOutBuf;
     pub const Qwen4MtpProject = @import("mtp.zig").Qwen4MtpProject;
     pub const qwen4MtpRelease = @import("mtp.zig").qwen4MtpRelease;
-    pub const qwen4MtpReset = @import("mtp.zig").qwen4MtpReset;
-    pub const qwen4MtpResetOwned = @import("mtp.zig").qwen4MtpResetOwned;
     pub const Qwen4MtpState = @import("mtp.zig").Qwen4MtpState;
     pub const qwen4MtpStateNew = @import("mtp.zig").qwen4MtpStateNew;
-    pub const qwen4MtpSwapState = @import("mtp.zig").qwen4MtpSwapState;
     pub const qwen4MtpTruncate = @import("mtp.zig").qwen4MtpTruncate;
-    pub const qwen4MtpTruncateLive = @import("mtp.zig").qwen4MtpTruncateLive;
-    pub const qwen4MtpTruncateOn = @import("mtp.zig").qwen4MtpTruncateOn;
-    pub const qwen4MtpTruncateToMarkLive = @import("mtp.zig").qwen4MtpTruncateToMarkLive;
-    pub const Qwen4Trace = @import("mtp.zig").Qwen4Trace;
     // ple.zig
-    pub const advancePlePrev = @import("ple.zig").advancePlePrev;
-    pub const pleAdvanceSerial = @import("ple.zig").pleAdvanceSerial;
-    pub const pleClaimSpecCapture = @import("ple.zig").pleClaimSpecCapture;
-    pub const pleDeferrable = @import("ple.zig").pleDeferrable;
-    pub const pleEmbedding = @import("ple.zig").pleEmbedding;
-    pub const pleEmbeddingGpu = @import("ple.zig").pleEmbeddingGpu;
-    pub const pleEvalIds = @import("ple.zig").pleEvalIds;
-    pub const pleFillFromIds = @import("ple.zig").pleFillFromIds;
-    pub const pleForward = @import("ple.zig").pleForward;
-    pub const pleGatherBf16 = @import("ple.zig").pleGatherBf16;
-    pub const pleHostIds = @import("ple.zig").pleHostIds;
-    pub const pleKickOff = @import("ple.zig").pleKickOff;
-    pub const plePrefetchBegin = @import("ple.zig").plePrefetchBegin;
     pub const plePrefetchEnd = @import("ple.zig").plePrefetchEnd;
-    pub const plePrepareIds = @import("ple.zig").plePrepareIds;
-    pub const plePrevOf = @import("ple.zig").plePrevOf;
-    pub const pleSettleFromArray = @import("ple.zig").pleSettleFromArray;
     pub const releasePlePending = @import("ple.zig").releasePlePending;
     // qsa/decode_gather.zig
-    pub const qsaBatchedAttn = @import("qsa/decode_gather.zig").qsaBatchedAttn;
     // qsa/indexer.zig
-    pub const qsaAppendKeys = @import("qsa/indexer.zig").qsaAppendKeys;
-    pub const qsaAppendPooled = @import("qsa/indexer.zig").qsaAppendPooled;
-    pub const qsaBlockVisibility = @import("qsa/indexer.zig").qsaBlockVisibility;
-    pub const qsaChunkSelect = @import("qsa/indexer.zig").qsaChunkSelect;
-    pub const qsaInstallRing = @import("qsa/indexer.zig").qsaInstallRing;
-    pub const qsaMask = @import("qsa/indexer.zig").qsaMask;
-    pub const qsaMaskBatched = @import("qsa/indexer.zig").qsaMaskBatched;
-    pub const qsaMaskFromQk = @import("qsa/indexer.zig").qsaMaskFromQk;
-    pub const qsaPooledCosSin = @import("qsa/indexer.zig").qsaPooledCosSin;
-    pub const qsaPooledKeys = @import("qsa/indexer.zig").qsaPooledKeys;
-    pub const qsaPooledKeysComposed = @import("qsa/indexer.zig").qsaPooledKeysComposed;
-    pub const qsaPooledRopeComposed = @import("qsa/indexer.zig").qsaPooledRopeComposed;
-    pub const qsaPoolNorm = @import("qsa/indexer.zig").qsaPoolNorm;
-    pub const qsaScoreBank = @import("qsa/indexer.zig").qsaScoreBank;
-    pub const qsaScoreCols = @import("qsa/indexer.zig").qsaScoreCols;
-    pub const qsaScoreOperand = @import("qsa/indexer.zig").qsaScoreOperand;
-    pub const qsaSelectBlocks = @import("qsa/indexer.zig").qsaSelectBlocks;
-    pub const qsaSelectMaskOps = @import("qsa/indexer.zig").qsaSelectMaskOps;
-    pub const qsaSlotEntry = @import("qsa/indexer.zig").qsaSlotEntry;
     // qsa/pooled.zig
     pub const markQsaPooledRopeStale = @import("qsa/pooled.zig").markQsaPooledRopeStale;
-    pub const resetQsaPooledRope = @import("qsa/pooled.zig").resetQsaPooledRope;
     // trunk/formats.zig
     pub const reordered = @import("trunk/formats.zig").reordered;
-    pub const armTrunkResident = @import("trunk/formats.zig").armTrunkResident;
     // trunk/linear.zig
     pub const qmatmul = @import("trunk/linear.zig").qmatmul;
     pub const lmHeadProject = @import("trunk/linear.zig").lmHeadProject;
-    pub const quantParamsFor = @import("trunk/linear.zig").quantParamsFor;
     pub const quantParamsHinted = @import("trunk/linear.zig").quantParamsHinted;
-    pub const mtpProjectionRows = @import("trunk/linear.zig").mtpProjectionRows;
-    pub const verifyFeatureEnabled = @import("trunk/linear.zig").verifyFeatureEnabled;
-    pub const rowGroupServes = @import("trunk/linear.zig").rowGroupServes;
     pub const attnProj = @import("trunk/linear.zig").attnProj;
     pub const attnDqFor = @import("trunk/linear.zig").attnDqFor;
     pub const rmsNorm = @import("trunk/linear.zig").rmsNorm;
     pub const silu = @import("trunk/linear.zig").silu;
     pub const computeGeglu = @import("trunk/linear.zig").computeGeglu;
-    pub const denseMLP = @import("trunk/linear.zig").denseMLP;
     pub const embedding = @import("trunk/linear.zig").embedding;
-    pub const applyVisionEmbeddingsWith = @import("trunk/linear.zig").applyVisionEmbeddingsWith;
     pub const lmHeadForeign = @import("trunk/linear.zig").lmHeadForeign;
     // trunk/attn.zig
-    pub const gatedFullAttnWith = @import("trunk/attn.zig").gatedFullAttnWith;
-    pub const gatedFullAttnProjected = @import("trunk/attn.zig").gatedFullAttnProjected;
-    pub const gatedAttnTail = @import("trunk/attn.zig").gatedAttnTail;
-    pub const qkAngleRowsFor = @import("trunk/attn.zig").qkAngleRowsFor;
-    pub const qkAngleFor = @import("trunk/attn.zig").qkAngleFor;
-    pub const ropeCosSinFromFreqs = @import("trunk/attn.zig").ropeCosSinFromFreqs;
-    pub const ropeInvFreq = @import("trunk/attn.zig").ropeInvFreq;
-    pub const ropeApplyCosSin = @import("trunk/attn.zig").ropeApplyCosSin;
-    pub const ropeAtPositions = @import("trunk/attn.zig").ropeAtPositions;
-    pub const applyMrope = @import("trunk/attn.zig").applyMrope;
-    pub const beginMropeChunk = @import("trunk/attn.zig").beginMropeChunk;
-    pub const mropeCosSinAt = @import("trunk/attn.zig").mropeCosSinAt;
-    pub const yarnActive = @import("trunk/attn.zig").yarnActive;
-    pub const yarnScaleRotated = @import("trunk/attn.zig").yarnScaleRotated;
-    pub const yarnScaleQK = @import("trunk/attn.zig").yarnScaleQK;
-    pub const stackedBatchedAttn = @import("trunk/attn.zig").stackedBatchedAttn;
-    pub const buildBatchedDecodeMask = @import("trunk/attn.zig").buildBatchedDecodeMask;
-    pub const padAndStackBatchedKV = @import("trunk/attn.zig").padAndStackBatchedKV;
-    pub const perSlotBatchedAttn = @import("trunk/attn.zig").perSlotBatchedAttn;
     // trunk/gdn.zig
-    pub const gatedDeltaNet = @import("trunk/gdn.zig").gatedDeltaNet;
-    pub const gatedDeltaNetProjected = @import("trunk/gdn.zig").gatedDeltaNetProjected;
-    pub const gdnCheckFused = @import("trunk/gdn.zig").gdnCheckFused;
-    pub const gdnProjGpu = @import("trunk/gdn.zig").gdnProjGpu;
-    pub const gdnProjArrays = @import("trunk/gdn.zig").gdnProjArrays;
-    pub const conv1dWithCache = @import("trunk/gdn.zig").conv1dWithCache;
     pub const compileGdnGate = @import("trunk/gdn.zig").compileGdnGate;
-    pub const computeGdnGate = @import("trunk/gdn.zig").computeGdnGate;
     // trunk/moe.zig
-    pub const moeRouterLogits = @import("trunk/moe.zig").moeRouterLogits;
-    pub const moeSharedDown = @import("trunk/moe.zig").moeSharedDown;
-    pub const moeSharedProject = @import("trunk/moe.zig").moeSharedProject;
-    pub const moeSharedGateTail = @import("trunk/moe.zig").moeSharedGateTail;
-    pub const moeAddGatedShared = @import("trunk/moe.zig").moeAddGatedShared;
-    pub const moeAddSharedDown = @import("trunk/moe.zig").moeAddSharedDown;
-    pub const moeAddSharedGateRows = @import("trunk/moe.zig").moeAddSharedGateRows;
-    pub const moeSharedDownRows = @import("trunk/moe.zig").moeSharedDownRows;
-    pub const moeVerifyRowsSolo = @import("trunk/moe.zig").moeVerifyRowsSolo;
-    pub const moeVerifyRows = @import("trunk/moe.zig").moeVerifyRows;
-    pub const moeMLP = @import("trunk/moe.zig").moeMLP;
-    pub const moeTensorParallel = @import("trunk/moe.zig").moeTensorParallel;
-    pub const moeExpertsRouted = @import("trunk/moe.zig").moeExpertsRouted;
-    pub const moeMLP2WithRouter = @import("trunk/moe.zig").moeMLP2WithRouter;
-    pub const moeDecodeGatherQmv = @import("trunk/moe.zig").moeDecodeGatherQmv;
-    pub const moeCudaDecode = @import("trunk/moe.zig").moeCudaDecode;
-    pub const moeDecodeGatherQmvRows = @import("trunk/moe.zig").moeDecodeGatherQmvRows;
-    pub const moeAffine4Decode = @import("trunk/moe.zig").moeAffine4Decode;
-    pub const moeFp4Decode = @import("trunk/moe.zig").moeFp4Decode;
-    pub const moeMLP2 = @import("trunk/moe.zig").moeMLP2;
-    pub const useGatherQmvDecode = @import("trunk/moe.zig").useGatherQmvDecode;
-    pub const scaleExperts = @import("trunk/moe.zig").scaleExperts;
-    pub const computeMoeRouting = @import("trunk/moe.zig").computeMoeRouting;
     pub const moeRoutingUncompiled = @import("trunk/moe.zig").moeRoutingUncompiled;
     pub const compileMoeRouting = @import("trunk/moe.zig").compileMoeRouting;
     // trunk/verify.zig
-    pub const verifyRowsJoined = @import("trunk/verify.zig").verifyRowsJoined;
-    pub const attnVerifyRows = @import("trunk/verify.zig").attnVerifyRows;
-    pub const gdnVerifyRows = @import("trunk/verify.zig").gdnVerifyRows;
-    pub const forwardRowAxisVerify = @import("trunk/verify.zig").forwardRowAxisVerify;
-    pub const takeJoinedVerifyLogits = @import("trunk/verify.zig").takeJoinedVerifyLogits;
     // trunk/batched.zig
-    pub const forwardMoeBatchedDecode = @import("trunk/batched.zig").forwardMoeBatchedDecode;
-    pub const forwardMoeBatchedVerify = @import("trunk/batched.zig").forwardMoeBatchedVerify;
-    pub const forwardMoeBatchedRows = @import("trunk/batched.zig").forwardMoeBatchedRows;
-    pub const batchedGdnReady = @import("trunk/batched.zig").batchedGdnReady;
-    pub const ssmGroupRelease = @import("trunk/batched.zig").ssmGroupRelease;
-    pub const ssmGroupDrop = @import("trunk/batched.zig").ssmGroupDrop;
-    pub const flushDeferredPle = @import("ple.zig").flushDeferredPle;
     pub const flushDeferredPleGroup = @import("ple.zig").flushDeferredPleGroup;
     pub const settleDeferredPle = @import("ple.zig").settleDeferredPle;
     pub const discardDeferredPle = @import("ple.zig").discardDeferredPle;
-    pub const mergeSsmAcrossSlots = @import("trunk/batched.zig").mergeSsmAcrossSlots;
-    pub const splitSsmToSlots = @import("trunk/batched.zig").splitSsmToSlots;
     // trunk/warmup.zig
     pub const warmupSpecVerify = @import("trunk/warmup.zig").warmupSpecVerify;
-
-    /// The serial forward: a slot that sat in a batched group gets its own entries back first.
-    pub fn forwardWith(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
-        return self.forwardQwen4With(ctx, token_ids);
-    }
-
-    /// `forwardWith` publishing the stream's last row and every row.
-    pub fn forwardWithCaptureAll(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, out_hidden: *mlx.mlx_array, out_hidden_all: *mlx.mlx_array) !mlx.mlx_array {
-        const saved = ctx.capture_hidden;
-        const saved_all = ctx.capture_hidden_all;
-        ctx.capture_hidden = out_hidden;
-        ctx.capture_hidden_all = out_hidden_all;
-        defer {
-            ctx.capture_hidden = saved;
-            ctx.capture_hidden_all = saved_all;
-        }
-        return self.forwardWith(ctx, token_ids);
-    }
 
     pub fn actDtype(self: *const Trunk) mlx.mlx_dtype {
         return self.config.actDtype();

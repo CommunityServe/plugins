@@ -13,16 +13,3 @@ pub const DtypeCastCache = struct {
         self.arr = .{ .ctx = null };
     }
 };
-
-/// `table` itself when it is in `want`, else its copy in `want`, made (and evaluated) once: borrowed from `cache`.
-pub fn constTableAs(table: mlx.mlx_array, want: mlx.mlx_dtype, cache: *DtypeCastCache, s: mlx.mlx_stream) !mlx.mlx_array {
-    if (mlx.mlx_array_dtype(table) == want) return table;
-    if (cache.arr.ctx != null and cache.dtype == want) return cache.arr;
-    cache.deinit();
-    var cast = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(cast);
-    try mlx.check(mlx.mlx_astype(&cast, table, want, s));
-    try mlx.check(mlx.mlx_array_eval(cast));
-    cache.* = .{ .arr = cast, .dtype = want };
-    return cast;
-}
