@@ -117,12 +117,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     }
     // The server's own flags this plugin follows (src/host_flags.zig), set before anything reads them.
-    host_flags.apply() catch |e| {
+    const flags = host_flags.apply() catch |e| {
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_qwen38: " ++ @errorName(x)),
         };
         return null;
     };
+    const eager = host_flags.warmsAt(flags, ctx.model_dir.slice());
     const s = gpa.create(Served) catch {
         out.* = Verdict.refuse(.failed, "turboexl3_qwen38: out of memory");
         return null;
@@ -134,12 +135,12 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     const m: *q4.Model = @ptrCast(@alignCast(mp));
-    s.* = .{ .m = m, .drafter = Drafter.init(m), .mtp = false };
+    s.* = .{ .m = m, .drafter = Drafter.init(m, flags.max_mtp_ctx, flags.mtp_history_window), .mtp = false };
     // The slots' KV scheme as the server's load resolves it, and the head's: dense, or with `--mtp-head-kv-quant` the
     // trunk's (#1005's `qwen4MtpHeadKvConfig`).
     m.kv = host_flags.kvQuantFor(ctx.model_dir.slice());
     if (m.kv.scheme == .affine) log.info("[turboexl3_qwen38] KV cache affine {d}-bit, group {d}\n", .{ m.kv.bits, m.kv.group_size });
-    if (host_flags.flags.mtp_head_kv_quant) if (m.trunk.qwen4_mtp) |*hd| hd.cache.reinit(@intCast(hd.cache.entries.len), m.kv) catch |e| {
+    if (flags.mtp_head_kv_quant) if (m.trunk.qwen4_mtp) |*hd| hd.cache.reinit(@intCast(hd.cache.entries.len), m.kv) catch |e| {
         q4.unload(mp);
         gpa.destroy(s);
         out.* = Verdict.named(.failed, @errorName(e));
@@ -148,18 +149,23 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // A pack without a head, or a server whose `mtp` setting is off: no rounds and no head history.
     if (s.drafter.has() and (q4.mtpSetting(ctx.settings_json.slice()) orelse true)) {
         s.mtp = true;
-        armHead(m);
+        armHead(m, eager);
         s.drafter.warmTwoChunk() catch |e| log.warn("[turboexl3_qwen38] the two-chunk warm-up failed ({s}): the first boundary is timed cold\n", .{@errorName(e)});
     }
     return s;
 }
 
 /// The head's load-time work, as #1005's load does it when the head serves (`qwen4_build_draft_rerank`, then its eager
-/// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and each verify width's
-/// kernels, to the depth cap `--mtp-max-depth` resolves to, compiled before any round is timed, on slots of the
-/// `--kv-quant` scheme (the flag's, as #1005's warm-up takes it).
-fn armHead(m: *q4.Model) void {
+/// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and where the server's
+/// eager warm-up reaches the load (`eager`, `host_flags.warmsAt`) each verify width's kernels, to the depth cap
+/// `--mtp-max-depth` resolves to, compiled before any round is timed, on slots of the `--kv-quant` scheme (the flag's,
+/// as #1005's warm-up takes it).
+fn armHead(m: *q4.Model, eager: bool) void {
     _ = mtp_head.qwen4BuildDraftRerank(&m.trunk);
+    if (!eager) {
+        log.info("[turboexl3_qwen38] --no-warmup-eager: no verify warm-up at load; each width compiles in its first round\n", .{});
+        return;
+    }
     const kv = host_flags.flags.kv_quant orelse KVQuantConfig.dense;
     const cap = ev_plan.resolveMtpDepthCapForProfile(depth_bounds.active.max, cost_profile.qwen4G17CostProfileForKv(&m.trunk, kv));
     warmup.warmupSpecVerify(&m.trunk, cap, kv) catch |e| log.warn("[turboexl3_qwen38] the verify warm-up failed ({s}): each width compiles in its first round\n", .{@errorName(e)});
@@ -178,14 +184,15 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 
 /// The host's slot caches are its engine's types, which this dylib's copies must never read as theirs: each slot runs
 /// on the state the model keeps for its id (`Caps.owns_decode_state`, `slot_state`). A forward's streams also extend
-/// the slot's MTP history.
+/// the slot's MTP history; a forward whose rows join none (`Drafter.takes`: a prompt chunk before the history window, a
+/// request that never drafts) computes none, as #1005 captures no hidden where it keeps no history.
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const s = served(mp);
     var own = f.*;
     own.cache_ops = null;
     own.caches = .{};
     const follow = s.mtp and f.mode != .verify and f.logits != .none and f.embeds.ctx == null;
-    if (follow) own.want_hidden = true;
+    if (follow and (f.positions.len > 1 or s.drafter.takes(slotOf(f), posOf(f), f.rows))) own.want_hidden = true;
     captureAt(s, f);
     const v = q4.forward(s.m, &own, out);
     // The prefill's last forward, or a failed one, ends its read-ahead.
@@ -213,16 +220,22 @@ fn captureAt(s: *Served, f: *const abi.Forward) void {
     };
 }
 
-/// Each slot's rows of a forward into its MTP history: one slot's `rows`, or one row per slot of a batched forward.
+/// A one-slot forward's slot id and first position.
+fn slotOf(f: *const abi.Forward) u32 {
+    return if (f.slots.len > 0) f.slots.slice()[0] else 0;
+}
+
+fn posOf(f: *const abi.Forward) u64 {
+    return if (f.positions.len > 0) f.positions.slice()[0] else 0;
+}
+
+/// Each slot's rows of a forward into its MTP history: one slot's `rows` (its streams null when it takes none), or one
+/// row per slot of a batched forward.
 fn followForward(s: *Served, f: *const abi.Forward, streams: mlx.mlx_array) !void {
-    if (streams.ctx == null) return error.NoStreams;
     const slots = @max(f.positions.len, 1);
     const ids_dev: mlx.mlx_array = .{ .ctx = f.ids.ctx };
-    if (slots == 1) {
-        const id: u32 = if (f.slots.len > 0) f.slots.slice()[0] else 0;
-        const pos: u64 = if (f.positions.len > 0) f.positions.slice()[0] else 0;
-        return s.drafter.follow(id, pos, f.rows, f.tokens.slice(), ids_dev, streams, true);
-    }
+    if (slots == 1) return s.drafter.follow(slotOf(f), posOf(f), f.rows, f.tokens.slice(), ids_dev, streams, true);
+    if (streams.ctx == null) return error.NoStreams;
     const st = s.m.trunk.s;
     for (0..slots) |i| {
         const id: u32 = if (f.slots.len > i) f.slots.slice()[i] else @intCast(i);

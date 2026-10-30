@@ -46,6 +46,12 @@ const draft_fuse = @import("draft_fuse.zig");
 /// controller demotes/promotes within [1, configured].
 pub const DEFAULT_DEPTH: u32 = 3;
 pub const MAX_DEPTH: u32 = 8;
+/// `--max-mtp-ctx`: MTP stays off past this many prompt tokens (inclusive; 0 = unlimited).
+/// A machine limit: `enable_mtp:true` in the body does not lift it. MTP only.
+pub fn mtpCtxWithinLimit(max: u32, ctx_tokens: usize) bool {
+    if (max == 0) return true;
+    return ctx_tokens <= @as(usize, max);
+}
 /// Per-silicon adaptive depth cap for machines on the `.generic` cost
 /// surface. The cap is a MACHINE measurement, so each row is one, never
 /// interpolated between chips; an unmeasured chip keeps the default row.
@@ -99,6 +105,7 @@ pub const MtpCostProfile = enum {
     g17_nax_qwen4_q4_gs64,
     g17_nax_qwen4_mixed_4_8_gs64,
 };
+pub const HISTORY_WINDOW_THRESHOLD: usize = 16384;
 /// One linear: quantized (w packed u32, s/b bf16) when `s.ctx != null`,
 /// otherwise a pre-transposed bf16 weight `[in, out]` for plain matmul.
 pub const QLinear = struct {

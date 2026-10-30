@@ -14,10 +14,19 @@ const attn_core = @import("direct/attn_core.zig");
 /// `--kv-attn-mode`: how a request reads an affine cache below the QSA budget.
 pub const KvAttnMode = enum { dense, fused, auto };
 
-/// What the flags say: null (a switch false) where the process names none.
+/// What the flags say. A depth or KV flag the process does not name is null; every other field then holds the server's
+/// default.
 pub const Flags = struct {
     mtp_min_depth: ?u32 = null,
     mtp_max_depth: ?u32 = null,
+    /// `--max-mtp-ctx`: no round drafts past this many context tokens; 0 = no ceiling.
+    max_mtp_ctx: u32 = 0,
+    /// `--mtp-history-window`: a long prefill's head history covers its last this many positions; 0 = all of them.
+    mtp_history_window: usize = 0,
+    /// `--warmup-eager` / `--no-warmup-eager`: the server's startup load warms (`warmsAt`).
+    warmup_eager: bool = true,
+    /// `--model`: the model the server loads at its start, the one load the warm-up flags reach.
+    model: ?[]const u8 = null,
     /// `--int8-qk`: the dense prefill attention on int8 Q and K.
     int8_qk: bool = false,
     kv_quant: ?KVQuantConfig = null,
@@ -42,6 +51,11 @@ const known = .{
     .{ .name = "--mtp-min-depth", .field = "mtp_min_depth", .value = depth },
     .{ .name = "--mtp-max-depth", .field = "mtp_max_depth", .value = depth },
     .{ .name = "--mtp-depth", .field = "mtp_max_depth", .value = oldDepth },
+    .{ .name = "--max-mtp-ctx", .field = "max_mtp_ctx", .value = tokens },
+    .{ .name = "--mtp-history-window", .field = "mtp_history_window", .value = positions },
+    .{ .name = "--warmup-eager", .field = "warmup_eager", .set = true },
+    .{ .name = "--no-warmup-eager", .field = "warmup_eager", .set = false },
+    .{ .name = "--model", .field = "model", .value = modelDir },
     .{ .name = "--int8-qk", .field = "int8_qk", .set = true },
     .{ .name = "--kv-quant", .field = "kv_quant", .value = kvQuant },
     .{ .name = "--kv-attn-mode", .field = "kv_attn_mode", .value = kvAttnMode },
@@ -68,6 +82,21 @@ fn depth(text: []const u8) error{NotADepth}!u32 {
 /// `--mtp-max-depth`'s deprecated spelling `--mtp-depth`: any integer, clamped into 1..MAX_DEPTH.
 fn oldDepth(text: []const u8) error{NotADepth}!u32 {
     return depth_bounds.parseClamped(text, mtp_mod.MAX_DEPTH);
+}
+
+/// `--max-mtp-ctx`'s token count, as the server's main reads it.
+fn tokens(text: []const u8) std.fmt.ParseIntError!u32 {
+    return std.fmt.parseInt(u32, text, 10);
+}
+
+/// `--mtp-history-window`'s position count, as the server's main reads it.
+fn positions(text: []const u8) std.fmt.ParseIntError!usize {
+    return std.fmt.parseInt(usize, text, 10);
+}
+
+/// `--model`'s directory, as the server's main takes it: the text itself, which its startup load hands the plugin.
+fn modelDir(text: []const u8) error{}![]const u8 {
+    return text;
 }
 
 /// A flag whose value the server refuses, and that value.
@@ -148,9 +177,9 @@ pub fn kvAttnFused(scheme: kv_quant.Scheme, prompt_len: usize) bool {
 
 /// What the server's flags set in this plugin: the MTP round policy's depth range (`depth_bounds.active`), with one line
 /// when a depth flag is named, and the dense prefill attention's int8 Q/K (`attn_core.int8_qk`), with one line when
-/// `--int8-qk` is; the KV flags are kept in `flags` for the load. A value the server refuses fails here by name, with a
-/// line naming the flag.
-pub fn apply() !void {
+/// `--int8-qk` is; the rest are kept in `flags` and returned for the load, with one line for each that changes what the
+/// plugin does. A value the server refuses fails here by name, with a line naming the flag.
+pub fn apply() !Flags {
     var bad: Bad = .{};
     const f = parse(_NSGetArgv().*[0..@intCast(_NSGetArgc().*)], &bad) catch |e| {
         log.err("[turboexl3_qwen38] {s} '{s}' is not a value the server takes ({s})\n", .{ bad.flag, bad.value, @errorName(e) });
@@ -163,16 +192,32 @@ pub fn apply() !void {
     flags = f;
     attn_core.int8_qk = f.int8_qk;
     if (f.int8_qk) log.info("[turboexl3_qwen38] --int8-qk: a dense prefill block of 64 rows or more attends on int8 Q and K (lossy)\n", .{});
-    const b = bounds orelse return;
-    depth_bounds.active = b;
-    if (b.pinned()) |n| {
-        log.info("[turboexl3_qwen38] MTP depth pinned to {d}\n", .{n});
-    } else if (b.max != 0) {
-        log.info("[turboexl3_qwen38] MTP depth bounded {d}..{d}\n", .{ b.min, b.max });
-    } else {
-        log.info("[turboexl3_qwen38] MTP depth bounded {d}..its adaptive cap\n", .{b.min});
+    if (bounds) |b| {
+        depth_bounds.active = b;
+        if (b.pinned()) |n| {
+            log.info("[turboexl3_qwen38] MTP depth pinned to {d}\n", .{n});
+        } else if (b.max != 0) {
+            log.info("[turboexl3_qwen38] MTP depth bounded {d}..{d}\n", .{ b.min, b.max });
+        } else {
+            log.info("[turboexl3_qwen38] MTP depth bounded {d}..its adaptive cap\n", .{b.min});
+        }
     }
+    if (f.max_mtp_ctx != 0) log.info("[turboexl3_qwen38] MTP stops drafting past {d} context tokens\n", .{f.max_mtp_ctx});
+    if (f.mtp_history_window != 0) log.info("[turboexl3_qwen38] MTP head history: the last {d} positions of a prefill past {d}\n", .{ f.mtp_history_window, mtp_mod.HISTORY_WINDOW_THRESHOLD });
+    return f;
 }
+
+/// Whether the server's eager warm-up reaches this plugin's load of `model_dir`, as the server decides it: its startup
+/// load (this process's first, of the model `--model` names) warms unless `--no-warmup-eager`, the one load its main
+/// hands the flag; every other load (on demand, a headless server's) warms.
+pub fn warmsAt(f: Flags, model_dir: []const u8) bool {
+    defer loaded = true;
+    const startup = !loaded and f.model != null and std.mem.eql(u8, f.model.?, model_dir);
+    return f.warmup_eager or !startup;
+}
+
+/// This process has loaded the plugin before (`warmsAt`): any later load is one the server makes on demand.
+var loaded = false;
 
 test "host flags: the depth, KV and --int8-qk flags take what the server takes" {
     const testing = std.testing;
@@ -203,4 +248,22 @@ test "host flags: the depth, KV and --int8-qk flags take what the server takes" 
     try testing.expectEqualStrings("--mtp-min-depth", bad.flag);
     try testing.expectError(error.NotADepth, parse(&.{ "mlx-serve", "--mtp-max-depth" }, &bad));
     try testing.expectError(error.MinAboveMax, (try parse(&.{ "mlx-serve", "--mtp-min-depth", "5", "--mtp-max-depth", "4" }, &bad)).depthBounds());
+}
+
+test "host flags: the context ceiling, the history window and the warm-up take what the server takes" {
+    const testing = std.testing;
+    var bad: Bad = .{};
+    // None named: the server's defaults.
+    try testing.expectEqual(Flags{}, try parse(&.{ "mlx-serve", "serve", "--port", "8080" }, &bad));
+    // A warm-up flag takes no value, so the flag after it still parses; the one named last wins.
+    const f = try parse(&.{ "mlx-serve", "--no-warmup-eager", "--max-mtp-ctx", "32768", "--mtp-history-window", "8192" }, &bad);
+    try testing.expectEqual(Flags{ .max_mtp_ctx = 32768, .mtp_history_window = 8192, .warmup_eager = false }, f);
+    try testing.expect((try parse(&.{ "mlx-serve", "--no-warmup-eager", "--warmup-eager" }, &bad)).warmup_eager);
+    try testing.expectEqualStrings("/m/k3", (try parse(&.{ "mlx-serve", "--model", "/m/k3", "--no-warmup-eager" }, &bad)).model.?);
+    // What the server refuses: a count that is not one, one past its type, a flag without a value.
+    try testing.expectError(error.InvalidCharacter, parse(&.{ "mlx-serve", "--max-mtp-ctx", "32k" }, &bad));
+    try testing.expectEqualStrings("--max-mtp-ctx", bad.flag);
+    try testing.expectError(error.Overflow, parse(&.{ "mlx-serve", "--max-mtp-ctx", "4294967296" }, &bad));
+    try testing.expectError(error.InvalidCharacter, parse(&.{ "mlx-serve", "--mtp-history-window" }, &bad));
+    try testing.expectEqualStrings("--mtp-history-window", bad.flag);
 }

@@ -7,7 +7,11 @@
 //! The head's history follows every committed token. Row r pairs the trunk's stream at position r with token r + 1
 //! and sits at position r + 1. A forward's rows whose next token is known join the history in one head forward: a
 //! prompt chunk's rows with the prompt's tokens after them (`resume_prompt` hands the prompt in), as #1005's prefill
-//! appends each chunk; the last row's stream waits as `last` for the token after it.
+//! appends each chunk; the last row's stream waits as `last` for the token after it. As in #1005, a prompt chunk before
+//! the window `--mtp-history-window` keeps adds none (the history starts late, at the head's next position), nor does
+//! anything a request past `--max-mtp-ctx` forwards. A request the engine runs no round for never drafts: the engine
+//! drafts from a request's first tick, so a one-row forward past the prompt before any round ends the history and frees
+//! the head's state. Its prompt's history is built all the same: nothing says which requests draft before the prefill.
 //!
 //! A round from t1 at `pos` runs the plan #1005's policy makes for it: the context's own continuation when the lookup
 //! gate prefers it, else the head's chain to the plan's base depth (the first step from `last` and t1, each next from the
@@ -16,7 +20,7 @@
 //! the n-gram leaf deferred so the graph builds while the drafts run), the drafts the trunk's argmax agrees with kept
 //! (at most `accept_cap`), the trunk rewound to them (the KV truncated, the recurrent states from the capture), and the
 //! head truncated to the round's origin with the committed rows appended. A round the policy keeps serial (its adaptive
-//! switch, a probe, a disabled request) drafts nothing.
+//! switch, a probe, a disabled request, a context past `--max-mtp-ctx`) drafts nothing.
 
 const std = @import("std");
 const kit = @import("mlx_serve");
@@ -67,8 +71,17 @@ const Slot = struct {
     last: Array = .{ .ctx = null },
     /// Where the slot's next forward starts for the history to stay whole.
     next: u64 = 0,
+    /// A forward that ends at or before this adds no rows: a prompt chunk before the window `--mtp-history-window`
+    /// keeps, or any forward of a prompt the server admits no MTP for (`--max-mtp-ctx`).
+    from: u64 = 0,
+    /// Row r sits at the head's position r + 1 - `base`: the rows the forwards before `from` skipped (a restore's own
+    /// from its head), so a history that starts late starts at the head's next position, as #1005's cache-relative
+    /// positions do.
+    base: u64 = 0,
     /// The history holds every committed row so far: rounds draft.
     synced: bool,
+    /// The engine ran a round (`step`, `verify`) for this request: it drafts.
+    drafts: bool = false,
     /// The request's round policy, from its first round (#1005's per-request state).
     gen: ?Generator = null,
     /// Committed ids the engine's own forwards left on the device, read into `gen.generated_ids` at the next round.
@@ -123,11 +136,15 @@ pub const Drafter = struct {
     /// The model's share of the round policy (the engine keeps it on its Transformer): the measured round-cost
     /// table, the chunk-A boundary's price, the exact-depth costs.
     pm: generator.Model,
+    /// `--max-mtp-ctx` (0 = no ceiling) and `--mtp-history-window` (0 = the whole history), as src/host_flags.zig reads
+    /// them: #1005's `generate.max_mtp_ctx` and `mtp_history_window_override`.
+    max_mtp_ctx: u32,
+    mtp_history_window: usize,
     slots: std.AutoHashMapUnmanaged(u32, *Slot) = .empty,
     open: ?Open = null,
 
-    pub fn init(m: *q4.Model) Drafter {
-        return .{ .m = m, .pm = .{ .trunk = &m.trunk, .round_cost = .{ .layout = round_cost.layoutFor(&m.cfg) } } };
+    pub fn init(m: *q4.Model, max_mtp_ctx: u32, mtp_history_window: usize) Drafter {
+        return .{ .m = m, .pm = .{ .trunk = &m.trunk, .round_cost = .{ .layout = round_cost.layoutFor(&m.cfg) } }, .max_mtp_ctx = max_mtp_ctx, .mtp_history_window = mtp_history_window };
     }
 
     /// The pack carries an MTP head.
@@ -231,7 +248,22 @@ pub const Drafter = struct {
         sl.prompt.clearRetainingCapacity();
         setLast(sl, .{ .ctx = null });
         sl.next = 0;
+        sl.from = 0;
+        sl.base = 0;
         sl.synced = true;
+        sl.drafts = false;
+    }
+
+    /// A request that decodes plain: its history ends, the head's state is freed, and no round of it drafts.
+    fn quiet(d: *Drafter, sl: *Slot) !void {
+        const t = &d.m.trunk;
+        const fresh = try mtp_head.qwen4MtpStateNew(t);
+        endRequest(sl);
+        mtp_head.qwen4MtpRelease(t, &sl.st);
+        sl.st.deinit();
+        sl.st = fresh;
+        setLast(sl, .{ .ctx = null });
+        sl.synced = false;
     }
 
     /// The request's policy, made at its first round as #1005's generate init makes it: the depth cap from the head's
@@ -262,11 +294,22 @@ pub const Drafter = struct {
     }
 
     /// The whole prompt before its prefill from `at` (`begin_prompt`, `resume_prompt`): 0 is a cold prompt, which starts
-    /// the slot over; past 0 the slot stands where `restore_at` left it.
+    /// the slot over; past 0 the slot stands where `restore_at` left it. A prompt past `--max-mtp-ctx` is one the
+    /// server admits no MTP for: none of its forwards adds history, as #1005 keeps none for it.
     pub fn prompt(d: *Drafter, id: u32, ids: []const u32, at: u64) !void {
         const sl = if (at == 0) try d.slotAt(id, 0) else d.slots.get(id) orelse return;
         sl.prompt.clearRetainingCapacity();
         try sl.prompt.appendSlice(gpa, ids);
+        sl.from = if (mtp_mod.mtpCtxWithinLimit(d.max_mtp_ctx, ids.len)) historyFrom(ids.len, at, d.mtp_history_window) else std.math.maxInt(u64);
+    }
+
+    /// Whether slot `id`'s forward of `n` rows at `pos` adds rows to its history, so `follow` reads its streams: one that
+    /// starts the slot over, else one on a whole history (`synced`, at `next`) that ends past the history's start
+    /// (`from`), unless it is a request decoding plain (`decodesPlain`).
+    pub fn takes(d: *const Drafter, id: u32, pos: u64, n: u32) bool {
+        const sl = d.slots.get(id) orelse return pos == 0;
+        if (pos == 0 and sl.next != 0) return true;
+        return sl.synced and pos == sl.next and pos + n > sl.from and !decodesPlain(sl, pos, n);
     }
 
     /// A slot's head history at a prompt boundary, copied (`aux.Snap.head`): its KV rows, its own QSA state, where its
@@ -339,12 +382,16 @@ pub const Drafter = struct {
         sl.prompt.clearRetainingCapacity();
         setLast(sl, .{ .ctx = null });
         sl.next = n;
+        sl.from = 0;
+        sl.base = if (head) |h| restoredBase(n, h.meta) else 0;
         sl.synced = head != null;
+        sl.drafts = false;
     }
 
     /// After slot `id`'s forward of `n` rows at `pos` (their ids `ids` on the host, else `ids_dev` on the device) with
-    /// the streams `streams` `[1, n, hc*H]` (borrowed): the rows whose next token is known join the history. `keep`: the
-    /// forward is the engine's, whose rows past the prompt the request's policy has not counted yet.
+    /// the streams `streams` `[1, n, hc*H]` (borrowed; null for a forward the history `takes` nothing of): the rows whose
+    /// next token is known join the history. `keep`: the forward is the engine's, whose rows past the prompt the
+    /// request's policy has not counted yet.
     pub fn follow(d: *Drafter, id: u32, pos: u64, n: u32, ids: []const u32, ids_dev: Array, streams: Array, keep: bool) !void {
         const sl = try d.slotAt(id, pos);
         if (!sl.synced or n == 0) return;
@@ -352,7 +399,15 @@ pub const Drafter = struct {
             sl.synced = false;
             return;
         }
+        if (decodesPlain(sl, pos, n)) return d.quiet(sl);
+        // Before the history's start: no rows, and the next row takes the head's next position.
+        if (pos + n <= sl.from) {
+            sl.next = pos + n;
+            sl.base += n;
+            return;
+        }
         errdefer sl.synced = false;
+        if (streams.ctx == null) return error.NoStreams;
         const t = &d.m.trunk;
         const s = t.s;
         const pend = sl.last.ctx != null;
@@ -366,7 +421,9 @@ pub const Drafter = struct {
         // The rows past the prompt are committed tokens the request's policy has not seen.
         const in_prompt: u32 = if (pos < p.len) @intCast(@min(p.len - pos, n)) else 0;
         if (keep and in_prompt < n) try keepPending(sl, if (ids.len == n) ids[in_prompt..] else &.{}, ids_dev, in_prompt, n, s);
-        if (total > 0) {
+        // Past `--max-mtp-ctx` the request drafts no more, and its rows join no history: #1005's serial block grows none.
+        const held = if (sl.gen) |*g| g.spec_disabled_runtime and g.spec_disable_reason == .max_ctx else false;
+        if (total > 0 and !held) {
             var row_ids = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(row_ids);
             if (host) |h| {
@@ -402,7 +459,7 @@ pub const Drafter = struct {
             try rowsAfter(&hist, if (pend) sl.last else null, streams, body, n, s);
             mtp_head.qwen4MtpActivate(t, &sl.st);
             // The first row sits at its token's position: `last`'s at `pos`, else row 0's at `pos + 1`.
-            const at: c_int = @intCast(if (pend) pos else pos + 1);
+            const at: c_int = @intCast((if (pend) pos else pos + 1) - sl.base);
             freeOut(try mtp_head.qwen4MtpForward(t, hist, row_ids, at, .none));
             // A prefill's rows: the head's history computes with its chunk, as #1005's prefill evaluates it with the
             // chunk's KV, so the prefix-cache snapshot and the first draft find it done.
@@ -427,6 +484,7 @@ pub const Drafter = struct {
     /// The request's policy brought up to t1: the ids the engine's own forwards committed read into its generated
     /// tokens, and its budget (`accept_cap` drafts may still be kept). Null when the slot's history cannot draft.
     fn policyAt(d: *Drafter, id: u32, pos: u64, cap: u32) !?*Generator {
+        if (d.slots.get(id)) |s| s.drafts = true;
         const sl = d.ready(id, pos) orelse return null;
         const own = ownOf(d.m, id) orelse return null;
         const g = d.policyOf(sl, own);
@@ -438,10 +496,18 @@ pub const Drafter = struct {
         return g;
     }
 
-    /// What this round runs, as #1005's round entry decides it: null = serial (the policy's adaptive switch, a probe or
-    /// its exit, a request it disabled), else the plan.
-    fn planOf(g: *Generator) ?MtpRoundPlan {
-        // Adaptive serial re-entry: sticky, except when the request crossed into a different KV bucket.
+    /// What this round runs, as #1005's round entry decides it: null = serial (a context past `max_mtp_ctx`, the
+    /// policy's adaptive switch, a probe or its exit, a request it disabled), else the plan.
+    fn planOf(g: *Generator, max_mtp_ctx: u32) ?MtpRoundPlan {
+        // `--max-mtp-ctx`, checked against prompt + generated: sticky (the context only grows), through the same
+        // `spec_disabled_runtime` fallback.
+        if (!g.spec_disabled_runtime and !mtp_mod.mtpCtxWithinLimit(max_mtp_ctx, g.mtpKvLen())) {
+            log.info("  mtp=off (ctx {d} > --max-mtp-ctx {d})\n", .{ g.mtpKvLen(), max_mtp_ctx });
+            g.spec_disabled_runtime = true;
+            g.spec_disable_reason = .max_ctx;
+        }
+        // Adaptive serial re-entry: sticky, except when the request crossed into a different KV bucket. `.max_ctx` never
+        // re-enters.
         if (g.spec_disabled_runtime and g.spec_disable_reason == .adaptive and g.mtpAdaptiveHeadMayResume()) {
             const b = g.mtpAdaptiveBucket(g.mtpKvLen());
             const prev_bucket = g.mtp_adaptive.bucket;
@@ -504,8 +570,8 @@ pub const Drafter = struct {
         }
     }
 
-    /// The head's chain for `plan` from t1 at `pos`, #1005's (`mtpChainBuild`), opened: chunk A to `m_lo` (on a
-    /// two-chunk plan drafting off the head's full logits, each draft's confidence beside it), dispatched.
+    /// The head's chain for `plan` from t1 at the head's position `pos`, #1005's (`mtpChainBuild`), opened: chunk A to
+    /// `m_lo` (on a two-chunk plan drafting off the head's full logits, each draft's confidence beside it), dispatched.
     fn chainOpen(d: *Drafter, sl: *Slot, t1: u32, pos: u64, plan: MtpRoundPlan, mask: ?Array) !Chain {
         const t = &d.m.trunk;
         var tok: i32 = @intCast(t1);
@@ -576,7 +642,7 @@ pub const Drafter = struct {
             _ = mlx.mlx_array_free(a);
         };
         var lent: []const Array = &.{};
-        const planned: ?MtpRoundPlan = if (g) |gg| planOf(gg) else null;
+        const planned: ?MtpRoundPlan = if (g) |gg| planOf(gg, d.max_mtp_ctx) else null;
         if (planned) |plan| {
             const gg = g.?;
             const sl = d.ready(id, pos).?;
@@ -598,9 +664,9 @@ pub const Drafter = struct {
                 }
                 lent = lookup_ids[0..k];
             } else {
-                opened = try d.chainOpen(sl, t1, pos, plan, mask);
+                opened = try d.chainOpen(sl, t1, pos - sl.base, plan, mask);
                 const c = &opened.?;
-                const closed = try d.chainClose(c, gg, pos, plan);
+                const closed = try d.chainClose(c, gg, pos - sl.base, plan);
                 b.drafts = closed.drafts;
                 b.n = closed.m;
                 lent = c.ids[0..closed.m];
@@ -719,7 +785,7 @@ pub const Drafter = struct {
         for (drafts[0..accepted], 1..) |dv, i| ids[i] = @intCast(dv);
         const id_arr = mlx.mlx_array_new_data(&ids, &[_]c_int{@intCast(accepted + 1)}, 1, .int32);
         defer _ = mlx.mlx_array_free(id_arr);
-        freeOut(try mtp_head.qwen4MtpForward(t, hidden, id_arr, @intCast(pos), .none));
+        freeOut(try mtp_head.qwen4MtpForward(t, hidden, id_arr, @intCast(pos - sl.base), .none));
         var last = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(last);
         try sliceRows(&last, streams, @intCast(accepted), @intCast(accepted + 1), s);
@@ -993,6 +1059,30 @@ fn pleIdsSource(buf: *[max_rows + 1]Array, t1: Array, drafts: []const Array, row
     buf[0] = t1;
     @memcpy(buf[1 .. 1 + drafts.len], drafts);
     return buf[0 .. 1 + drafts.len];
+}
+
+/// Where the head history of a prompt of `len` tokens starts when its prefill runs from `at`, as #1005's generate init
+/// decides it: with `--mtp-history-window` (`window`), a prefill of more than `HISTORY_WINDOW_THRESHOLD` positions before
+/// its last token keeps its last `window` only (`effectiveMtpHistoryWindow`), from the first chunk that ends inside them
+/// (`chunkNeedsMtpHistory`); 0 when every chunk adds rows.
+fn historyFrom(len: u64, at: u64, window: usize) u64 {
+    const prefix = len -| at -| 1;
+    if (window == 0 or prefix <= mtp_mod.HISTORY_WINDOW_THRESHOLD) return 0;
+    return at + prefix - @min(window, prefix);
+}
+
+/// Whether the engine's forward of `n` rows at `pos` is a one-row decode past the prompt for a request it has run no
+/// round for: one that never drafts. The engine runs a drafting request's first round at its first tick, where a
+/// forced span (a thinking budget's close) comes in one forward of several rows.
+fn decodesPlain(sl: *const Slot, pos: u64, n: u32) bool {
+    return !sl.drafts and n == 1 and sl.prompt.items.len > 0 and pos >= sl.prompt.items.len;
+}
+
+/// The `base` of a history restored at `n` with the head state `meta`: row n takes the head's next position, after its
+/// `stash_len` rows from `origin` on (an empty one's first row sits at 1).
+fn restoredBase(n: u64, meta: mtp.Qwen4MtpState.Meta) u64 {
+    if (meta.stash_len == 0) return n;
+    return n + 1 - meta.stash_len - @as(u64, @intCast(meta.origin));
 }
 
 fn setLast(sl: *Slot, stream: Array) void {
