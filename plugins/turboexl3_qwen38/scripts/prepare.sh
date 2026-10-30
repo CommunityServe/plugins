@@ -2,7 +2,7 @@
 # Generates src/mlx_serve/ for a build: the slice of mlx-serve at MLX_SERVE_REF (scripts/sync-mlx-serve.sh) with
 # overlay/mlx_serve/ over it. build.sh runs it (plugin.json's "prepare"). It regenerates when the ref, the overlay, the
 # scripts or build.zig (whose test filters the sync reads) changed since the last run, and on every run it checks the
-# tree against the hash in scripts/mlx_serve.sha256, so only the reviewed tree builds.
+# tree against the hash in scripts/mlx_serve.sha256 (scripts/check-mlx-serve.sh), so only the reviewed tree builds.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -22,10 +22,4 @@ if [ ! -f "$dst/.generated" ] || [ "$(cat "$dst/.generated")" != "$stamp" ]; the
   cp -R "$here/overlay/mlx_serve/." "$dst/"
   echo "$stamp" > "$dst/.generated"
 fi
-got="$(cd "$dst" && find . -type f ! -name .generated | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
-want="$(tr -d '[:space:]' < "$here/scripts/mlx_serve.sha256")"
-if [ "$got" != "$want" ]; then
-  echo "prepare: src/mlx_serve hashes to $got, not the reviewed $want (scripts/mlx_serve.sha256): re-sync (delete" >&2
-  echo "src/mlx_serve, run scripts/prepare.sh, review what it wrote) and commit the new hash" >&2
-  exit 1
-fi
+exec bash "$here/scripts/check-mlx-serve.sh"

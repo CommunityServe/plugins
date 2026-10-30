@@ -9,6 +9,8 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // src/mlx_serve is generated (scripts/prepare.sh): no build goes on with a tree other than the reviewed one.
+    _ = b.run(&.{ "bash", b.root.joinString(b.allocator, "scripts/check-mlx-serve.sh") catch @panic("OOM") });
     const lib = @import("mlx_serve_kit").plugin(b, .{ .name = "turboexl3_qwen38" });
     const root = lib.root_module.import_table.get("plugin").?;
     const dep = b.dependency("turboexl3", .{ .target = root.resolved_target.?, .optimize = root.optimize.? });
