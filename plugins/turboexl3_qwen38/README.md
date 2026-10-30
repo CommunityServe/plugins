@@ -22,6 +22,9 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load. MTP needs tw
   as the built-in does (lossy).
 - `--kv-quant 4` or `8` (a model's `kv_quant` in ~/.mlx-serve/model-settings.json first), `--kv-attn-mode` and
   `--mtp-head-kv-quant`, read the same way, keep the KV cache affine (group 64) and read it as the built-in does.
+- The prefix cache's snapshots (src/cache/aux.zig: KV, recurrent state with the QSA history, the head's history) go to
+  the server's disk tier with `--prefix-cache-disk`, and at exit within `--shutdown-persist-secs`, in
+  src/cache/codec.zig's form; a later prompt, after a restart too, restores from there as it would from RAM.
 
 ## Measured
 

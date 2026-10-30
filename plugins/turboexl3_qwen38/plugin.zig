@@ -430,21 +430,36 @@ fn auxBeginPrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), rows: abi.Ar
     return .ok;
 }
 
-fn auxImportPlan(_: *anyopaque, _: abi.Str, out: *u64) callconv(.c) Verdict {
+// The disk tier (`--prefix-cache-disk`; the server calls these only with it attached): a snapshot in
+// src/cache/codec.zig's form, its header and its arrays.
+
+/// The header checked against this loaded instance, and the peak its import holds.
+fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdict {
     out.* = 0;
-    return Verdict.refuse(.unsupported, "turboexl3_qwen38: the disk tier holds no module snapshots yet");
+    out.* = aux.importPlan(served(mp).m, header.slice()) catch |e| return diskRefused("header", e);
+    return .ok;
 }
 
-fn auxExportArrays(_: *anyopaque, _: abi.Handle, out: *abi.AuxExport) callconv(.c) Verdict {
+fn auxExportArrays(mp: *anyopaque, handle: abi.Handle, out: *abi.AuxExport) callconv(.c) Verdict {
+    if (out.size < @sizeOf(abi.AuxExport)) return diskRefused("export", error.AuxSnapshotStorage);
     out.tensor_len = 0;
     out.names_len = 0;
     out.header_len = 0;
-    return Verdict.refuse(.unsupported, "turboexl3_qwen38: the disk tier holds no module snapshots yet");
+    const sn = snapOf(handle) orelse return diskRefused("export", error.AuxNoSnapshot);
+    aux.exportArrays(served(mp).m, sn, out) catch |e| return diskRefused("export", e);
+    return .ok;
 }
 
-fn auxImportArrays(_: *anyopaque, _: abi.Span(u32), _: abi.Str, _: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
+fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    return Verdict.refuse(.unsupported, "turboexl3_qwen38: the disk tier holds no module snapshots yet");
+    out.* = aux.importArrays(served(mp).m, ids.slice(), header.slice(), arrays.slice()) catch |e| return diskRefused("import", e);
+    return .ok;
+}
+
+/// A disk-tier call refused, by name and in the log: the server keeps its RAM snapshot, or prefills the prompt cold.
+fn diskRefused(what: []const u8, e: anyerror) Verdict {
+    log.err("[turboexl3_qwen38] prefix-cache disk {s} refused: {s}\n", .{ what, @errorName(e) });
+    return Verdict.named(.failed, @errorName(e));
 }
 
 /// Ends the open read-ahead, if any (#1005 ends it on every exit of the prefill).
@@ -486,6 +501,8 @@ test {
     _ = @import("src/spec/drafter.zig");
     // The server's flags as the plugin reads them (`zig build mlx-free-test`).
     _ = @import("src/host_flags.zig");
+    // The disk tier's form of a prefix-cache snapshot, its header read back (`zig build mlx-free-test`).
+    _ = @import("src/cache/codec.zig");
     // #1005's trunk_quant block lookup, MLX-free (`zig build mlx-free-test`).
     _ = @import("src/mlx_serve/sdk/quant/block_test.zig");
     // #1005's EXL3 tests (`zig build gpu-test`, the server's MLX linked); mlx-free-test's filters leave them out.

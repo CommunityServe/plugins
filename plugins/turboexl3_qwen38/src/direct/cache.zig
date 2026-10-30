@@ -95,7 +95,8 @@ pub const KVCacheEntry = struct {
 const buffers = .{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" };
 const view_names = .{ "key_view", "value_view", "key_scales_view", "key_biases_view", "value_scales_view", "value_biases_view" };
 
-fn newEntry() KVCacheEntry {
+/// An entry with no buffers, uninitialized.
+pub fn newEntry() KVCacheEntry {
     var e: KVCacheEntry = undefined;
     inline for (buffers ++ view_names) |f| @field(e, f) = mlx.mlx_array_new();
     e.offset = 0;
