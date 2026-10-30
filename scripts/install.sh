@@ -6,7 +6,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 name="${1:?usage: scripts/install.sh <name> [--home <dir>]}"; shift
 command -v mlx-serve >/dev/null || { echo "mlx-serve is not on PATH (install it from github.com/ddalcu/mlx-serve)" >&2; exit 1; }
-mlx-serve plugin 2>&1 | grep -q "plugin install" || { echo "this mlx-serve ($(mlx-serve --version 2>&1 | tail -1)) has no 'plugin' command: use a release that ships the plugin kit" >&2; exit 1; }
+# `mlx-serve plugin` alone prints its usage and exits 1, so its output is read before grep (pipefail would fail the probe).
+usage="$(mlx-serve plugin 2>&1 || true)"
+grep -q "plugin install" <<<"$usage" || { echo "this mlx-serve ($(mlx-serve --version 2>&1 | tail -1)) has no 'plugin' command: use a release that ships the plugin kit" >&2; exit 1; }
 "$ROOT/scripts/build.sh" "$name"
 dylib="$ROOT/plugins/$name/zig-out/lib/lib$name.dylib"
 if [ "${1:-}" = "--home" ]; then

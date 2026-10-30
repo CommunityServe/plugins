@@ -1,0 +1,15 @@
+.{
+    .name = .turboexl3_qwen38,
+    .version = "0.0.0",
+    .fingerprint = 0x549ea500ccde3d62,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .mlx_serve_kit = .{ .path = "../../.kit/kit" },
+        // turboexl3 (davidtai/turboexl3): the EXL3 kernels, its plugin-kit launcher and its quant table, at its main.
+        .turboexl3 = .{
+            .url = "https://github.com/davidtai/turboexl3/archive/7500027d2c9792cd20cb3ed7d33f92aa21e00972.tar.gz",
+            .hash = "turboexl3-0.1.0-tZE8b5iUNgFuGKc49cHQE5efYJUVDpSQeP_Y58q3j18j",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "scripts", "tests", "NOTICE", "README.md" },
+}
