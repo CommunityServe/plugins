@@ -403,6 +403,9 @@ pub const Drafter = struct {
             // The first row sits at its token's position: `last`'s at `pos`, else row 0's at `pos + 1`.
             const at: c_int = @intCast(if (pend) pos else pos + 1);
             freeOut(try mtp_head.qwen4MtpForward(t, hist, row_ids, at, .none));
+            // A prefill's rows: the head's history computes with its chunk, as #1005's prefill evaluates it with the
+            // chunk's KV, so the prefix-cache snapshot and the first draft find it done.
+            if (n > 1) try queueHistory(t);
         }
         if (after == null) {
             var last = mlx.mlx_array_new();
@@ -1066,6 +1069,21 @@ fn keepPending(sl: *Slot, host: []const u32, dev: Array, from: u32, n: u32, s: m
         try mlx.check(mlx.mlx_slice(&ref, flat, &[_]c_int{@intCast(from)}, 1, &[_]c_int{@intCast(n)}, 1, &[_]c_int{1}, 1, s));
     }
     try sl.pending.append(gpa, ref);
+}
+
+/// The head's live history, its KV rows and QSA history, queued for evaluation (`mlx_async_eval`).
+fn queueHistory(t: *Trunk) !void {
+    const m = &(t.qwen4_mtp orelse return);
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (m.cache.entries) |e| if (e.initialized) for ([_]Array{ e.keys, e.values }) |a| if (a.ctx != null) {
+        _ = mlx.mlx_vector_array_append_value(vec, a);
+    };
+    const q = &m.entry;
+    for ([_]Array{ q.aux_state, q.qsa_pooled, q.qsa_key_buf, q.qsa_pooled_buf, q.qsa_score_bank, q.qsa_score_buf }) |a| if (a.ctx != null) {
+        _ = mlx.mlx_vector_array_append_value(vec, a);
+    };
+    if (mlx.mlx_vector_array_size(vec) > 0) try mlx.check(mlx.mlx_async_eval(vec));
 }
 
 /// `ids` (any integer dtype, any shape) read off the device onto `list`.
