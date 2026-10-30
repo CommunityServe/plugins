@@ -149,26 +149,27 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // A pack without a head, or a server whose `mtp` setting is off: no rounds and no head history.
     if (s.drafter.has() and (q4.mtpSetting(ctx.settings_json.slice()) orelse true)) {
         s.mtp = true;
-        armHead(m, eager);
-        s.drafter.warmTwoChunk() catch |e| log.warn("[turboexl3_qwen38] the two-chunk warm-up failed ({s}): the first boundary is timed cold\n", .{@errorName(e)});
+        armHead(s, eager);
     }
     return s;
 }
 
-/// The head's load-time work, as #1005's load does it when the head serves (`qwen4_build_draft_rerank`, then its eager
-/// `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and where the server's
-/// eager warm-up reaches the load (`eager`, `host_flags.warmsAt`) each verify width's kernels, to the depth cap
-/// `--mtp-max-depth` resolves to, compiled before any round is timed, on slots of the `--kv-quant` scheme (the flag's,
-/// as #1005's warm-up takes it).
-fn armHead(m: *q4.Model, eager: bool) void {
+/// The head's load-time work, as #1005's load does it when the head serves (`qwen4_build_draft_rerank`, then, inside
+/// its eager warm-up, `qwen4_warmup_spec_verify`): the rerank head built here rather than inside the first round, and
+/// where the server's eager warm-up reaches the load (`eager`, `host_flags.warmsAt`) each verify width's kernels, to the
+/// depth cap `--mtp-max-depth` resolves to, on slots of the `--kv-quant` scheme (the flag's, as #1005's warm-up takes
+/// it), and the two-chunk round's, compiled before any round is timed.
+fn armHead(s: *Served, eager: bool) void {
+    const m = s.m;
     _ = mtp_head.qwen4BuildDraftRerank(&m.trunk);
     if (!eager) {
-        log.info("[turboexl3_qwen38] --no-warmup-eager: no verify warm-up at load; each width compiles in its first round\n", .{});
+        log.info("[turboexl3_qwen38] --no-warmup-eager: no MTP warm-up at load; each verify width and the first two-chunk boundary compile in their first round\n", .{});
         return;
     }
     const kv = host_flags.flags.kv_quant orelse KVQuantConfig.dense;
     const cap = ev_plan.resolveMtpDepthCapForProfile(depth_bounds.active.max, cost_profile.qwen4G17CostProfileForKv(&m.trunk, kv));
     warmup.warmupSpecVerify(&m.trunk, cap, kv) catch |e| log.warn("[turboexl3_qwen38] the verify warm-up failed ({s}): each width compiles in its first round\n", .{@errorName(e)});
+    s.drafter.warmTwoChunk() catch |e| log.warn("[turboexl3_qwen38] the two-chunk warm-up failed ({s}): the first boundary is timed cold\n", .{@errorName(e)});
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {
