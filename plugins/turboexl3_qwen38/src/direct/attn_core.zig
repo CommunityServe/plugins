@@ -1,13 +1,15 @@
 //! The direct model's attention core, after attn.zig's projections, norms and RoPE: the KV append, attention over the
 //! indexer's block picks (the decode kernel, the split pass with its merge folded into the gated o_proj, the prefill
-//! gather) or under its mask, the batched tick's reads, SDPA below the QSA budget, and the gate and o_proj. Cut from
-//! today's `trunk/attn.zig`, `trunk/fusion.zig`, `qsa/` and the `sdk/blocks/attention` launchers to what the K packs run:
-//! a dense bf16 KV cache (a quantized one is refused), an M5-class GPU (NAX), every launch on a GPU stream (the trunk's,
-//! a wavefront half's or a side stream), so the copies' `streamIsGpu` declines are gone.
+//! gather) or under its mask, the batched tick's reads, SDPA below the QSA budget (int8 Q and K under `--int8-qk`), and
+//! the gate and o_proj. Cut from today's `trunk/attn.zig`, `trunk/fusion.zig`, `qsa/` and the `sdk/blocks/attention`
+//! launchers to what the K packs run: a dense bf16 KV cache (a quantized one is refused), an M5-class GPU (NAX), every
+//! launch on a GPU stream (the trunk's, a wavefront half's or a side stream), so the copies' `streamIsGpu` and NAX
+//! declines are gone.
 
 const std = @import("std");
 const abi = @import("../mlx_serve/abi/quant.zig");
 const mlx = @import("../mlx_serve/mlx/ffi.zig");
+const log = @import("../mlx_serve/sdk/util/log.zig");
 const kernelSource = @import("../mlx_serve/mlx/kernels.zig").source;
 const Trunk = @import("../mlx_serve/plugins/qwen4_exp/trunk.zig").Trunk;
 const fusion = @import("../mlx_serve/plugins/qwen4_exp/trunk/fusion.zig");
@@ -43,6 +45,11 @@ const QSA_DEC_CH: c_int = 32;
 const QSA_DEC_BD: c_int = 256;
 /// The hd-256 mask kernel's work per dispatch (batch·Hq·qL·keys); past it the key axis splits into dispatches.
 const FUSED256_DISPATCH_BUDGET: i64 = 250_000_000;
+/// The int8 Q/K kernel's query tile, 16 rows a simdgroup and `Q8_WM` simdgroups down (the rows one Q scale covers, and
+/// the fewest a block takes it with), and its key block (the keys one K scale covers).
+const Q8_WM: c_int = 4;
+const Q8_BQ: c_int = 16 * Q8_WM;
+const Q8_BK: c_int = 32;
 
 const ATTN256_KERNEL_HEADER = kernelSource("kernels/attention/attn256_header.metal");
 const ATTN256_KERNEL_SOURCE = kernelSource("kernels/attention/attn256.metal");
@@ -61,6 +68,15 @@ const QSA_ATTN_MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_m
 const QSA_DEC_HEADER = kernelSource("kernels/attention/qsa_decode_header.metal");
 const QSA_DEC_PARTS_SOURCE = kernelSource("kernels/attention/qsa_decode_parts.metal");
 const QSA_DEC_MERGE_SOURCE = kernelSource("kernels/attention/qsa_decode_merge.metal");
+/// The int8 Q/K hd-256 entry of MLX's tensor-unit flash attention (ported from oMLX), and int8_attn.zig's row quantizer.
+const NAX_ATTN_256Q8_SOURCE = kernelSource("kernels/attention/nax_attention_256q8_entry.metal");
+const NAX_ATTN_HEADER = kernelSource("kernels/attention/nax_tiles.metal") ++ kernelSource("kernels/attention/nax_attention.metal");
+const INT8_QUANT_ROWS_SOURCE = kernelSource("kernels/dit/int8_attn_quant.metal");
+
+/// The server's `--int8-qk` (src/host_flags.zig sets it at load): a dense prefill block of 64 rows or more attends on
+/// int8 Q and K (lossy).
+pub var int8_qk = false;
+var int8_qk_engaged = false;
 
 var attn256_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var attn_qsa256_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -69,6 +85,8 @@ var qsa_attn_d_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qsa_attn_merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qsa_dec_parts_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qsa_dec_merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var nax_attn_256q8_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var int8_quant_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 const QsaAttnCfgKey = struct { q_shape: ShapeKey, h_kv: c_int, ratio: c_int };
 var qsa_attn_cfgs = QsaCfgCache(QsaAttnCfgKey, 2){};
@@ -235,10 +253,12 @@ fn maskAttn(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_ar
     return sdpa(s, q, k, v, scale, "array", mask, false);
 }
 
-/// Attention over the whole cache below the QSA budget: a block of rows causal (row groups the vector kernel serves at
-/// 3..8 rows, MLX's fused NAX kernel from 9), a decode row plain.
+/// Attention over the whole cache below the QSA budget: a block of rows causal (under `--int8-qk` the int8 Q/K kernel
+/// from 64 rows; else row groups the vector kernel serves at 3..8 rows, MLX's fused NAX kernel from 9), a decode row
+/// plain.
 fn denseAttn(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, is_prefill: bool) !mlx.mlx_array {
     if (!is_prefill) return sdpa(s, q, k, v, scale, "", .{ .ctx = null }, false);
+    if (try int8QkAttn(s, q, k, v, scale)) |out| return out;
     if (try splitCausalSdpa(s, q, k, v, scale)) |out| return out;
     return sdpa(s, q, k, v, scale, "causal", .{ .ctx = null }, sdpaForceFused(q, k));
 }
@@ -686,6 +706,117 @@ fn attn256Base16Aligned(a: mlx.mlx_array) bool {
     if (mlx._mlx_array_is_available(&avail, a) != 0 or !avail) return true;
     const p = mlx.mlx_array_data_uint32(a) orelse return true;
     return @intFromPtr(p) % 16 == 0;
+}
+
+// ── `--int8-qk`: msv_nax_attn_256_q8 (nax_attention.zig) ──
+
+/// Causal hd-256 attention on the tensor units with int8 Q and K (SageAttention; `--int8-qk`, lossy): Q quantized per
+/// 64-row tile, K per 32-key block after removing each KV head's mean key (a constant offset on every key moves each
+/// score row by a constant, which softmax ignores), P and V in q's dtype, one dispatch over every key; the output a
+/// [B, H, qL, 256] view like SDPA's. Null: the switch off, or a block under one Q tile (verify widths and short blocks
+/// keep the kernels below). Any other shape it declines is one the K packs never make.
+fn int8QkAttn(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
+    if (!int8_qk) return null;
+    if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return error.DirectModelInt8QkDeclined;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(k);
+    const vs = mlx.getShape(v);
+    if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return error.DirectModelInt8QkDeclined;
+    if (ks[0] != qs[0] or vs[0] != qs[0] or vs[1] != ks[1] or vs[2] != ks[2]) return error.DirectModelInt8QkDeclined;
+    if (ks[1] == 0 or @rem(qs[1], ks[1]) != 0 or ks[2] < qs[2]) return error.DirectModelInt8QkDeclined;
+    const dt = mlx.mlx_array_dtype(q);
+    if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(k) != dt or mlx.mlx_array_dtype(v) != dt) return error.DirectModelInt8QkDeclined;
+    if (qs[2] < Q8_BQ) return null;
+
+    // Each KV head's mean key; then Q's int8 codes and scales, and those of K less that mean.
+    var mean = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mean);
+    try mlx.check(mlx.mlx_mean_axis(&mean, k, 2, true, s));
+    const qq = try int8QuantRows(s, q, Q8_BQ, null);
+    defer for (qq) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const kq = try int8QuantRows(s, k, Q8_BK, mean);
+    defer for (kq) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+
+    const b = qs[0];
+    const h = qs[1];
+    const ql = qs[2];
+    const kl = ks[2];
+    const nq = @divTrunc(ql + Q8_BQ - 1, Q8_BQ);
+    const nq_aligned = @divTrunc(ql, Q8_BQ);
+    const nk = @divTrunc(kl + Q8_BK - 1, Q8_BK);
+    const nk_aligned = @divTrunc(kl, Q8_BK);
+    // No sinks and no row state carried in: one-element stand-ins, the sinks' in q's dtype.
+    const one = [_]c_int{1};
+    const zero = [_]f32{0};
+    const dummy = mlx.mlx_array_new_data(&zero, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(dummy);
+    var sinks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sinks);
+    try mlx.check(mlx.mlx_astype(&sinks, dummy, dt, s));
+    // omlx_nax::AttnParams: B H D qL kL gqa scale NQ NK NQ_aligned NK_aligned qL_rem kL_rem qL_off kb_begin kb_end.
+    const pdata = [16]i32{ b, h, 256, ql, kl, @divExact(h, ks[1]), @bitCast(scale), nq, nk, nq_aligned, nk_aligned, ql - nq_aligned * Q8_BQ, kl - nk_aligned * Q8_BK, kl - ql, 0, nk };
+    const params = mlx.mlx_array_new_data(&pdata, &[_]c_int{16}, 1, .int32);
+    defer _ = mlx.mlx_array_free(params);
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ b, ql, h, 256 }, 4, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one, 1, .float32));
+    // One threadgroup of 4 x 2 simdgroups per 64-row q tile per head per batch; the grid in threads.
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, nq * 32 * Q8_WM * 2, h, b));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32 * Q8_WM * 2, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "WM", Q8_WM));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(config, "ALIGN_Q", @rem(ql, Q8_BQ) == 0));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(config, "ALIGN_K", @rem(kl, Q8_BK) == 0));
+    const kernel = try cachedKernel(&nax_attn_256q8_kernel, "msv_nax_attn_256_q8", &.{ "q", "k", "v", "sinks", "state", "params", "qi", "ki", "qs", "ks" }, &.{ "out", "state_out" }, NAX_ATTN_256Q8_SOURCE, NAX_ATTN_HEADER);
+    var outs: [2]mlx.mlx_array = undefined;
+    try launch(s, kernel, config, &.{ q, k, v, sinks, dummy, params, qq[0], kq[0], qq[1], kq[1] }, &outs);
+    defer for (outs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    // [B, qL, H, 256] rows viewed as [B, H, qL, 256].
+    var view = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(view);
+    try mlx.check(mlx.mlx_transpose_axes(&view, outs[0], &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+    log.debug("[attn] int8 QK call qL={d} kL={d}\n", .{ ql, kl });
+    if (!int8_qk_engaged) {
+        int8_qk_engaged = true;
+        log.info("[attn] int8 QK hd-256 prefill attention engaged (--int8-qk; lossy)\n", .{});
+    }
+    return view;
+}
+
+/// int8_attn.zig's row quantizer `msv_int8_quant_rows`, its strided arm (x read through its strides, one block a
+/// threadgroup): the int8 codes of x [B, H, L, D] less `mean` [B, H, 1, D] where given, and one fp32 scale per `rows`-row
+/// block, [B * H * blocks], absmax / 127 and at least 1e-6 / 127; a code is x * (1 / scale) rounded. The caller frees
+/// both.
+fn int8QuantRows(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, mean: ?mlx.mlx_array) ![2]mlx.mlx_array {
+    const kernel = try cachedKernel(&int8_quant_rows_kernel, "msv_int8_quant_rows", &.{ "x", "mean", "eps" }, &.{ "q", "scales" }, INT8_QUANT_ROWS_SOURCE, "");
+    const sh = mlx.getShape(x);
+    const blocks = sh[0] * sh[1] * @divTrunc(sh[2] + rows - 1, rows);
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, sh.ptr, 4, .int8));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{blocks}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, blocks * 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SG", 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", mlx.mlx_array_dtype(x)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "D", sh[3]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "ROWS", rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(config, "HAS_MEAN", mean != null));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(config, "DIVIDE", false));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(config, "CONTIG", false));
+    const eps = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps);
+    var out: [2]mlx.mlx_array = undefined;
+    try launch(s, kernel, config, &.{ x, mean orelse x, eps }, &out);
+    return out;
 }
 
 // ── SDPA below the QSA budget (sdpa.zig) ──
