@@ -75,7 +75,7 @@ const Model = struct {
     policy: rows_policy.Policy = .{},
     /// A round whose verify the engine is accepting (`NativeDrafter.verify` until `finish`).
     open: ?Open = null,
-    /// This request's copy rounds, the drafts they verified and kept; logged when the next request resets the state.
+    /// This request's copy rounds, the drafts they verified and kept; logged when the next request starts (`startCopies`).
     copy: CopyStats = .{},
     /// Whether this request still takes copies (`copy_lookup.Backoff`).
     copy_backoff: copy_lookup.Backoff = .{},
@@ -351,10 +351,16 @@ fn clearIds(m: *Model) void {
 
 const CopyStats = struct { rounds: u64 = 0, drafted: u64 = 0, accepted: u64 = 0 };
 
-fn reset(m: *Model) void {
+/// A new request's copy arm: the last one's copy rounds are logged and its backoff forgotten. Runs from both places a
+/// request starts, a fresh state (`reset`) and a restored prefix (`auxRestoreAt`).
+fn startCopies(m: *Model) void {
     if (m.copy.rounds > 0) log.info("[sushi_ds41] copy rounds={d} drafted={d} accepted={d}\n", .{ m.copy.rounds, m.copy.drafted, m.copy.accepted });
     m.copy = .{};
     m.copy_backoff = .{};
+}
+
+fn reset(m: *Model) void {
+    startCopies(m);
     dsv.resetState(m.mdl);
     m.open = null;
     clearIds(m);
@@ -555,6 +561,7 @@ fn auxRestoreAt(mp: *anyopaque, _: u32, h: abi.Handle, pos: u64) callconv(.c) Ve
     const m: *Model = @ptrCast(@alignCast(mp));
     const sn = snapOf(h) orelse return Verdict.refuse(.unsupported, "sushi_ds41: no snapshot to restore");
     if (pos != sn.n) return Verdict.refuse(.unsupported, "sushi_ds41: restore needs the snapshot's exact position");
+    startCopies(m);
     clearIds(m);
     m.ids.appendSlice(gpa, sn.ids) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
     dsv.restoreState(m.mdl, sn.slots, sn.n, sn.ids) catch |e| {
