@@ -21,15 +21,27 @@ pub fn build(b: *std.Build) void {
     const run = b.addRunArtifact(tests);
     b.step("claims", "Run the claim and parse tests").dependOn(&run.step);
 
-    // The Metal tests of src/attn_nax.zig, src/index_nax.zig and src/vision_key.zig, linked to an MLX the caller names
-    // (the server's own, so its pin), never to the dylib: `zig build gpu-test -Dmlx-lib=<dir holding libmlxc.dylib>`.
-    // The matmul2d tests skip without an M5.
+    // The Metal tests of src/attn_nax.zig, src/index_nax.zig, src/vision_key.zig and src/prefill_pipe_test.zig, linked to
+    // an MLX the caller names (the server's own, so its pin), never to the dylib:
+    // `zig build gpu-test -Dmlx-lib=<dir holding libmlxc.dylib>`. The matmul2d tests skip without an M5, the pipeline
+    // test without `DSV41_TINY` (sushi's tiny checkpoint).
     const mlx_lib = b.option([]const u8, "mlx-lib", "Directory holding the libmlxc.dylib the Metal test links") orelse return;
     const gpu = b.createModule(.{ .root_source_file = b.path("src/attn_nax_test.zig"), .target = root.resolved_target, .optimize = root.optimize, .link_libc = true });
     gpu.addLibraryPath(.{ .cwd_relative = mlx_lib });
     gpu.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
     gpu.addRPath(.{ .cwd_relative = mlx_lib });
+    // The slice's model reaches the vendored module, whose `mlx_host` is this root (it exports mlx, log and io_util).
+    const gpu_exl3 = b.createModule(.{
+        .root_source_file = b.path("src/sushi/exl3/root.zig"),
+        .target = root.resolved_target,
+        .optimize = root.optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_host", .module = gpu }},
+    });
+    gpu.addImport("sushi_exl3", gpu_exl3);
     const gpu_run = b.addRunArtifact(b.addTest(.{ .root_module = gpu, .filters = &.{"sushi_ds41 gpu"} }));
     gpu_run.setEnvironmentVariable("SUSHI_DS41_GPU_TEST", "1");
+    // `DSV41_TINY` is read at run time, outside the step's cache key: always run, so setting it is never a cached no-op.
+    gpu_run.has_side_effects = true;
     b.step("gpu-test", "Run the Metal tests (needs -Dmlx-lib; the matmul2d ones skip without an M5)").dependOn(&gpu_run.step);
 }

@@ -1,9 +1,13 @@
 //! The Metal tests of `attn_nax.zig` (`attnFusedNax` against the slice's `attnFused`, `attnFusedNaxPacked` against
 //! `attnFusedPacked`, at the release's attention shape) and `index_nax.zig` (`indexScoresNax` against `indexScoresTile`).
 //! The root of `zig build gpu-test -Dmlx-lib=<dir>` only (it links that MLX and sets SUSHI_DS41_GPU_TEST); skipped
-//! without an M5. It also runs `vision_key.zig`'s test, which needs MLX but no M5.
+//! without an M5. It also runs `vision_key.zig`'s test, which needs MLX but no M5, and `prefill_pipe_test.zig`, which
+//! needs the tiny checkpoint (`DSV41_TINY`). As the plugin's root does, it is the `mlx_host` of the slice's
+//! `sushi_exl3` module.
 const std = @import("std");
-const mlx = @import("sushi/mlx.zig");
+pub const mlx = @import("sushi/mlx.zig");
+pub const log = @import("sushi/log.zig");
+pub const io_util = @import("sushi/io_util.zig");
 const sc_mod = @import("sushi/dsv41/dsv41_scope.zig");
 const kernels = @import("sushi/dsv41/dsv41_kernels.zig");
 const dsv = @import("sushi/dsv41/dsv41_model.zig");
@@ -16,6 +20,7 @@ const ci = sc_mod.ci;
 
 test {
     _ = @import("vision_key.zig");
+    _ = @import("prefill_pipe_test.zig");
 }
 
 const Case = struct { L: usize, wp: usize, K: usize, nc: usize, dt: mlx.mlx_dtype = .bfloat16, packed_rows: bool = false, holes: bool = false, all_neg: bool = false, oob: bool = false };
