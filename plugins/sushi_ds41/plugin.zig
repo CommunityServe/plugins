@@ -213,6 +213,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         pf.* = dsv.Profile.init(verify_profile);
         m.mdl.profile = pf;
     }
+    if (std.c.getenv("SUSHI_DS41_PREFILL_PIPELINE")) |raw| m.mdl.pipe_depth = pipeSetting(raw);
+    log.info("[sushi_ds41] prefill pipeline: up to {d} prefill-width layers in flight{s}\n", .{ m.mdl.pipe_depth, if (m.mdl.pipe_depth == 0) " (off: every layer waits)" else "" });
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
     errdefer if (m.tower) |*t| t.deinit();
@@ -374,6 +376,7 @@ fn reset(m: *Model) void {
 /// told what follows it so the next chunk's Engram rows read while it runs, then the last token alone for the logits.
 /// Logits `[rows, vocab]`. `progress` gets the rows forwarded after each chunk (`Forward.progress`).
 fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64) !mlx.mlx_array {
+    errdefer dsv.pipeDrain(m.mdl) catch {};
     var rows = media;
     const prefix = if (want == .last and ids.len > 1) ids.len - 1 else 0;
     var at: usize = 0;
@@ -389,6 +392,9 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
         at = end;
         if (progress) |p| @atomicStore(u64, p, at, .monotonic);
     }
+    // Pipelined state-only layers finish before the restore point reads the state (no-op when nothing is in flight).
+    // Progress above counts rows submitted; this is where they are done.
+    try dsv.pipeDrain(m.mdl);
     try capture(m);
     const logits = try forwardRows(m, ids[prefix..], want, &.{}, rows);
     defer _ = mlx.mlx_array_free(logits);
@@ -397,6 +403,16 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     try mlx.check(mlx.mlx_reshape(&o, logits, &[_]c_int{ -1, @intCast(m.cfg.vocab) }, 2, m.s));
     return o;
 }
+
+/// The `SUSHI_DS41_PREFILL_PIPELINE` value: prefill layers in flight, capped at `pipe_measured`; 0 (or unparsable)
+/// turns the pipeline off.
+fn pipeSetting(raw: [*:0]const u8) usize {
+    const n = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return 0;
+    return @min(n, pipe_measured);
+}
+
+/// The deepest pipeline measured (M5 Ultra, 2,048-row chunks): a deeper setting is capped here until one is.
+const pipe_measured = 2;
 
 /// One pass over `rows`; the logits are the caller's to free (an intermediate chunk's are dropped).
 fn forwardRows(m: *Model, rows: []const u32, want: dsv.Want, ahead: []const u32, media: ?dsv.VisionRows) !mlx.mlx_array {
@@ -442,6 +458,15 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 test {
     _ = config;
     _ = attn_nax;
+}
+
+test "sushi_ds41 prefill pipeline: SUSHI_DS41_PREFILL_PIPELINE parses to layers in flight, 0 or junk is off, capped" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 0), pipeSetting("0"));
+    try t.expectEqual(@as(usize, 0), pipeSetting("off"));
+    try t.expectEqual(@as(usize, 1), pipeSetting("1"));
+    try t.expectEqual(@as(usize, 2), pipeSetting("2"));
+    try t.expectEqual(@as(usize, pipe_measured), pipeSetting("99"));
 }
 
 // ── prefix cache ──
