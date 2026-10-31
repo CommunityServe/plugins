@@ -137,6 +137,8 @@ pub fn rows(st: *State, a: std.mem.Allocator, g: anytype, h: anytype, layer: u32
     }
     const y = try one(st, a, g, h, layer, x, wts, n, k, sp, route_ids, base);
     if (mode != .check) return g.keep(y);
+    // The one call's rows are no longer held: the lane's loads may take them, so its sum is evaluated first.
+    try g.evalAll(&.{y});
     const ref = try laneSum(g, h, layer, x, ids, wts);
     try check(st, g, layer, n, k, sp, y, ref);
     return g.keep(ref);
