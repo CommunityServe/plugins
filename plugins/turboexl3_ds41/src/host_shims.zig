@@ -21,6 +21,13 @@ pub fn install(raw: ?*const anyopaque) bool {
     return true;
 }
 
+/// Bytes the plugin may still allocate on the GPU (`Host.memory_ceiling`: the host's ceiling less what is resident);
+/// no limit with no table kept.
+pub fn memoryCeiling() u64 {
+    const t = table orelse return std.math.maxInt(u64);
+    return t.memory_ceiling(t.ctx);
+}
+
 fn gpu() ?*const host.HostGpu {
     const t = table orelse return null;
     return t.gpu;
@@ -45,9 +52,15 @@ fn arrays(xs: [*]const mlx.mlx_array) [*]const common.Array {
 
 // ── mlx_event_shim.cpp ──
 
-/// The event shim's ABI version (sdk_ext/expert/event.zig `abi_version`).
+/// The event shim's ABI version: the one these shims implement, which must be the streamer's
+/// (sdk_ext/expert/event.zig `abi_version`), or an mlx-serve bump that changes the contract does not build.
+const event_abi = 2026092801;
+comptime {
+    if (@import("mlx_stream").event_abi != event_abi) @compileError("the expert streamer's event ABI changed: re-check src/host_shims.zig against mlx-serve's mlx_event_shim.cpp");
+}
+
 export fn dsv41ev_abi() i32 {
-    return 2026092801;
+    return event_abi;
 }
 
 export fn dsv41ev_create_metal(start: u64, object: *u64) i32 {

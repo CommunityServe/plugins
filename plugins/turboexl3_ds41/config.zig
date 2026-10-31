@@ -63,6 +63,13 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     return v;
 }
 
+/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the server's environment: mlx-serve hands a plugin's load only the settings it
+/// knows): the streamed bank's experts run on turboexl3 (src/routed_t3.zig) instead of the streamer's own EXL3 kernels.
+pub fn routedT3(value: ?[]const u8) bool {
+    const v = value orelse return false;
+    return std.mem.eql(u8, v, "turboexl3");
+}
+
 /// The built-in's facts as this plugin serves them: the bank streams (the copy's parse saw `experts.bin`), the state is
 /// the module's own, the host loads none of the shards (`weights.keep_key` refuses every key: the plugin reads them
 /// itself), and the DSpark stages draft as the model's native drafter.
@@ -146,4 +153,9 @@ test "turboexl3_ds41 refuses by name the pack before its repack and a codebook i
         try testing.expect(!v.isOk() and p.private == null);
         try testing.expectEqualStrings(c.why, v.why.slice());
     }
+}
+
+test "turboexl3_ds41 runs the routed experts on turboexl3 only when MLX_SERVE_DSV41_ROUTED names it" {
+    try testing.expect(routedT3("turboexl3"));
+    for ([_]?[]const u8{ null, "", "0", "streamer", "turboexl3 " }) |v| try testing.expect(!routedT3(v));
 }

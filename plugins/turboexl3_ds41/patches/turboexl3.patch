@@ -1,6 +1,420 @@
+diff -ruN a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -268,7 +268,9 @@
+     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
+     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
+     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
++    pub const MLX_SERVE_DSV41_COMPILE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 compiled decode stretches (=0: every op eager)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
++    pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
+     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
+diff -ruN a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/bill.zig
+--- a/plugins/deepseek_v41/bill.zig
++++ b/plugins/deepseek_v41/bill.zig
+@@ -32,12 +32,16 @@
+ /// `context + stream_generation`).
+ pub fn streamBudget(config: *const cfg_mod.Config, context: u64, wired_margin: u64) struct { prompt: u64, decode: u64 } {
+     const in_use = system.getTotalMemBytes() -| system.getAvailableMemBytes();
+-    const box = @as(u64, mlx.maxRecommendedWorkingSet()) -| wired_margin -| stream_host_bytes -| in_use;
++    var box = @as(u64, mlx.maxRecommendedWorkingSet()) -| wired_margin -| stream_host_bytes -| in_use;
++    // An outside plugin's room is also within the host's ceiling (`Host.memory_ceiling`, net of what is resident).
++    if (host_ceiling) |ceiling| box = @min(box, ceiling() -| wired_margin -| stream_host_bytes);
+     return .{
+         .prompt = box -| prefillAt(config, context, stream_call_rows),
+         .decode = box -| prefillAt(config, context + stream_generation, 1),
+     };
+ }
++/// The bytes the host lets the plugin still allocate on the GPU (set by the plugin's load); null in mlx-serve itself.
++pub var host_ceiling: ?*const fn () u64 = null;
+ /// The table's `bill`: only the KV sources' compressed latents and index keys grow per token (bf16); the windows
+ /// are a fixed ring per slot inside the module's state.
+ pub fn bill(p: *const abi.Parsed, shape: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -32,6 +32,8 @@
+ const streamed = @import("../../sdk/weights/streamed.zig");
+ const dkern = @import("decode/decode.zig");
+ const device = @import("../../mlx/device.zig");
++/// An exllamav3 pack's linears and resident expert banks (trellis, suh and svh): turboexl3 runs them.
++const t3 = @import("turboexl3");
+ const A = mlx.mlx_array;
+ const S = mlx.mlx_stream;
+ const Config = @import("config.zig").Config;
+@@ -252,7 +254,10 @@
+     s: A = none,
+     b: A = none,
+     qp: QuantParams = .{ .bits = 0, .group_size = 0 },
++    /// An EXL3 linear (`exl3Lin`; `w` unset): turboexl3 runs it. A grouped one (`exl3Groups`) stacks its groups.
++    x3: ?t3.Proj = null,
+     pub fn apply(self: *const Lin, sc: *Scope, x: A) !A {
++        if (self.x3) |p| return sc.keep(try t3.linear(sc.s, x, p.trellis, p.suh, p.svh, .mul1));
+         if (self.s.ctx == null) return sc.matmul(x, try sc.t2(self.w));
+         // Not f32: MLX runs f32 GEMMs on the matrix units as TF32.
+         if (mlx.mlx_array_dtype(x) != .float32 and mlx.mlx_array_size(x) / @as(usize, @intCast(dim(x, -1))) >= DENSE_ROWS)
+@@ -278,7 +283,8 @@
+ };
+ /// `wkv` above ratio 1: the kv rows then the gate rows as one linear whose
+ /// f32 input meets f32 math (scales widened to f32), since pooling runs in f32.
+-pub const Comp = struct { wkv: Lin, norm: A };
++/// An EXL3 pack keeps the gate rows apart (`wgate`): turboexl3 runs each linear.
++pub const Comp = struct { wkv: Lin, norm: A, wgate: ?Lin = null };
+ pub const Idx = struct { wq_b: Lin, weights_proj: Lin, wk: ?Lin, k_norm: A };
+ /// Stacked routed experts `[E, out, in]`; `gather_qmm` reads them by index.
+ pub const Bank = struct {
+@@ -293,7 +299,8 @@
+ /// in their place (they address experts from the buffer pointer): MLX bills
+ /// a command buffer for each bound array's size, and a whole bank forced a
+ /// commit at every kernel.
+-pub const Experts = struct { gate: Bank, up: Bank, down: Bank, gu: ?Bank = null, views: ?[2]Bank = null };
++/// `x3`: an EXL3 pack's resident bank (the DSpark stages'), turboexl3's clamped MoE; the MLX banks are then unset.
++pub const Experts = struct { gate: Bank, up: Bank, down: Bank, gu: ?Bank = null, views: ?[2]Bank = null, x3: ?t3.Bank = null };
+ pub const Layer = struct {
+     attn_norm: A,
+     ffn_norm: A,
+@@ -636,6 +643,7 @@
+     return w.get(name);
+ }
+ fn getLin(w: *const Weights, in_dim: usize, comptime base: []const u8, args: anytype) !Lin {
++    if (getOpt(w, base ++ ".trellis", args)) |tr| return exl3Lin(w, in_dim, base, args, tr);
+     const wt = try getW(w, base ++ ".weight", args);
+     const sc = getOpt(w, base ++ ".scales", args) orelse return .{ .w = wt };
+     const bi = getOpt(w, base ++ ".biases", args) orelse none;
+@@ -646,6 +654,76 @@
+     };
+     return .{ .w = wt, .s = sc, .b = bi, .qp = qp };
+ }
++/// An EXL3 linear of `in_dim` inputs as exllamav3 stores it: trellis i16 [in/16, out/16, 16 K], suh f16 [in], svh f16
++/// [out]. The pack's codebook is mul1 (the plugin's parse refuses any other).
++fn exl3Lin(w: *const Weights, in_dim: usize, comptime base: []const u8, args: anytype, tr: A) !Lin {
++    const suh = try getW(w, base ++ ".suh", args);
++    const svh = try getW(w, base ++ ".svh", args);
++    const sh = mlx.getShape(tr);
++    const in_ok = sh.len == 3 and @as(usize, @intCast(sh[0])) * 16 == in_dim and mlx.getShape(suh).len == 1 and mlx.getShape(suh)[0] == sh[0] * 16;
++    if (!in_ok or mlx.getShape(svh).len != 1 or mlx.getShape(svh)[0] != sh[1] * 16 or mlx.mlx_array_dtype(suh) != .float16 or mlx.mlx_array_dtype(svh) != .float16) {
++        var buf: NameBuf = undefined;
++        log.err("deepseek_v41: {s} is not an EXL3 linear of {d} inputs\n", .{ std.fmt.bufPrint(&buf, base, args) catch base, in_dim });
++        return error.Dsv41Exl3Geometry;
++    }
++    return .{ .w = none, .x3 = .{ .trellis = tr, .suh = suh, .svh = svh } };
++}
++/// An EXL3 pack's grouped linear (`wo_a`, stored as its `groups` slices of `in_dim` inputs) as one turboexl3 grouped
++/// linear: the slices' trellis, suh and svh stacked on a new first axis, the slices' own released.
++fn exl3Groups(m: *Dsv41Model, w: *Weights, comptime base: []const u8, li: usize, groups: usize, in_dim: usize) !Lin {
++    if (groups == 0 or groups > 16) return error.Dsv41Exl3Geometry;
++    var parts: [3][16]A = undefined;
++    for (0..groups) |g| {
++        const p = (try getLin(w, in_dim, base, .{ li, g })).x3 orelse return error.Dsv41Exl3Geometry;
++        parts[0][g] = p.trellis;
++        parts[1][g] = p.suh;
++        parts[2][g] = p.svh;
++    }
++    var out: [3]A = undefined;
++    for (&out, 0..) |*o, k| o.* = try m.own(try mlx.stackEvaluated(parts[k][0..groups], m.s));
++    for (0..groups) |g| inline for (.{ "trellis", "suh", "svh" }) |part| {
++        var buf: NameBuf = undefined;
++        w.remove(try std.fmt.bufPrint(&buf, base ++ "." ++ part, .{ li, g }));
++    };
++    return .{ .w = none, .x3 = .{ .trellis = out[0], .suh = out[1], .svh = out[2] } };
++}
++/// An EXL3 pack's experts per expert (`.experts.<e>.w1` / `w3` / `w2`) as one resident turboexl3 bank: each projection's
++/// experts stacked on a new first axis (the trellis read as u16, the same bits), the experts' own released.
++fn exl3Bank(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, n_experts: usize) !t3.Bank {
++    const d = m.cfg.hidden_size;
++    const inter = m.cfg.moe_intermediate_size;
++    var bank: t3.Bank = undefined;
++    var parts: [3]std.ArrayList(A) = .{ .empty, .empty, .empty };
++    defer for (&parts) |*p| p.deinit(m.gpa);
++    inline for (.{ .{ "w1", "gate" }, .{ "w3", "up" }, .{ "w2", "down" } }, 0..) |pf, k| {
++        for (&parts) |*p| p.clearRetainingCapacity();
++        for (0..n_experts) |e| {
++            const p = (try getLin(w, if (k == 2) inter else d, pfx ++ ".{d}.ffn.experts.{d}." ++ pf[0], .{ li, e })).x3 orelse return error.Dsv41Exl3Geometry;
++            try parts[0].append(m.gpa, p.trellis);
++            try parts[1].append(m.gpa, p.suh);
++            try parts[2].append(m.gpa, p.svh);
++        }
++        var stacked: [3]A = undefined;
++        for (&stacked, &parts) |*o, *p| o.* = try m.own(try mlx.stackEvaluated(p.items, m.s));
++        var u = mlx.mlx_array_new();
++        try mlx.check(mlx.mlx_view(&u, stacked[0], .uint16, m.s));
++        @field(bank, pf[1]) = .{ .trellis = try m.own(try evalOne(u)), .suh = stacked[1], .svh = stacked[2] };
++        // The stacks hold the experts now: the map's copies go, or the bank is resident twice.
++        for (0..n_experts) |e| inline for (.{ "trellis", "suh", "svh" }) |part| {
++            var buf: NameBuf = undefined;
++            w.remove(try std.fmt.bufPrint(&buf, pfx ++ ".{d}.ffn.experts.{d}." ++ pf[0] ++ "." ++ part, .{ li, e }));
++        };
++    }
++    return bank;
++}
++/// A plain f16 weight (an EXL3 pack keeps its unquantized linears f16) in the activation dtype, so its matmul stays in
++/// it; the map's f16 copy released.
++fn actLin(m: *Dsv41Model, w: *Weights, l: Lin) !Lin {
++    if (l.x3 != null or l.s.ctx != null or mlx.mlx_array_dtype(l.w) != .float16 or m.act == .float16) return l;
++    const out: Lin = .{ .w = try ownCast(m, l.w, m.act) };
++    release(m, w, l.w);
++    return out;
++}
+ /// A dense weight that an mxfp8 code plus e8m0 scale per 32 columns holds
+ /// exactly (fp8 blocks a converter widened to bf16) as that pair, half the
+ /// bytes; null when any value would move.
+@@ -753,6 +831,16 @@
+     }
+     return out;
+ }
++/// A KV source's compressor: above ratio 1 its kv and gate rows as one linear (`poolLin`), an EXL3 pack's apart.
++fn compOf(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, ratio: u8) !Comp {
++    const d = m.cfg.hidden_size;
++    const kv = try getLin(w, d, pfx ++ ".{d}.attn.compressor.wkv", .{li});
++    const norm = try ownCast(m, try getW(w, pfx ++ ".{d}.attn.compressor.norm.weight", .{li}), m.act);
++    if (ratio <= 1) return .{ .wkv = kv, .norm = norm };
++    const gate = try getLin(w, d, pfx ++ ".{d}.attn.compressor.wgate", .{li});
++    if (kv.x3 != null or gate.x3 != null) return .{ .wkv = kv, .wgate = gate, .norm = norm };
++    return .{ .wkv = try poolLin(m, w, kv, gate), .norm = norm };
++}
+ /// `kv` and `gate` as `Comp.wkv` holds them above ratio 1: rows fused when the
+ /// formats agree (affine scales and biases widened to f32; dense rows as
+ /// stored, `denseF32x` reads them), else both dequantized to f32 rows.
+@@ -841,6 +929,8 @@
+         .up = bankOf(try getLin(w, d, pfx ++ ".{d}.ffn.experts.w3", .{li})),
+         .down = bankOf(try getLin(w, inter, pfx ++ ".{d}.ffn.experts.w2", .{li})),
+     };
++    if (getOpt(w, pfx ++ ".{d}.ffn.experts.0.w1.trellis", .{li}) != null)
++        return .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = .{ .w = none }, .x3 = try exl3Bank(m, w, pfx, li, n_experts) };
+     if (getOpt(w, pfx ++ ".{d}.ffn.experts.0.w1.weight", .{li}) != null) {
+         var banks: [3]Bank = undefined;
+         inline for (.{ "w1", "w3", "w2" }, 0..) |proj, k| {
+@@ -884,8 +974,11 @@
+     const ratio: u8 = if (trunk_li) |t| c.dsv4_compress_ratios[t] else 0;
+     const is_kv = if (trunk_li) |t| m.isKvSource(t) else false;
+     const is_ix = if (trunk_li) |t| m.isIndexSource(t) else false;
+-    var wo_a = try getLin(w, heads * hd / og, pfx ++ ".{d}.attn.wo_a", .{li});
+-    if (wo_a.s.ctx == null) if (try exactMxfp8(m.s, wo_a.w)) |pair| {
++    var wo_a = if (getOpt(w, pfx ++ ".{d}.attn.wo_a.slice.0.trellis", .{li}) != null)
++        try exl3Groups(m, w, pfx ++ ".{d}.attn.wo_a.slice.{d}", li, og, heads * hd / og)
++    else
++        try getLin(w, heads * hd / og, pfx ++ ".{d}.attn.wo_a", .{li});
++    if (wo_a.x3 == null and wo_a.s.ctx == null) if (try exactMxfp8(m.s, wo_a.w)) |pair| {
+         // A decode step reads every wo_a: half the bytes, the same values.
+         wo_a = .{ .w = try m.own(pair[0]), .s = try m.own(pair[1]), .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
+         var buf: NameBuf = undefined;
+@@ -917,14 +1010,11 @@
+         .wo_b = try getLin(w, og * ol, pfx ++ ".{d}.attn.wo_b", .{li}),
+         .sink = sink,
+         .ratio = ratio,
+-        .comp = if (is_kv) .{
+-            .wkv = if (ratio > 1) try poolLin(m, w, try getLin(w, d, pfx ++ ".{d}.attn.compressor.wkv", .{li}), try getLin(w, d, pfx ++ ".{d}.attn.compressor.wgate", .{li})) else try getLin(w, d, pfx ++ ".{d}.attn.compressor.wkv", .{li}),
+-            .norm = try ownCast(m, try getW(w, pfx ++ ".{d}.attn.compressor.norm.weight", .{li}), m.act),
+-        } else null,
++        .comp = if (is_kv) try compOf(m, w, pfx, li, ratio) else null,
+         .idx = if (is_ix) .{
+             .wq_b = try getLin(w, c.dsv4_q_lora_rank, pfx ++ ".{d}.attn.indexer.wq_b", .{li}),
+-            .weights_proj = try getLin(w, d, pfx ++ ".{d}.attn.indexer.weights_proj", .{li}),
+-            .wk = if (is_kv) try getLin(w, hd, pfx ++ ".{d}.attn.indexer.wk", .{li}) else null,
++            .weights_proj = try actLin(m, w, try getLin(w, d, pfx ++ ".{d}.attn.indexer.weights_proj", .{li})),
++            .wk = if (is_kv) try actLin(m, w, try getLin(w, hd, pfx ++ ".{d}.attn.indexer.wk", .{li})) else null,
+             .k_norm = if (is_kv) try ownCast(m, try getW(w, pfx ++ ".{d}.attn.indexer.k_norm.weight", .{li}), m.act) else none,
+         } else null,
+         .gate_w = try getW(w, pfx ++ ".{d}.ffn.gate.weight", .{li}),
+@@ -1229,7 +1319,9 @@
+ /// The pack's tensors as the engine's loader reads a V4.1 pack: the text prefix stripped, a tensor two shards carry
+ /// from the shard the index names, the vision tower only on `vision`, the Engram projections kept beside its tables.
+ pub fn loadPack(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, vision: bool) !Weights {
+-    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .index_owners = true });
++    // An EXL3 pack keeps its f16 suh and svh as stored (turboexl3 reads them f16), and its routed trunk experts stream
++    // from the bank: a shard that still holds them loads none of them.
++    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .index_owners = true, .keep_f16 = true, .skip = &routedTrunkExpert });
+     errdefer w.deinit();
+     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/engram/engram-residents.safetensors", .{dir}, 0);
+     defer gpa.free(path);
+@@ -1239,6 +1331,11 @@
+     try weights_load.loadSafetensorsFile(gpa, &w, path, s, .{});
+     return w;
+ }
++/// A trunk layer's routed expert (`layers.<l>.ffn.experts.`), which the streamed bank serves.
++fn routedTrunkExpert(key: []const u8) bool {
++    const k = if (std.mem.startsWith(u8, key, weights_load.dsv41_text_prefix)) key[weights_load.dsv41_text_prefix.len..] else key;
++    return std.mem.startsWith(u8, k, "layers.") and std.mem.indexOf(u8, k, ".ffn.experts.") != null;
++}
+ pub const InitOpts = struct {
+     /// The activation dtype; tests run f32 against the f32 reference.
+     act: mlx.mlx_dtype = .bfloat16,
+@@ -1257,7 +1354,7 @@
+     const m = try gpa.create(Dsv41Model);
+     errdefer gpa.destroy(m);
+     const n_layers = cfg.num_hidden_layers;
+-    const n_stages: usize = if (opts.dspark and cfg.dsv4_dspark_block_size > 0 and getOpt(w, "mtp.0.main_proj.weight", .{}) != null)
++    const n_stages: usize = if (opts.dspark and cfg.dsv4_dspark_block_size > 0 and (getOpt(w, "mtp.0.main_proj.weight", .{}) != null or getOpt(w, "mtp.0.main_proj.trellis", .{}) != null))
+         cfg.dsv4_n_compress_ratios - n_layers
+     else
+         0;
+@@ -1343,7 +1440,7 @@
+     } else {
+         m.embed = try getLin(w, cfg.hidden_size, "embed", .{});
+         m.head = try getLin(w, cfg.hidden_size, "head", .{});
+-        if (m.head.s.ctx == null) {
++        if (m.head.x3 != null) log.info("deepseek_v41: lm head EXL3, as shipped\n", .{}) else if (m.head.s.ctx == null) {
+             if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
+             log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
+         }
+@@ -1365,8 +1462,9 @@
+             .main_proj = try getLin(w, cfg.hidden_size * targets, "mtp.0.main_proj", .{}),
+             .main_norm = try ownCast(m, try getW(w, "mtp.0.main_norm.weight", .{}), m.act),
+             .norm = try ownCast(m, try getW(w, "mtp.{d}.norm.weight", .{last}), m.act),
+-            .markov_embed = try getW(w, "mtp.{d}.markov_head.embed.weight", .{last}),
+-            .markov_head = try ownCast(m, try getW(w, "mtp.{d}.markov_head.head.weight", .{last}), m.act),
++            // The release's names (`markov_w1`, the bigram embedding; `markov_w2`, its head) where the pack keeps them.
++            .markov_embed = getOpt(w, "mtp.{d}.markov_head.markov_w1.weight", .{last}) orelse try getW(w, "mtp.{d}.markov_head.embed.weight", .{last}),
++            .markov_head = try ownCast(m, getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) orelse try getW(w, "mtp.{d}.markov_head.head.weight", .{last}), m.act),
+             .conf = try ownCast(m, try getW(w, "mtp.{d}.confidence_head.proj.weight", .{last}), .float32),
+         };
+         m.n_mtp = n_stages;
+@@ -1519,7 +1617,7 @@
+ }
+ /// Engram for the pack in `dir`: the token map, the hash, and each layer's
+ /// table and projections. Without Engram layers in the config this is a no-op.
+-fn initEngram(m: *Dsv41Model, w: *const Weights, dir: []const u8) !void {
++fn initEngram(m: *Dsv41Model, w: *Weights, dir: []const u8) !void {
+     const c = &m.cfg;
+     if (c.dsv41_n_engram_layers == 0) return;
+     m.token_map = try engram.loadTokenMap(m.gpa, dir, c.vocab_size, c.dsv41_engram_compressed_vocab);
+@@ -1552,7 +1650,7 @@
+         try mlx.check(mlx.mlx_array_eval(prod));
+         m.engrams[k] = .{
+             .layer = l,
+-            .wkv = try getLin(w, cols * c.dsv41_engram_head_dim, "layers.{d}.engram.wkv", .{l}),
++            .wkv = try actLin(m, w, try getLin(w, cols * c.dsv41_engram_head_dim, "layers.{d}.engram.wkv", .{l})),
+             .qk = prod,
+             .table = try engram.Table.open(m.gpa, dir, k, l, c.dsv41_engram_rows[k], c.dsv41_engram_head_dim),
+         };
+@@ -2427,6 +2525,8 @@
+ /// The grouped `wo_a` of heads already grouped and inverse-roped `[og, L, in]`: `[L, og * o_lora]` in `m.act`.
+ pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A) !A {
+     const L = dim(ob, 1);
++    // An EXL3 pack's groups: turboexl3's grouped linear reads `[L, og, in]`.
++    if (ly.wo_a.x3) |p| return sc.astype(try sc.reshape(try sc.keep(try t3.linearGrouped(sc.s, try sc.transpose(ob, &.{ 1, 0, 2 }), p, .mul1)), &.{ ci(L), -1 }), m.act);
+     const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
+     const oa = if (wd.ctx != null)
+         try sc.matmul(ob, try sc.transpose(wd, &.{ 0, 2, 1 }))
+@@ -2439,6 +2539,7 @@
+ /// `x` [L, K] f32 through the dense linear `l` in f32: decode rows read `l`
+ /// as stored (`DENSE_F32X_SOURCE`); wider inputs widen it (MLX promotes).
+ pub fn denseF32x(sc: *Scope, m: *const Dsv41Model, l: *const Lin, x: A) !A {
++    if (l.x3 != null) return l.apply(sc, x);
+     const L = dim(x, 0);
+     const N = dim(l.w, 0);
+     const K = dim(x, 1);
+@@ -2463,7 +2564,10 @@
+ /// latent at its group's first position and stores it fp4-simulated.
+ pub fn compress(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Comp, x: A, p0: usize) !void {
+     // Pooling runs in f32, weights included (the reference promotes them).
+-    const proj = if (m.layers[li].ratio == 1) try cw.wkv.apply(sc, x) else try denseF32x(sc, m, &cw.wkv, try sc.astype(x, .float32));
++    const proj = if (m.layers[li].ratio == 1) try cw.wkv.apply(sc, x) else if (cw.wgate) |*g| blk: {
++        const xf = try sc.astype(x, .float32);
++        break :blk try sc.concat(&.{ try cw.wkv.apply(sc, xf), try g.apply(sc, xf) }, -1);
++    } else try denseF32x(sc, m, &cw.wkv, try sc.astype(x, .float32));
+     return compressFrom(sc, m, st, li, cw, proj, p0);
+ }
+ /// `compressFrom` on the fused pool step (`decode/idx_score.zig`); false (nothing moved) where it declines.
+@@ -3136,9 +3240,22 @@
+         if (dim(x, 0) > region_rows) return slotPrefill(sc, m, &sl, x, r.wts, try shared(sc, m, ly, x));
+         return withShared(sc, m, ly, x, try rowSum(sc, try slotRows(sc, m, &sl, x, r.wts, null)));
+     };
++    if (ly.experts.x3) |*b| return withShared(sc, m, ly, x, try routedExl3(sc, m, b, x, r.idx, r.wts));
+     if (dim(x, 0) > region_rows) return moePrefill(sc, m, ly, x, r.idx, r.wts, try shared(sc, m, ly, x));
+     return withShared(sc, m, ly, x, try routed(sc, m, ly, x, r.idx, r.wts));
+ }
++/// A resident EXL3 bank's routed sum `[L, d]` f32: turboexl3's MoE with the pack's SwiGLU clamp.
++fn routedExl3(sc: *Scope, m: *const Dsv41Model, b: *const t3.Bank, x: A, idx: A, wts: A) !A {
++    const L = dim(x, 0);
++    const k = dim(idx, 1);
++    const d = dim(x, 1);
++    const limit = m.cfg.dsv4_swiglu_limit;
++    if (limit < 1 or limit > 128 or limit != @floor(limit)) return error.Dsv41Exl3Clamp;
++    const x3 = try sc.reshape(x, &.{ 1, ci(L), ci(d) });
++    const inds = try sc.reshape(try sc.astype(idx, .uint32), &.{ 1, ci(L), ci(k) });
++    const y = try sc.keep(try t3.moeClamped(sc.s, x3, b.*, inds, try sc.reshape(wts, &.{ 1, ci(L), ci(k) }), .mul1, @intFromFloat(limit)));
++    return sc.astype(try sc.reshape(y, &.{ ci(L), ci(d) }), .float32);
++}
+ // ── Engram ──────────────────────────────────────────────────────────────
+ /// The gated write of the n-gram rows into the stream `[L, hc, dim]`: `wkv`
+ /// turns the rows into one key per copy plus a shared value, and the gate is
+@@ -3842,6 +3959,8 @@
+     return rows <= region_rows and m.regions.len > 0 and m.trace == null;
+ }
+ fn compileRegions(m: *Dsv41Model) !void {
++    // `MLX_SERVE_DSV41_COMPILE=0`: every decode stretch runs eager (no region is compiled).
++    if (env.get(.MLX_SERVE_DSV41_COMPILE)) |v| if (v[0] == '0') return;
+     m.regions = try m.gpa.alloc(LayerRegions, m.n_layers);
+     for (m.regions, 0..) |*r, li| r.* = .{ .m = m, .li = li };
+     for (m.regions) |*r| inline for (comptime std.enums.values(Region)) |kind| {
+diff -ruN a/plugins/deepseek_v41/vision.zig b/plugins/deepseek_v41/vision.zig
+--- a/plugins/deepseek_v41/vision.zig
++++ b/plugins/deepseek_v41/vision.zig
+@@ -436,6 +436,15 @@
+         };
+     }
+     fn lin(self: NameCtx, comptime fmt: []const u8, args: anytype, in_dim: u32) !Lin {
++        // An exllamav3 pack's tower linear is EXL3 where the pack ships no plain weight.
++        if (self.get(fmt ++ ".weight", args) == null) if (self.get(fmt ++ ".trellis", args)) |tr| {
++            const sh = mlx.getShape(tr);
++            if (sh.len != 3 or @as(u32, @intCast(sh[0])) * 16 != in_dim) {
++                log.warn("DEEPSEEK VISION: " ++ fmt ++ " is not an EXL3 linear of its inputs\n", args);
++                return error.InvalidVisionWeights;
++            }
++            return .{ .w = .{ .ctx = null }, .bias = self.get(fmt ++ ".bias", args) orelse .{ .ctx = null }, .x3 = .{ .trellis = tr, .suh = try self.must(fmt ++ ".suh", args), .svh = try self.must(fmt ++ ".svh", args) } };
++        };
+         var l = Lin{ .w = try self.must(fmt ++ ".weight", args), .bias = self.get(fmt ++ ".bias", args) orelse .{ .ctx = null } };
+         if (self.get(fmt ++ ".scales", args)) |sc| {
+             l.scales = sc;
+diff -ruN a/plugins/glm5_next/vision.zig b/plugins/glm5_next/vision.zig
+--- a/plugins/glm5_next/vision.zig
++++ b/plugins/glm5_next/vision.zig
+@@ -22,6 +22,7 @@
+ const fused_activations = @import("../../sdk/blocks/mlp/fused_activations.zig");
+ const params_mod = @import("../../sdk/quant/params.zig");
+ const log = @import("../../sdk/util/log.zig");
++const t3 = @import("turboexl3");
+ /// OPENAI_CLIP_MEAN / OPENAI_CLIP_STD, the processor's normalization.
+ const MEAN = [3]f32{ 0.48145466, 0.4578275, 0.40821073 };
+ const STD = [3]f32{ 0.26862954, 0.26130258, 0.27577711 };
+@@ -131,6 +132,8 @@
+     biases: mlx.mlx_array = .{ .ctx = null },
+     bias: mlx.mlx_array = .{ .ctx = null },
+     qp: ?params_mod.QuantParams = null,
++    /// An exllamav3 pack's EXL3 linear (`w` unset): turboexl3 runs it.
++    x3: ?t3.Proj = null,
+ };
+ const Block = struct {
+     norm1: mlx.mlx_array,
+@@ -409,6 +412,14 @@
+ };
+ /// A dense or quantized `x @ w.T`, plus the bias when the linear has one.
+ pub fn linear(x: mlx.mlx_array, l: Lin, s: mlx.mlx_stream) !mlx.mlx_array {
++    // An EXL3 linear: turboexl3's, its bias (the pack's f16) in x's dtype.
++    if (l.x3) |p| {
++        if (l.bias.ctx == null) return t3.linear(s, x, p.trellis, p.suh, p.svh, .mul1);
++        var b = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(b);
++        try mlx.check(mlx.mlx_astype(&b, l.bias, mlx.mlx_array_dtype(x), s));
++        return t3.linearBias(s, x, p.trellis, p.suh, p.svh, b, .mul1);
++    }
+     var out = mlx.mlx_array_new();
+     if (l.qp) |qp| {
+         try mlx.check(mlx.mlx_quantized_matmul(&out, x, l.w, l.scales, l.biases, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), s));
+@@ -483,6 +494,7 @@
+     for ([_]mlx.mlx_array{ l.w, l.scales, l.biases, l.bias }) |a| {
+         if (a.ctx != null) try list.append(allocator, a);
+     }
++    if (l.x3) |p| try list.appendSlice(allocator, &.{ p.trellis, p.suh, p.svh });
+ }
+ /// Weight lookup under the tower's prefix; handles are BORROWED from the weights map.
+ const NameCtx = struct {
 diff -ruN a/sdk/util/shared.zig b/sdk/util/shared.zig
---- a/sdk/util/shared.zig	2026-10-30 23:54:07
-+++ b/sdk/util/shared.zig	2026-10-30 23:54:07
+--- a/sdk/util/shared.zig
++++ b/sdk/util/shared.zig
 @@ -10,7 +10,8 @@
      return struct {
          var storage: T = init;
@@ -20,3 +434,126 @@ diff -ruN a/sdk/util/shared.zig b/sdk/util/shared.zig
          fn addr() callconv(.c) *anyopaque {
              return @ptrCast(&storage);
          }
+diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -21,6 +21,12 @@
+ const T = mlx.mlx_array;
+ const Math = xp.QuantMath(G, xq.Accepted(G));
+ const Hook = xp.ExpertsWith(G, xp.StreamSource, Math, .{ .prefill = true, .lookahead = true, .gated = true });
++/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the plugin's src/routed_t3.zig): the same schedule, turboexl3's math, neither
++/// banked waves nor the device route (both are the streamer's own kernels').
++const routed_t3 = @import("mlx_host").routed_t3;
++const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows);
++const HookT3 = xp.ExpertsWith(G, xp.StreamSource, MathT3, .{ .prefill = true, .lookahead = true, .gated = true });
++const Hooks = union(enum) { stream: Hook, t3: HookT3 };
+ pub const Gate = Hook.Gate;
+ pub const Phase = enum { prompt, decode };
+ /// The trunk's MoE geometry the bank must match.
+@@ -100,7 +106,9 @@
+     decode_rows: []u32,
+     stream: *expert_stream.Stream,
+     source: xp.StreamSource,
+-    hook: Hook,
++    hook: Hooks,
++    gates_t3: []HookT3.Gate = &.{},
++    t3_state: MathT3.State = .{ .limit = 0 },
+     bill: Bill,
+     phase: Phase = .prompt,
+     released: bool = false,
+@@ -160,12 +168,25 @@
+         });
+         errdefer self.stream.deinit();
+         self.source = xp.StreamSource.init(self.stream);
+-        self.hook = try Hook.initWith(a, &self.g, &self.source, Math.init(self.q, geo), geo, .{ .gates = self.gates, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true });
++        self.gates_t3 = &.{};
++        self.t3_state = .{ .limit = 0 };
++        if (routed_t3.enabled) {
++            if (geo.swiglu_limit < 1 or geo.swiglu_limit > 128 or geo.swiglu_limit != @floor(geo.swiglu_limit)) return error.RoutedT3Clamp;
++            self.t3_state.limit = @intFromFloat(geo.swiglu_limit);
++            self.gates_t3 = try a.alloc(HookT3.Gate, gates.len);
++            errdefer a.free(self.gates_t3);
++            for (self.gates_t3, gates) |*o, gt| o.* = .{ .w = gt.w, .bias = gt.bias };
++            self.hook = .{ .t3 = try HookT3.initWith(a, &self.g, &self.source, .{ .state = &self.t3_state }, geo, .{ .gates = self.gates_t3, .event = event, .wide = wide, .hoist_first = true }) };
++            std.log.info("streamed exl3: the routed experts run on turboexl3 (MLX_SERVE_DSV41_ROUTED)", .{});
++        } else self.hook = .{ .stream = try Hook.initWith(a, &self.g, &self.source, Math.init(self.q, geo), geo, .{ .gates = self.gates, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true }) };
+         return self;
+     }
+     pub fn deinit(self: *Source) void {
+         _ = mlx.mlx_synchronize(self.g.s);
+-        self.hook.deinit();
++        switch (self.hook) {
++            inline else => |*h| h.deinit(),
++        }
++        self.a.free(self.gates_t3);
+         self.stream.deinit();
+         self.q.deinit(&self.g);
+         kernel_set.Set.uninstall(G, &self.g);
+@@ -184,7 +205,10 @@
+         const g = &self.g;
+         defer g.reset();
+         const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
+-        const ro = try self.hook.at(layer).routed(g, x, ids);
++        self.t3_state.n = 0;
++        const ro = switch (self.hook) {
++            inline else => |*h| try h.at(layer).routed(g, x, ids),
++        };
+         const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
+         return g.keep(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false));
+     }
+@@ -199,32 +223,40 @@
+         for (ids) |e| counts[e] += 1;
+         const ranked = try self.a.alloc(u16, n);
+         defer self.a.free(ranked);
+-        try self.hook.at(layer).readAheadSeed(sdk_ext.expert.policy.rankHottest(counts, ranked));
++        switch (self.hook) {
++            inline else => |*h| try h.at(layer).readAheadSeed(sdk_ext.expert.policy.rankHottest(counts, ranked)),
++        }
+     }
+     /// The rows of `p`: decode grows the slot banks once the prompt's windows are freed; a prompt shrinks them back,
+     /// keeping the residents decode left.
+     pub fn setPhase(self: *Source, p: Phase) !void {
+         if (p == self.phase) return;
+-        try self.hook.flush();
+-        switch (p) {
+-            .decode => {
+-                self.released = (try self.hook.releaseTransient()) > 0;
+-                _ = mlx.mlx_synchronize(self.g.s);
+-                self.g.clearCache();
+-                try self.hook.grow(&self.g, self.decode_rows);
++        switch (self.hook) {
++            inline else => |*h| {
++                try h.flush();
++                switch (p) {
++                    .decode => {
++                        self.released = (try h.releaseTransient()) > 0;
++                        _ = mlx.mlx_synchronize(self.g.s);
++                        self.g.clearCache();
++                        try h.grow(&self.g, self.decode_rows);
++                    },
++                    .prompt => {
++                        _ = try h.shrink(self.prompt_rows, .keep);
++                        _ = mlx.mlx_synchronize(self.g.s);
++                        self.g.clearCache();
++                        _ = try h.regrowTransient(&self.g, self.released);
++                    },
++                }
+             },
+-            .prompt => {
+-                _ = try self.hook.shrink(self.prompt_rows, .keep);
+-                _ = mlx.mlx_synchronize(self.g.s);
+-                self.g.clearCache();
+-                _ = try self.hook.regrowTransient(&self.g, self.released);
+-            },
+         }
+         self.phase = p;
+     }
+     /// After the eval that consumed the forward's calls.
+     pub fn settle(self: *Source) !void {
+-        try self.hook.flush();
++        switch (self.hook) {
++            inline else => |*h| try h.flush(),
++        }
+     }
+     pub fn stats(self: *Source) expert_stream.Stats {
+         return self.source.stats();

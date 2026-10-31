@@ -16,8 +16,11 @@ pub const io_util = @import("src/mlx_serve/sdk/util/io_util.zig");
 pub const shared = @import("src/mlx_serve/sdk/util/shared.zig");
 pub const mtp_acceptance = @import("src/mlx_serve/sdk/spec/mtp_acceptance.zig");
 pub const quant_abi = kit.abi.quant;
+/// The routed experts' turboexl3 math the copied streamer runs when the model setting asks (src/routed_t3.zig).
+pub const routed_t3 = @import("src/routed_t3.zig");
 const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
+const bill = @import("src/mlx_serve/plugins/deepseek_v41/bill.zig");
 const shims = @import("src/host_shims.zig");
 const t3kit = @import("turboexl3_kit");
 
@@ -72,6 +75,9 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     }
     t3kit.bind(ctx.host.?);
+    // The streamed bank's slot rows fit within the host's ceiling, not only the device's working set.
+    bill.host_ceiling = &shims.memoryCeiling;
+    routed_t3.enabled = config.routedT3(env.span(.MLX_SERVE_DSV41_ROUTED));
     var own = ctx.*;
     own.weights = null;
     const mp = ds.table.load(&own, out) orelse return null;
