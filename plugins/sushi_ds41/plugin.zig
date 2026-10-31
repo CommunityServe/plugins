@@ -27,6 +27,7 @@ const attn_nax = @import("src/attn_nax.zig");
 const index_nax = @import("src/index_nax.zig");
 const vision_key = @import("src/vision_key.zig");
 const copy_lookup = @import("src/copy_lookup.zig");
+const ablation = @import("src/ablation.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -84,6 +85,9 @@ const Model = struct {
     pool_now: u64 = pool_bytes,
     /// Positions the expert cache was sized to leave room for (a request's state and one prefill chunk's working set).
     billed_context: u64 = default_context,
+    /// Calibration (`SUSHI_DS41_TAP_DIR`): where each prompt's tap is written, and how many were.
+    tap_dir: ?[]const u8 = null,
+    tap_seq: u64 = 0,
 };
 
 // ── bill ──
@@ -224,6 +228,13 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         log.info("[sushi_ds41] prefill pipeline: off (SUSHI_DS41_PREFILL_PIPELINE=0: every layer waits)\n", .{})
     else
         log.info("[sushi_ds41] prefill pipeline: up to {d} prefill-width layers in flight\n", .{m.mdl.pipe_depth});
+    if (std.c.getenv("SUSHI_DS41_TAP_DIR")) |d| {
+        const tap = try gpa.create(dsv.StreamTap);
+        tap.* = try dsv.StreamTap.init(gpa, c.layers, tap_rows);
+        m.mdl.stream_tap = tap;
+        m.tap_dir = std.mem.span(d);
+        log.warn("[sushi_ds41] calibration tap ON: every prompt's per-layer activations and last ids are written to {s} (owner-only files); unset SUSHI_DS41_TAP_DIR to stop\n", .{m.tap_dir.?});
+    }
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
     errdefer if (m.tower) |*t| t.deinit();
@@ -248,6 +259,9 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     _ = mlx.mlx_clear_cache();
     return m;
 }
+
+/// Rows the calibration tap keeps per pass: positions -5..-2 from a prompt's prefix pass, -1 from its last-token pass.
+const tap_rows = 4;
 
 /// MLX's freed-buffer pool during decode, which the ledger bills.
 const pool_bytes: u64 = 1 << 30;
@@ -295,6 +309,10 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     }
     if (m.snap) |sn| freeSnap(sn);
     if (m.tower) |*t| t.deinit();
+    if (m.mdl.stream_tap) |t| {
+        t.deinit();
+        gpa.destroy(t);
+    }
     m.mdl.deinit();
     m.engine.deinit();
     gpa.destroy(m.engine);
@@ -312,6 +330,8 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     if (f.mode == .verify or f.mode == .batched_rows) return Verdict.refuse(.unsupported, "sushi_ds41: no speculative verify or batched rows");
     if (f.capture_layers.len > 0 or f.want_hidden) return Verdict.refuse(.unsupported, "sushi_ds41: no layer capture or hidden rows (not an embedding model)");
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "sushi_ds41: one slot's rows at a time");
+    if (armAblation(m, f)) |refused| return refused;
+    defer ablation.disarm(m.mdl);
     const host = hostIds(m, f) catch return Verdict.refuse(.failed, "sushi_ds41: the token ids do not read back");
     defer host.deinit();
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
@@ -334,6 +354,20 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     };
     if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
     return .ok;
+}
+
+/// Arms the forward's ablation on the model for this call (`ablation.disarm` after); a refusal when the host's table
+/// is not one this plugin runs.
+fn armAblation(m: *Model, f: *const abi.Forward) ?Verdict {
+    const a = (ablation.of(f) catch |e| return switch (e) {
+        error.AblationStrength => Verdict.refuse(.unsupported, "sushi_ds41: ablation strength is not in [0, 1]"),
+        error.AblationSlots => Verdict.refuse(.unsupported, "sushi_ds41: one ablation entry per slot"),
+    }) orelse return null;
+    ablation.arm(m.mdl, a, m.cfg.dim, m.s) catch |e| return switch (e) {
+        error.AblationShape => Verdict.refuse(.unsupported, "sushi_ds41: ablation directions are not [1, dim] f32"),
+        else => Verdict.refuse(.failed, "sushi_ds41: the ablation could not be armed"),
+    };
+    return null;
 }
 
 const HostIds = struct {
@@ -386,6 +420,11 @@ fn reset(m: *Model) void {
 /// Logits `[rows, vocab]`. `progress` gets the rows forwarded after each chunk (`Forward.progress`).
 fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64) !mlx.mlx_array {
     errdefer dsv.pipeDrain(m.mdl) catch {};
+    // The tap records the prefix's last chunk and the last token's pass: every layer runs both.
+    if (m.mdl.stream_tap) |t| t.clear();
+    defer if (m.mdl.stream_tap) |t| {
+        t.on = false;
+    };
     var rows = media;
     const prefix = if (want == .last and ids.len > 1) ids.len - 1 else 0;
     var at: usize = 0;
@@ -396,6 +435,7 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
         // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
         // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
         // its decoder (`extendState`).
+        if (m.mdl.stream_tap) |t| t.on = end == prefix;
         if (end < prefix and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
         if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
         at = end;
@@ -405,8 +445,13 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     // Progress above counts rows submitted; this is where they are done.
     try dsv.pipeDrain(m.mdl);
     try capture(m);
+    if (m.mdl.stream_tap) |t| t.on = true;
     const logits = try forwardRows(m, ids[prefix..], want, &.{}, rows);
     defer _ = mlx.mlx_array_free(logits);
+    if (m.mdl.stream_tap) |t| {
+        ablation.dumpTap(gpa, t, m.tap_dir.?, m.tap_seq, m.ids.items, m.s) catch |e| log.err("[sushi_ds41] tap dump failed: {s}\n", .{@errorName(e)});
+        m.tap_seq += 1;
+    }
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_reshape(&o, logits, &[_]c_int{ -1, @intCast(m.cfg.vocab) }, 2, m.s));
@@ -469,6 +514,7 @@ test {
     _ = config;
     _ = attn_nax;
     _ = @import("src/all_resident_test.zig");
+    _ = ablation;
 }
 
 test "sushi_ds41 prefill pipeline: SUSHI_DS41_PREFILL_PIPELINE parses to layers in flight, only 0 is off, junk keeps the default, capped" {
@@ -787,6 +833,8 @@ fn roundFailed(e: anyerror) Verdict {
 fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (roundEntry(m, f, out)) |refused| return refused;
+    if (armAblation(m, f)) |refused| return refused;
+    defer ablation.disarm(m.mdl);
     const suppress: ?mlx.mlx_array = if (f.suppress_mask.ctx != null) .{ .ctx = f.suppress_mask.ctx } else null;
     var open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e);
     defer _ = mlx.mlx_array_free(open.logits);
@@ -803,6 +851,8 @@ fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callc
 fn nativeVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (roundEntry(m, f, out)) |refused| return refused;
+    if (armAblation(m, f)) |refused| return refused;
+    defer ablation.disarm(m.mdl);
     const open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e);
     out.logits = .{ .ctx = open.logits.ctx };
     out.round.n = @intCast(open.rows);

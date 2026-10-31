@@ -21,6 +21,7 @@ const ci = sc_mod.ci;
 test {
     _ = @import("vision_key.zig");
     _ = @import("prefill_pipe_test.zig");
+    _ = @import("ablation_test.zig");
 }
 
 const Case = struct { L: usize, wp: usize, K: usize, nc: usize, dt: mlx.mlx_dtype = .bfloat16, packed_rows: bool = false, holes: bool = false, all_neg: bool = false, oob: bool = false };
