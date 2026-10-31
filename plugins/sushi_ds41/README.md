@@ -8,6 +8,7 @@ DeepSeek-V4.1-Flash on sushi's own model code, as an outside plugin for mlx-serv
     scripts/sync-sushi.sh <sushi checkout>  # refresh src/sushi/ from sushi
     scripts/sync-sushi.sh --check <sushi checkout> <tag>  # does a sushi release touch this slice? exit 0 = keep the pin
     zig build gpu-test -Dmlx-lib=<dir holding libmlxc.dylib>  # from this folder: the Metal tests (the matmul2d ones skip without an M5)
+    zig build gpu-test -Dmlx-lib=<dir> -Ddsv41-tiny=<dir>    # plus the prefill pipeline test on sushi's tiny checkpoint
 
 Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`, `finish`), outside-plugin image hooks
 (ddalcu/mlx-serve#1002), host-decoded media (`MediaInput`, ddalcu/mlx-serve#1003) and the array-based aux snapshot hooks

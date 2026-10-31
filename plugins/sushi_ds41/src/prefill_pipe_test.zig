@@ -1,7 +1,7 @@
 //! The prefill pipeline (`pipe_depth`, `SUSHI_DS41_PREFILL_PIPELINE`) against the waiting schedule on the tiny
 //! checkpoint: the same ids give the same logits byte for byte, and no pipelined layer is left in flight where the
-//! plugin reads the state. Run by `zig build gpu-test -Dmlx-lib=<dir>` with `DSV41_TINY=<dir>` (sushi's
-//! tests/dump_dsv41_fixtures.py); skipped without either.
+//! plugin reads the state. Run by `zig build gpu-test -Dmlx-lib=<dir> -Ddsv41-tiny=<dir>` (sushi's
+//! tests/dump_dsv41_fixtures.py), which sets `DSV41_TINY`; skipped without it.
 const std = @import("std");
 const mlx = @import("sushi/mlx.zig");
 const sc_mod = @import("sushi/dsv41/dsv41_scope.zig");
