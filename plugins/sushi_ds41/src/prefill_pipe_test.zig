@@ -13,10 +13,13 @@ const exl3 = @import("sushi_exl3");
 const testing = std.testing;
 const Scope = sc_mod.Scope;
 
-/// A logits array's f32 bytes (bf16 widens exactly, so equal bytes here are equal bf16 bytes).
+/// A logits array's f32 bytes (bf16 widens exactly, so equal bytes here are equal bf16 bytes). Non-empty and finite:
+/// two arms that both broke the same way would otherwise compare equal.
 fn bytesOf(sc: *Scope, a: sc_mod.A) ![]u8 {
     defer _ = mlx.mlx_array_free(a);
     const rows = try sc_mod.hostF32(try sc.astype(a, .float32));
+    try testing.expect(rows.len > 0);
+    for (rows) |v| try testing.expect(std.math.isFinite(v));
     return testing.allocator.dupe(u8, std.mem.sliceAsBytes(rows));
 }
 
@@ -32,7 +35,8 @@ const Arm = struct {
 
 /// One prompt whole, then the same prompt as a state-only chunk (`extendState`, as the plugin's `run` does) and a
 /// logits chunk, at `depth` layers in flight. `streamed`: the experts hook may refill slabs, so `extendState` drains
-/// itself; resident experts leave its last layers queued for the caller.
+/// itself; resident experts (in banks, or a hook that reports every layer resident) leave its last layers queued for
+/// the caller.
 fn arm(m: *dsv.Model, sc: *Scope, ids: []const u32, cut: usize, depth: usize, streamed: bool) !Arm {
     m.pipe_depth = depth;
     dsv.resetState(m);
@@ -99,4 +103,27 @@ test "sushi_ds41 gpu: pipelined prefill layers give the waiting schedule's logit
         m.experts = .{ .hook = st.hook() };
         try expectSameBytes(m, &sc, &ids, cut, true);
     }
+    {
+        // A hook that reports every layer resident (`Hook.all_resident`, as `StqStream` does on the live pack) keeps
+        // the cross-chunk overlap: no drain in `extendState`. The cache holds every expert, and this hook evaluates its
+        // sum before it returns, so the claim is safe here.
+        const m = try dsv.tinyModel(dir, .{ .act = .bfloat16, .experts = false }, s);
+        defer m.deinit();
+        const per_expert = try dstream.expertBytes(&m.cfg);
+        var engine = try stream.Engine.initWithOptions(testing.allocator, dir, dstream.geometry(&m.cfg), m.cfg.experts * m.cfg.layers * per_expert, s, .{
+            .layout = .mxfp4_w123,
+            .io_workers = 2,
+            .bounce_size = 1 << 20,
+        });
+        defer engine.deinit();
+        var st = dstream.Stream{ .engine = &engine, .cfg = &m.cfg, .act = .bfloat16 };
+        var hook = st.hook();
+        hook.all_resident = everyLayerResident;
+        m.experts = .{ .hook = hook };
+        try expectSameBytes(m, &sc, &ids, cut, false);
+    }
+}
+
+fn everyLayerResident(_: *anyopaque) bool {
+    return true;
 }
