@@ -1,0 +1,60 @@
+diff -ruN a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -273,6 +273,7 @@
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
++    pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
+diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -27,6 +27,9 @@
+ const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows);
+ const HookT3 = xp.ExpertsWith(G, xp.StreamSource, MathT3, .{ .prefill = true, .lookahead = true, .gated = true });
+ const Hooks = union(enum) { stream: Hook, t3: HookT3 };
++/// `MLX_SERVE_DSV41_ROUTED_ONE` (the plugin's src/routed_one.zig): a wide prompt call's resident experts as one turboexl3
++/// call over the base bank, its streamed ones on this schedule (or the whole call on the wide lane, as before).
++const routed_one = @import("mlx_host").routed_one;
+ pub const Gate = Hook.Gate;
+ pub const Phase = enum { prompt, decode };
+ /// The trunk's MoE geometry the bank must match.
+@@ -109,6 +112,7 @@
+     hook: Hooks,
+     gates_t3: []HookT3.Gate = &.{},
+     t3_state: MathT3.State = .{ .limit = 0 },
++    one: routed_one.State = .{},
+     bill: Bill,
+     phase: Phase = .prompt,
+     released: bool = false,
+@@ -170,6 +174,9 @@
+         self.source = xp.StreamSource.init(self.stream);
+         self.gates_t3 = &.{};
+         self.t3_state = .{ .limit = 0 };
++        self.one = .{};
++        if (routed_one.on()) self.one = try routed_one.State.init(geo.swiglu_limit);
++        errdefer self.one.deinit(a);
+         if (routed_t3.enabled) {
+             if (geo.swiglu_limit < 1 or geo.swiglu_limit > 128 or geo.swiglu_limit != @floor(geo.swiglu_limit)) return error.RoutedT3Clamp;
+             self.t3_state.limit = @intFromFloat(geo.swiglu_limit);
+@@ -187,6 +194,7 @@
+             inline else => |*h| h.deinit(),
+         }
+         self.a.free(self.gates_t3);
++        self.one.deinit(self.a);
+         self.stream.deinit();
+         self.q.deinit(&self.g);
+         kernel_set.Set.uninstall(G, &self.g);
+@@ -206,6 +214,9 @@
+         defer g.reset();
+         const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
+         self.t3_state.n = 0;
++        if (routed_one.on() and self.phase == .prompt) switch (self.hook) {
++            inline else => |*h| if (try routed_one.rows(&self.one, self.a, g, h, layer, x, ids, wts, decode_route_ids)) |y| return y,
++        };
+         const ro = switch (self.hook) {
+             inline else => |*h| try h.at(layer).routed(g, x, ids),
+         };

@@ -25,6 +25,18 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
 - The routed experts are the repack's `experts.bin` bank. The streamer's own EXL3 kernels (mul1, K2 and K3) run them;
   `MLX_SERVE_DSV41_ROUTED=turboexl3` runs them on turboexl3's `moeClamped` instead (src/routed_t3.zig: each routed pair
   a row of a top-1 call, on the streamer's schedule without its banked waves and device route).
+- `MLX_SERVE_DSV41_ROUTED_ONE` (src/routed_one.zig, its MLX-free plan src/one_plan.zig, the hook in
+  patches/turboexl3-wide-one.patch) runs a wide prompt call's resident routed experts as one turboexl3 `moeClamped`
+  call over the layer's base slot bank in the router's [rows, top-k] layout, in place of the wide lane's DIG-X waves
+  and per-pair join. Unset or `0`, nothing changes.
+  - `1`: a call whose experts are all resident is that call. A call with streamed experts runs its resident pairs as
+    that call (each streamed pair in it at weight 0) and its streamed experts on the streamer's schedule, a combine
+    adding their weighted rows, when its resident pairs are at least half its pairs. Any other call keeps the lane.
+  - `resident`: only the calls whose experts are all resident.
+  - `check`: both ways on every call `1` takes, the lane's sum served; one `[routed-one] check` line a call against
+    turboexl3's bar for two summation orders (the difference's rms within 2^-8 of the reference's, its largest within
+    8e-2 of it). The sums agree within rounding (another GEMM order, f16 inner products), not bit for bit.
+  - `[routed-one]` at each request's end counts the calls by path.
 - The streamer's MLX shims (events, uninitialized buffers, the launch cache, the read pool's Metal signal) are the
   plugin's own, over the server's host table (src/host_shims.zig). The read pool is the streamer's C, compiled here.
 - The DSpark stages draft as the model's native drafter (plugin.zig), greedy or under the engine's sampling, with the

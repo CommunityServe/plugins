@@ -18,6 +18,9 @@ pub const mtp_acceptance = @import("src/mlx_serve/sdk/spec/mtp_acceptance.zig");
 pub const quant_abi = kit.abi.quant;
 /// The routed experts' turboexl3 math the copied streamer runs when the model setting asks (src/routed_t3.zig).
 pub const routed_t3 = @import("src/routed_t3.zig");
+/// A wide prompt call's resident routed experts as one turboexl3 call, when `MLX_SERVE_DSV41_ROUTED_ONE` asks
+/// (src/routed_one.zig, read by the copied streamer's source).
+pub const routed_one = @import("src/routed_one.zig");
 const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
 const v4plugin = @import("src/mlx_serve/plugins/deepseek_v4/plugin.zig");
@@ -90,6 +93,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // The streamed bank's slot rows fit within the host's ceiling, not only the device's working set.
     bill.host_ceiling = &shims.memoryCeiling;
     routed_t3.enabled = config.routedT3(env.span(.MLX_SERVE_DSV41_ROUTED));
+    routed_one.mode = routed_one.modeOf(env.span(.MLX_SERVE_DSV41_ROUTED_ONE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ROUTED_ONE is none of 0, 1, resident, check: the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     // Before the model's load, which compiles its decode stretches only when the stage profiler is off.
     stage_prof.configure(env.span(.MLX_SERVE_DSV41_STAGE_PROF));
     var own = ctx.*;
@@ -106,6 +116,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (drafter) |*d| d.deinit();
     drafter = rounds.Drafter.init(gpa, on);
     log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on" else "off (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
+    if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     return mp;
 }
@@ -347,10 +358,11 @@ fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: ab
     return n;
 }
 
-var meter_buf: [1536]u8 = undefined;
+var meter_buf: [2048]u8 = undefined;
 
 /// The request's DSpark rounds beside the engine's `[spec-stats]`, which counts every native round a stage round; the
-/// stage profiler's lines (src/stage_prof.zig) when it is on; the expert stream's counters since the last request.
+/// stage profiler's lines (src/stage_prof.zig) when it is on; the expert stream's counters since the last request, and
+/// the one-call path's (src/routed_one.zig) when it is on.
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = slot;
     stage_prof.requestEnd();
@@ -365,7 +377,8 @@ const StreamStats = @TypeOf(@as(*Exl3Source, undefined).stats());
 var stream_prev: StreamStats = .{};
 
 /// `[stream-stats]`: the streamed bank's routes, resident hits and misses (unique experts a route), evictions, bytes
-/// read and the host's read waits since the last request (the first request's include the load's).
+/// read and the host's read waits since the last request (the first request's include the load's); then `[routed-one]`
+/// (`routed_one.meters`).
 fn streamMeters(m: *ds.Model, buf: []u8) []const u8 {
     const r = m.mdl.streamed orelse return buf[0..0];
     if (r.math != .source) return buf[0..0];
@@ -386,7 +399,8 @@ fn streamMeters(m: *ds.Model, buf: []u8) []const u8 {
         s.spec_landed -| p.spec_landed,
         s.claimed -| p.claimed,
     }) catch {};
-    return w.buffered();
+    const n = w.buffered().len;
+    return buf[0 .. n + routed_one.meters(&src.one, buf[n..]).len];
 }
 
 fn fillRound(round: *abi.Round, tokens: []const u32, rows: u32, position: usize) void {
