@@ -114,6 +114,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         .placeholder_ids = .{ .image = if (c.vision != null) c.image_token_id else 0 },
         .private = priv,
     };
+    if (comptime @hasField(abi.Caps, "ablation")) p.caps.ablation = true;
     p.shell = .{
         .vocab_size = c.vocab,
         .hidden_size = c.dim,
