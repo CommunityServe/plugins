@@ -109,9 +109,20 @@ pub const Backoff = struct {
     edge: f32 = 0,
     /// Stage rounds' ms per token, smoothed (the plugin's DSpark rounds at a short context land near this).
     stage_ms_per_token: f32 = 12,
+    /// Copies kept a copy round, smoothed, and whether the last copy round kept every draft: a round verifies what
+    /// copies have been landing plus 2, or the whole cap right after one landed whole (mlx-serve's `mtp_lookup.gate`).
+    kept: f32 = 5,
+    streak: bool = false,
 
     const max_period: u32 = 16;
     const keep: f32 = 0.8;
+
+    /// Drafts the next copy round may verify, of `cap`: sized to what copies have been landing, so one that is rejected
+    /// early wastes a few rows, not 16. At or under the stage block, `copyLen` leaves the round to the stage draft.
+    pub fn width(self: *const Backoff, cap: usize) usize {
+        if (self.streak) return cap;
+        return @min(cap, @as(usize, @intFromFloat(@ceil(@max(self.kept, 0)))) + 2);
+    }
 
     /// A match worth copying turned up: whether to take it.
     pub fn take(self: *Backoff) bool {
@@ -126,10 +137,12 @@ pub const Backoff = struct {
         self.stage_ms_per_token = keep * self.stage_ms_per_token + (1 - keep) * ms / @as(f32, @floatFromInt(tokens));
     }
 
-    /// A copy round that committed `tokens` (t1 and the copies kept) in `ms`.
-    pub fn observeCopy(self: *Backoff, tokens: usize, ms: f32) void {
+    /// A copy round that verified `drafted` copies, kept `kept` of them and took `ms`.
+    pub fn observeCopy(self: *Backoff, drafted: usize, kept: usize, ms: f32) void {
+        self.kept = 0.7 * self.kept + 0.3 * @as(f32, @floatFromInt(kept));
+        self.streak = kept == drafted;
         if (!std.math.isFinite(ms) or ms <= 0) return;
-        const saved = @as(f32, @floatFromInt(tokens)) * self.stage_ms_per_token - ms;
+        const saved = @as(f32, @floatFromInt(1 + kept)) * self.stage_ms_per_token - ms;
         self.edge = keep * self.edge + (1 - keep) * saved;
         if (self.edge < 0) {
             self.owed = self.period;
@@ -189,18 +202,33 @@ test "sushi_ds41 copy: copies that lose to stage rounds back off, doubling; a wi
     for (0..10) |_| b.observeStage(3, 30); // stage rounds: 10 ms a token
     try testing.expect(b.take());
     // A 16-row copy rejected after 2 drafts: 3 tokens in 60 ms, 30 ms worse than the stage rounds would have taken.
-    b.observeCopy(3, 60);
+    b.observeCopy(15, 2, 60);
     try testing.expectEqual(@as(u32, 1), b.owed);
     try testing.expect(!b.take());
     try testing.expect(b.take());
-    b.observeCopy(3, 60);
+    b.observeCopy(15, 2, 60);
     try testing.expectEqual(@as(u32, 2), b.owed);
     // A copy kept whole: 16 tokens in 60 ms, 100 ms better; the edge turns positive and the next loss owes one again.
     b.owed = 0;
-    for (0..3) |_| b.observeCopy(16, 60);
+    for (0..3) |_| b.observeCopy(15, 15, 60);
     try testing.expect(b.edge > 0);
     try testing.expectEqual(@as(u32, 1), b.period);
     try testing.expect(b.take());
+}
+
+test "sushi_ds41 copy: a round verifies what copies have been landing plus 2, the cap after one landed whole" {
+    var b: Backoff = .{};
+    try testing.expectEqual(@as(usize, 7), b.width(15)); // prior: 5 kept
+    b.observeCopy(7, 7, 50);
+    try testing.expectEqual(@as(usize, 15), b.width(15)); // landed whole
+    b.observeCopy(15, 1, 50);
+    try testing.expect(!b.streak);
+    // 0.7 * (0.7 * 5 + 0.3 * 7) + 0.3 * 1 = 4.22, so 5 + 2: still a copy of more than the 5-row block.
+    try testing.expectEqual(@as(usize, 7), b.width(15));
+    for (0..4) |_| b.observeCopy(7, 1, 50);
+    // Copies keep about 1: the width falls to the block, so `copyLen` leaves rounds to the stage draft.
+    try testing.expect(b.width(15) <= 5);
+    try testing.expectEqual(@as(usize, 0), copyLen(.{ .draft = &(@as([15]u32, @splat(0))), .suffix = STRONG_SUFFIX }, b.width(15), 5));
 }
 
 test "sushi_ds41 copy: only a long agreement that outruns the stage block is copied" {

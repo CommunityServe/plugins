@@ -830,7 +830,7 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
 /// round.
 fn copyDrafts(m: *Model, t1: u32, cap: u32, drafts: []u32) !?usize {
     try m.lookup.sync(gpa, m.ids.items);
-    const room = @min(@as(usize, cap), max_verify_rows - 1, drafts.len);
+    const room = m.copy_backoff.width(@min(@as(usize, cap), max_verify_rows - 1, drafts.len));
     const found = m.lookup.matchBest(t1, @intCast(room));
     const n = copy_lookup.copyLen(found, room, m.cfg.dspark.block);
     if (n == 0 or !m.copy_backoff.take()) return null;
@@ -863,7 +863,7 @@ fn closeRound(m: *Model, o: *const Open, accepted: usize, r: *abi.Round) !void {
         m.copy.rounds += 1;
         m.copy.drafted += o.rows - 1;
         m.copy.accepted += accepted;
-        m.copy_backoff.observeCopy(1 + accepted, o.draft_ms + verify_ms);
+        m.copy_backoff.observeCopy(o.rows - 1, accepted, o.draft_ms + verify_ms);
     } else {
         if (!o.drafted) m.policy.observePlain(verify_ms) else m.policy.observeRound(o.conf[0 .. o.block_len - 1], @intCast(o.rows), @intCast(accepted), o.draft_ms, verify_ms);
         m.copy_backoff.observeStage(1 + accepted, o.draft_ms + verify_ms);
