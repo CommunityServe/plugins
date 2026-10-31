@@ -1,0 +1,28 @@
+diff -ruN a/plugins/deepseek_v41/media.zig b/plugins/deepseek_v41/media.zig
+--- a/plugins/deepseek_v41/media.zig
++++ b/plugins/deepseek_v41/media.zig
+@@ -20,16 +20,20 @@
+     const c = config.of(p);
+     const px = vision.preprocess(gpa, in.rgb.slice(), in.height, in.width, c.vision_patch_size, c.dv_downsample, c.dv_max_image_tokens, c.dv_min_pixels, c.dv_max_wh_ratio) catch
+         return Verdict.refuse(.failed, "deepseek_v41: the image's dimensions have no grid");
+-    defer gpa.free(px.bytes);
+-    const feat: c_int = @intCast(3 * c.vision_patch_size * c.vision_patch_size);
+-    const n: c_int = @intCast(px.grid_h * px.grid_w);
++    // An outside plugin's prepare runs on a connection thread, which never calls MLX: the pixels go back as host bytes
++    // (float32, a row per grid cell), which the host copies, then frees through `freeBytes`.
+     out.* = .{
+         .kind = .image,
+         .rows = @intCast(spanRows(c, px.grid_h, px.grid_w)),
+         .grid = .{ 1, px.grid_h, px.grid_w },
+-        .pixels = .{ .ctx = mlx.mlx_array_new_data(px.bytes.ptr, &[_]c_int{ n, feat }, 2, .float32).ctx },
++        .bytes = .of(px.bytes),
++        .free = &freeBytes,
+     };
+     return .ok;
++}
++fn freeBytes(item: *abi.MediaItem) callconv(.c) void {
++    gpa.free(@constCast(item.bytes.slice()));
++    item.bytes = .{};
+ }
+ pub fn tower(mp: *anyopaque, item: *const abi.MediaItem, out: *abi.Array) callconv(.c) Verdict {
+     const m: *@import("plugin.zig").Model = @ptrCast(@alignCast(mp));
