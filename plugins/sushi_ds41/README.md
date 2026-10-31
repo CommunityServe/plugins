@@ -64,6 +64,8 @@ simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2
   the next chunk's tail overwrites the 128-row rings that tail would fill. Prefill 8k / 32k / 64k 2466 / 2758 / 2729 to
   2562 / 3079 / 3063 tok/s on the M5 Ultra; text and logprobs are byte-identical on 8k to 64k prompts, a merged tail, an
   image and a prefix-cache restore.
+- Prefill pipeline: a prefill-width layer is submitted, not waited on, with up to 2 in flight
+  (`SUSHI_DS41_PREFILL_PIPELINE`, 0 turns it off; `patches/prefill-pipeline.patch`, `pipeOn`). Same graphs, same bytes.
 - Not supported: Thunderbolt pair, other quant formats, snapshot serialization (no SSD tier).
 
 `plugin check` needs a conformance fixture pack, which an STQ pack cannot provide small; the plugin is checked by serving.
