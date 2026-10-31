@@ -97,6 +97,47 @@ pub const Index = struct {
     }
 };
 
+/// When a request stops taking copies: a copy round verifies up to 16 rows, so one that is rejected early costs far more
+/// than the stage round it replaced. Each copy round is priced against the stage rounds' own ms per token; copies that
+/// lose back the next matches off (skipped, the stage drafts instead), doubling to a cap, as the rows policy backs off
+/// stage drafts that lose to plain steps.
+pub const Backoff = struct {
+    /// Matches to skip before the next copy, and the stretch the next losing stretch of copies will owe.
+    owed: u32 = 0,
+    period: u32 = 1,
+    /// Decayed ms a copy round saved against stage rounds for its tokens; negative while copies lose.
+    edge: f32 = 0,
+    /// Stage rounds' ms per token, smoothed (the plugin's DSpark rounds at a short context land near this).
+    stage_ms_per_token: f32 = 12,
+
+    const max_period: u32 = 16;
+    const keep: f32 = 0.8;
+
+    /// A match worth copying turned up: whether to take it.
+    pub fn take(self: *Backoff) bool {
+        if (self.owed == 0) return true;
+        self.owed -= 1;
+        return false;
+    }
+
+    /// A stage round (or a plain step) that committed `tokens` in `ms`.
+    pub fn observeStage(self: *Backoff, tokens: usize, ms: f32) void {
+        if (tokens == 0 or !std.math.isFinite(ms) or ms <= 0) return;
+        self.stage_ms_per_token = keep * self.stage_ms_per_token + (1 - keep) * ms / @as(f32, @floatFromInt(tokens));
+    }
+
+    /// A copy round that committed `tokens` (t1 and the copies kept) in `ms`.
+    pub fn observeCopy(self: *Backoff, tokens: usize, ms: f32) void {
+        if (!std.math.isFinite(ms) or ms <= 0) return;
+        const saved = @as(f32, @floatFromInt(tokens)) * self.stage_ms_per_token - ms;
+        self.edge = keep * self.edge + (1 - keep) * saved;
+        if (self.edge < 0) {
+            self.owed = self.period;
+            self.period = @min(self.period * 2, max_period);
+        } else self.period = 1;
+    }
+};
+
 /// Drafts a copy round takes from a match, or 0 for the stage draft. The stage block already lands most drafts on
 /// repeated text, so only a quoted span (a long agreement) whose copy outruns the block is worth the wider verify.
 pub fn copyLen(found: ?Match, cap: usize, block: usize) usize {
@@ -141,6 +182,25 @@ test "sushi_ds41 copy: sync indexes only the new ids and starts over on a shorte
     try idx.sync(testing.allocator, &.{ 9, 9 });
     try testing.expectEqual(@as(usize, 2), idx.toks.items.len);
     try testing.expect(idx.matchBest(4, 2) == null);
+}
+
+test "sushi_ds41 copy: copies that lose to stage rounds back off, doubling; a winning copy clears the stretch" {
+    var b: Backoff = .{};
+    for (0..10) |_| b.observeStage(3, 30); // stage rounds: 10 ms a token
+    try testing.expect(b.take());
+    // A 16-row copy rejected after 2 drafts: 3 tokens in 60 ms, 30 ms worse than the stage rounds would have taken.
+    b.observeCopy(3, 60);
+    try testing.expectEqual(@as(u32, 1), b.owed);
+    try testing.expect(!b.take());
+    try testing.expect(b.take());
+    b.observeCopy(3, 60);
+    try testing.expectEqual(@as(u32, 2), b.owed);
+    // A copy kept whole: 16 tokens in 60 ms, 100 ms better; the edge turns positive and the next loss owes one again.
+    b.owed = 0;
+    for (0..3) |_| b.observeCopy(16, 60);
+    try testing.expect(b.edge > 0);
+    try testing.expectEqual(@as(u32, 1), b.period);
+    try testing.expect(b.take());
 }
 
 test "sushi_ds41 copy: only a long agreement that outruns the stage block is copied" {

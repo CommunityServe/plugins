@@ -77,6 +77,8 @@ const Model = struct {
     open: ?Open = null,
     /// This request's copy rounds, the drafts they verified and kept; logged when the next request resets the state.
     copy: CopyStats = .{},
+    /// Whether this request still takes copies (`copy_lookup.Backoff`).
+    copy_backoff: copy_lookup.Backoff = .{},
     prev_cache_limit: ?usize = null,
     /// The MLX buffer-pool cap in force (`borrow.poolCap` of the last pass's rows): `pool_bytes` at decode widths.
     pool_now: u64 = pool_bytes,
@@ -352,6 +354,7 @@ const CopyStats = struct { rounds: u64 = 0, drafted: u64 = 0, accepted: u64 = 0 
 fn reset(m: *Model) void {
     if (m.copy.rounds > 0) log.info("[sushi_ds41] copy rounds={d} drafted={d} accepted={d}\n", .{ m.copy.rounds, m.copy.drafted, m.copy.accepted });
     m.copy = .{};
+    m.copy_backoff = .{};
     dsv.resetState(m.mdl);
     m.open = null;
     clearIds(m);
@@ -823,7 +826,7 @@ fn copyDrafts(m: *Model, t1: u32, cap: u32, drafts: []u32) !?usize {
     const room = @min(@as(usize, cap), max_verify_rows - 1, drafts.len);
     const found = m.lookup.matchBest(t1, @intCast(room));
     const n = copy_lookup.copyLen(found, room, m.cfg.dspark.block);
-    if (n == 0) return null;
+    if (n == 0 or !m.copy_backoff.take()) return null;
     @memcpy(drafts[0..n], found.?.draft[0..n]);
     return n;
 }
@@ -853,7 +856,11 @@ fn closeRound(m: *Model, o: *const Open, accepted: usize, r: *abi.Round) !void {
         m.copy.rounds += 1;
         m.copy.drafted += o.rows - 1;
         m.copy.accepted += accepted;
-    } else if (!o.drafted) m.policy.observePlain(verify_ms) else m.policy.observeRound(o.conf[0 .. o.block_len - 1], @intCast(o.rows), @intCast(accepted), o.draft_ms, verify_ms);
+        m.copy_backoff.observeCopy(1 + accepted, o.draft_ms + verify_ms);
+    } else {
+        if (!o.drafted) m.policy.observePlain(verify_ms) else m.policy.observeRound(o.conf[0 .. o.block_len - 1], @intCast(o.rows), @intCast(accepted), o.draft_ms, verify_ms);
+        m.copy_backoff.observeStage(1 + accepted, o.draft_ms + verify_ms);
+    }
     r.n = @intCast(1 + accepted);
     r.accepted = @intCast(accepted);
     r.rows = @intCast(o.rows);
