@@ -34,9 +34,16 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
     the draft (more than the block, up to the 7 a verify carries on the bank's decode lane), with no stage forward.
     `MLX_SERVE_DSV41_DSPARK_COPY=0` turns them off.
   - The verify policy: a stage round verifies the prefix of the block whose calibrated confidence buys the most tokens
-    per ms of verify, on the verify ladder the plugin measures from its own rounds (ms by rows, the engine's prior
-    ladder for rows not yet measured), and where drafting does not pay the round verifies `t1` alone (the engine's
-    backoff). `MLX_SERVE_DSV41_DSPARK_POLICY=0` verifies the whole block every round.
+    per ms of verify, on the verify ladder the plugin measures from its own rounds, and where drafting does not pay the
+    round verifies `t1` alone (the engine's backoff). `MLX_SERVE_DSV41_DSPARK_POLICY=0` verifies the whole block every
+    round.
+  - The ladder (src/rounds.zig `Ladder`): the 1-row cell in ms, every other row as a ratio to it, so a level change
+    the plain rounds see moves every row; each cell the lower median of its last 8 samples and the engine's prior
+    ladder (one stall moves it a rank, a new level takes 4 or 5 samples); a cell unsampled for 64 rounds counts no
+    dearer than the fresh rows around it, and a row never measured is the prior's shape bent to them. The two ends
+    are refreshed once stale: the 1-row cell by a plain round, the whole block on a stage round (the backoff's probes
+    included; the backoff does not judge a refresh). `refreshes=` in `dspark policy:` counts them; a stale cell in
+    `ladder_ms` ends in `~`.
   - The context is the prompt the resume hands the plugin, then each forward's and round's tokens at their positions;
     a gap or a failed forward drops it, and with it the copies, until the next prompt.
   - Each request's rounds are logged beside the engine's `[spec-stats]` (`dspark rounds:`, `dspark policy:` with the
@@ -53,5 +60,5 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
 
 ## Measured
 
-Nothing yet on the served pack. The copy rounds and the verify policy have not run on a GPU; their choices are tested
-MLX-free (`zig build test`).
+Nothing yet on the served pack. The copy rounds, the verify policy and its ladder have not run on a GPU; their choices
+are tested MLX-free (`zig build test`).
