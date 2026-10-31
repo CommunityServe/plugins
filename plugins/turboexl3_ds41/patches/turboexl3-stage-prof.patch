@@ -1,0 +1,344 @@
+diff -ruN a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -273,6 +273,7 @@
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
++    pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
+     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
+diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -34,6 +34,8 @@
+ const device = @import("../../mlx/device.zig");
+ /// An exllamav3 pack's linears and resident expert banks (trellis, suh and svh): turboexl3 runs them.
+ const t3 = @import("turboexl3");
++/// The stage profiler (turboexl3_ds41's src/stage_prof.zig, `MLX_SERVE_DSV41_STAGE_PROF`): off, every mark returns at once.
++const prof = @import("../../../stage_prof.zig");
+ const A = mlx.mlx_array;
+ const S = mlx.mlx_stream;
+ const Config = @import("config.zig").Config;
+@@ -1907,11 +1909,12 @@
+ /// previous mix: the staggered hyper-connections). A decode-width block is one
+ /// stage (`hcStage`), a wide one the mix and norm kernels.
+ pub fn hcPreNorm(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, norm_w: A) !Normed {
+-    if (dim(x, 0) <= region_rows) {
++    const n: Normed = if (dim(x, 0) <= region_rows) blk: {
+         const r = try hcStage(sc, m, x, null, cpre, hc, norm_w);
+-        return .{ .sp = r.sp, .h = r.h };
+-    }
+-    return hcPreNormWide(sc, m, x, cpre, hc, norm_w);
++        break :blk .{ .sp = r.sp, .h = r.h };
++    } else try hcPreNormWide(sc, m, x, cpre, hc, norm_w);
++    try prof.mark(.attn_hc, &.{ n.sp.pre, n.sp.post, n.sp.comb, n.h });
++    return n;
+ }
+ /// `hcPreNorm` for blocks of many rows, where throughput rules: the mix and norm kernels.
+ pub fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, norm_w: A) !Normed {
+@@ -2058,10 +2061,13 @@
+ /// width the expand is rebuilt wherever the stage reads it, saving its dispatch from the chain; a wide
+ /// block pays for that rebuild in every mix, so it expands once.
+ pub fn hcExpandPreNorm(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !Staged {
+-    if (dim(x, 0) <= region_rows) return hcStage(sc, m, x, .{ .y = y, .sp = sp }, cpre, hc, norm_w);
+-    const x1 = try hcExpand(sc, x, y, sp);
+-    const r = try hcPreNormWide(sc, m, x1, cpre, hc, norm_w);
+-    return .{ .x1 = x1, .sp = r.sp, .h = r.h };
++    const s: Staged = if (dim(x, 0) <= region_rows) try hcStage(sc, m, x, .{ .y = y, .sp = sp }, cpre, hc, norm_w) else blk: {
++        const x1 = try hcExpand(sc, x, y, sp);
++        const r = try hcPreNormWide(sc, m, x1, cpre, hc, norm_w);
++        break :blk .{ .x1 = x1, .sp = r.sp, .h = r.h };
++    };
++    try prof.mark(.ffn_hc, &.{ s.x1, s.sp.pre, s.sp.post, s.sp.comb, s.h });
++    return s;
+ }
+ /// The hc split of the mixes `z` and the collapse of `x` with `cpre`, rms-normed.
+ pub fn hcNorm(sc: *Scope, m: *const Dsv41Model, z: A, x: A, cpre: A, norm_w: A, eps: A) !Normed {
+@@ -2156,14 +2162,19 @@
+         keys_w = if (prev.ctx != null) try sc.concat(&.{ prev, kv }, 0) else kv;
+         try ls.win.write(kv, p0, sc.s);
+     }
++    try prof.mark(.qkv, &.{ q, kv, keys_w, ls.win.buf });
+     var comp_rows = none;
+     var topk = none;
+     if (ly.ratio > 0) {
+         const r: usize = ly.ratio;
+         const clen = (p0 + L) / r;
+-        if (ly.comp) |*cw| if (sh.floor == null) try compress(sc, m, st, li, cw, x, p0);
++        if (ly.comp) |*cw| if (sh.floor == null) {
++            try compress(sc, m, st, li, cw, x, p0);
++            try prof.mark(.compressor, &.{ if (ls.comp) |rw| rw.buf else none, if (ls.idx_k) |rw| rw.buf else none, ls.pend_kv, ls.pend_gate });
++        };
+         if (ly.idx) |*iw| {
+             sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
++            try prof.mark(.indexer, &.{ sh.topk, sh.cand });
+         }
+         topk = sh.topk;
+         if (clen > 0 and topk.ctx != null) {
+@@ -2174,6 +2185,7 @@
+     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+     if (compiled) {
+         const o = try attnDecode(sc, m, ly, q, ls.win, comp_rows, topk, p0, scale, ropeFor(m, li).inv);
++        try prof.mark(.attn_core, &.{o});
+         var y: [1]A = undefined;
+         try runRegion(sc, m, li, .attn_out, &.{o}, &y);
+         return y[0];
+@@ -2188,6 +2200,7 @@
+         try attnWide(sc, m, ly.sink, q, keys_w, wp, comp_rows, topk, scale, m.act)
+     else
+         try attnWideF32(sc, ly.sink, q, keys_w, try windowBand(sc, wp, L, window), comp_rows, topk, scale, m.act);
++    try prof.mark(.attn_core, &.{o});
+     if (m.trace) |t| {
+         try t.put("sa_q_{d}", .{li}, q);
+         try t.put("sa_kv_{d}", .{li}, keys_w);
+@@ -2486,7 +2499,9 @@
+     const qr = try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
+     const qb = try ly.wq_b.apply(sc, qr);
+     const q = try ropeTail(sc, m, try sc.reshape(qb, &.{ ci(dim(x, 0)), ci(c.num_attention_heads), ci(c.head_dim) }), periods, pos, 1.0);
+-    return .{ .q = q, .kv = try kvRow(sc, m, ly, periods, kv, pos), .qr = qr };
++    const row = try kvRow(sc, m, ly, periods, kv, pos);
++    try prof.mark(.qkv, &.{ q, row, qr });
++    return .{ .q = q, .kv = row, .qr = qr };
+ }
+ /// The projected window row `kv` normed, roped and fp8 round-tripped.
+ pub fn kvRow(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, kv: A, pos: A) !A {
+@@ -2520,7 +2535,9 @@
+     const L = dim(r, 0);
+     const og = c.dsv4_o_groups;
+     const gin = c.num_attention_heads * c.head_dim / og;
+-    return ly.wo_b.apply(sc, try attnOutA(sc, m, ly, try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(og), ci(gin) }), &.{ 1, 0, 2 }), null)); // [og, L, in]
++    const y = try ly.wo_b.apply(sc, try attnOutA(sc, m, ly, try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(og), ci(gin) }), &.{ 1, 0, 2 }), null)); // [og, L, in]
++    try prof.mark(.attn_out, &.{y});
++    return y;
+ }
+ /// The grouped `wo_a` of heads already grouped and inverse-roped `[og, L, in]`: `[L, og * o_lora]` in `m.act`.
+ pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A) !A {
+@@ -3206,7 +3223,10 @@
+ }
+ /// The routed sum `y` (f32) plus the shared expert.
+ pub fn withShared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A) !A {
+-    return addShared(sc, m, y, try shared(sc, m, ly, x));
++    try prof.mark(.routed, &.{y});
++    const sy = try shared(sc, m, ly, x);
++    try prof.mark(.shared, &.{sy});
++    return addShared(sc, m, y, sy);
+ }
+ pub fn shared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
+     // A prompt's rows take the routed experts' activation kernel (weight 1): one pass, not the f32 op chain's five.
+@@ -3232,6 +3252,7 @@
+ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
+     const ly = &m.layers[li];
+     const r = try route(sc, m, ly, x, img);
++    try prof.mark(.router, &.{ r.idx, r.wts });
+     // The DSpark stages' experts stay resident.
+     if (li < m.n_layers) if (m.streamed) |src| {
+         if (src.math == .source) return withShared(sc, m, ly, x, try sc.keep(try src.math.source(src.ctx, @intCast(li), x, r.idx, r.wts).get()));
+@@ -3344,6 +3365,7 @@
+             };
+             var y: [1]A = undefined;
+             try runRegion(sc, m, li, .ffn_post, &.{ p[0], p[2], p[3], p[4], ro }, &y);
++            try prof.mark(.combine, &y);
+             pre.* = p[1];
+             return y[0];
+         }
+@@ -3356,7 +3378,9 @@
+     const y = try moe(sc, m, li, mid.h, sh.img);
+     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
+     pre.* = mid.sf.pre;
+-    return hcExpand(sc, mid.x1, y, &mid.sf);
++    const out = try hcExpand(sc, mid.x1, y, &mid.sf);
++    try prof.mark(.combine, &.{out});
++    return out;
+ }
+ /// `block` for at most `dkern.max_rows` rows on the fused decode kernels (`decode/`), today's stretches where one is
+ /// missing; null (before any state moves) where a kernel declines the layer.
+@@ -3514,7 +3538,11 @@
+     const p0 = st.n;
+     const hc = c.dsv4_hc_mult;
+     const d = c.hidden_size;
++    // The stage profiler's forward: a decode token the engine's sampler made runs before its clock starts.
++    try prof.begin(m.s, if (st.verify != null) .verify else if (L == 1) .decode else .prompt, L, if (ids == .gpu) &.{ids.gpu} else &.{});
++    defer prof.end();
+     if (m.streamed) |src| try src.phase(L > region_rows);
++    try prof.mark(.phase, &.{});
+     if (ids == .gpu) {
+         if (L != 1 or m.pair != null) return error.Dsv41GpuIdsUnsupported;
+         const tv = mlx.mlx_vector_array_new_value(ids.gpu);
+@@ -3592,6 +3620,7 @@
+     defer if (prefetch) |pf| if (m.ahead != pf) pf.finish();
+     if (eng_on and ids == .host) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
+     sp.prefetch = prefetch;
++    try prof.mark(.embed, held);
+     var from: usize = 0;
+     if (ids == .gpu and m.engrams.len > 0) {
+         var first = m.n_layers;
+@@ -3639,6 +3668,11 @@
+         if (st.verify) |*v| {
+             v.mh = sc.out(all);
+         } else try commitMain(&sc, m, st, all, sp.p0);
++        if (prof.on) {
++            try rows.appendSlice(gpa, &.{ all, st.mh });
++            for (st.ds) |r| try rows.append(gpa, r.buf);
++            try prof.mark(.ds_commit, rows.items);
++        }
+     }
+     // The final collapse uses the last layer's FFN mix.
+     var h: A = undefined;
+@@ -3653,6 +3687,7 @@
+         h = try sc.concat(parts.items, 0);
+     }
+     const logits = try sc.astype(try m.head.apply(&sc, try sc.rms(h, m.norm, c.rms_norm_eps)), .float32);
++    try prof.mark(.head, &.{logits});
+     var ev: std.ArrayList(A) = .empty;
+     defer ev.deinit(gpa);
+     try ev.append(gpa, logits);
+@@ -3674,6 +3709,7 @@
+     // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.
+     const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
+     for (lo..hi) |li| {
++        prof.layer();
+         if (wide) try wideLayer(m, gpa, st, sp, li) else for (0..n_spans) |k| {
+             // A span's intermediates are dropped as soon as it is built, so the
+             // layer's evaluation frees each one when its consumers are done.
+@@ -3696,6 +3732,7 @@
+             defer ev.deinit(gpa);
+             for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
+             try appendLayerState(gpa, &ev, &st.layers[li]);
++            try prof.mark(.rest, ev.items);
+             if (!decode) try evalAll(ev.items) else {
+                 // A decode step's graph takes the host about as long as the GPU
+                 // takes to run it: hand each layer over as it is built.
+@@ -3793,7 +3830,9 @@
+     const x = try sc.concat(parts, 0);
+     const pres = try sc.concat(sp.pres, 0);
+     if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, x, pres, sp.img, ra, src.ctx);
++    try prof.mark(.read_ahead, &.{ x, pres });
+     const pa = try hcPreNormWide(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm);
++    try prof.mark(.attn_hc, &.{ pa.sp.pre, pa.sp.post, pa.sp.comb, pa.h });
+     const pos = try sc.i(ci(sp.p0));
+     const pj = try qkvProj(&sc, m, ly, ropeFor(m, li).fwd, pa.h, pos);
+     const heads = try gpa.alloc(A, n_spans);
+@@ -3814,10 +3853,12 @@
+         if (!sh.grouped) o_k = try ssc.transpose(try ssc.reshape(try ropeTail(&ssc, m, o_k, ropeFor(m, li).inv, try ssc.i(ci(sp.p0 + lo)), 1.0), &.{ ci(hi - lo), og, -1 }), &.{ 1, 0, 2 });
+         if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
+         o.* = try sc.keep(ssc.out(try attnOutA(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null)));
++        try prof.mark(.attn_out, &.{o.*});
+         hold(&sp.topks[k], sh.topk);
+         hold(&sp.cands[k], sh.cand);
+     }
+     const y = try ly.wo_b.apply(&sc, try sc.concat(heads, 0));
++    try prof.mark(.attn_out, &.{y});
+     const pf = try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
+     // A streamed bank reads each layer's experts once per call: one MoE over all of its rows.
+     const group = if (m.streamed != null) n_spans else @max(1, m.moe_rows / sp.span);
+@@ -3831,6 +3872,7 @@
+         const yg = try moe(&gsc, m, li, try gsc.slice(pf.h, 0, lo, hi), try sp.imgSlice(&gsc, lo, hi));
+         const sf: Split = .{ .pre = try gsc.slice(pf.sp.pre, 0, lo, hi), .post = try gsc.slice(pf.sp.post, 0, lo, hi), .comb = try gsc.slice(pf.sp.comb, 0, lo, hi) };
+         const xg = try hcExpand(&gsc, try gsc.slice(pf.x1, 0, lo, hi), yg, &sf);
++        try prof.mark(.combine, &.{xg});
+         for (k0..k1) |k| {
+             const a, const b = sp.bounds(k);
+             hold(&sp.xs[k], try gsc.slice(xg, 0, a - lo, b - lo));
+@@ -3908,6 +3950,8 @@
+         hold(&tsp.pres[k], try sc.slice(pre, 0, off + lo, off + hi));
+     }
+     for ([_][]A{ sp.xs, sp.pres, sp.topks, sp.cands }) |slots| for (slots) |*s| hold(s, none);
++    const ls = &st.layers[li];
++    try prof.mark(.ced_replay, &.{ x, pre, if (ls.comp) |rw| rw.buf else none, if (ls.idx_k) |rw| rw.buf else none, ls.pend_kv, ls.pend_gate });
+ }
+ /// Span `k`'s stream entering layer `li`: its Engram write, and its DSpark
+ /// main row when the layer is a target.
+@@ -3931,9 +3975,11 @@
+         // An image span's rows get no Engram write (the reference shuts their gate).
+         x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
+         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
++        try prof.mark(.engram, &.{x});
+     }
+     if (m.n_mtp > 0) if (m.dsparkTarget(li)) |t| {
+         hold(&sp.mh[k * m.cfg.dsv4_n_dspark_target_layers + t], try sc.astype(try sc.mean(try sc.astype(x, .float32), 1, false), m.act));
++        try prof.mark(.ds_main, sp.mh[k * m.cfg.dsv4_n_dspark_target_layers + t ..][0..1]);
+     };
+     return x;
+ }
+@@ -3963,6 +4009,8 @@
+     if (env.get(.MLX_SERVE_DSV41_COMPILE)) |v| if (v[0] == '0') return;
+     m.regions = try m.gpa.alloc(LayerRegions, m.n_layers);
+     for (m.regions, 0..) |*r, li| r.* = .{ .m = m, .li = li };
++    // The stage profiler syncs inside the stretches, which a compiled graph cannot: `runRegion` runs them eager.
++    if (prof.on) return;
+     for (m.regions) |*r| inline for (comptime std.enums.values(Region)) |kind| {
+         const raw = mlx.mlx_closure_new_func_payload(&RegionBody(kind).call, @ptrCast(r), null);
+         defer _ = mlx.mlx_closure_free(raw);
+@@ -3980,8 +4028,17 @@
+     const in = mlx.mlx_vector_array_new_data(args.ptr, args.len);
+     defer _ = mlx.mlx_vector_array_free(in);
+     var res = mlx.mlx_vector_array_new();
+-    defer _ = mlx.mlx_vector_array_free(res);
+-    try mlx.check(mlx.mlx_closure_apply(&res, m.regions[li].fns[@backingInt(kind)], in));
++    defer if (res.ctx != null) {
++        _ = mlx.mlx_vector_array_free(res);
++    };
++    const r = &m.regions[li];
++    const f = r.fns[@backingInt(kind)];
++    // A stretch left uncompiled (`compileRegions`): its body, eager, sets `res` to its outputs.
++    if (f.ctx == null) {
++        _ = mlx.mlx_vector_array_free(res);
++        res = .{ .ctx = null };
++        try RegionBody(kind).run(r.m, li, &res, in);
++    } else try mlx.check(mlx.mlx_closure_apply(&res, f, in));
+     for (out, 0..) |*o, i| {
+         var x = mlx.mlx_array_new();
+         o.* = try sc.res(mlx.mlx_vector_array_get(&x, res, i), &x);
+@@ -4034,6 +4091,7 @@
+                     const sa: Split = .{ .pre = a[2], .post = a[3], .comb = a[4] };
+                     const pf = try hcExpandPreNorm(&sc, m, a[0], a[1], &sa, a[2], &ly.hc_ffn, ly.ffn_norm);
+                     const r = try route(&sc, m, ly, pf.h, none);
++                    try prof.mark(.router, &.{ r.idx, r.wts });
+                     res.* = mlx.mlx_vector_array_new_data(&.{ pf.x1, pf.sp.pre, pf.sp.post, pf.sp.comb, pf.h, r.idx, r.wts }, 7);
+                 },
+                 // `routed`'s gate and up rows and the weights -> the weighted activation
+@@ -4700,6 +4758,7 @@
+     const p = try sc.op1(mlx.mlx_exp, try sc.sub(logits, mx));
+     const denom = try sc.add(try sc.sum(p, -1, true), try sc.op1(mlx.mlx_exp, try sc.sub(ly.sink, mx)));
+     const o = try sc.astype(try sc.div(try sc.matmul(p, keys), denom), m.act);
++    try prof.mark(.attn_core, &.{o});
+     return attnOut(sc, m, ly, m.rope_plain.inv, o, pos);
+ }
+ pub const DsparkDraft = dsv4.DsparkDraft;
+@@ -4716,6 +4775,8 @@
+ }
+ /// `keep_logits` also copies the Markov-biased rows to the host.
+ fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
++    try prof.begin(m.s, .draft, m.ds_block, &.{});
++    defer prof.end();
+     var sc = Scope.init(gpa, m.s);
+     defer sc.deinit();
+     const c = &m.cfg;
+@@ -4729,14 +4790,17 @@
+     const emb = try m.embed.rows(&sc, try sc.ints(ids[0..B], &.{ci(B)}), m.act);
+     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(d) });
+     var pre = try onehotPre(&sc, m, B);
++    try prof.mark(.embed, &.{ x, pre });
+     const window = @min(c.sliding_window, n);
+     var dummy: Shared = .{};
+     for (0..m.n_mtp) |si| {
++        prof.layer();
+         const keys = try st.ds[si].read(&sc, n - window, n);
+         x = try block(&sc, m, st, m.n_layers + si, x, &pre, n, &dummy, keys);
+     }
+     const hout = try hcCollapse(&sc, x, pre);
+     const logits = try sc.astype(try m.head.apply(&sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
++    try prof.mark(.head, &.{logits});
+     var cur = try sc.ints(ids[0..1], &.{1});
+     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
+     var toks: [16]A = undefined;
+@@ -4773,6 +4837,7 @@
+             }
+         }
+     } else @memset(conf, 0);
++    try prof.mark(.markov, &.{});
+     const host_logits = try gpa.alloc(f32, if (keep_logits) B * m.vocab else 0);
+     if (keep_logits) @memcpy(host_logits, (mlx.mlx_array_data_float32(rows_all) orelse return error.NoData)[0 .. B * m.vocab]);
+     return .{ .ids = out_ids, .len = len, .logits = host_logits, .confidence = conf };

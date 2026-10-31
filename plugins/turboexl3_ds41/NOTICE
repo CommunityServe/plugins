@@ -1,5 +1,5 @@
 turboexl3_ds41 vendors third-party code below. Each copy is unchanged but for the edits scripts/sync-mlx-serve.sh makes,
-listed at its top (among them, the copies' blank lines are taken out), and those in patches/turboexl3.patch. It builds
+listed at its top (among them, the copies' blank lines are taken out), and those in patches/*.patch. It builds
 against the mlx-serve plugin kit and turboexl3 (build.zig.zon, by URL and hash).
 
 --------------------------------------------------------------------------------
@@ -13,8 +13,9 @@ at their mlx-serve paths, from the commit in MLX_SERVE_REF: the slices scripts/s
 DSpark round helpers the drafter runs) and scripts/slice-stream.txt (the expert streamer) name, with the Metal kernels
 and other files they embed and the read pool's C (sdk/weights/streamed/csrc/q3_lookahead4_exl3.c, q3_lookahead4.h).
 overlay/mlx_serve/ is copied over it: the files in the script's EDGES list, which are this plugin's own code at
-mlx-serve paths, not copies. patches/turboexl3.patch then edits the copies (the EXL3 arm and the drafter's switches);
-the patch is this plugin's.
+mlx-serve paths, not copies. patches/turboexl3.patch then edits the copies (the EXL3 arm and the drafter's switches),
+and the other patches/*.patch after it in name order (fixes, a diagnostic, the stage profiler's hooks); the patches are
+this plugin's.
 
 src/host_shims.zig stands in for mlx-serve's sdk/weights/streamed/csrc/mlx_event_shim.cpp, mlx_alloc_shim.cpp,
 mlx_launch_cache.inc and q3_event_shim.mm (their C symbols, over the server's host table); it is this plugin's code.

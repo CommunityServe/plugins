@@ -13,7 +13,8 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
 - src/mlx_serve (generated, not committed) is mlx-serve's own DeepSeek-V4.1 model (plugins/deepseek_v41), its vision
   tower, and mlx-serve's expert streamer (sdk/weights/streamed, module `mlx_stream`), at MLX_SERVE_REF.
   scripts/prepare.sh writes it with scripts/sync-mlx-serve.sh, copies overlay/mlx_serve over it and applies
-  patches/turboexl3.patch. A build refuses a tree whose hash is not scripts/mlx_serve.sha256.
+  patches/turboexl3.patch, then the other patches/*.patch in name order. A build refuses a tree whose hash is not
+  scripts/mlx_serve.sha256.
 - The patch is the EXL3 arm:
   - turboexl3 runs every trellis linear of the trunk, the LM head, the DSpark stages and the vision tower. `wo_a` runs
     as one grouped linear and the tower's biased linears through `linearBias`.
@@ -49,6 +50,13 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   - Each request's rounds are logged beside the engine's `[spec-stats]` (`dspark rounds:`, `dspark policy:` with the
     measured ladder in `ladder_ms`); each round's phases go to `[dspark-prof]` (diag `dspark-profile`).
 - `MLX_SERVE_DSV41_COMPILE=0` runs every decode stretch eager instead of compiled.
+- `MLX_SERVE_DSV41_STAGE_PROF=1` (src/stage_prof.zig, hooks in patches/turboexl3-stage-prof.patch) times each
+  forward by stage, a sync at each stage's end, and logs at each request's end one `[stage-prof]` line per kind and
+  rows (decode, verify by rows, prompt chunks by powers of two, the DSpark draft):
+  `verify rows=6 forwards= layers= wall_ms= attn_core=total_ms/calls/ms_per_call ...`, a call a layer's (a
+  forward's for `phase`, `embed`, `ds_commit`, `head`, `markov`). `=N` (N > 1) logs every N forwards as well. Synced
+  stages lose their overlap: the times attribute a forward, they are not its served speed. With it on, the decode
+  stretches run eager, the same ops on the same kernels, uncompiled; unset, nothing changes.
 
 ## The pack
 
@@ -61,4 +69,5 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
 ## Measured
 
 Nothing yet on the served pack. The copy rounds, the verify policy and its ladder have not run on a GPU; their choices
-are tested MLX-free (`zig build test`).
+are tested MLX-free (`zig build test`). The stage profiler has not run on a GPU either: its accounting and log lines are
+tested MLX-free, its hooks only built.

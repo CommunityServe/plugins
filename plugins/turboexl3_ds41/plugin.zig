@@ -22,6 +22,7 @@ const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
 const v4plugin = @import("src/mlx_serve/plugins/deepseek_v4/plugin.zig");
 const rounds = @import("src/rounds.zig");
+const stage_prof = @import("src/stage_prof.zig");
 const bill = @import("src/mlx_serve/plugins/deepseek_v41/bill.zig");
 const shims = @import("src/host_shims.zig");
 const t3kit = @import("turboexl3_kit");
@@ -89,6 +90,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // The streamed bank's slot rows fit within the host's ceiling, not only the device's working set.
     bill.host_ceiling = &shims.memoryCeiling;
     routed_t3.enabled = config.routedT3(env.span(.MLX_SERVE_DSV41_ROUTED));
+    // Before the model's load, which compiles its decode stretches only when the stage profiler is off.
+    stage_prof.configure(env.span(.MLX_SERVE_DSV41_STAGE_PROF));
     var own = ctx.*;
     own.weights = null;
     const mp = ds.table.load(&own, out) orelse return null;
@@ -103,6 +106,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (drafter) |*d| d.deinit();
     drafter = rounds.Drafter.init(gpa, on);
     log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on" else "off (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
+    if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     return mp;
 }
 
@@ -345,10 +349,12 @@ fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: ab
 
 var meter_buf: [1024]u8 = undefined;
 
-/// The request's DSpark rounds beside the engine's `[spec-stats]`, which counts every native round a stage round.
+/// The request's DSpark rounds beside the engine's `[spec-stats]`, which counts every native round a stage round; the
+/// stage profiler's lines (src/stage_prof.zig) when it is on.
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = mp;
     _ = slot;
+    stage_prof.requestEnd();
     const dr = if (drafter) |*d| d else {
         out.* = .{};
         return;

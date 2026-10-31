@@ -174,4 +174,5 @@ test "turboexl3_ds41 keeps its DSpark copy rounds and verify policy on unless th
 
 test {
     _ = @import("src/rounds.zig");
+    _ = @import("src/stage_prof.zig");
 }

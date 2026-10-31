@@ -20,9 +20,13 @@ if [ ! -f "$dst/.generated" ] || [ "$(cat "$dst/.generated")" != "$stamp" ]; the
   cp -R "$here/overlay/mlx_serve/." "$dst/"
   MLX_SERVE_KIT="${MLX_SERVE_KIT:-$root/.kit/kit}" OVERLAY="$here/overlay/mlx_serve" bash "$here/scripts/sync-mlx-serve.sh" "$src" >&2
   cp -R "$here/overlay/mlx_serve/." "$dst/"
-  # The edits to the copies (patches/*.patch, unified diffs against the generated tree), in name order.
-  for p in "$here"/patches/*.patch; do
+  # The edits to the copies (patches/*.patch, unified diffs against the generated tree): turboexl3.patch, the EXL3 arm,
+  # first, then the others in name order, each made against the tree the ones before it wrote (a bare glob puts
+  # turboexl3.patch after turboexl3-*.patch: '-' sorts before '.').
+  base="$here/patches/turboexl3.patch"
+  for p in "$base" "$here"/patches/*.patch; do
     [ -e "$p" ] || continue
+    if [ "$p" = "$base" ]; then [ -z "${base_done:-}" ] || continue; base_done=1; fi
     patch -s -N -p1 -d "$dst" -i "$p" || { echo "prepare: $(basename "$p") does not apply to the generated tree" >&2; exit 1; }
   done
   find "$dst" \( -name '*.orig' -o -name '*.rej' \) -delete
