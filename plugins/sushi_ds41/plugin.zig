@@ -213,8 +213,17 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         pf.* = dsv.Profile.init(verify_profile);
         m.mdl.profile = pf;
     }
-    if (std.c.getenv("SUSHI_DS41_PREFILL_PIPELINE")) |raw| m.mdl.pipe_depth = pipeSetting(raw);
-    log.info("[sushi_ds41] prefill pipeline: up to {d} prefill-width layers in flight{s}\n", .{ m.mdl.pipe_depth, if (m.mdl.pipe_depth == 0) " (off: every layer waits)" else "" });
+    if (std.c.getenv("SUSHI_DS41_PREFILL_PIPELINE")) |raw| {
+        const text = std.mem.span(raw);
+        if (pipeSetting(text)) |n| m.mdl.pipe_depth = n else log.warn("[sushi_ds41] SUSHI_DS41_PREFILL_PIPELINE=\"{s}\" is not a layer count: kept {d} (0 turns the pipeline off)\n", .{ text, m.mdl.pipe_depth });
+    }
+    // The profiles time each stage when it ends, so they turn the pipeline off (`pipeOn`) whatever the setting.
+    if (m.mdl.profile != null)
+        log.info("[sushi_ds41] prefill pipeline: off (a SUSHI_DSV41_*_PROFILE diagnostic waits on every layer)\n", .{})
+    else if (m.mdl.pipe_depth == 0)
+        log.info("[sushi_ds41] prefill pipeline: off (SUSHI_DS41_PREFILL_PIPELINE=0: every layer waits)\n", .{})
+    else
+        log.info("[sushi_ds41] prefill pipeline: up to {d} prefill-width layers in flight\n", .{m.mdl.pipe_depth});
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
     errdefer if (m.tower) |*t| t.deinit();
@@ -404,10 +413,11 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     return o;
 }
 
-/// The `SUSHI_DS41_PREFILL_PIPELINE` value: prefill layers in flight, capped at `pipe_measured`; 0 (or unparsable)
-/// turns the pipeline off.
-fn pipeSetting(raw: [*:0]const u8) usize {
-    const n = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return 0;
+/// The `SUSHI_DS41_PREFILL_PIPELINE` value: prefill layers in flight, capped at `pipe_measured`; only 0 turns the
+/// pipeline off. Null when it is no count (a typo, empty, "on"): the caller warns and keeps the default, so a bad value
+/// never turns a default-on feature off.
+fn pipeSetting(raw: []const u8) ?usize {
+    const n = std.fmt.parseInt(usize, raw, 10) catch return null;
     return @min(n, pipe_measured);
 }
 
@@ -460,13 +470,13 @@ test {
     _ = attn_nax;
 }
 
-test "sushi_ds41 prefill pipeline: SUSHI_DS41_PREFILL_PIPELINE parses to layers in flight, 0 or junk is off, capped" {
+test "sushi_ds41 prefill pipeline: SUSHI_DS41_PREFILL_PIPELINE parses to layers in flight, only 0 is off, junk keeps the default, capped" {
     const t = std.testing;
-    try t.expectEqual(@as(usize, 0), pipeSetting("0"));
-    try t.expectEqual(@as(usize, 0), pipeSetting("off"));
-    try t.expectEqual(@as(usize, 1), pipeSetting("1"));
-    try t.expectEqual(@as(usize, 2), pipeSetting("2"));
-    try t.expectEqual(@as(usize, pipe_measured), pipeSetting("99"));
+    try t.expectEqual(@as(?usize, 0), pipeSetting("0"));
+    try t.expectEqual(@as(?usize, 1), pipeSetting("1"));
+    try t.expectEqual(@as(?usize, 2), pipeSetting("2"));
+    try t.expectEqual(@as(?usize, pipe_measured), pipeSetting("99"));
+    for ([_][]const u8{ "", "on", "off", "two", "-1", " 2", "2x" }) |junk| try t.expectEqual(@as(?usize, null), pipeSetting(junk));
 }
 
 // ── prefix cache ──

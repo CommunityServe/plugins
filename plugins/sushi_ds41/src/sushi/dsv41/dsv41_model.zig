@@ -203,6 +203,9 @@ pub const Experts = union(enum) {
         prefetch: ?*const fn (ctx: *anyopaque, layer: usize, cand: []const u16, rows: usize, n: usize, m: usize) void = null,
         /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
         spec: ?Spec = null,
+        /// Whether every layer maps its picks to resident slots on the GPU right now, so no route writes a slab from
+        /// the host. Null: the hook may stream (`streamsExperts`).
+        all_resident: ?*const fn (ctx: *anyopaque) bool = null,
     };
 
     pub const Spec = struct {
@@ -2164,11 +2167,21 @@ pub const pipe_max = 8;
 ///
 /// Safe with a streamed (non-resident) expert layer too: its hook reads the layer's picks on the host before it
 /// writes any slab, and that read waits for the router, which needs the previous layer's routed output, so no queued
-/// layer still reads a slab being refilled. That ordering holds only while one pass runs at a time: interleaving two
-/// chunks' layers (a wavefront) under this pipeline would let a slab write race a queued reader of the other chunk.
+/// layer still reads a slab being refilled. That ordering holds only inside one pass: the next chunk's first picks do
+/// not wait for this chunk's last layers, so `extendState` drains before it returns when the experts stream
+/// (`streamsExperts`), and interleaving two chunks' layers (a wavefront) under this pipeline would let a slab write race
+/// a queued reader of the other chunk.
 fn pipeOn(m: *const Model, rows: usize) bool {
     comptime std.debug.assert(cfg_mod.ring_slack <= exl3.kernels.DECODE_ROWS_MAX);
     return m.pipe_depth > 0 and rows > exl3.kernels.DECODE_ROWS_MAX and !m.sync_layers and m.profile == null and m.trace == null;
+}
+
+/// Whether a route may write an expert slab from the host: a hook that does not say every layer is resident.
+fn streamsExperts(m: *const Model) bool {
+    return switch (m.experts) {
+        .resident => false,
+        .hook => |hk| if (hk.all_resident) |f| !f(hk.ctx) else true,
+    };
 }
 
 /// Queues a layer's arrays `ev` and tracks its output stream `x`; past `pipe_depth` layers in flight, waits for the
@@ -2193,8 +2206,12 @@ fn pipeWaitOldest(m: *Model) !void {
 }
 
 /// Waits for every pipelined layer and forgets them, then for everything else queued on the stream (the pass-begin
-/// and compressor submits the ring does not track). No-op when nothing is in flight. A failed wait still empties the
-/// queue.
+/// and compressor submits the ring does not track). A failed wait still empties the queue.
+///
+/// With no layer in flight it returns at once and skips that stream sync too, on purpose: decode and verify passes
+/// never pipeline and reach this on every step (`finishPass`, `resetState`), so they pay no sync for it. A pipelined
+/// pass keeps at least one layer in the ring until it is drained, so its untracked submits never sit on the stream
+/// behind an empty ring.
 pub fn pipeDrain(m: *Model) !void {
     if (m.pipe_n == 0) return;
     var first: ?anyerror = null;
@@ -3353,6 +3370,11 @@ fn cedCompress(sc: *Scope, m: *Model, p: *Pass, li: usize) !void {
 /// (`window` rows), and the next chunk's tail overwrites those rows before any query reads one: its band starts at its
 /// own first row (`cedReplay`). So the chunk runs the encoder layers and the split layer's compressor over every row,
 /// then stops: no decoder, no DSpark rows, no head. The prompt's state is the full pass's, bit for bit.
+///
+/// A pipelined chunk (`pipeOn`) returns with up to `pipe_depth` layers and the split layer's compressor still queued
+/// when the experts are resident: the next chunk keeps the GPU busy behind them. The caller drains (`pipeDrain`)
+/// before it reads the state (a restore point, a capture) or ends the prompt; `finishPass` and `resetState` drain too.
+/// With streamed experts it drains itself, so the next chunk's first slab refill waits for no queued reader.
 pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows, ahead: []const u32) !void {
     const split = m.ced_split orelse return error.Dsv41NoCedSplit;
     errdefer m.dropAhead();
@@ -3373,7 +3395,12 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(m.gpa);
     try appendStateArrays(m.gpa, &ev, &st.layers[split]);
-    try if (pipeOn(m, ids.len)) submitAll(ev.items) else evalAll(ev.items);
+    if (!pipeOn(m, ids.len)) {
+        try evalAll(ev.items);
+    } else {
+        try submitAll(ev.items);
+        if (streamsExperts(m)) try pipeDrain(m);
+    }
     reportEngramWait(m, ids.len);
     st.n = pass.p0 + ids.len;
     transient_peak.end(.prefill_chunk, ids.len);
