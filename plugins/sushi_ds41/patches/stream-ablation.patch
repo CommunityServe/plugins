@@ -1,5 +1,5 @@
 diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
-index 4bb3119..26b861d 100644
+index 4bb3119..71817ef 100644
 --- a/src/sushi/dsv41/dsv41_model.zig
 +++ b/src/sushi/dsv41/dsv41_model.zig
 @@ -556,6 +556,81 @@ pub const Trace = struct {
@@ -150,16 +150,17 @@ index 4bb3119..26b861d 100644
      const ex = try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(L), ci(hc), ci(c.dim) }));
      const x = sc.out(ex);
      errdefer _ = mlx.mlx_array_free(x);
-@@ -2996,7 +3087,7 @@ const Undo = struct {
+@@ -2996,7 +3087,8 @@ const Undo = struct {
  /// Whether layer `li` of the pass queues its routed chain from the stream's cache map.
  fn specOn(m: *const Model, p: *const Pass, li: usize) bool {
      if (!m.route_spec or m.sync_layers or p.ids.len > exl3.kernels.DECODE_ROWS_MAX or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
 -    if (m.trace != null or m.profile != null or p.tail != null or p.img.ctx != null) return false;
-+    if (m.trace != null or m.stream_tap != null or m.profile != null or p.tail != null or p.img.ctx != null) return false;
++    const tapping = if (m.stream_tap) |t| t.on else false;
++    if (m.trace != null or tapping or m.profile != null or p.tail != null or p.img.ctx != null) return false;
      const hk = switch (m.experts) {
          .resident => return false,
          .hook => |hk| hk,
-@@ -3070,7 +3161,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
+@@ -3070,7 +3162,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
      if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
      if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map\n", .{ spec_kept, spec_rebuilt });
      if (sum == null) return null;
@@ -168,7 +169,7 @@ index 4bb3119..26b861d 100644
  }
  
  /// Checks the pass's unresolved layer, if any, and takes its exact output where the queued chain missed.
-@@ -3124,6 +3215,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
+@@ -3124,6 +3216,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
      const L = p.ids.len;
      var sc = Scope.init(gpa, m.s);
      defer sc.deinit();
@@ -176,7 +177,7 @@ index 4bb3119..26b861d 100644
      if (prof(m, L)) |pf| {
          pf.restart();
          pf.decoder = if (m.ced_split) |split| li >= split else false;
-@@ -3178,6 +3270,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
+@@ -3178,6 +3271,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
      try appendStateArrays(gpa, &ev, &p.st.layers[li]);
      try appendVerifyArrays(gpa, &ev, p.st, li);
      if (m.trace) |t| try t.put("stream_{d}", .{li}, p.x);
@@ -184,7 +185,7 @@ index 4bb3119..26b861d 100644
      if (prof(m, L)) |pf| return pf.mark(.expand, ev.items);
      if (piped) return pipeSubmit(m, ev.items, p.x);
      if (wait) return evalAll(ev.items);
-@@ -3540,7 +3633,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
+@@ -3540,7 +3634,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
      for (in[0..B], 0..) |*v, k| v.* = @intCast(if (k == 0) t1 else c.dspark.noise_id);
      var in_ids: [cfg_mod.max_block]u32 = undefined;
      for (in_ids[0..B], in[0..B]) |*o, v| o.* = @intCast(v);

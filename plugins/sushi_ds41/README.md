@@ -74,7 +74,7 @@ simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2
   the graphs unchanged. The slice edit is `patches/stream-ablation.patch` (applied last).
 - Calibration tap: `SUSHI_DS41_TAP_DIR=<dir>` writes each prompt's stream (the mean of the hc copies entering every
   layer and leaving the last, for the prefix pass's last 4 rows and the last token) as `tap-<seq>.npy` (f32
-  `[layers + 1, rows, dim]`) plus a line in `index.jsonl`. Route speculation is off while it records.
+  `[layers + 1, rows, dim]`) plus a line in `index.jsonl`. Route speculation is off only for the passes it records.
 - Not supported: Thunderbolt pair, other quant formats, snapshot serialization (no SSD tier).
 
 `plugin check` needs a conformance fixture pack, which an STQ pack cannot provide small; the plugin is checked by serving.

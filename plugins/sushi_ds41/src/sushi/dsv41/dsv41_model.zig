@@ -3087,7 +3087,8 @@ const Undo = struct {
 /// Whether layer `li` of the pass queues its routed chain from the stream's cache map.
 fn specOn(m: *const Model, p: *const Pass, li: usize) bool {
     if (!m.route_spec or m.sync_layers or p.ids.len > exl3.kernels.DECODE_ROWS_MAX or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
-    if (m.trace != null or m.stream_tap != null or m.profile != null or p.tail != null or p.img.ctx != null) return false;
+    const tapping = if (m.stream_tap) |t| t.on else false;
+    if (m.trace != null or tapping or m.profile != null or p.tail != null or p.img.ctx != null) return false;
     const hk = switch (m.experts) {
         .resident => return false,
         .hook => |hk| hk,
