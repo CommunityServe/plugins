@@ -124,3 +124,65 @@ test "sushi_ds41 gpu: the stream tap keeps the hc mean of each pass's last rows 
     tap.clear();
     try testing.expectEqual(@as(usize, 0), tap.sites[0].items.len);
 }
+
+const tap_files = @import("tap.zig");
+
+/// One recorded pass of `layers + 1` sites, dumped into `dir` as request `seq`.
+fn dumpOne(sc: *Scope, dir: []const u8, seq: u64, ablated: bool) !void {
+    var tap = try dsv.StreamTap.init(testing.allocator, 2, 4);
+    defer tap.deinit();
+    tap.on = true;
+    const x = try randn(sc, &.{ 6, HC, D }, 51);
+    for (0..3) |site| try tap.record(sc, site, x);
+    try tap_files.dumpTap(testing.allocator, &tap, dir, seq, &.{ 1, 2, 3 }, ablated, sc.s);
+}
+
+fn modeOf(path: []const u8) !u32 {
+    const z = try testing.allocator.dupeSentinel(u8, path, 0);
+    defer testing.allocator.free(z);
+    var st: std.c.Stat = undefined;
+    if (std.c.stat(z, &st) != 0) return error.NoStat;
+    return @intCast(st.mode & 0o777);
+}
+
+test "sushi_ds41 gpu: a tap dump writes the npy and an index line with the ablated flag, and owner-only modes only for what it makes" {
+    try skipNoGpu();
+    var sc = Scope.init(testing.allocator, mlx.mlx_default_gpu_stream_new());
+    defer sc.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    // A directory the tap makes is the owner's only.
+    const made = try std.fs.path.join(testing.allocator, &.{ root, "made" });
+    defer testing.allocator.free(made);
+    try dumpOne(&sc, made, 0, true);
+    try testing.expectEqual(@as(u32, 0o700), try modeOf(made));
+    // An existing directory keeps the mode its owner gave it.
+    try tmp.dir.createDirPath(io, "mine");
+    const mine = try std.fs.path.join(testing.allocator, &.{ root, "mine" });
+    defer testing.allocator.free(mine);
+    const mine_z = try testing.allocator.dupeSentinel(u8, mine, 0);
+    defer testing.allocator.free(mine_z);
+    _ = std.c.chmod(mine_z, 0o755);
+    try dumpOne(&sc, mine, 4, false);
+    try testing.expectEqual(@as(u32, 0o755), try modeOf(mine));
+    var d = try tmp.dir.openDir(io, "made", .{});
+    defer d.close(io);
+    const index = try d.readFileAlloc(io, "index.jsonl", testing.allocator, .limited(4096));
+    defer testing.allocator.free(index);
+    try testing.expect(std.mem.indexOf(u8, index, "\"seq\":0,\"file\":\"tap-000000.npy\",\"ablated\":true") != null);
+    const npy = try std.fs.path.join(testing.allocator, &.{ made, "tap-000000.npy" });
+    defer testing.allocator.free(npy);
+    try testing.expectEqual(@as(u32, 0o600), try modeOf(npy));
+    const bytes = try d.readFileAlloc(io, "tap-000000.npy", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes[0..128], "'shape': (3, 4, 256)") != null);
+    var m = try tmp.dir.openDir(io, "mine", .{});
+    defer m.close(io);
+    const index2 = try m.readFileAlloc(io, "index.jsonl", testing.allocator, .limited(4096));
+    defer testing.allocator.free(index2);
+    try testing.expect(std.mem.indexOf(u8, index2, "\"ablated\":false") != null);
+    try testing.expectEqual(@as(u64, 5), tap_files.nextTapSeq(testing.allocator, mine));
+}

@@ -28,6 +28,7 @@ const index_nax = @import("src/index_nax.zig");
 const vision_key = @import("src/vision_key.zig");
 const copy_lookup = @import("src/copy_lookup.zig");
 const ablation = @import("src/ablation.zig");
+const tap_files = @import("src/tap.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -234,17 +235,17 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         tap.* = try dsv.StreamTap.init(gpa, c.layers, tap_rows);
         m.mdl.stream_tap = tap;
         m.tap_dir = std.mem.span(d);
-        m.tap_seq = ablation.nextTapSeq(gpa, m.tap_dir.?);
+        m.tap_seq = tap_files.nextTapSeq(gpa, m.tap_dir.?);
         log.warn("[sushi_ds41] calibration tap ON: every prompt's per-layer activations and last ids are written to {s} (owner-only files); unset SUSHI_DS41_TAP_DIR to stop\n", .{m.tap_dir.?});
     }
-    // The tower borrows its tensors from `m.weights`, which the model left them in.
-    if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
-    errdefer if (m.tower) |*t| t.deinit();
     errdefer if (m.mdl.stream_tap) |t| {
         t.deinit();
         gpa.destroy(t);
         m.mdl.stream_tap = null;
     };
+    // The tower borrows its tensors from `m.weights`, which the model left them in.
+    if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
+    errdefer if (m.tower) |*t| t.deinit();
     dsv.logMemory(m.mdl);
     m.experts = try gpa.create(dstream.StqStream);
     errdefer gpa.destroy(m.experts);
@@ -356,7 +357,7 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     // A host older than `Forward.progress` passes a shorter struct.
     const progress: ?*u64 = if (f.size >= @offsetOf(abi.Forward, "progress") + @sizeOf(?*u64)) f.progress else null;
     // The tap records prompt passes only, never a one-token decode forward.
-    const logits = run(m, host.ids, want, rows, progress, f.mode == .prefill) catch |e| {
+    const logits = run(m, host.ids, want, rows, progress, ablation.tapsMode(f.mode)) catch |e| {
         log.err("[sushi_ds41] forward failed: {s}\n", .{@errorName(e)});
         return Verdict.refuse(.failed, "sushi_ds41: the forward failed");
     };
@@ -458,7 +459,7 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     const logits = try forwardRows(m, ids[prefix..], want, &.{}, rows);
     defer _ = mlx.mlx_array_free(logits);
     if (tapping) {
-        ablation.dumpTap(gpa, m.mdl.stream_tap.?, m.tap_dir.?, m.tap_seq, m.ids.items, m.mdl.ablation != null, m.s) catch |e| log.err("[sushi_ds41] tap dump failed: {s}\n", .{@errorName(e)});
+        tap_files.dumpTap(gpa, m.mdl.stream_tap.?, m.tap_dir.?, m.tap_seq, m.ids.items, m.mdl.ablation != null, m.s) catch |e| log.err("[sushi_ds41] tap dump failed: {s}\n", .{@errorName(e)});
         m.tap_seq += 1;
     }
     var o = mlx.mlx_array_new();
@@ -524,6 +525,7 @@ test {
     _ = attn_nax;
     _ = @import("src/all_resident_test.zig");
     _ = ablation;
+    _ = tap_files;
 }
 
 test "sushi_ds41 prefill pipeline: SUSHI_DS41_PREFILL_PIPELINE parses to layers in flight, only 0 is off, junk keeps the default, capped" {
