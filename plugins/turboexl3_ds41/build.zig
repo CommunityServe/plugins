@@ -45,6 +45,16 @@ pub fn build(b: *std.Build) void {
     root.addImport("mlx_stream", stream);
     // turboexl3: its library and its plugin-kit launcher over this plugin's `sdk` for them.
     const dep = b.dependency("turboexl3", .{ .target = target, .optimize = optimize });
+    // ROUTED_ONE=check's exact reference (src/one_exact.zig) against turboexl3's own reference projection: its MLX-free
+    // src/format.zig as a module of its own, for a test in `zig build test` (the served build reaches it as `t3.format`).
+    const format = b.createModule(.{ .root_source_file = dep.path("src/format.zig"), .target = target, .optimize = optimize });
+    const exact = b.addTest(.{ .name = "one_exact", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/one_exact_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "turboexl3_format", .module = format }},
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(exact).step);
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/turboexl3_sdk.zig"),
         .target = target,

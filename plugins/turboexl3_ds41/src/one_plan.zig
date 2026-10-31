@@ -161,6 +161,33 @@ pub fn placedOnce(ids: []const u16, slot_of: []const u32, loc: []const i32, rows
     return placed == rows;
 }
 
+/// The f32 arrays `check` builds over a call's elements (rows x hidden): the difference, its magnitude, the reference's,
+/// the floor, the relative error, the lane's magnitude budget and what exceeds it, with room to spare.
+pub const check_arrays: u64 = 10;
+
+/// What a prompt call of `rows` rows of top-`k` holds on the GPU at most under `mode` (every array alive at once; MLX
+/// frees an intermediate once its last reader has run): the prefill bill's routed term with the switch on
+/// (plugins/deepseek_v41's `prefillBytes`, patches/turboexl3-wide-one.patch). `experts`: the slot bank's rows.
+/// - The one call, turboexl3's prefill chain at 128-row tiles (src/prefill.zig `moeT128`) over S = rows x k slots: per
+///   slot the route's order and prep's inv (u32); prep's gate and up rows (f16 [S, hidden] each) and their block sums
+///   (f32 [S, hidden / 128] each); both gate|up launches' outputs (f16 [S, inter] per op and launch); mid's down rows (f16
+///   [S, inter]) and block sums (f32 [S, inter / 128]); both down launches' outputs (f16 [S, hidden] each); this call's
+///   slots, scores and weight mask (u32, f32, f32). Per row its f32 input and its f32 sum; the route's tile tables.
+/// - With streamed experts (`on`, `check`): their wave outputs (bf16 [S / 2, hidden] at most: `takes` runs a mixed call
+///   only when the residents hold half its pairs), their placements and weights (i32 and f32 per pair), the combine's
+///   f32 sum.
+/// - `check`: the lane's rows beside the one call's (its bf16 join and take, their f32 cast, the weighted product and
+///   the magnitudes, f32 [S, hidden] but the bf16 two), and `check_arrays` f32 arrays over the call's elements.
+pub fn callBytes(mode: Mode, rows: u64, k: u64, hidden: u64, inter: u64, experts: u64) u64 {
+    if (mode == .off) return 0;
+    const s = rows * k;
+    const per_slot = 2 * 4 + 2 * 2 * hidden + 2 * 4 * (hidden / 128) + 2 * 2 * 2 * inter + 2 * inter + 4 * (inter / 128) + 2 * 2 * hidden + 3 * 4;
+    var b = s * per_slot + rows * hidden * 2 * 4 + (s / 32 + 4 * experts) * 16 + 4 * experts;
+    if (mode != .resident) b += (s / 2) * hidden * 2 + s * 2 * 4 + rows * hidden * 4;
+    if (mode == .check) b += s * hidden * (2 + 2 + 4 + 4 + 4) + rows * hidden * 4 * check_arrays;
+    return b;
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -270,4 +297,29 @@ test "routed one: the streamed pairs' rows in the combine's source are each plac
     var resident_placed = loc;
     resident_placed[0] = 2;
     try testing.expect(!placedOnce(&ids, &slot_of, &resident_placed, 3, &seen));
+}
+
+test "routed one: the bill's term holds every array of the one call at a 16K-row prompt call, and nothing with the switch off" {
+    const rows: u64 = 16384;
+    const k: u64 = 6;
+    const hidden: u64 = 5120;
+    const inter: u64 = 2304;
+    const s = rows * k;
+    // turboexl3's moeT128, array by array (src/prefill.zig), and this path's inputs
+    const route = s * 4 + (s / 32 + 4 * 384) * 16 + 4 * 384; // order u32 [S]; tiles, tiles128 int32 [., 4]; xbase
+    const prep = 2 * s * hidden * 2 + s * 4 + 2 * s * (hidden / 128) * 4; // xg, xu f16; inv u32; xsg, xsu f32
+    const gate_up = 2 * 2 * s * inter * 2; // gate and up, the mixed and the 128-row launch's, f16 [S, inter]
+    const mid = s * inter * 2 + s * (inter / 128) * 4; // xd f16; xsd f32
+    const down = 2 * s * hidden * 2; // the mixed and the 128-row launch's, f16 [S, hidden]
+    const call = 3 * s * 4 + rows * hidden * 4 + rows * hidden * 4; // slots, scores, mask; the f32 input; the f32 sum
+    const one = route + prep + gate_up + mid + down + call;
+    try testing.expectEqual(one, callBytes(.resident, rows, k, hidden, inter, 384));
+    // about 7.0 GB at 16K rows: the bill's routed term before it was 1.18 GB (8192 rows x 6 pairs x (3 x 2304 + 5120) x 2)
+    try testing.expect(one > 6_900_000_000 and one < 7_100_000_000);
+    const mixed = one + (s / 2) * hidden * 2 + s * 8 + rows * hidden * 4;
+    try testing.expectEqual(mixed, callBytes(.on, rows, k, hidden, inter, 384));
+    try testing.expectEqual(mixed + s * hidden * 16 + rows * hidden * 4 * check_arrays, callBytes(.check, rows, k, hidden, inter, 384));
+    try testing.expectEqual(@as(u64, 0), callBytes(.off, rows, k, hidden, inter, 384));
+    // a call of more rows holds more
+    try testing.expect(callBytes(.on, rows / 2, k, hidden, inter, 384) < callBytes(.on, rows, k, hidden, inter, 384));
 }

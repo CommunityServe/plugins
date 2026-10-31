@@ -35,8 +35,18 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   - `resident`: only the calls whose experts are all resident.
   - `check`: both ways on every call `1` takes, the lane's sum served; one `[routed-one] check` line a call against
     turboexl3's bar for two summation orders (the difference's rms within 2^-8 of the reference's, its largest within
-    8e-2 of it). The sums agree within rounding (another GEMM order, f16 inner products), not bit for bit.
+    8e-2 of it). The sums agree within rounding (another GEMM order, f16 inner products), not bit for bit. The line
+    also gives where the largest difference is (row, column, both values, the row's experts and weights), the largest
+    reference element, the element-wise relative error (floored at the reference's rms) and how many elements pass
+    1e-2 of it, and the largest difference beyond what the lane's bf16 pair rows may move an element (2^-8 of
+    sum_j |w_j| |row_j|: `rounded=`). A call of 1024 rows or more is also compared to the exact sum on up to 8 rows:
+    each row's experts in f64 from the base bank's own bytes (src/one_exact.zig, held to turboexl3's reference
+    projection by src/one_exact_test.zig), against both paths' rows and each of the lane's pair rows (`[routed-one]
+    exact` lines).
   - `[routed-one]` at each request's end counts the calls by path.
+  - The prefill bill's routed term (plugins/deepseek_v41's `prefillBytes`) is, with the switch on, the one call's
+    working set where that is more (src/one_plan.zig `callBytes`, every array alive at once: about 7.0 GB for a
+    16K-row call with every expert resident, 7.8 GB with streamed experts, 19 GB under `check`).
 - The streamer's MLX shims (events, uninitialized buffers, the launch cache, the read pool's Metal signal) are the
   plugin's own, over the server's host table (src/host_shims.zig). The read pool is the streamer's C, compiled here.
 - The DSpark stages draft as the model's native drafter (plugin.zig), greedy or under the engine's sampling, with the

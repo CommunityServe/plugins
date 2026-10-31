@@ -29,6 +29,7 @@ const mlx = @import("mlx_serve").mlx;
 const t3 = @import("turboexl3");
 const log = @import("mlx_serve/sdk/util/log.zig");
 const plan = @import("one_plan.zig");
+const exact = @import("one_exact.zig");
 
 /// Set at load from `MLX_SERVE_DSV41_ROUTED_ONE` (`one_plan.modeOf`), before the bank opens.
 pub var mode: plan.Mode = .off;
@@ -55,8 +56,20 @@ pub const Stats = struct {
     masked: u64 = 0,
     checks: u64 = 0,
     check_fail: u64 = 0,
+    /// Checks over the bar beyond the lane's bf16 stores (`Gpu.beyond`).
+    rounded_fail: u64 = 0,
     worst_ratio: f64 = 0,
     worst_rms_diff: f64 = 0,
+    worst_rel: f64 = 0,
+    worst_beyond: f64 = 0,
+    /// Calls compared to the exact sum, and each path's worst error there (relative to the element, to its budget), and
+    /// the lane's pair rows' worst.
+    exact_calls: u64 = 0,
+    exact_one_rel: f64 = 0,
+    exact_lane_rel: f64 = 0,
+    exact_one_mag: f64 = 0,
+    exact_lane_mag: f64 = 0,
+    exact_lane_pairs: f64 = 0,
 };
 
 /// The source's state for the path: the pack's SwiGLU clamp, the combine kernel, the host scratch, the counters.
@@ -139,8 +152,11 @@ pub fn rows(st: *State, a: std.mem.Allocator, g: anytype, h: anytype, layer: u32
     if (mode != .check) return g.keep(y);
     // The one call's rows are no longer held: the lane's loads may take them, so its sum is evaluated first.
     try g.evalAll(&.{y});
-    const ref = try laneSum(g, h, layer, x, ids, wts);
-    try check(st, g, layer, n, k, sp, y, ref);
+    // The lane's sum as `Source.rows` makes it: its rows [n, k, hidden], weighted, summed over k in f32.
+    const lane32 = try g.astype(try h.at(layer).routed(g, x, ids), .float32);
+    const w32 = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
+    const ref = try g.sum(try g.mul(lane32, try g.expandDims(w32, -1)), -2, false);
+    try check(st, a, g, h, layer, x, w32, y, ref, lane32, n, k, sp, base);
     return g.keep(ref);
 }
 
@@ -370,33 +386,333 @@ fn viewU16(g: anytype, code: mlx.mlx_array) !mlx.mlx_array {
     return g.adopt(v);
 }
 
-/// The wide lane's routed sum of the call, as `Source.rows` makes it: the lane's rows [n, k, hidden], weighted, summed
-/// over k in f32.
-fn laneSum(g: anytype, h: anytype, layer: u32, x: mlx.mlx_array, ids: mlx.mlx_array, wts: mlx.mlx_array) !mlx.mlx_array {
-    const ro = try h.at(layer).routed(g, x, ids);
-    const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
-    return g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false);
+/// The lane's per-pair rows are stored in bf16 (`routeExpertBf16`: the DIG-X waves write bf16): each moves by at most half
+/// a unit in its last place, 2^-8 of its value.
+const bf16_half_ulp: f64 = 1.0 / 256.0;
+/// `check` also compares a call of this many rows or more to the exact sum, on at most `exact_rows` sampled rows.
+const exact_min_rows = 1024;
+const exact_rows = 8;
+const Exact = exact.Exact(t3.format);
+
+/// `check`'s comparison on the GPU, f32, over the call's n x hidden elements, d = one - lane.
+const Gpu = struct {
+    max_abs: f64,
+    rms_ref: f64,
+    /// rms(d) / rms(lane)
+    rms_diff: f64,
+    max_ref: f64,
+    /// max |d| / max(|lane|, rms_ref): the element-wise relative error, floored at the reference's rms
+    max_rel: f64,
+    /// max(|d| - 2^-8 sum_j |w_j| |lane row_j|): the difference beyond the lane's bf16 stores
+    beyond: f64,
+    /// at the largest |d|: the lane's value, the one path's, and the lane's budget sum_j |w_j| |row_j|
+    ref_at: f64,
+    one_at: f64,
+    mag_at: f64,
+    /// flat indices of the largest |d|, |lane|, relative error and excess, and the elements past 1e-2 relative
+    at_abs: usize,
+    at_ref: usize,
+    at_rel: usize,
+    at_beyond: usize,
+    over: u32,
+};
+
+fn gpuCompare(g: anytype, y: mlx.mlx_array, ref: mlx.mlx_array, lane32: mlx.mlx_array, w32: mlx.mlx_array) !Gpu {
+    const total: c_int = @intCast(mlx.mlx_array_size(ref));
+    const yf = try g.reshape(y, &.{total});
+    const rf = try g.reshape(ref, &.{total});
+    const d = try g.sub(yf, rf);
+    const ad = try g.abs(d);
+    const ar = try g.abs(rf);
+    const ms_d = try g.mean(try g.square(d), 0, false);
+    const ms_r = try g.mean(try g.square(rf), 0, false);
+    const rel = try g.div(ad, try g.maximum(ar, try g.sqrt(ms_r)));
+    const mag = try g.reshape(try g.sum(try g.mul(try g.abs(lane32), try g.abs(try g.expandDims(w32, -1))), -2, false), &.{total});
+    const beyond = try g.sub(ad, try g.mul(mag, try g.scalar(bf16_half_ulp, .float32)));
+    const i_abs = try g.argmax(ad, 0);
+    const i_ref = try g.argmax(ar, 0);
+    const i_rel = try g.argmax(rel, 0);
+    const i_beyond = try g.argmax(beyond, 0);
+    const over = try g.astype(try g.sum(try g.astype(try g.greater(rel, try g.scalar(1e-2, .float32)), .uint32), 0, false), .uint32);
+    var v: [9]f32 = undefined;
+    _ = try g.hostF32(try g.stack(&.{ try g.max(ad, 0, false), ms_d, ms_r, try g.max(ar, 0, false), try g.max(rel, 0, false), try g.max(beyond, 0, false), try g.take(rf, i_abs, 0), try g.take(yf, i_abs, 0), try g.take(mag, i_abs, 0) }, 0), &v);
+    var ix: [5]u32 = undefined;
+    _ = try g.hostU32(try g.stack(&.{ i_abs, i_ref, i_rel, i_beyond, over }, 0), &ix);
+    const rms_ref = @sqrt(@as(f64, v[2]));
+    return .{
+        .max_abs = v[0],
+        .rms_ref = rms_ref,
+        .rms_diff = @sqrt(@as(f64, v[1])) / floorOf(rms_ref),
+        .max_ref = v[3],
+        .max_rel = v[4],
+        .beyond = v[5],
+        .ref_at = v[6],
+        .one_at = v[7],
+        .mag_at = v[8],
+        .at_abs = ix[0],
+        .at_ref = ix[1],
+        .at_rel = ix[2],
+        .at_beyond = ix[3],
+        .over = ix[4],
+    };
 }
 
-/// `check`: the one path's sum `y` against the lane's `ref`, logged.
-fn check(st: *State, g: anytype, layer: u32, n: usize, k: usize, sp: plan.Split, y: mlx.mlx_array, ref: mlx.mlx_array) !void {
-    const total: c_int = @intCast(mlx.mlx_array_size(ref));
-    const d = try g.reshape(try g.sub(y, ref), &.{total});
-    const r = try g.reshape(ref, &.{total});
-    const v = try g.stack(&.{ try g.max(try g.abs(d), 0, false), try g.mean(try g.square(d), 0, false), try g.mean(try g.square(r), 0, false) }, 0);
-    var out: [3]f32 = undefined;
-    _ = try g.hostF32(v, &out);
-    const rms_ref = @sqrt(@as(f64, out[2]));
-    const ratio = if (rms_ref > 0) @as(f64, out[0]) / rms_ref else @as(f64, out[0]);
-    const rms_diff = if (rms_ref > 0) @sqrt(@as(f64, out[1])) / rms_ref else @sqrt(@as(f64, out[1]));
-    const ok = rms_diff <= bar_rms_diff and ratio <= bar_ratio;
+fn floorOf(rms: f64) f64 {
+    return if (rms > 0) rms else 1;
+}
+
+/// `check`: the one path's sum `y` against the lane's `ref` (from its rows `lane32` [n, k, hidden] f32 and the weights
+/// `w32` [n, k] f32), logged with where the largest difference is and what the lane's bf16 stores allow there; a call of
+/// `exact_min_rows` rows or more is also compared to the exact sum on sampled rows (`exactSample`).
+fn check(st: *State, a: std.mem.Allocator, g: anytype, h: anytype, layer: u32, x: mlx.mlx_array, w32: mlx.mlx_array, y: mlx.mlx_array, ref: mlx.mlx_array, lane32: mlx.mlx_array, n: usize, k: usize, sp: plan.Split, base: anytype) !void {
+    const hidden: usize = @intCast(h.hidden);
+    // The row's weights and the exact sample take a top-k of at most 16 (DeepSeek-V4.1's is 6).
+    if (k > 16) return error.RoutedOneCheckTopK;
+    const c = try gpuCompare(g, y, ref, lane32, w32);
+    const fl = floorOf(c.rms_ref);
+    const ratio = c.max_abs / fl;
+    const beyond = c.beyond / fl;
+    const ok = c.rms_diff <= bar_rms_diff and ratio <= bar_ratio;
+    const ok_rounded = c.rms_diff <= bar_rms_diff and beyond <= bar_ratio;
     st.stats.checks += 1;
     if (!ok) st.stats.check_fail += 1;
-    // NaN compares false: a NaN check is a failure, and worst stays the last finite one.
+    if (!ok_rounded) st.stats.rounded_fail += 1;
+    // NaN compares false: a NaN check is a failure, and each worst stays the last finite one.
     if (ratio > st.stats.worst_ratio) st.stats.worst_ratio = ratio;
-    if (rms_diff > st.stats.worst_rms_diff) st.stats.worst_rms_diff = rms_diff;
-    log.info("[routed-one] check layer={d} rows={d} pairs={d} resident_pairs={d} experts={d}/{d} max_abs={e:.3} rms_ref={e:.3} ratio={e:.3} rms_diff={e:.3} bar={e:.1}/{e:.1} {s}\n", .{ layer, n, n * k, sp.resident_pairs, sp.n_resident, sp.distinct.len, out[0], rms_ref, ratio, rms_diff, bar_rms_diff, bar_ratio, if (ok) "PASS" else "FAIL" });
+    if (c.rms_diff > st.stats.worst_rms_diff) st.stats.worst_rms_diff = c.rms_diff;
+    if (c.max_rel > st.stats.worst_rel) st.stats.worst_rel = c.max_rel;
+    if (beyond > st.stats.worst_beyond) st.stats.worst_beyond = beyond;
+    // The largest difference's row (its position in the call) and column, and the row's experts and weights.
+    const row = c.at_abs / hidden;
+    var wv: [16]f32 = undefined;
+    const sel = try g.hostArray(std.mem.sliceAsBytes(&[_]u32{@intCast(row)}), &.{1}, .uint32);
+    const wrow = try g.hostF32(try g.take(w32, sel, 0), wv[0..k]);
+    var eb: [256]u8 = undefined;
+    var ew = std.Io.Writer.fixed(&eb);
+    for (st.ids.items[row * k ..][0..k], wrow) |e, w| ew.print("{d}:{d:.4},", .{ e, w }) catch {};
+    log.info("[routed-one] check layer={d} rows={d} pairs={d} resident_pairs={d} experts={d}/{d} max_abs={e:.3} at={d}:{d} ref={e:.4} one={e:.4} mag={e:.4} row_experts={s} max_ref={e:.3} max_ref_row={d} rms_ref={e:.3} ratio={e:.3} rms_diff={e:.3} max_rel={e:.3} max_rel_at={d}:{d} over_1e-2={d} beyond_bf16={e:.3} beyond_at={d}:{d} bar={e:.1}/{e:.1} {s} rounded={s}\n", .{
+        layer,                       n,                           n * k,          sp.resident_pairs, sp.n_resident,  sp.distinct.len, c.max_abs, row, c.at_abs % hidden, c.ref_at, c.one_at, c.mag_at, ew.buffered(),
+        c.max_ref,                   c.at_ref / hidden,           c.rms_ref,      ratio,             c.rms_diff,     c.max_rel,       c.at_rel / hidden, c.at_rel % hidden, c.over, beyond, c.at_beyond / hidden, c.at_beyond % hidden,
+        bar_rms_diff,                bar_ratio,                   if (ok) "PASS" else "FAIL", if (ok_rounded) "PASS" else "FAIL",
+    });
+    if (n >= exact_min_rows) try exactSample(st, a, g, h, layer, x, w32, y, ref, lane32, n, k, c, base);
 }
+
+/// One projection of a slot bank on the host: its code (u16 halfwords [rows, in/16, out/16, n]), rin (suh) and rout (svh)
+/// f16 bits, read in place from the stream's unified-memory arrays.
+const HostProj = struct {
+    code: []const u16,
+    rin: []const u16,
+    rout: []const u16,
+    in: usize,
+    out: usize,
+    rate: t3.format.Rate,
+    stride: usize,
+
+    fn of(p: anytype) !HostProj {
+        const sh = mlx.getShape(p.code);
+        if (sh.len != 4) return error.RoutedOneExactShape;
+        const in: usize = @intCast(sh[1] * 16);
+        const out: usize = @intCast(sh[2] * 16);
+        const rate = t3.format.Rate.fromN(@intCast(sh[3])) orelse return error.RoutedOneExactRate;
+        return .{ .code = try hostU16(p.code), .rin = try hostU16(p.rin), .rout = try hostU16(p.rout), .in = in, .out = out, .rate = rate, .stride = (in / 16) * (out / 16) * rate.halfwords() };
+    }
+
+    fn slot(p: HostProj, s: usize) struct { code: []const u16, suh: []const u16, svh: []const u16 } {
+        return .{ .code = p.code[s * p.stride ..][0..p.stride], .suh = p.rin[s * p.in ..][0..p.in], .svh = p.rout[s * p.out ..][0..p.out] };
+    }
+};
+
+fn hostU16(arr: mlx.mlx_array) ![]const u16 {
+    const p = mlx.mlx_array_data_uint8(arr) orelse return error.RoutedOneExactNoData;
+    const words: [*]const u16 = @ptrCast(@alignCast(p));
+    return words[0..mlx.mlx_array_size(arr)];
+}
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// `check`'s exact comparison: up to `exact_rows` rows of the call (the largest difference's, the largest relative
+/// error's, the largest excess's and the largest reference element's rows, the first two, the middle and the last), each
+/// row's routed experts through `one_exact` in f64 from the base bank's own bytes (a row whose experts are not all at
+/// the slots the one call read is skipped), against the one path's row, the lane's, and each of the lane's pair rows.
+fn exactSample(st: *State, a: std.mem.Allocator, g: anytype, h: anytype, layer: u32, x: mlx.mlx_array, w32: mlx.mlx_array, y: mlx.mlx_array, ref: mlx.mlx_array, lane32: mlx.mlx_array, n: usize, k: usize, c: Gpu, base: anytype) !void {
+    const t0 = nowNs();
+    const hidden: usize = @intCast(h.hidden);
+    const policy = &h.source.stream.layers[layer].policy;
+    const cand = [_]usize{ c.at_abs / hidden, c.at_rel / hidden, c.at_beyond / hidden, c.at_ref / hidden, 0, 1, n / 2, n - 1 };
+    var sample: [exact_rows]u32 = undefined;
+    var nr: usize = 0;
+    var skipped: usize = 0;
+    next: for (cand) |r| {
+        if (nr == exact_rows) break;
+        for (sample[0..nr]) |q| if (q == r) continue :next;
+        for (st.ids.items[r * k ..][0..k]) |e| {
+            const s = st.slot_of.items[e];
+            const cur = policy.slotOf(e) orelse plan.no_slot;
+            if (s == plan.no_slot or cur != s) {
+                skipped += 1;
+                continue :next;
+            }
+        }
+        sample[nr] = @intCast(r);
+        nr += 1;
+    }
+    if (nr == 0) {
+        log.info("[routed-one] exact layer={d} no sampled row has all its experts at the one call's slots (skipped={d})\n", .{ layer, skipped });
+        return;
+    }
+    const gate = try HostProj.of(base.gate);
+    const up = try HostProj.of(base.up);
+    const down = try HostProj.of(base.down);
+    const inter = gate.out;
+    if (gate.in != hidden or up.out != inter or down.in != inter or down.out != hidden) return error.RoutedOneExactShape;
+    // The sampled rows as the GPU paths hold them: the bf16 input, the weights, the one path's and the lane's sums, the
+    // lane's pair rows.
+    const sel = try g.hostArray(std.mem.sliceAsBytes(sample[0..nr]), &.{@intCast(nr)}, .uint32);
+    const xb = if (g.dtypeOf(x) == .bfloat16) x else try g.astype(x, .bfloat16);
+    const buf = try a.alloc(f32, nr * (3 * hidden + k + k * hidden));
+    defer a.free(buf);
+    const hx = buf[0 .. nr * hidden];
+    const hy = buf[nr * hidden ..][0 .. nr * hidden];
+    const hr = buf[2 * nr * hidden ..][0 .. nr * hidden];
+    const hw = buf[3 * nr * hidden ..][0 .. nr * k];
+    const hl = buf[3 * nr * hidden + nr * k ..][0 .. nr * k * hidden];
+    _ = try g.hostF32(try g.astype(try g.take(xb, sel, 0), .float32), hx);
+    _ = try g.hostF32(try g.take(y, sel, 0), hy);
+    _ = try g.hostF32(try g.take(ref, sel, 0), hr);
+    _ = try g.hostF32(try g.take(w32, sel, 0), hw);
+    _ = try g.hostF32(try g.take(lane32, sel, 0), hl);
+    // Each pair's exact row, the pairs of one expert through its decode together.
+    const np = nr * k;
+    const wide = @max(hidden, inter);
+    const f = try a.alloc(f64, nr * hidden + np * hidden + np * (wide + 3 * inter));
+    defer a.free(f);
+    const x64 = f[0 .. nr * hidden];
+    const d64 = f[nr * hidden ..][0 .. np * hidden];
+    const scratch = f[nr * hidden + np * hidden ..];
+    for (hx, x64) |v, *o| o.* = v;
+    const ex = Exact.init();
+    const limit: f64 = @floatFromInt(st.limit);
+    var done: [exact_rows * 16]bool = @splat(false);
+    var experts: usize = 0;
+    for (0..np) |p0| if (!done[p0]) {
+        const e = st.ids.items[@as(usize, sample[p0 / k]) * k + p0 % k];
+        var users: [exact_rows * 16]usize = undefined;
+        var nu: usize = 0;
+        for (p0..np) |p| if (!done[p] and st.ids.items[@as(usize, sample[p / k]) * k + p % k] == e) {
+            users[nu] = p;
+            nu += 1;
+            done[p] = true;
+        };
+        experts += 1;
+        var xs: [exact_rows * 16][]const f64 = undefined;
+        var ts: [exact_rows * 16][]f64 = undefined;
+        var gs: [exact_rows * 16][]f64 = undefined;
+        var us: [exact_rows * 16][]f64 = undefined;
+        var td: [exact_rows * 16][]f64 = undefined;
+        var ds: [exact_rows * 16][]f64 = undefined;
+        for (users[0..nu], 0..) |p, u| {
+            const sc = scratch[u * (wide + 3 * inter) ..][0 .. wide + 3 * inter];
+            xs[u] = x64[(p / k) * hidden ..][0..hidden];
+            ts[u] = sc[0..wide];
+            gs[u] = sc[wide..][0..inter];
+            us[u] = sc[wide + inter ..][0..inter];
+            td[u] = sc[wide + 2 * inter ..][0..inter];
+            ds[u] = d64[p * hidden ..][0..hidden];
+        }
+        const s = st.slot_of.items[e];
+        const sg = gate.slot(s);
+        const su = up.slot(s);
+        const sd = down.slot(s);
+        ex.project(sg.code, sg.suh, sg.svh, hidden, inter, gate.rate, xs[0..nu], ts[0..nu], gs[0..nu]);
+        ex.project(su.code, su.suh, su.svh, hidden, inter, up.rate, xs[0..nu], ts[0..nu], us[0..nu]);
+        var hs: [exact_rows * 16][]const f64 = undefined;
+        for (gs[0..nu], us[0..nu], 0..) |gv, uv, u| {
+            for (gv, uv) |*o, uu| o.* = exact.swigluClamped(o.*, uu, limit);
+            hs[u] = gv;
+        }
+        ex.project(sd.code, sd.suh, sd.svh, inter, hidden, down.rate, hs[0..nu], td[0..nu], ds[0..nu]);
+    };
+    // Per sampled row: the exact sum and its budget sum_j |w_j| |pair_j|, each path's error against it.
+    const fl = floorOf(c.rms_ref);
+    var worst: Worst = .{};
+    for (0..nr) |ri| {
+        var e1: Err = .{};
+        var e2: Err = .{};
+        var pair_rel: f64 = 0;
+        var max_y: f64 = 0;
+        var ss_y: f64 = 0;
+        for (0..k) |j| {
+            const dj = d64[(ri * k + j) * hidden ..][0..hidden];
+            var ssj: f64 = 0;
+            for (dj) |v| ssj += v * v;
+            const rms_j = floorOf(@sqrt(ssj / @as(f64, @floatFromInt(hidden))));
+            for (dj, hl[(ri * k + j) * hidden ..][0..hidden]) |v, l| pair_rel = @max(pair_rel, @abs(@as(f64, l) - v) / @max(@abs(v), rms_j));
+        }
+        for (0..hidden) |col| {
+            var sum: f64 = 0;
+            var mag: f64 = 0;
+            for (0..k) |j| {
+                const w: f64 = hw[ri * k + j];
+                const v = d64[(ri * k + j) * hidden + col];
+                sum += w * v;
+                mag += @abs(w) * @abs(v);
+            }
+            max_y = @max(max_y, @abs(sum));
+            ss_y += sum * sum;
+            e1.add(hy[ri * hidden + col], sum, mag, fl);
+            e2.add(hr[ri * hidden + col], sum, mag, fl);
+            if (sample[ri] == c.at_abs / hidden and col == c.at_abs % hidden) worst = .{ .ri = ri, .col = col, .exact = sum, .mag = mag };
+        }
+        const hf: f64 = @floatFromInt(hidden);
+        log.info("[routed-one] exact layer={d} row={d} max_exact={e:.4} rms_row={e:.3} one: max_abs={e:.3} rel={e:.3} vs_mag={e:.3} rms={e:.3} lane: max_abs={e:.3} rel={e:.3} vs_mag={e:.3} rms={e:.3} lane_pairs_rel={e:.3}\n", .{
+            layer, sample[ri], max_y, @sqrt(ss_y / hf), e1.max_abs, e1.rel, e1.vs_mag, @sqrt(e1.ss / hf) / fl, e2.max_abs, e2.rel, e2.vs_mag, @sqrt(e2.ss / hf) / fl, pair_rel,
+        });
+        st.stats.exact_one_rel = @max(st.stats.exact_one_rel, e1.rel);
+        st.stats.exact_lane_rel = @max(st.stats.exact_lane_rel, e2.rel);
+        st.stats.exact_one_mag = @max(st.stats.exact_one_mag, e1.vs_mag);
+        st.stats.exact_lane_mag = @max(st.stats.exact_lane_mag, e2.vs_mag);
+        st.stats.exact_lane_pairs = @max(st.stats.exact_lane_pairs, pair_rel);
+    }
+    st.stats.exact_calls += 1;
+    if (worst.ri) |ri| {
+        const row = sample[ri];
+        var pb: [1024]u8 = undefined;
+        var pw = std.Io.Writer.fixed(&pb);
+        for (0..k) |j| {
+            const e = st.ids.items[@as(usize, row) * k + j];
+            pw.print(" e={d}/slot={d}/w={d:.4}/exact={e:.5}/lane={e:.5}", .{ e, st.slot_of.items[e], hw[ri * k + j], d64[(ri * k + j) * hidden + worst.col], hl[(ri * k + j) * hidden + worst.col] }) catch {};
+        }
+        const one_v: f64 = hy[ri * hidden + worst.col];
+        const lane_v: f64 = hr[ri * hidden + worst.col];
+        log.info("[routed-one] exact worst layer={d} row={d} col={d} exact={e:.5} one={e:.5} lane={e:.5} one-exact={e:.3} lane-exact={e:.3} mag={e:.4} pairs:{s}\n", .{ layer, row, worst.col, worst.exact, one_v, lane_v, one_v - worst.exact, lane_v - worst.exact, worst.mag, pw.buffered() });
+    }
+    log.info("[routed-one] exact layer={d} rows={d} skipped={d} experts={d} ms={d}\n", .{ layer, nr, skipped, experts, (nowNs() - t0) / std.time.ns_per_ms });
+}
+
+/// A path's error against the exact sum over a row: the largest, relative to the element (floored at the call's rms) and
+/// to the element's budget sum_j |w_j| |pair_j| (floored likewise), and the sum of squares.
+const Err = struct {
+    max_abs: f64 = 0,
+    rel: f64 = 0,
+    vs_mag: f64 = 0,
+    ss: f64 = 0,
+
+    fn add(e: *Err, got: f32, want: f64, mag: f64, fl: f64) void {
+        const d = @abs(@as(f64, got) - want);
+        e.max_abs = @max(e.max_abs, d);
+        e.rel = @max(e.rel, d / @max(@abs(want), fl));
+        e.vs_mag = @max(e.vs_mag, d / @max(mag, fl));
+        e.ss += d * d;
+    }
+};
+
+/// The largest GPU difference's element, when its row is sampled.
+const Worst = struct { ri: ?usize = null, col: usize = 0, exact: f64 = 0, mag: f64 = 0 };
 
 /// `[routed-one]`: the path's calls since the last request's end (nothing when it is off).
 pub fn meters(st: *State, buf: []u8) []const u8 {
@@ -404,8 +720,9 @@ pub fn meters(st: *State, buf: []u8) []const u8 {
     const s = st.stats;
     st.stats = .{};
     var w = std.Io.Writer.fixed(buf);
-    w.print("[routed-one] mode={s} wide_calls={d} one={d} mixed={d} lane={d} pairs={d} masked={d} checks={d} check_fail={d} worst_ratio={e:.3} worst_rms_diff={e:.3}\n", .{
-        @tagName(mode), s.wide, s.one, s.mixed, s.lane, s.pairs, s.masked, s.checks, s.check_fail, s.worst_ratio, s.worst_rms_diff,
+    w.print("[routed-one] mode={s} wide_calls={d} one={d} mixed={d} lane={d} pairs={d} masked={d} checks={d} check_fail={d} rounded_fail={d} worst_ratio={e:.3} worst_rms_diff={e:.3} worst_rel={e:.3} worst_beyond_bf16={e:.3} exact_calls={d} exact_one_rel={e:.3} exact_lane_rel={e:.3} exact_one_vs_mag={e:.3} exact_lane_vs_mag={e:.3} exact_lane_pairs_rel={e:.3}\n", .{
+        @tagName(mode), s.wide,           s.one,              s.mixed,         s.lane,         s.pairs,          s.masked,          s.checks,         s.check_fail,     s.rounded_fail,
+        s.worst_ratio,  s.worst_rms_diff, s.worst_rel,        s.worst_beyond,  s.exact_calls,  s.exact_one_rel,  s.exact_lane_rel,  s.exact_one_mag,  s.exact_lane_mag, s.exact_lane_pairs,
     }) catch {};
     return w.buffered();
 }
