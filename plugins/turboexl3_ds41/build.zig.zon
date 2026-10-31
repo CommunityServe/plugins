@@ -1,0 +1,15 @@
+.{
+    .name = .turboexl3_ds41,
+    .version = "0.0.0",
+    .fingerprint = 0x707be5b734e0c8e7,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .mlx_serve_kit = .{ .path = "../../.kit/kit" },
+        // turboexl3 (davidtai/turboexl3): the EXL3 kernels and its plugin-kit launcher, at its DeepSeek-V4.1 commit.
+        .turboexl3 = .{
+            .url = "https://github.com/davidtai/turboexl3/archive/970a3ca05c1e49dd243442171463f7587ce8fa0b.tar.gz",
+            .hash = "turboexl3-0.1.0-tZE8bwZvOgE9XR_IIK2auSh6yu1Mm1ZZEpd-PyzGAWrN",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "scripts", "patches", "tests", "NOTICE", "README.md" },
+}

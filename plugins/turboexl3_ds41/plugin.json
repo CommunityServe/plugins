@@ -1,0 +1,16 @@
+{
+  "name": "turboexl3_ds41",
+  "kind": "model",
+  "version": "0.1.0",
+  "summary": "DeepSeek-V4.1-Flash EXL3 packs streamed from SSD: mlx-serve's own DeepSeek-V4.1 model and expert streamer, the EXL3 math in turboexl3, on M5-class Macs (NAX).",
+  "models": [
+    "deepseek_v41 with an exllamav3 quantization_config and an experts.bin bank (OpensourceWTF/DeepSeek-V4.1-Flash-1017-streaming-repack-exl3-2.81bpw)"
+  ],
+  "requires_mlx_serve": ">=26.11.1",
+  "fixture": "none",
+  "fixture_reason": "A streamed EXL3 pack has no small form: the conformance suite needs a tiny pack the plugin can load.",
+  "test_step": "test",
+  "prepare": "scripts/prepare.sh",
+  "maintainers": ["davidtai"],
+  "license": "MIT"
+}

@@ -1,0 +1,22 @@
+diff -ruN a/sdk/util/shared.zig b/sdk/util/shared.zig
+--- a/sdk/util/shared.zig	2026-10-30 23:54:07
++++ b/sdk/util/shared.zig	2026-10-30 23:54:07
+@@ -10,7 +10,8 @@
+     return struct {
+         var storage: T = init;
+         var cached: ?*T = null;
+-        const sym = "mlx_serve_shared_" ++ name;
++        // This plugin's copies export under their own prefix: the kit's own copy of a file (its log) exports its name.
++        const sym = "turboexl3_ds41_shared_" ++ name;
+         fn addr() callconv(.c) *anyopaque {
+             return &storage;
+         }
+@@ -32,7 +33,7 @@
+ pub fn SharedThreadLocal(comptime T: type, comptime name: []const u8, comptime init: T) type {
+     return struct {
+         threadlocal var storage: T = init;
+-        const sym = "mlx_serve_shared_tls_" ++ name;
++        const sym = "turboexl3_ds41_shared_tls_" ++ name;
+         fn addr() callconv(.c) *anyopaque {
+             return @ptrCast(&storage);
+         }
