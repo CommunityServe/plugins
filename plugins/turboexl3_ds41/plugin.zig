@@ -347,19 +347,46 @@ fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: ab
     return n;
 }
 
-var meter_buf: [1024]u8 = undefined;
+var meter_buf: [1536]u8 = undefined;
 
 /// The request's DSpark rounds beside the engine's `[spec-stats]`, which counts every native round a stage round; the
-/// stage profiler's lines (src/stage_prof.zig) when it is on.
+/// stage profiler's lines (src/stage_prof.zig) when it is on; the expert stream's counters since the last request.
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
-    _ = mp;
     _ = slot;
     stage_prof.requestEnd();
-    const dr = if (drafter) |*d| d else {
-        out.* = .{};
-        return;
-    };
-    out.* = abi.Str.of(dr.meters(&meter_buf));
+    const head = if (drafter) |*d| d.meters(&meter_buf) else meter_buf[0..0];
+    const tail = streamMeters(model(mp), meter_buf[head.len..]);
+    out.* = abi.Str.of(meter_buf[0 .. head.len + tail.len]);
+}
+
+const Exl3Source = @import("src/mlx_serve/sdk/weights/streamed.zig").Exl3.Source;
+const StreamStats = @TypeOf(@as(*Exl3Source, undefined).stats());
+/// The stream's counters at the last request's end (they count for the process).
+var stream_prev: StreamStats = .{};
+
+/// `[stream-stats]`: the streamed bank's routes, resident hits and misses (unique experts a route), evictions, bytes
+/// read and the host's read waits since the last request (the first request's include the load's).
+fn streamMeters(m: *ds.Model, buf: []u8) []const u8 {
+    const r = m.mdl.streamed orelse return buf[0..0];
+    if (r.math != .source) return buf[0..0];
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    const s = src.stats();
+    const p = stream_prev;
+    stream_prev = s;
+    var w = std.Io.Writer.fixed(buf);
+    w.print("[stream-stats] routes={d} hits={d} misses={d} evictions={d} read_gb={d:.2} read_wait_ms={d:.1} read_wall_ms={d:.1} spec_issued={d} spec_landed={d} claimed={d}\n", .{
+        s.route_calls -| p.route_calls,
+        s.expert_cache_hits -| p.expert_cache_hits,
+        s.expert_cache_misses -| p.expert_cache_misses,
+        s.expert_cache_evictions -| p.expert_cache_evictions,
+        @as(f64, @floatFromInt(s.expert_bytes_read -| p.expert_bytes_read)) / 1e9,
+        @as(f64, @floatFromInt(s.read_wait_ns -| p.read_wait_ns)) / 1e6,
+        @as(f64, @floatFromInt(s.read_wall_ns -| p.read_wall_ns)) / 1e6,
+        s.spec_issued -| p.spec_issued,
+        s.spec_landed -| p.spec_landed,
+        s.claimed -| p.claimed,
+    }) catch {};
+    return w.buffered();
 }
 
 fn fillRound(round: *abi.Round, tokens: []const u32, rows: u32, position: usize) void {
