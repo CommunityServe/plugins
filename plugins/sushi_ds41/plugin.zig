@@ -848,9 +848,8 @@ fn closeRound(m: *Model, o: *const Open, accepted: usize, r: *abi.Round) !void {
     const verify_ms = nanosSince(o.verify_start);
     try m.ids.appendSlice(gpa, o.ids[0 .. 1 + accepted]);
     if (o.copied) {
-        // The stage policy's calibration and backoff are about stage blocks; a copy round only teaches it the price of
-        // a wide verify.
-        m.policy.cost.observeRound(@intCast(o.rows), verify_ms, 0);
+        // The stage policy learns from stage blocks only: a copy round's wide verify would move its fitted row price,
+        // and so the stage rounds' widths, in requests the copy arm only touches now and then.
         m.copy.rounds += 1;
         m.copy.drafted += o.rows - 1;
         m.copy.accepted += accepted;
