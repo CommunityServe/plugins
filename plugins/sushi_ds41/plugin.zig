@@ -230,14 +230,21 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         log.info("[sushi_ds41] prefill pipeline: up to {d} prefill-width layers in flight\n", .{m.mdl.pipe_depth});
     if (std.c.getenv("SUSHI_DS41_TAP_DIR")) |d| {
         const tap = try gpa.create(dsv.StreamTap);
+        errdefer gpa.destroy(tap);
         tap.* = try dsv.StreamTap.init(gpa, c.layers, tap_rows);
         m.mdl.stream_tap = tap;
         m.tap_dir = std.mem.span(d);
+        m.tap_seq = ablation.nextTapSeq(gpa, m.tap_dir.?);
         log.warn("[sushi_ds41] calibration tap ON: every prompt's per-layer activations and last ids are written to {s} (owner-only files); unset SUSHI_DS41_TAP_DIR to stop\n", .{m.tap_dir.?});
     }
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
     errdefer if (m.tower) |*t| t.deinit();
+    errdefer if (m.mdl.stream_tap) |t| {
+        t.deinit();
+        gpa.destroy(t);
+        m.mdl.stream_tap = null;
+    };
     dsv.logMemory(m.mdl);
     m.experts = try gpa.create(dstream.StqStream);
     errdefer gpa.destroy(m.experts);
@@ -348,7 +355,8 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     const rows: ?dsv.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
     // A host older than `Forward.progress` passes a shorter struct.
     const progress: ?*u64 = if (f.size >= @offsetOf(abi.Forward, "progress") + @sizeOf(?*u64)) f.progress else null;
-    const logits = run(m, host.ids, want, rows, progress) catch |e| {
+    // The tap records prompt passes only, never a one-token decode forward.
+    const logits = run(m, host.ids, want, rows, progress, f.mode == .prefill) catch |e| {
         log.err("[sushi_ds41] forward failed: {s}\n", .{@errorName(e)});
         return Verdict.refuse(.failed, "sushi_ds41: the forward failed");
     };
@@ -418,7 +426,8 @@ fn reset(m: *Model) void {
 /// A prompt as sushi runs it: all but its last token in chunks (`prefill_width`, a short tail merged into the last), each
 /// told what follows it so the next chunk's Engram rows read while it runs, then the last token alone for the logits.
 /// Logits `[rows, vocab]`. `progress` gets the rows forwarded after each chunk (`Forward.progress`).
-fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64) !mlx.mlx_array {
+fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64, prompt: bool) !mlx.mlx_array {
+    const tapping = prompt and m.mdl.stream_tap != null;
     errdefer dsv.pipeDrain(m.mdl) catch {};
     // The tap records the prefix's last chunk and the last token's pass: every layer runs both.
     if (m.mdl.stream_tap) |t| t.clear();
@@ -435,7 +444,7 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
         // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
         // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
         // its decoder (`extendState`).
-        if (m.mdl.stream_tap) |t| t.on = end == prefix;
+        if (tapping) m.mdl.stream_tap.?.on = end == prefix;
         if (end < prefix and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
         if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
         at = end;
@@ -445,11 +454,11 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
     // Progress above counts rows submitted; this is where they are done.
     try dsv.pipeDrain(m.mdl);
     try capture(m);
-    if (m.mdl.stream_tap) |t| t.on = true;
+    if (tapping) m.mdl.stream_tap.?.on = true;
     const logits = try forwardRows(m, ids[prefix..], want, &.{}, rows);
     defer _ = mlx.mlx_array_free(logits);
-    if (m.mdl.stream_tap) |t| {
-        ablation.dumpTap(gpa, t, m.tap_dir.?, m.tap_seq, m.ids.items, m.s) catch |e| log.err("[sushi_ds41] tap dump failed: {s}\n", .{@errorName(e)});
+    if (tapping) {
+        ablation.dumpTap(gpa, m.mdl.stream_tap.?, m.tap_dir.?, m.tap_seq, m.ids.items, m.mdl.ablation != null, m.s) catch |e| log.err("[sushi_ds41] tap dump failed: {s}\n", .{@errorName(e)});
         m.tap_seq += 1;
     }
     var o = mlx.mlx_array_new();

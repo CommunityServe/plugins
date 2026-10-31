@@ -611,6 +611,10 @@ pub const StreamTap = struct {
             _ = mlx.mlx_array_free(mean);
             return e;
         };
+        // Queued now, so the record holds its `[k, dim]` rows rather than the whole stream until the dump.
+        const v = mlx.mlx_vector_array_new_data(&[_]A{mean}, 1);
+        defer _ = mlx.mlx_vector_array_free(v);
+        try mlx.check(mlx.mlx_async_eval(v));
     }
 
     pub fn clear(self: *StreamTap) void {

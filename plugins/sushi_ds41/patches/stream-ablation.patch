@@ -1,8 +1,8 @@
 diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
-index 4bb3119..9c57aa5 100644
+index 4bb3119..26b861d 100644
 --- a/src/sushi/dsv41/dsv41_model.zig
 +++ b/src/sushi/dsv41/dsv41_model.zig
-@@ -556,6 +556,77 @@ pub const Trace = struct {
+@@ -556,6 +556,81 @@ pub const Trace = struct {
      }
  };
  
@@ -61,6 +61,10 @@ index 4bb3119..9c57aa5 100644
 +            _ = mlx.mlx_array_free(mean);
 +            return e;
 +        };
++        // Queued now, so the record holds its `[k, dim]` rows rather than the whole stream until the dump.
++        const v = mlx.mlx_vector_array_new_data(&[_]A{mean}, 1);
++        defer _ = mlx.mlx_vector_array_free(v);
++        try mlx.check(mlx.mlx_async_eval(v));
 +    }
 +
 +    pub fn clear(self: *StreamTap) void {
@@ -80,7 +84,7 @@ index 4bb3119..9c57aa5 100644
  /// Host wall time of a wide chunk per stage, each stage evaluated before the next is built (so graph building counts
  /// with the GPU work it queues). `routed` includes the expert fill the `[expert-stream]` line splits out.
  pub const Profile = struct {
-@@ -695,6 +766,10 @@ pub const Model = struct {
+@@ -695,6 +770,10 @@ pub const Model = struct {
      ced_split: ?usize = null,
      /// Diagnostic (`SUSHI_DSV41_PREFILL_PROFILE`): a wide chunk evaluates after every stage and logs where its time went.
      profile: ?*Profile = null,
@@ -91,7 +95,7 @@ index 4bb3119..9c57aa5 100644
  
      pub fn deinit(self: *Model) void {
          pipeDrain(self) catch {};
-@@ -2326,11 +2401,22 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
+@@ -2326,11 +2405,22 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
  /// normalized stream-key dot.
  fn engramApply(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A) !A {
      const wkv_in = try sc.astype(try sc.reshape(rows, &.{ ci(dim(x, 0)), -1 }), m.act);
@@ -115,7 +119,7 @@ index 4bb3119..9c57aa5 100644
  /// `engramApply`, except on an image span's rows (`img`, none for text): the reference shuts their gate, so
  /// they pass through.
  fn engramWrite(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A, img: A) !A {
-@@ -2422,7 +2508,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
+@@ -2422,7 +2512,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
          var asc = Scope.init(sc.a, sc.s);
          defer asc.deinit();
          const o = if (ds) |d| try dsparkAttention(&asc, m, li, h, d, p0) else try attention(&asc, m, st, li, h, p0, sh, span);
@@ -124,7 +128,7 @@ index 4bb3119..9c57aa5 100644
      };
      if (m.trace) |t| try t.put("attn_{d}", .{li}, a);
      const pf = try hcPre(sc, m, x, .{ .y = a, .prev = pa.mix }, none, &ly.hc_ffn, ly.ffn_norm);
-@@ -2431,11 +2517,11 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
+@@ -2431,11 +2521,11 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0:
      const h2 = pf.h;
      if (prof(m, dim(x, 0))) |p| try p.mark(.hc_ffn, &.{ h2, x1, sf.pre, sf.post, sf.comb });
      if (m.trace) |t| try t.put("ffn_in_{d}", .{li}, h2);
@@ -138,7 +142,7 @@ index 4bb3119..9c57aa5 100644
      };
      if (sh.spec) |*u| {
          u.x1 = sc.out(x1);
-@@ -2847,6 +2933,7 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
+@@ -2847,6 +2937,7 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
          const picked = try sc.astype(try sc.take(try sc.reshape(vr.rows, &.{ -1, ci(c.dim) }), try sc.ints(take, &.{ci(L)}), 0), m.act);
          emb = try sc.where(try sc.expand(is_img, -1), picked, emb);
      }
@@ -146,7 +150,7 @@ index 4bb3119..9c57aa5 100644
      const ex = try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(L), ci(hc), ci(c.dim) }));
      const x = sc.out(ex);
      errdefer _ = mlx.mlx_array_free(x);
-@@ -2996,7 +3083,7 @@ const Undo = struct {
+@@ -2996,7 +3087,7 @@ const Undo = struct {
  /// Whether layer `li` of the pass queues its routed chain from the stream's cache map.
  fn specOn(m: *const Model, p: *const Pass, li: usize) bool {
      if (!m.route_spec or m.sync_layers or p.ids.len > exl3.kernels.DECODE_ROWS_MAX or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
@@ -155,7 +159,7 @@ index 4bb3119..9c57aa5 100644
      const hk = switch (m.experts) {
          .resident => return false,
          .hook => |hk| hk,
-@@ -3070,7 +3157,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
+@@ -3070,7 +3161,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
      if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
      if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map\n", .{ spec_kept, spec_rebuilt });
      if (sum == null) return null;
@@ -164,7 +168,7 @@ index 4bb3119..9c57aa5 100644
  }
  
  /// Checks the pass's unresolved layer, if any, and takes its exact output where the queued chain missed.
-@@ -3124,6 +3211,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
+@@ -3124,6 +3215,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
      const L = p.ids.len;
      var sc = Scope.init(gpa, m.s);
      defer sc.deinit();
@@ -172,7 +176,7 @@ index 4bb3119..9c57aa5 100644
      if (prof(m, L)) |pf| {
          pf.restart();
          pf.decoder = if (m.ced_split) |split| li >= split else false;
-@@ -3178,6 +3266,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
+@@ -3178,6 +3270,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
      try appendStateArrays(gpa, &ev, &p.st.layers[li]);
      try appendVerifyArrays(gpa, &ev, p.st, li);
      if (m.trace) |t| try t.put("stream_{d}", .{li}, p.x);
@@ -180,7 +184,7 @@ index 4bb3119..9c57aa5 100644
      if (prof(m, L)) |pf| return pf.mark(.expand, ev.items);
      if (piped) return pipeSubmit(m, ev.items, p.x);
      if (wait) return evalAll(ev.items);
-@@ -3540,7 +3629,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
+@@ -3540,7 +3633,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
      for (in[0..B], 0..) |*v, k| v.* = @intCast(if (k == 0) t1 else c.dspark.noise_id);
      var in_ids: [cfg_mod.max_block]u32 = undefined;
      for (in_ids[0..B], in[0..B]) |*o, v| o.* = @intCast(v);

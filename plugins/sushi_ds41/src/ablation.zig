@@ -52,7 +52,7 @@ pub fn disarm(mdl: *dsv.Model) void {
 
 /// The tap's rows for one prompt as `<dir>/tap-<seq>.npy` (f32 `[layers + 1, rows, dim]`, the rows in prompt order,
 /// last one the prompt's last token) and a line in `<dir>/index.jsonl`. Clears the tap.
-pub fn dumpTap(gpa: std.mem.Allocator, tap: *dsv.StreamTap, dir: []const u8, seq: u64, ids: []const u32, s: mlx.mlx_stream) !void {
+pub fn dumpTap(gpa: std.mem.Allocator, tap: *dsv.StreamTap, dir: []const u8, seq: u64, ids: []const u32, ablated: bool, s: mlx.mlx_stream) !void {
     defer tap.clear();
     const sites = tap.sites.len;
     if (sites == 0 or tap.sites[0].items.len == 0) return;
@@ -79,12 +79,15 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *dsv.StreamTap, dir: []const u8, seq
     const data = (mlx.mlx_array_data_float32(all) orelse return error.TapNotF32)[0..mlx.mlx_array_size(all)];
 
     const io = std.Io.Threaded.global_single_threaded.io();
+    const existed = if (std.Io.Dir.cwd().access(io, dir, .{})) true else |_| false;
     var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
     defer d.close(io);
-    // Prompt activations and ids: the owner's only.
-    const dir_z = try gpa.dupeSentinel(u8, dir, 0);
-    defer gpa.free(dir_z);
-    _ = std.c.chmod(dir_z, 0o700);
+    // Prompt activations and ids: a directory the tap makes is the owner's only.
+    if (!existed) {
+        const dir_z = try gpa.dupeSentinel(u8, dir, 0);
+        defer gpa.free(dir_z);
+        _ = std.c.chmod(dir_z, 0o700);
+    }
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
     var header_buf: [256]u8 = undefined;
@@ -98,7 +101,7 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *dsv.StreamTap, dir: []const u8, seq
 
     var line: std.Io.Writer.Allocating = .init(gpa);
     defer line.deinit();
-    try line.writer.print("{{\"seq\":{d},\"file\":\"{s}\",\"prompt_tokens\":{d},\"rows\":{d},\"tail_ids\":[", .{ seq, name, ids.len, shape[1] });
+    try line.writer.print("{{\"seq\":{d},\"file\":\"{s}\",\"ablated\":{},\"prompt_tokens\":{d},\"rows\":{d},\"tail_ids\":[", .{ seq, name, ablated, ids.len, shape[1] });
     const tail = ids[ids.len - @min(ids.len, 8) ..];
     for (tail, 0..) |t, i| try line.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
     try line.writer.writeAll("]}\n");
@@ -109,6 +112,17 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *dsv.StreamTap, dir: []const u8, seq
     defer idx.close(io);
     const end = (try idx.stat(io)).size;
     try idx.writePositionalAll(io, line.written(), end);
+}
+
+/// The next tap file number in `dir`: the lines `index.jsonl` already holds, so a restarted server neither overwrites
+/// a file nor repeats a number.
+pub fn nextTapSeq(gpa: std.mem.Allocator, dir: []const u8) u64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = std.fs.path.join(gpa, &.{ dir, "index.jsonl" }) catch return 0;
+    defer gpa.free(path);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 << 20)) catch return 0;
+    defer gpa.free(text);
+    return std.mem.count(u8, text, "\n");
 }
 
 /// A version 1.0 `.npy` header for little-endian f32 `[a, b, c]`, padded to 64 bytes.
