@@ -1,0 +1,14 @@
+diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -242,6 +242,10 @@
+                         try h.grow(&self.g, self.decode_rows);
+                     },
+                     .prompt => {
++                        // `shrink` frees the grown rows and checks MLX's active bytes dropped by them, so no command may
++                        // still hold them (the grow's own fills, a decode's last eval): a phase change right after the
++                        // load's grow otherwise fails at random with GrownRowsStillReferenced and leaves the stream failed.
++                        _ = mlx.mlx_synchronize(self.g.s);
+                         _ = try h.shrink(self.prompt_rows, .keep);
+                         _ = mlx.mlx_synchronize(self.g.s);
+                         self.g.clearCache();

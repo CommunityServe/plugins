@@ -1,0 +1,15 @@
+diff -ruN a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41/plugin.zig
+--- a/plugins/deepseek_v41/plugin.zig
++++ b/plugins/deepseek_v41/plugin.zig
+@@ -318,7 +318,10 @@
+     if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
+         return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
+     const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
+-    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
++    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch |e| {
++        std.log.err("deepseek_v41: the forward failed: {t} (last cross-unit error {s}; {d} rows at {d})", .{ e, @import("../../sdk/util/err_name.zig").last(), in.host.len, pos });
++        return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
++    };
+     if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
+     return .ok;
+ }
