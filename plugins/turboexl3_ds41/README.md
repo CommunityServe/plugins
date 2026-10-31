@@ -26,8 +26,21 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   a row of a top-1 call, on the streamer's schedule without its banked waves and device route).
 - The streamer's MLX shims (events, uninitialized buffers, the launch cache, the read pool's Metal signal) are the
   plugin's own, over the server's host table (src/host_shims.zig). The read pool is the streamer's C, compiled here.
-- The DSpark stages draft as the model's native drafter (plugin.zig), greedy or under the engine's sampling. A round
-  verifies the whole block.
+- The DSpark stages draft as the model's native drafter (plugin.zig), greedy or under the engine's sampling, with the
+  two round features the engine gives its built-in model (src/rounds.zig, over the engine's own `mtp_lookup.zig`,
+  `verify.zig` and `dflash/policy.zig` from `engines/mlx/spec`, copied by scripts/slice.txt). Both only choose what a
+  round verifies; the trunk's accept decides what is kept.
+  - Copy rounds: where the context agrees with the committed tail and `t1` for 16 tokens or more, its continuation is
+    the draft (more than the block, up to the 7 a verify carries on the bank's decode lane), with no stage forward.
+    `MLX_SERVE_DSV41_DSPARK_COPY=0` turns them off.
+  - The verify policy: a stage round verifies the prefix of the block whose calibrated confidence buys the most tokens
+    per ms of verify, on the verify ladder the plugin measures from its own rounds (ms by rows, the engine's prior
+    ladder for rows not yet measured), and where drafting does not pay the round verifies `t1` alone (the engine's
+    backoff). `MLX_SERVE_DSV41_DSPARK_POLICY=0` verifies the whole block every round.
+  - The context is the prompt the resume hands the plugin, then each forward's and round's tokens at their positions;
+    a gap or a failed forward drops it, and with it the copies, until the next prompt.
+  - Each request's rounds are logged beside the engine's `[spec-stats]` (`dspark rounds:`, `dspark policy:` with the
+    measured ladder in `ladder_ms`); each round's phases go to `[dspark-prof]` (diag `dspark-profile`).
 - `MLX_SERVE_DSV41_COMPILE=0` runs every decode stretch eager instead of compiled.
 
 ## The pack
@@ -40,4 +53,5 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
 
 ## Measured
 
-Nothing yet: no GPU run of this plugin has been made.
+Nothing yet on the served pack. The copy rounds and the verify policy have not run on a GPU; their choices are tested
+MLX-free (`zig build test`).

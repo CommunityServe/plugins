@@ -52,13 +52,13 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         }
 
         /// A prompt call's pairs: `rows.slot` each pair's slot row, `rows.act_row` its row of `x` (null: x's rows are
-        /// the pairs').
+        /// the pairs'). The result is kept: the streamer's wide path holds it past the call's scope and releases it.
         pub fn prefill(self: *const Self, g: *G, layer: u32, x: T, rows: PrefillRows, bank: Bank) !T {
             _ = layer;
             const n: c_int = @intCast(rows.slot.len);
             const ids = try g.hostArray(std.mem.sliceAsBytes(rows.slot), &.{n}, .uint32);
             const xs = if (rows.act_row) |r| try g.take(x, try g.hostArray(std.mem.sliceAsBytes(r), &.{n}, .uint32), 0) else x;
-            return pairs(self.state.limit, g, xs, ids, bank);
+            return g.keep(try pairs(self.state.limit, g, xs, ids, bank));
         }
 
         pub fn finishPrefill(_: *const Self, _: *G) !void {}

@@ -1,5 +1,9 @@
 # The mlx-serve files the plugin's root module copies (scripts/sync-mlx-serve.sh), as paths under mlx-serve's src/: the
-# DeepSeek-V4.1 model (plugins/deepseek_v41) and what it imports, but the files the plugin kit ships by name.
+# DeepSeek-V4.1 model (plugins/deepseek_v41) and what it imports, but the files the plugin kit ships by name, and the
+# engine's DSpark round helpers the drafter runs (src/rounds.zig: the context lookup, copy length and round policy).
+engines/mlx/spec/dflash/policy.zig
+engines/mlx/spec/mtp_lookup.zig
+engines/mlx/spec/verify.zig
 env.zig
 mlx/array.zig
 mlx/device.zig

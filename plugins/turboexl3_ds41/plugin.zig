@@ -1,7 +1,7 @@
 //! turboexl3_ds41: DeepSeek-V4.1-Flash's EXL3 packs in the streaming repack, on M5-class GPUs. The model is mlx-serve's
 //! own deepseek_v41 (a build-time copy, src/mlx_serve), its routed experts stream from the pack's bank through
 //! mlx-serve's expert streamer (module `mlx_stream`), turboexl3 runs the EXL3 trunk, and the DSpark stages draft as the
-//! model's native drafter.
+//! model's native drafter, with the engine's copy rounds and verify policy (src/rounds.zig).
 
 const std = @import("std");
 const kit = @import("mlx_serve");
@@ -20,6 +20,8 @@ pub const quant_abi = kit.abi.quant;
 pub const routed_t3 = @import("src/routed_t3.zig");
 const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
+const v4plugin = @import("src/mlx_serve/plugins/deepseek_v4/plugin.zig");
+const rounds = @import("src/rounds.zig");
 const bill = @import("src/mlx_serve/plugins/deepseek_v41/bill.zig");
 const shims = @import("src/host_shims.zig");
 const t3kit = @import("turboexl3_kit");
@@ -35,6 +37,8 @@ pub const plugin = kit.sdk.Plugin{
 
 /// The built-in's table but for its name, claim and parse, its load (`load`), the drafter (the engine reaches no
 /// outside plugin's module: the stages draft through `NativeDrafter`) and its weights (the plugin reads the shards).
+/// Its forward and resume also keep the drafter's token history (`forward`, `resumePrompt`), and its meters report the
+/// drafter's rounds.
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),
     .claims = config.claims,
@@ -43,13 +47,20 @@ pub const table = abi.ModelTable{
     .bill = ds.table.bill,
     .load = &load,
     .unload = &unload,
-    .forward = ds.table.forward,
+    .forward = &forward,
     .release_slot = ds.table.release_slot,
     .activate_slot = ds.table.activate_slot,
-    .cache = ds.table.cache,
+    .cache = &cache_hooks,
     .media = ds.table.media,
     .spec = &.{ .native_drafter = &native_drafter },
     .weights = &.{ .keep_key = &keepNone, .resident_bytes = ds.table.weights.resident_bytes },
+    .meters = &meters,
+};
+
+const cache_hooks: abi.CacheHooks = blk: {
+    var c = ds.table.cache.*;
+    c.resume_prompt = &resumePrompt;
+    break :blk c;
 };
 
 const Verdict = abi.Verdict;
@@ -82,11 +93,24 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     own.weights = null;
     const mp = ds.table.load(&own, out) orelse return null;
     open = null;
+    const on: rounds.Switches = .{
+        .copy = config.switchOn(env.span(.MLX_SERVE_DSV41_DSPARK_COPY)),
+        .policy = config.switchOn(env.span(.MLX_SERVE_DSV41_DSPARK_POLICY)),
+    };
+    // The policy reads each draft's confidence, as the engine has its built-in model's stages do.
+    model(mp).mdl.ds_want_conf = on.policy;
+    dropPending();
+    if (drafter) |*d| d.deinit();
+    drafter = rounds.Drafter.init(gpa, on);
+    log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on" else "off (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
     return mp;
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {
     dropOpen(model(mp));
+    dropPending();
+    if (drafter) |*d| d.deinit();
+    drafter = null;
     ds.table.unload(mp);
 }
 
@@ -94,12 +118,25 @@ fn model(mp: *anyopaque) *ds.Model {
     return @ptrCast(@alignCast(mp));
 }
 
-// ── DSpark: the stages' rounds as the model's native drafter (the in-tree engine's `dsparkRoundWith`) ──
+// ── DSpark: the stages' rounds as the model's native drafter (the in-tree engine's `moduleRound`) ──
 
 const native_drafter: abi.NativeDrafter = .{ .step = &draftStep, .verify = &draftVerify, .finish = &draftFinish };
 
-/// A verify `draftVerify` left open for `draftFinish`: one per process (one streamed bank serves one model).
-const Open = struct { pending: dsv41.DsparkPending };
+/// The drafter's token history, verify ladder and request policy (src/rounds.zig): one per process (one streamed bank
+/// serves one model, one request at a time).
+var drafter: ?rounds.Drafter = null;
+
+/// What a round verifies, for what it teaches once its tokens are kept.
+const Round = struct {
+    kind: rounds.Kind,
+    drafts: usize,
+    /// A stage round's confidence logits of its verified drafts.
+    conf: [16]f32 = undefined,
+    watch: io_util.Stopwatch,
+};
+
+/// A verify `draftVerify` left open for `draftFinish`: one per process.
+const Open = struct { pending: dsv41.DsparkPending, round: Round };
 var open: ?Open = null;
 
 fn dropOpen(m: *ds.Model) void {
@@ -112,38 +149,75 @@ fn dropOpen(m: *ds.Model) void {
 /// Closes a verify keeping `t1` alone (the verify's anchors freed, its other rows rolled back), on the paths that
 /// abandon a round: the engine refuses the request after them.
 fn closeVerify(m: *ds.Model, st: *dsv41.State, pending: *dsv41.DsparkPending) void {
-    var r = dsv41.dsparkFinish(m.mdl, gpa, st, pending, 0, 0) catch return;
-    r.deinit(gpa);
+    var r = dsv41.dsparkFinish(m.mdl, gpa, st, pending, 0, 0) catch {
+        if (drafter) |*d| d.history.lose();
+        return;
+    };
+    defer r.deinit(gpa);
+    if (drafter) |*d| d.history.write(st.n - r.tokens.len, r.tokens);
 }
 
 /// The round's checks and its state: one committed token, the stages loaded, the state at the engine's position.
 fn roundState(m: *ds.Model, f: *const abi.Forward, out: *const abi.ForwardOut) union(enum) { st: *dsv41.State, refused: Verdict } {
     if (out.size < @sizeOf(abi.ForwardOut)) return .{ .refused = Verdict.refuse(.unsupported, "turboexl3_ds41: the host's ForwardOut has no round") };
     if (m.mdl.dspark == null or m.mdl.n_mtp == 0) return .{ .refused = Verdict.refuse(.unsupported, "turboexl3_ds41: the DSpark stages are not loaded") };
+    if (drafter == null) return .{ .refused = Verdict.refuse(.failed, "turboexl3_ds41: the drafter is not loaded") };
     if (f.tokens.len != 1) return .{ .refused = Verdict.refuse(.unsupported, "turboexl3_ds41: a round starts from one committed token") };
     if (f.tokens.slice()[0] >= m.cfg.vocab_size) return .{ .refused = Verdict.refuse(.failed, "turboexl3_ds41: token id past the vocabulary") };
     // A verify the engine never finished is discarded.
     dropOpen(m);
     const st = if (m.mdl.dec_state) |*s| s else return .{ .refused = Verdict.refuse(.failed, "turboexl3_ds41: a round needs the prompt's state") };
     if (f.positions.len > 0 and st.n != f.positions.slice()[0]) return .{ .refused = Verdict.refuse(.failed, "turboexl3_ds41: the position does not follow the model's state") };
+    settlePending(&drafter.?);
     return .{ .st = st };
 }
 
-/// The stages' draft from `t1`, cut to what a verify carries and the round may keep.
-fn draft(m: *ds.Model, st: *dsv41.State, t1: u32, accept_cap: u32) !dsv41.DsparkDraft {
-    var d = try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
-    d.len = @min(d.len, dsv41.maxVerifyDrafts(m.mdl), @as(usize, accept_cap), abi.max_round_tokens - 1);
-    return d;
+const Drafted = struct { d: dsv41.DsparkDraft, round: Round };
+
+/// The round's drafts from `t1` (`rounds.Drafter.plan`), at most what a verify carries and the round may keep: the
+/// context's continuation, none, or the stages' draft cut by the policy.
+fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_cap: u32) !Drafted {
+    const watch = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+    const max = @min(dsv41.maxVerifyDrafts(m.mdl), @as(usize, accept_cap), abi.max_round_tokens - 1);
+    const plan = dr.plan(st.n, t1, max, accept_cap, m.mdl.ds_block);
+    if (plan == .stage) {
+        var d = try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
+        errdefer d.deinit(gpa);
+        d.len = dr.cut(d.confidence[0..@min(d.len, max)]);
+        var round: Round = .{ .kind = .stage, .drafts = d.len, .watch = watch };
+        @memcpy(round.conf[0..d.len], d.confidence[0..d.len]);
+        return .{ .d = d, .round = round };
+    }
+    const copied: []const u32 = if (plan == .copy) plan.copy else &.{};
+    const ids = try gpa.alloc(u32, copied.len + 1);
+    ids[0] = t1;
+    @memcpy(ids[1..], copied);
+    return .{ .d = .{ .ids = ids, .len = copied.len, .logits = &.{}, .confidence = &.{} }, .round = .{ .kind = plan, .drafts = copied.len, .watch = watch } };
+}
+
+/// A round's kept tokens: its phases to `[dspark-prof]`, what it teaches to the drafter, its tokens to the history.
+fn kept(m: *ds.Model, round: *const Round, r: *dsv41.DsparkRound, st: *const dsv41.State) void {
+    r.phases.draft_ns = if (round.kind == .stage) m.mdl.ds_draft_ns else 0;
+    dsv41.dsparkObserve(m.mdl, r.phases);
+    const dr = if (drafter) |*d| d else return;
+    const conf: []const f32 = if (round.kind == .stage) round.conf[0..round.drafts] else &.{};
+    dr.learn(round.kind, round.drafts, conf, r.accepted, msOf(r.phases.verify_ns), msOf(round.watch.read()));
+    dr.history.write(st.n - r.tokens.len, r.tokens);
+}
+
+fn msOf(ns: u64) f32 {
+    return @as(f32, @floatFromInt(ns)) / std.time.ns_per_ms;
 }
 
 fn roundFailed(e: anyerror) Verdict {
     log.err("[turboexl3_ds41] draft round failed: {s}\n", .{@errorName(e)});
+    if (drafter) |*d| d.history.lose();
     return Verdict.named(.failed, @errorName(e));
 }
 
-/// One greedy round: the stages draft from `t1`, a verify chunk `[t1, drafts]` reads them through the trunk, the
-/// longest prefix of drafts the trunk's own argmax (under the suppress mask) agrees with stays, and the trunk's token
-/// after it is the next round's `t1`.
+/// One greedy round: `t1` and its drafts (`draft`) through the trunk as one verify chunk, the longest prefix of drafts
+/// the trunk's own argmax (under the suppress mask) agrees with stays, and the trunk's token after it is the next
+/// round's `t1`.
 fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m = model(mp);
     const st = switch (roundState(m, f, out)) {
@@ -151,23 +225,22 @@ fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callco
         .refused => |v| return v,
     };
     const t1 = f.tokens.slice()[0];
-    var d = draft(m, st, t1, f.accept_cap) catch |e| return roundFailed(e);
-    defer d.deinit(gpa);
-    var pending = dsv41.dsparkBeginWith(m.mdl, gpa, st, t1, &d) catch |e| return roundFailed(e);
+    var p = draft(m, &drafter.?, st, t1, f.accept_cap) catch |e| return roundFailed(e);
+    defer p.d.deinit(gpa);
+    var pending = dsv41.dsparkBeginWith(m.mdl, gpa, st, t1, &p.d) catch |e| return roundFailed(e);
     defer pending.deinit();
     const suppress: ?mlx.mlx_array = if (f.suppress_mask.ctx != null) .{ .ctx = f.suppress_mask.ctx } else null;
     var best: [abi.max_round_tokens]u32 = undefined;
-    argmaxRows(m, pending.vl_g, suppress, best[0 .. d.len + 1]) catch |e| {
+    argmaxRows(m, pending.vl_g, suppress, best[0 .. p.d.len + 1]) catch |e| {
         closeVerify(m, st, &pending);
         return roundFailed(e);
     };
     var accepted: usize = 0;
-    while (accepted < d.len and best[accepted] == d.ids[accepted + 1]) accepted += 1;
+    while (accepted < p.d.len and best[accepted] == p.d.ids[accepted + 1]) accepted += 1;
     var r = dsv41.dsparkFinish(m.mdl, gpa, st, &pending, accepted, best[accepted]) catch |e| return roundFailed(e);
     defer r.deinit(gpa);
-    r.phases.draft_ns = m.mdl.ds_draft_ns;
-    dsv41.dsparkObserve(m.mdl, r.phases);
-    fillRound(&out.round, r.tokens, @intCast(d.len + 1), st.n);
+    kept(m, &p.round, &r, st);
+    fillRound(&out.round, r.tokens, @intCast(p.d.len + 1), st.n);
     out.round.accepted = r.accepted;
     out.round.next_token = r.next_token;
     return .ok;
@@ -181,19 +254,19 @@ fn draftVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
         .refused => |v| return v,
     };
     const t1 = f.tokens.slice()[0];
-    var d = draft(m, st, t1, f.accept_cap) catch |e| return roundFailed(e);
-    defer d.deinit(gpa);
-    var pending = dsv41.dsparkBeginWith(m.mdl, gpa, st, t1, &d) catch |e| return roundFailed(e);
-    const rows = d.len + 1;
+    var p = draft(m, &drafter.?, st, t1, f.accept_cap) catch |e| return roundFailed(e);
+    defer p.d.deinit(gpa);
+    var pending = dsv41.dsparkBeginWith(m.mdl, gpa, st, t1, &p.d) catch |e| return roundFailed(e);
+    const rows = p.d.len + 1;
     const logits = rowsF32(m, pending.vl_g, rows) catch |e| {
         closeVerify(m, st, &pending);
         pending.deinit();
         return roundFailed(e);
     };
     out.logits = .{ .ctx = logits.ctx };
-    fillRound(&out.round, d.ids[0..rows], @intCast(rows), st.n);
+    fillRound(&out.round, p.d.ids[0..rows], @intCast(rows), st.n);
     out.round.accepted = 0;
-    open = .{ .pending = pending };
+    open = .{ .pending = pending, .round = p.round };
     return .ok;
 }
 
@@ -211,9 +284,76 @@ fn draftFinish(mp: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c)
     // The engine picked the token after the accepted drafts itself: the round's own next token is not read.
     var r = dsv41.dsparkFinish(m.mdl, gpa, st, &o.pending, accepted, 0) catch |e| return roundFailed(e);
     defer r.deinit(gpa);
+    kept(m, &o.round, &r, st);
     fillRound(&out.round, r.tokens, @intCast(o.pending.b + 1), st.n);
     out.round.accepted = r.accepted;
     return .ok;
+}
+
+// ── The drafter's token history: what the state holds, by position ──
+
+/// A decode token the forward took on the GPU, read into the history once its forward has run.
+const PendingToken = struct { at: usize, id: mlx.mlx_array };
+var pending_tok: ?PendingToken = null;
+
+fn settlePending(dr: *rounds.Drafter) void {
+    const p = pending_tok orelse return;
+    pending_tok = null;
+    defer _ = mlx.mlx_array_free(p.id);
+    const tok = v4plugin.hostToken(p.id) catch return dr.history.lose();
+    dr.history.write(p.at, &.{tok});
+}
+
+fn dropPending() void {
+    const p = pending_tok orelse return;
+    pending_tok = null;
+    _ = mlx.mlx_array_free(p.id);
+}
+
+/// The built-in's forward, the tokens it took written into the drafter's history at their positions: host ids as
+/// given, a prompt's device ids read back as the forward reads them (before it runs, so the read waits on none of it),
+/// a decode token the forward keeps on the GPU read once the forward has read it (at the next round or forward).
+fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
+    const dr = if (drafter) |*d| d else return ds.table.forward(mp, f, out);
+    settlePending(dr);
+    const at: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
+    const on_gpu = f.ids.ctx != null and f.rows == 1 and f.logits != .all_rows;
+    const in: ?v4plugin.Ids = if (on_gpu) null else v4plugin.Ids.of(f) catch null;
+    defer if (in) |x| x.deinit();
+    const v = ds.table.forward(mp, f, out);
+    if (!v.isOk() or f.slots.len > 1 or (!on_gpu and in == null)) {
+        dr.history.lose();
+        return v;
+    }
+    if (in) |x| {
+        dr.history.write(at, x.host);
+    } else {
+        var id = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&id, .{ .ctx = f.ids.ctx });
+        pending_tok = .{ .at = at, .id = id };
+    }
+    return v;
+}
+
+/// The built-in's resume: the drafter's request begins on the prompt prefix the state kept.
+fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
+    const n = ds.table.cache.resume_prompt.?(mp, slot, prompt, media_rows);
+    dropPending();
+    if (drafter) |*d| d.begin(prompt.slice()[0..@min(@as(usize, @intCast(n)), prompt.len)]);
+    return n;
+}
+
+var meter_buf: [1024]u8 = undefined;
+
+/// The request's DSpark rounds beside the engine's `[spec-stats]`, which counts every native round a stage round.
+fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
+    _ = mp;
+    _ = slot;
+    const dr = if (drafter) |*d| d else {
+        out.* = .{};
+        return;
+    };
+    out.* = abi.Str.of(dr.meters(&meter_buf));
 }
 
 fn fillRound(round: *abi.Round, tokens: []const u32, rows: u32, position: usize) void {

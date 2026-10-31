@@ -70,6 +70,13 @@ pub fn routedT3(value: ?[]const u8) bool {
     return std.mem.eql(u8, v, "turboexl3");
 }
 
+/// `MLX_SERVE_DSV41_DSPARK_COPY` and `MLX_SERVE_DSV41_DSPARK_POLICY` (the server's environment, as `routedT3`): the
+/// drafter's copy rounds and verify policy (src/rounds.zig), on unless the value starts with `0`.
+pub fn switchOn(value: ?[]const u8) bool {
+    const v = value orelse return true;
+    return v.len == 0 or v[0] != '0';
+}
+
 /// The built-in's facts as this plugin serves them: the bank streams (the copy's parse saw `experts.bin`), the state is
 /// the module's own, the host loads none of the shards (`weights.keep_key` refuses every key: the plugin reads them
 /// itself), and the DSpark stages draft as the model's native drafter.
@@ -158,4 +165,13 @@ test "turboexl3_ds41 refuses by name the pack before its repack and a codebook i
 test "turboexl3_ds41 runs the routed experts on turboexl3 only when MLX_SERVE_DSV41_ROUTED names it" {
     try testing.expect(routedT3("turboexl3"));
     for ([_]?[]const u8{ null, "", "0", "streamer", "turboexl3 " }) |v| try testing.expect(!routedT3(v));
+}
+
+test "turboexl3_ds41 keeps its DSpark copy rounds and verify policy on unless the setting starts with 0" {
+    for ([_]?[]const u8{ null, "", "1", "on" }) |v| try testing.expect(switchOn(v));
+    for ([_][]const u8{ "0", "00", "0n" }) |v| try testing.expect(!switchOn(v));
+}
+
+test {
+    _ = @import("src/rounds.zig");
 }
