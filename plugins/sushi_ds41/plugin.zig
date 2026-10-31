@@ -79,8 +79,6 @@ const Model = struct {
     copy: CopyStats = .{},
     /// Whether this request still takes copies (`copy_lookup.Backoff`).
     copy_backoff: copy_lookup.Backoff = .{},
-    /// A long prompt's n-gram index, built on a thread while the prompt prefills (`startIndex`); `copyDrafts` takes it.
-    builder: ?*copy_lookup.Builder = null,
     prev_cache_limit: ?usize = null,
     /// The MLX buffer-pool cap in force (`borrow.poolCap` of the last pass's rows): `pool_bytes` at decode widths.
     pool_now: u64 = pool_bytes,
@@ -293,7 +291,6 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     m.weights.deinit();
     m.ids.deinit(gpa);
     m.lookup.deinit(gpa);
-    if (m.builder) |b| b.discard();
     gpa.destroy(m);
 }
 
@@ -313,7 +310,6 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     if (pos + host.ids.len > m.billed_context + generation_rows) return Verdict.refuse(.failed, "sushi_ds41: the request is longer than the context the expert cache was sized for (raise ctx_size)");
     for (host.ids) |t| if (t >= m.cfg.vocab) return Verdict.refuse(.failed, "sushi_ds41: token id past the vocabulary");
     capture(m) catch return Verdict.refuse(.failed, "sushi_ds41: the restore point could not be taken");
-    startIndex(m, host.ids);
     const want: dsv.Want = if (f.logits == .all_rows) .all else .last;
     const rows: ?dsv.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
     // A host older than `Forward.progress` passes a shorter struct.
@@ -351,21 +347,6 @@ fn hostIds(m: *Model, f: *const abi.Forward) !HostIds {
 fn clearIds(m: *Model) void {
     m.ids.clearRetainingCapacity();
     m.lookup.clear();
-    if (m.builder) |b| b.discard();
-    m.builder = null;
-}
-
-/// Prompts this long have their n-gram index built on a thread while they prefill; shorter ones index inline, at the
-/// first round.
-const index_thread_rows = 4096;
-
-/// Starts indexing the history plus `prompt` on a thread, so the first decode round finds the index built.
-fn startIndex(m: *Model, prompt: []const u32) void {
-    if (prompt.len < index_thread_rows) return;
-    if (m.builder) |b| b.discard();
-    m.builder = null;
-    m.lookup.clear();
-    m.builder = copy_lookup.Builder.start(gpa, m.ids.items, prompt) catch null;
 }
 
 const CopyStats = struct { rounds: u64 = 0, drafted: u64 = 0, accepted: u64 = 0 };
@@ -848,13 +829,6 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
 /// The copy arm: writes the context's continuation after `t1` to `drafts` and returns its length, or null for a stage
 /// round.
 fn copyDrafts(m: *Model, t1: u32, cap: u32, drafts: []u32) !?usize {
-    if (m.builder) |b| {
-        var ms: f64 = 0;
-        m.lookup.deinit(gpa);
-        m.lookup = b.finish(&ms);
-        m.builder = null;
-        log.info("[sushi_ds41] copy index: {d} ids in {d:.1} ms on a thread\n", .{ m.lookup.toks.items.len, ms });
-    }
     try m.lookup.sync(gpa, m.ids.items);
     const room = m.copy_backoff.width(@min(@as(usize, cap), max_verify_rows - 1, drafts.len));
     const found = m.lookup.matchBest(t1, @intCast(room));

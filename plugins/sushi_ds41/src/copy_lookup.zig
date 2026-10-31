@@ -97,64 +97,6 @@ pub const Index = struct {
     }
 };
 
-/// The index of a long prompt, built on a thread of its own while the prompt prefills, so the first decode round does
-/// not index 100k+ ids inline. `ids` is a copy the thread owns; `finish` joins and hands the index over.
-pub const Builder = struct {
-    gpa: std.mem.Allocator,
-    thread: std.Thread,
-    ids: []u32,
-    index: Index = .{},
-    failed: bool = false,
-    ms: f64 = 0,
-
-    /// Starts indexing `before` followed by `prompt` (the history the prompt extends, then the prompt).
-    pub fn start(gpa: std.mem.Allocator, before: []const u32, prompt: []const u32) !*Builder {
-        const b = try gpa.create(Builder);
-        errdefer gpa.destroy(b);
-        const ids = try gpa.alloc(u32, before.len + prompt.len);
-        errdefer gpa.free(ids);
-        @memcpy(ids[0..before.len], before);
-        @memcpy(ids[before.len..], prompt);
-        b.* = .{ .gpa = gpa, .thread = undefined, .ids = ids };
-        b.thread = try std.Thread.spawn(.{}, build, .{b});
-        return b;
-    }
-
-    fn build(b: *Builder) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const start_at = std.Io.Timestamp.now(io, .awake);
-        b.index.toks.ensureTotalCapacity(b.gpa, b.ids.len) catch {};
-        b.index.next.ensureTotalCapacity(b.gpa, @intCast(b.ids.len)) catch {};
-        b.index.extend(b.gpa, b.ids) catch {
-            b.failed = true;
-        };
-        b.ms = @as(f64, @floatFromInt(start_at.untilNow(io, .awake).nanoseconds)) / 1e6;
-    }
-
-    /// Joins the thread and returns its index (empty if it failed), with its build ms in `out_ms`; frees the builder.
-    pub fn finish(b: *Builder, out_ms: *f64) Index {
-        b.thread.join();
-        const gpa = b.gpa;
-        var index = b.index;
-        if (b.failed) {
-            index.deinit(gpa);
-            index = .{};
-        }
-        out_ms.* = b.ms;
-        gpa.free(b.ids);
-        gpa.destroy(b);
-        return index;
-    }
-
-    /// Joins the thread and throws its work away (the history it indexed was replaced).
-    pub fn discard(b: *Builder) void {
-        const gpa = b.gpa;
-        var ms: f64 = 0;
-        var index = b.finish(&ms);
-        index.deinit(gpa);
-    }
-};
-
 /// When a request stops taking copies: a copy round verifies up to 16 rows, so one that is rejected early costs far more
 /// than the stage round it replaced. Each copy round is priced against the stage rounds' own ms per token; copies that
 /// lose back the next matches off (skipped, the stage drafts instead), doubling to a cap, as the rows policy backs off
@@ -287,21 +229,6 @@ test "sushi_ds41 copy: a round verifies what copies have been landing plus 2, th
     // Copies keep about 1: the width falls to the block, so `copyLen` leaves rounds to the stage draft.
     try testing.expect(b.width(15) <= 5);
     try testing.expectEqual(@as(usize, 0), copyLen(.{ .draft = &(@as([15]u32, @splat(0))), .suffix = STRONG_SUFFIX }, b.width(15), 5));
-}
-
-test "sushi_ds41 copy: a prompt indexed on a thread matches one indexed inline" {
-    const before = [_]u32{ 9, 9, 1, 2, 3, 4, 5, 6 };
-    const prompt = [_]u32{ 7, 1, 2, 3 };
-    const b = try Builder.start(testing.allocator, &before, &prompt);
-    var ms: f64 = 0;
-    var threaded = b.finish(&ms);
-    defer threaded.deinit(testing.allocator);
-    var inline_idx: Index = .{};
-    defer inline_idx.deinit(testing.allocator);
-    try inline_idx.extend(testing.allocator, &before);
-    try inline_idx.extend(testing.allocator, &prompt);
-    try testing.expectEqualSlices(u32, inline_idx.toks.items, threaded.toks.items);
-    try testing.expectEqualSlices(u32, (inline_idx.matchBest(4, 2) orelse return error.NoMatch).draft, (threaded.matchBest(4, 2) orelse return error.NoMatch).draft);
 }
 
 test "sushi_ds41 copy: only a long agreement that outruns the stage block is copied" {
