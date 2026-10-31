@@ -309,6 +309,9 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     if (st.n != pos) return Verdict.refuse(.failed, "sushi_ds41: the position does not follow the model's state");
     if (pos + host.ids.len > m.billed_context + generation_rows) return Verdict.refuse(.failed, "sushi_ds41: the request is longer than the context the expert cache was sized for (raise ctx_size)");
     for (host.ids) |t| if (t >= m.cfg.vocab) return Verdict.refuse(.failed, "sushi_ds41: token id past the vocabulary");
+    // Every row's logits come from one pass over the whole span (`run` chunks only a prompt that wants the last row's),
+    // so refuse a span wider than the widest prefill pass: a DeepSeek-V4.1 pass past 8,192 rows can hang the machine.
+    if (f.logits == .all_rows and host.ids.len > sc.prefill_width + sc.tail_merge_rows) return Verdict.refuse(.too_large, "sushi_ds41: every row's logits past one prefill pass");
     capture(m) catch return Verdict.refuse(.failed, "sushi_ds41: the restore point could not be taken");
     const want: dsv.Want = if (f.logits == .all_rows) .all else .last;
     const rows: ?dsv.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
