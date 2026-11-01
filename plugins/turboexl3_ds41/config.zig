@@ -194,6 +194,7 @@ test {
     _ = @import("src/prompt_tl.zig");
     _ = @import("src/whole_stream.zig");
     _ = @import("src/stage.zig");
+    _ = @import("src/stage_next.zig");
     _ = @import("src/verify_tl.zig");
     _ = @import("src/late_gemv.zig");
     _ = @import("src/shared_hoist.zig");

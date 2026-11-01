@@ -74,6 +74,8 @@ pub const Counters = struct {
     stage_posted: u64 = 0,
     stage_adopted: u64 = 0,
     stage_bytes: u64 = 0,
+    /// MLX_SERVE_DSV41_STAGE_NEXT: of the staged records, those posted during the call before theirs.
+    stage_early: u64 = 0,
 
     fn since(a: Counters, b: Counters) Counters {
         var d: Counters = .{};
@@ -426,7 +428,7 @@ pub fn report(c: Counters) void {
         const ra_ns = r.ra1 -| r.ra0;
         const attn_ns = r.t_idx -| r.t0;
         const moe_ns = r.t1 -| r.t_idx;
-        std.debug.print("[prompt-io] call={d} layer={d} rows={d} dec={d} uniq={d} ra_ms={d:.1} attn_ms={d:.1} moe_ms={d:.1} other_ms={d:.1} layer_ms={d:.1} read_gb={d:.3} rwall_ms={d:.1} rwait_ms={d:.1} misses={d} hits={d} ahead_hits={d} ahead_posted={d} staged={d} adopted={d}\n", .{ i, r.layer, r.rows, @intFromBool(r.dec), dc.misses + dc.hits, ms(ra_ns), ms(attn_ns), ms(moe_ns), ms(layer_ns -| (ra_ns + attn_ns + moe_ns)), ms(layer_ns), gb(dl.bytes), ms(dl.wall_ns), ms(dl.wait_ns), dc.misses, dc.hits, dc.ahead_hits, dl.ahead_posted, dl.stage_posted, dl.stage_adopted });
+        std.debug.print("[prompt-io] call={d} layer={d} rows={d} dec={d} uniq={d} ra_ms={d:.1} attn_ms={d:.1} moe_ms={d:.1} other_ms={d:.1} layer_ms={d:.1} read_gb={d:.3} rwall_ms={d:.1} rwait_ms={d:.1} misses={d} hits={d} ahead_hits={d} ahead_posted={d} staged={d} adopted={d} early={d}\n", .{ i, r.layer, r.rows, @intFromBool(r.dec), dc.misses + dc.hits, ms(ra_ns), ms(attn_ns), ms(moe_ns), ms(layer_ns -| (ra_ns + attn_ns + moe_ns)), ms(layer_ns), gb(dl.bytes), ms(dl.wall_ns), ms(dl.wait_ns), dc.misses, dc.hits, dc.ahead_hits, dl.ahead_posted, dl.stage_posted, dl.stage_adopted, dl.stage_early });
         if (r.g[0] != 0) {
             const steps = wideSteps(r);
             std.debug.print("[prompt-io] wide call={d} layer={d} ra_wait_ms={d:.1} ra_host_ms={d:.1} hc_ms={d:.1} qkv_ms={d:.1} attn_ms={d:.1} wob_ms={d:.1} ffn_ms={d:.1} route_ms={d:.1}", .{ i, r.layer, ms(steps[0]), ms(steps[1]), ms(steps[2]), ms(steps[3]), ms(steps[4]), ms(steps[5]), ms(steps[6]), ms(steps[7]) });
@@ -440,7 +442,7 @@ pub fn report(c: Counters) void {
     dec.print("decoder");
     all.print("total");
     const d = c.since(c_prompt);
-    std.debug.print("[stream-stats prompt] wall_ms={d:.1} routes={d} hits={d} misses={d} evictions={d} read_gb={d:.2} read_wait_ms={d:.1} read_wall_ms={d:.1} ahead_posted={d} ahead_hits={d} ahead_gb={d:.2} spec_issued={d} spec_landed={d} claimed={d} fill_posted={d} fill_gb={d:.2} stage_posted={d} stage_adopted={d} stage_gb={d:.2} calls={d} dropped={d}\n", .{ ms(t_end -| t_prompt), d.routes, d.hits, d.misses, d.evictions, gb(d.bytes), ms(d.wait_ns), ms(d.wall_ns), d.ahead_posted, d.ahead_hits, gb(d.ahead_bytes), d.spec_issued, d.spec_landed, d.claimed, d.fill_posted, gb(d.fill_bytes), d.stage_posted, d.stage_adopted, gb(d.stage_bytes), n_calls, dropped });
+    std.debug.print("[stream-stats prompt] wall_ms={d:.1} routes={d} hits={d} misses={d} evictions={d} read_gb={d:.2} read_wait_ms={d:.1} read_wall_ms={d:.1} ahead_posted={d} ahead_hits={d} ahead_gb={d:.2} spec_issued={d} spec_landed={d} claimed={d} fill_posted={d} fill_gb={d:.2} stage_posted={d} stage_adopted={d} stage_gb={d:.2} stage_early={d} calls={d} dropped={d}\n", .{ ms(t_end -| t_prompt), d.routes, d.hits, d.misses, d.evictions, gb(d.bytes), ms(d.wait_ns), ms(d.wall_ns), d.ahead_posted, d.ahead_hits, gb(d.ahead_bytes), d.spec_issued, d.spec_landed, d.claimed, d.fill_posted, gb(d.fill_bytes), d.stage_posted, d.stage_adopted, gb(d.stage_bytes), d.stage_early, n_calls, dropped });
     for (probes[0..n_probes]) |p| {
         var buf: [32]u8 = undefined;
         const prev_s = if (p.prev) |h| std.fmt.bufPrint(&buf, "{d:.2}", .{share(h, p.actual)}) catch "?" else "-";

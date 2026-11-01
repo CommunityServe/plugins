@@ -357,6 +357,31 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   the encoder: 205.3 GB on against 229.3 (w-pio-20261101-0953, a profile build). Exact: `check` (w-pio-20261101-0953)
   compared 2,564,014,080 tail words and 23,135,944,704 score words over both requests, none different, and every arm's
   texts are the policy-off references (cold d081845201, new-text slice 3 4d5b401f3c).
+- `MLX_SERVE_DSV41_STAGE_NEXT` (src/stage_next.zig, patches/turboexl3-zzz8j-stage-next.patch; on, `=0` off; with
+  `MLX_SERVE_DSV41_STAGE`): a wide prompt layer's read-ahead and predicted transient loads read during the call before
+  it. `=0`: staging posts a layer's stream misses at the layer's start, so they read under its attention (~4.5 GB a
+  16K-row layer, ~340 ms at the drive's rate against ~250 ms of attention) and its call waits on the rest, while the
+  drive idles from the call before's last reads to this layer's start (~5.5 s of a cold 16K prompt's encoder): a shorter
+  attention (Q_TAIL) turned into as much more waiting on bytes. On, the model predicts layer N+1's routes from layer N's
+  FFN rows (N+1's gate over N's MoE input, its columns scaled by the two FFN norms' ratio) and hands the ids,
+  unevaluated, to the source before N's call (`Routed.next_fn`, `NextAhead`), which starts them behind its routing
+  barrier. Right after the call's last route the source reads them back (each expert's votes, hottest first), reads
+  layer N+1's predicted seed ahead into N+1's persistent rows (`Stream.readAheadNext`: P1's row rule; N's call never
+  reads those rows) and lays N+1's stream misses out as staging does (`Stream.stageNext`); each window's records are
+  posted once no route holds the window (a group drains before its release) and the copier is done with it. Layer N+1's
+  staging takes them as its own (the windows not posted yet posted then; none posted: staging as before), its call
+  adopts them as before, and its own read-ahead reads whatever its prediction adds. The read pool is first come, first
+  served and N's routes' reads are all queued first. The ticket ring doubles again (4096). `[prompt-io]` `early=` counts
+  the records posted during the call before theirs (in that call's line), `[stream-stats prompt]` `stage_early=` the
+  prompt's. The hook also takes a cap and DEC_PREFETCH's row rule (`fill`) and can skip the windows, for a caller that
+  reads ahead into persistent rows only. Exact: the prediction picks which records are read ahead and into which rows,
+  never the routes.
+- On against `=0` (w-pio-20261101-1102, on 9f62348; usage seed with SEED_FREE, the DSpark verify policy and copy rounds
+  off, A B B A): 1254.1 and 1259.3 tok/s cold prefill against 1211.6 and 1214.2 (+3.6%); new text 1287.3 and 1283.1
+  against 1281.2 and 1280.6 (+0.3%). Over the cold request's encoder the moe stage took 4489 and 4431 ms against 4930
+  and 4968, the host's waits on bytes 536 and 595 against 1048 and 1077; 4434 and 4427 of the 4638 and 4630 staged
+  records were posted during the call before theirs, 3965 and 3944 adopted (85%). Exact: the texts are the policy-off
+  references in every arm (cold d081845201, new-text slice 3 4d5b401f3c).
 
 ## The pack
 
