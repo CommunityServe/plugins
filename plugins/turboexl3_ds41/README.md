@@ -102,6 +102,20 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   forward's for `phase`, `embed`, `ds_commit`, `head`, `markov`). `=N` (N > 1) logs every N forwards as well. Synced
   stages lose their overlap: the times attribute a forward, they are not its served speed. With it on, the decode
   stretches run eager, the same ops on the same kernels, uncompiled; unset, nothing changes.
+- `MLX_SERVE_DSV41_LOOKAHEAD` (src/stream_lookahead.zig, read by the copied stream through
+  patches/turboexl3-zz3-lookahead.patch) sets the decode's expert lookahead, which reads the next layer's predicted
+  experts ahead of its route. Unset, the streamer's constants: 2 records read ahead a layer call, idle rule 0.
+  `<budget>[:<idle>]`: 0 to 4 records (0 turns the predictor off) and the idle rule 0 or 1 (1: a speculative thread past
+  the first may start a chunk while one demand read runs). Budgets 0 to 2 keep the stream's sizing and its rows; 4 sizes
+  it for 4. The served bytes are the same at every setting. On the full pack (code-ctx16384, greedy with the prefix
+  cached, window w-20261101-0226), at full-block verifies the default verified 7.0 +/- 1.7 ms a round faster than 0
+  (107.6 against 114.6 ms, faster in 89 of 107 rounds, the same greedy text), and budget 4 issued 57% more records for no
+  more claimed ones.
+- `[round-io]` (src/round_io.zig, on with the DSpark profile, `MLX_SERVE_DIAG=dspark-profile`) logs at each request's
+  end the expert stream's traffic of the decode's rounds and of the rest (the prompt pass): unique experts missed and
+  hit, the demand's bytes (and those copied out of lookahead records), the lookahead's bytes, its abandoned ones, its
+  records issued and claimed, the read wall and wait times, and the process's disk reads and page-ins
+  (`proc_pid_rusage`); then one line a round beside its verify time.
 
 ## The pack
 

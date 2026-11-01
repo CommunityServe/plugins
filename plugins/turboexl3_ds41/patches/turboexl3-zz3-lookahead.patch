@@ -1,0 +1,84 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -273,6 +273,7 @@
+     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
++    pub const MLX_SERVE_DSV41_LOOKAHEAD: Var = .{ .kind = .kill, .type = .text, .default = "2 (records read ahead a layer call; idle rule 0)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's expert lookahead (turboexl3_ds41): <budget>[:<idle>], the records read ahead a layer call 0 to 4 (0: the predictor off) and the idle rule 0 or 1; the served bytes are the same at every setting" };
+     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
+     pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig	2026-10-31 21:53:43
++++ b/sdk/weights/streamed/exl3_source.zig	2026-10-31 21:53:44
+@@ -60,7 +60,14 @@
+     }
+ };
+ const wide_depth: u8 = 5;
+-const lookahead: expert_stream.Lookahead = .{ .k = 8, .tau = std.math.inf(f32), .budget = 2 };
++/// The decode's lookahead as `MLX_SERVE_DSV41_LOOKAHEAD` sets it (turboexl3_ds41's src/stream_lookahead.zig, set at its
++/// load): unset, the constants (k 8, every row's plain top-K, 2 records read ahead a layer call, idle rule 0). The stream
++/// is sized for `initBudget` (2 below it, so its memory and rows stay); a call reads ahead `budget` of them (0: none, the
++/// predictor off in `experts.zig`).
++const la_setting = &@import("mlx_host").stream_lookahead.setting;
++fn lookahead() expert_stream.Lookahead {
++    return .{ .k = 8, .tau = std.math.inf(f32), .budget = la_setting.initBudget(), .idle_busy = la_setting.idle_busy };
++}
+ const event_watchdog_ms = 2000;
+ const wide: xp.Wide = .{ .seed = true, .hot_first = true, .depth = wide_depth, .defer_base = true, .read_ahead = true, .base_at_seed = true, .seed_aligned = true };
+ const forms: xq.Forms = .{ .down_pair = true, .gu_one = true };
+@@ -99,7 +106,7 @@
+         .row_bytes = row,
+         .prompt_windows = wide_depth * window,
+         .decode_windows = if (release) window else wide_depth * window,
+-        .staging = expert_admission.lookaheadCharge(record, 2 * lookahead.budget, std.heap.pageSize()),
++        .staging = expert_admission.lookaheadCharge(record, 2 * lookahead().budget, std.heap.pageSize()),
+         .rows = undefined,
+     };
+     const n: u64 = bank.n_experts;
+@@ -177,7 +184,7 @@
+         self.stream = try expert_stream.Stream.init(a, &self.bank, .{
+             .rows = self.prompt_rows,
+             .slot_memory = .{ .mlx = s },
+-            .lookahead = lookahead,
++            .lookahead = lookahead(),
+             .event = .{ .backend = .{ .metal = event.object }, .watchdog_ms = event_watchdog_ms },
+             .wide_depth = wide_depth,
+             .transient_rows = @as(u32, wide_depth) * sdk_ext.expert.policy.max_route_ids,
+@@ -185,6 +192,10 @@
+             .fill_reserve = fillReserve(self.prompt_rows),
+         });
+         errdefer self.stream.deinit();
++        // A budget under the stream's: each call reads ahead fewer records (0 never selects: the predictor is off).
++        if (la_setting.budget > 0 and la_setting.budget < la_setting.initBudget()) {
++            if (self.stream.selector) |*sel| sel.budget = la_setting.budget;
++        }
+         self.source = xp.StreamSource.init(self.stream);
+         self.gates_t3 = &.{};
+         self.t3_state = .{ .limit = 0 };
+diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streamed/experts.zig
+--- a/sdk/weights/streamed/experts.zig	2026-10-31 21:53:43
++++ b/sdk/weights/streamed/experts.zig	2026-10-31 21:53:44
+@@ -41,6 +41,12 @@
+ const prof = @import("profile/prefill_timers.zig");
+ const xq = @import("../../quant/exl3/stream/quant.zig");
+ pub const max_route_ids = expert_policy.max_route_ids;
++/// turboexl3_ds41's `MLX_SERVE_DSV41_LOOKAHEAD=0` (its src/stream_lookahead.zig): the decode's predictor off, nothing
++/// read ahead; every other setting predicts.
++fn lookaheadPredicts() bool {
++    const host = @import("mlx_host");
++    return if (@hasDecl(host, "stream_lookahead")) host.stream_lookahead.setting.predicts() else true;
++}
+ /// The widest decode / verify forward (the RC routes' and the verify block's rows): at most
+ /// `decode_forward_rows * top_k` routed ids, which construction proves fit one route (`max_route_ids`),
+ /// so a forward of <= 8 rows never reaches the wide lane.
+@@ -1407,7 +1413,7 @@
+             const t_call = tt;
+             if (comptime timeline.enabled) timeline.point(layer, .call, self.readGauge(), false);
+             // The installed decode-only predictor follows the source's phase; the last layer predicts nothing.
+-            const predict = if (comptime routes.lookahead and predictor_decode_only) self.source.decoding() else routes.lookahead;
++            const predict = (if (comptime routes.lookahead and predictor_decode_only) self.source.decoding() else routes.lookahead) and lookaheadPredicts();
+             const sc: ?T = if (if (predict) self.predictorGate(layer) else null) |gate| try self.scoresOf(g, xf, gate) else null;
+             // The barrier's arrays: the ids, then the scores when there are any.
+             var bar: [2]T = undefined;

@@ -30,6 +30,12 @@ pub const dec_prefetch = @import("src/dec_prefetch.zig");
 /// The DSpark draft's Markov chain in B + 1 launches (src/markov.zig, called by the copied model's draft;
 /// `MLX_SERVE_DSV41_MARKOV`).
 const markov = @import("src/markov.zig");
+/// Each DSpark round's expert stream traffic and the process's disk reads beside its verify time (src/round_io.zig), on
+/// with the DSpark profile (`MLX_SERVE_DIAG=dspark-profile`).
+const round_io = @import("src/round_io.zig");
+/// The decode's expert lookahead (`MLX_SERVE_DSV41_LOOKAHEAD`, src/stream_lookahead.zig), read by the copied stream
+/// (exl3_source.zig, experts.zig) through this root.
+pub const stream_lookahead = @import("src/stream_lookahead.zig");
 const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
 const v4plugin = @import("src/mlx_serve/plugins/deepseek_v4/plugin.zig");
@@ -117,6 +123,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     markov.tally = .{};
+    // Before the model's load: the stream sizes its lookahead when it opens.
+    stream_lookahead.setting = stream_lookahead.parse(env.span(.MLX_SERVE_DSV41_LOOKAHEAD)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_LOOKAHEAD is none of 0 to 4, with an optional :0 or :1: the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     // Before the model's load, which compiles its decode stretches only when the stage profiler is off.
     stage_prof.configure(env.span(.MLX_SERVE_DSV41_STAGE_PROF));
     prompt_io.configure(env.span(.MLX_SERVE_DSV41_PROMPT_IO));
@@ -162,7 +176,37 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .check => "fused and the op chain, compared every draft; the op chain's served (MLX_SERVE_DSV41_MARKOV=check); [markov] lines at each request's end",
         .off => "the op chain (MLX_SERVE_DSV41_MARKOV=0)",
     }});
+    const la = stream_lookahead.setting;
+    if (!la.isDefault()) log.info("[turboexl3_ds41] decode lookahead (MLX_SERVE_DSV41_LOOKAHEAD): {d} records read ahead a layer call{s}, idle rule {d}, the stream sized for {d}\n", .{ la.budget, if (la.predicts()) "" else " (the predictor off)", la.idle_busy, la.initBudget() });
+    round_io.on = model(mp).mdl.ds_prof != null;
+    if (round_io.on) {
+        round_io.start(ioSnap(model(mp)));
+        log.info("[turboexl3_ds41] [round-io] on (the DSpark profile): each round's expert stream traffic and the process's disk reads beside its verify time, the decode's and the rest's at each request's end\n", .{});
+    }
     return mp;
+}
+
+/// The stream's counters and the process's disk reads now (`round_io`).
+fn ioSnap(m: *ds.Model) round_io.Snap {
+    const pr = round_io.proc();
+    const r = m.mdl.streamed orelse return .{ .phys = pr.phys, .pageins = pr.pageins };
+    if (r.math != .source) return .{ .phys = pr.phys, .pageins = pr.pageins };
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    const s = src.stats();
+    return .{
+        .misses = s.expert_cache_misses,
+        .hits = s.expert_cache_hits,
+        .demand = s.expert_bytes_read,
+        .spec = s.spec_bytes,
+        .abandoned = s.spec_abandoned_bytes,
+        .claimed = s.claimed,
+        .issued = s.spec_issued,
+        .wall_ns = s.read_wall_ns,
+        .wait_ns = s.read_wait_ns,
+        .adopt = s.adopt_bytes,
+        .phys = pr.phys,
+        .pageins = pr.pageins,
+    };
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {
@@ -236,6 +280,7 @@ const Drafted = struct { d: dsv41.DsparkDraft, round: Round };
 /// The round's drafts from `t1` (`rounds.Drafter.plan`), at most what a verify carries and the round may keep: the
 /// context's continuation, none, or the stages' draft cut by the policy.
 fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_cap: u32) !Drafted {
+    if (round_io.on) round_io.begin(ioSnap(m));
     const watch = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     const max = @min(dsv41.maxVerifyDrafts(m.mdl), @as(usize, accept_cap), abi.max_round_tokens - 1);
     const plan = dr.plan(st.n, t1, max, accept_cap, m.mdl.ds_block);
@@ -258,6 +303,7 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
 fn kept(m: *ds.Model, round: *const Round, r: *dsv41.DsparkRound, st: *const dsv41.State) void {
     r.phases.draft_ns = if (round.kind == .stage) m.mdl.ds_draft_ns else 0;
     dsv41.dsparkObserve(m.mdl, r.phases);
+    if (round_io.on) round_io.end(ioSnap(m), round.drafts + 1, r.phases.verify_ns, round.watch.read());
     const dr = if (drafter) |*d| d else return;
     const conf: []const f32 = if (round.kind == .stage) round.conf[0..round.drafts] else &.{};
     dr.learn(round.kind, round.drafts, conf, r.accepted, msOf(r.phases.verify_ns), msOf(round.watch.read()));
@@ -269,6 +315,7 @@ fn msOf(ns: u64) f32 {
 }
 
 fn roundFailed(e: anyerror) Verdict {
+    round_io.abandon();
     log.err("[turboexl3_ds41] draft round failed: {s}\n", .{@errorName(e)});
     if (drafter) |*d| d.history.lose();
     return Verdict.named(.failed, @errorName(e));
@@ -373,6 +420,7 @@ fn dropPending() void {
 /// given, a prompt's device ids read back as the forward reads them (before it runs, so the read waits on none of it),
 /// a decode token the forward keeps on the GPU read once the forward has read it (at the next round or forward).
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
+    round_io.abandon();
     const dr = if (drafter) |*d| d else return ds.table.forward(mp, f, out);
     settlePending(dr);
     const at: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
@@ -402,18 +450,21 @@ fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: ab
     return n;
 }
 
-var meter_buf: [2048]u8 = undefined;
+var meter_buf: [131072]u8 = undefined;
 
 /// The request's DSpark rounds beside the engine's `[spec-stats]`, which counts every native round a stage round; the
 /// stage profiler's lines (src/stage_prof.zig) when it is on; the expert stream's counters since the last request, and
-/// the one-call path's (src/routed_one.zig) when it is on; the Markov chain's drafts (src/markov.zig) when it is on.
+/// the one-call path's (src/routed_one.zig) when it is on; the Markov chain's drafts (src/markov.zig) when it is on; each
+/// round's stream traffic (src/round_io.zig) with the DSpark profile.
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = slot;
     stage_prof.requestEnd();
     const head = if (drafter) |*d| d.meters(&meter_buf) else meter_buf[0..0];
     const mid = streamMeters(model(mp), meter_buf[head.len..]);
     const tail = markov.meters(meter_buf[head.len + mid.len ..]);
-    out.* = abi.Str.of(meter_buf[0 .. head.len + mid.len + tail.len]);
+    const n = head.len + mid.len + tail.len;
+    const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }
 
 const Exl3Source = @import("src/mlx_serve/sdk/weights/streamed.zig").Exl3.Source;
