@@ -93,6 +93,12 @@ pub const stage = @import("src/stage.zig");
 /// A wide prompt layer's predicted transient loads read during the call before it, into the windows that call's groups
 /// let go (`MLX_SERVE_DSV41_STAGE_NEXT`, src/stage_next.zig), read by the copied model, stream and source.
 pub const stage_next = @import("src/stage_next.zig");
+/// The wide prompt layers' per-prompt regions (src/scratch.zig), read by the copied model and stream.
+pub const scratch = @import("src/scratch.zig");
+/// A wide prompt call's DIG-X waves write into per-prompt regions (`MLX_SERVE_DSV41_SCRATCH_WAVES`,
+/// src/scratch_waves.zig on src/scratch.zig's `Region`, its twins' texts by src/wave_twins.zig), read by the copied
+/// quant and source.
+pub const scratch_waves = @import("src/scratch_waves.zig");
 /// A profile build (`zig build -Dplugin-profile=true`, never served): the copied stream's profile probes compiled in (its
 /// `sdk` reads this through this root) and the decode verify's GPU timeline (`MLX_SERVE_DSV41_TIMELINE`,
 /// src/verify_tl.zig).
@@ -264,6 +270,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     whole_stream.configure(env.span(.MLX_SERVE_DSV41_WHOLE_STREAM)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_WHOLE_STREAM is not 0 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    scratch_waves.configure(env.span(.MLX_SERVE_DSV41_SCRATCH_WAVES)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_WAVES is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -466,6 +479,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] [round-io] on (the DSpark profile): each round's expert stream traffic and the process's disk reads beside its verify time, the decode's and the rest's at each request's end\n", .{});
     }
     if (direct_parts.on) if (partsSnap(model(mp))) |ps| direct_parts.start(ps);
+    switch (scratch_waves.mode) {
+        .off => log.info("[turboexl3_ds41] prefill waves' intermediates in fresh buffers (MLX_SERVE_DSV41_SCRATCH_WAVES=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] prefill waves into per-prompt regions (MLX_SERVE_DSV41_SCRATCH_WAVES; =0: fresh buffers): their launches as write-into twins of the stock texts (compiled at load) on two sets of a wave's intermediates at {d} rows, an uncarried call's waves on them; [scratch-waves] at each request's end\n", .{scratch_waves.set_rows}),
+        .check => log.info("[turboexl3_ds41] prefill waves into per-prompt regions, checked (MLX_SERVE_DSV41_SCRATCH_WAVES=check): the fresh waves served, every launch's region output compared with the fresh one; [scratch-waves] per launch (words, differ, max_abs, max_ulps, over1) at each request's end\n", .{}),
+    }
     return mp;
 }
 
@@ -785,7 +803,8 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const tail = markov.meters(meter_buf[head.len + mid.len ..]);
     const n0 = head.len + mid.len + tail.len;
     const dp = if (partsSnap(model(mp))) |ps| direct_parts.meters(ps, meter_buf[n0..]) else meter_buf[n0..n0];
-    const n = n0 + dp.len;
+    const swl = scratch_waves.meters(meter_buf[n0 + dp.len ..]);
+    const n = n0 + dp.len + swl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }

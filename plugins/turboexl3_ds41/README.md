@@ -173,6 +173,25 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   warm server's fills evicted residents and its prompt lost 2 to 3%; with the rule a warm server's second prompt posted
   no fill (w-pio-20261101-0338). Over the usage seed it does not help: with SEED_FREE, S=10 took 984.7 tok/s against
   986.4 to 997.3 without it, its decoder misses 1404 against 1320.
+- `MLX_SERVE_DSV41_SCRATCH_WAVES` (src/scratch_waves.zig on src/scratch.zig's `Region`, the twins' texts by
+  src/wave_twins.zig, their launches and the wiring in patches/turboexl3-zzz8n-scratch-waves.patch; on by default, `=0`
+  off, `check`): a wide prompt call's DIG-X waves write their intermediates into per-prompt regions, not fresh buffers.
+  A wave's launches (take2, the gate|up GEMM, onepass, the down GEMM; the GEMMs at K3 and K2) run as write-into twins
+  of the stock texts, derived at load from the registry's pinned texts: each output becomes a `device` cast of a
+  `<out>_dst` input (a whole region: an evaluated array, so no `contiguous` copy stands in for it), one carrier word
+  is the only output, the launch before's carrier is bound as `dep`, every other word is the stock text's.
+  rot_widen1 is a dep twin (the stock text with `dep` bound): its y stays MLX's output, the combine's part. Each anchor
+  (the `fp contract` pragma where expected, every output named, no name the twin adds) is checked and every twin
+  compiled by one launch at load; one that fails refuses the load by name. No manifest, enum or pin changes. Two sets
+  of the intermediates (by the wave's parity, at the tier shape's 7168 rows, 2 x 459 MB; two waves in flight never
+  share one) carry an uncarried call's waves; a carried call's and a solo wave stay fresh. `check` runs the stock
+  launches beside the twins and compares every launch's output (words, those that differ, max abs, max ulps, over
+  one ulp). On the full pack (M5 Max, the a4k canonical, --wired-margin-gib 3, EVICT=1; w-pio-20261101-1514, a1 b1 b2
+  a2, each a cold code-ctx16384 card request then the new-text 16K slice 3): cold 1195.5 and 1208.0 tok/s against
+  1183.4 and 1181.1 (+1.65%), new text 1239.1 and 1217.5 against 1201.8 and 1202.0 (+2.20%), the guard's accounted
+  peaks 109.0 / 105.9 GiB on against 102.2 / 108.7 off; check (c1, margin 12): 88,177,669,376 words over 760 waves,
+  every launch's output (x0, x1, zg, zu, hd, z, y) 0 words differing, max ulps 0. Exact: the texts identical in every
+  arm.
 - `MLX_SERVE_DSV41_SEED_FREE` (src/seed_free.zig, the policy in patches/turboexl3-zz5-seed-free.patch, tested by
   src/seed_free_test.zig): the rows the usage seed fills stay free until a route uses their expert. The prompt's
   read-ahead may take one for an expert its prediction ranks before the seeded one, so a layer's rows hold its call's

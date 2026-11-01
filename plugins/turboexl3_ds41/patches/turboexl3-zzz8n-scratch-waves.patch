@@ -1,0 +1,412 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig	2026-11-01 09:24:16
++++ b/env.zig	2026-11-01 09:24:17
+@@ -290,6 +290,7 @@
+     pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "turboexl3", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' decode (turboexl3, the default: turboexl3_ds41's banked decode; streamer: the streamer's own EXL3 kernels)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
++    pub const MLX_SERVE_DSV41_SCRATCH_WAVES: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prefill waves' per-prompt regions (turboexl3_ds41): on (the default; unset, empty or 1), a wide prompt call's DIG-X waves launch write-into twins of their stock texts (derived and compiled at load) on two sets of regions (by the wave's parity), not fresh buffers for their intermediates, the same words; check, the fresh waves served and every launch's region output compared with the fresh one (words, max abs, max ulps); 0: fresh buffers" };
+     pub const MLX_SERVE_DSV41_SEED_FREE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 usage seed's rows free until routed (turboexl3_ds41): the prompt's read-ahead may take a row the load's seed filled that no route has used, for an expert its prediction ranks before the seeded one, and the CED decoder prefetch one whose expert its prediction does not name" };
+     pub const MLX_SERVE_DSV41_SHARED_HOIST: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode layer's shared expert committed on its own when the routed call returns (turboexl3_ds41): it runs behind the device hit wave, while a layer with misses waits on their bytes; the same kernels, served bytes unchanged (=0: in the layer's last stretch)" };
+     pub const MLX_SERVE_DSV41_ROUTES: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode route recorder (turboexl3_ds41's route-recording builds only, zig build -Droute-rec=true): an absolute directory; each request's decode routes (expert.routes' file) and its rounds' tokens written there at its end" };
+diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/stream/quant.zig
+--- a/sdk/quant/exl3/stream/quant.zig	2026-11-01 09:24:16
++++ b/sdk/quant/exl3/stream/quant.zig	2026-11-01 09:24:16
+@@ -11,7 +11,11 @@
+ //! from exl3_kernel_ops.zig.
+ const std = @import("std");
+ const env = @import("mlx_host").env;
++/// turboexl3_ds41 (MLX_SERVE_DSV41_SCRATCH_WAVES): the waves' per-prompt regions and their twins' text derivation (the
++/// plugin's src/scratch_waves.zig, src/wave_twins.zig).
++const sw = @import("mlx_host").scratch_waves;
+ const kset = @import("../../../weights/streamed/sdk_ext/kernel_set.zig");
++const mtl = @import("../../../weights/streamed/sdk_ext/metal_launch.zig");
+ const mlx = @import("sdk").mlx;
+ const xk = @import("kernels.zig");
+ const selfcheck = @import("selfcheck.zig");
+@@ -222,6 +226,8 @@
+         forms: Forms = .{},
+         /// the banked route (`routeBanked`): every bank's rows of a wave in one launch per stage; null: not installed
+         banked: ?Banked(G) = null,
++        /// MLX_SERVE_DSV41_SCRATCH_WAVES's twins (`routeScratchWaves`); null: the waves' stock launches only
++        into: ?*IntoTwins = null,
+         /// Once per bank bind and per grow: the three projections' arrays are the kernels' (cap
+         /// within the kernels' bound, shapes, dtypes).
+         pub fn checkBank(self: *const Self, g: *G, bank: quant.BankArrays(A), diag: *Diag) !void {
+@@ -294,6 +300,23 @@
+             for (self.waves) |*w| w.dig.widen1_e = self.reg.get(.dsv41_prefill_dig_rot_widen1_5120_obf16);
+             self.expert_bf16 = true;
+         }
++        /// MLX_SERVE_DSV41_SCRATCH_WAVES, at construction (after `routeExpertBf16`, before any prefill): every layer's
++        /// uncarried waves launch the write-into twins (`IntoTwins`: derived from the registry's pinned stock texts, each
++        /// anchor checked, each compiled now by one launch; a twin that does not refuses the load by name). The twins are
++        /// the chain down's with the bf16 expert outputs: refused by name otherwise.
++        pub fn routeScratchWaves(self: *Self, g: *G, diag: *Diag) !void {
++            if (comptime G.T != mlx.mlx_array) return error.ScratchWavesNeedsMlx;
++            if (self.fused_down or !self.expert_bf16)
++                return intoRefuse(diag, error.ScratchWavesNeedsBf16Chain, "exl3 scratch waves: the twins are the chain down's with bf16 expert outputs (MLX_SERVE_DSV41_SCRATCH_WAVES)", .{});
++            if (self.into != null or self.waves.len == 0) return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: routed twice or no waves", .{});
++            const tw = try self.a.create(IntoTwins);
++            errdefer self.a.destroy(tw);
++            tw.* = try IntoTwins.init(self.a, self.reg, diag);
++            errdefer tw.deinit();
++            try tw.compileAll(g.s, self.waves[0].tiles_gu, self.waves[0].tiles_dn, diag);
++            self.into = tw;
++            for (self.waves) |*w| w.into = tw;
++        }
+         /// The routed decode forms, at construction (before any decode): the GEMVs rebuilt on the forms' texts. Exact by
+         /// the registry's twin checks (every word == mul1h's) and kbench v9; no device check here.
+         pub fn routeForms(self: *Self, g: *G, forms: Forms) !void {
+@@ -316,6 +339,10 @@
+         /// Releases the routes (statics, prepared configs, the row maps, the wave states) and
+         /// the plan's results. The kernel set stays the load context's.
+         pub fn deinit(self: *Self, g: *G) void {
++            if (self.into) |tw| {
++                tw.deinit();
++                self.a.destroy(tw);
++            }
+             if (self.banked) |*b| b.deinit(g);
+             for (self.waves) |*w| w.deinit(g);
+             self.a.free(self.waves);
+@@ -946,6 +973,162 @@
+ /// Row i reads act row i (the switch's `selected`), or act row `act_row[i]` when given (the
+ /// chunk's tokens and position / top_k: the same words without the switch's row take).
+ pub const PrefillRows = quant.PrefillRows;
++// ── MLX_SERVE_DSV41_SCRATCH_WAVES: the DIG-X wave launches' write-into twins (turboexl3_ds41) ──
++/// The wave launches an arena wave runs on its set's regions (the K3 and K2 GEMMs apart).
++pub const IntoTwin = enum { take2v, gemm_gu_k3, gemm_gu_k2, onepass, gemm_dn_k3, gemm_dn_k2, widen1 };
++/// Each twin's stock text (the chain down with the bf16 expert outputs, `routeExpertBf16`'s rot_widen1), where that
++/// text keeps its `fp contract` pragma (the plugin's src/wave_twins.zig anchor), and whether the twin is a dep twin
++/// (the stock text with `dep` bound, its outputs MLX's own: rot_widen1's y, the combine's part).
++const IntoSpec = struct { k: Kernel, pragma: sw.twins.Pragma, dep_only: bool = false };
++const into_specs = std.enums.EnumArray(IntoTwin, IntoSpec).init(.{
++    .take2v = .{ .k = .dsv41_prefill_dig_take2v_5120, .pragma = .first },
++    .gemm_gu_k3 = .{ .k = .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128, .pragma = .none },
++    .gemm_gu_k2 = .{ .k = .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128, .pragma = .none },
++    .onepass = .{ .k = .q3_prefill_dig2_swiglu_2304_x, .pragma = .none },
++    .gemm_dn_k3 = .{ .k = .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128, .pragma = .none },
++    .gemm_dn_k2 = .{ .k = .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128, .pragma = .none },
++    .widen1 = .{ .k = .dsv41_prefill_dig_rot_widen1_5120_obf16, .pragma = .first, .dep_only = true },
++});
++pub const IntoError = error{ ScratchWavesTwin, ScratchWavesNeedsBf16Chain, ScratchWavesNeedsMlx };
++fn intoRefuse(diag: ?*Diag, err: IntoError, comptime fmt: []const u8, args: anytype) IntoError {
++    if (diag) |d| d.set(fmt, args);
++    return err;
++}
++/// The twins' MLX kernels: made at construction from the registry's pinned stock texts and headers (`init`: each
++/// derived by the plugin's src/wave_twins.zig, its anchors checked, a refusal naming the kernel) and compiled then
++/// (`compileAll`: one launch of each at one row, evaluated). A launch takes its stock entry's own rule (`xk.launchFor`):
++/// a write-into twin's inputs are the stock's, each output's region (whole, an evaluated array), then `dep`, and its one
++/// output the [1] uint32 carrier; a dep twin's inputs are the stock's then `dep`, its outputs the stock's.
++pub const IntoTwins = struct {
++    reg: *const xk.Registry,
++    kernels: std.enums.EnumArray(IntoTwin, mlx.mlx_fast_metal_kernel) = .initFill(.{ .ctx = null }),
++
++    pub fn init(a: Allocator, reg: *const xk.Registry, diag: ?*Diag) (IntoError || error{OutOfMemory})!IntoTwins {
++        var self: IntoTwins = .{ .reg = reg };
++        errdefer self.deinit();
++        for (std.enums.values(IntoTwin)) |t| {
++            const spec = into_specs.get(t);
++            const e = reg.get(spec.k);
++            const hdr = reg.header(e);
++            if (e.outputs.len == 0 or (spec.dep_only and e.outputs.len != 1) or e.inputs.len + e.outputs.len + 1 > xk.max_inputs)
++                return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: {t}: {d} inputs and {d} outputs, no twin", .{ spec.k, e.inputs.len, e.outputs.len });
++            var in_names: [xk.max_inputs][*:0]const u8 = undefined;
++            for (e.inputs, 0..) |arg, i| in_names[i] = arg.name.ptr;
++            if (spec.dep_only) {
++                sw.twins.checkDep(e.source, hdr) catch |err|
++                    return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: {t}: the stock text is not the dep twin's ({s})", .{ spec.k, @errorName(err) });
++                in_names[e.inputs.len] = "dep";
++                var out_names: [xk.max_outputs][*:0]const u8 = undefined;
++                for (e.outputs, 0..) |o, i| out_names[i] = o.name.ptr;
++                const twin_name = try std.fmt.allocPrintSentinel(a, "{s}_dep", .{e.mlx_name}, 0);
++                defer a.free(twin_name);
++                const k = kset.newKernel(twin_name.ptr, in_names[0 .. e.inputs.len + 1], out_names[0..e.outputs.len], e.source.ptr, hdr.ptr, e.ensure_row_contiguous) orelse
++                    return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: {t}: its dep twin's mlx_fast_metal_kernel_new failed", .{spec.k});
++                self.kernels.set(t, k);
++                continue;
++            }
++            var outs: [xk.max_outputs]sw.twins.Out = undefined;
++            for (e.outputs, 0..) |o, i| outs[i] = .{ .name = o.name, .mtype = sw.twins.metalType(@tagName(o.dtype)) orelse
++                return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: {t}: output {s} is {t}, no twin type", .{ spec.k, o.name, o.dtype }) };
++            const text = sw.twins.derive(a, e.source, hdr, outs[0..e.outputs.len], spec.pragma) catch |err| switch (err) {
++                error.OutOfMemory => return error.OutOfMemory,
++                else => return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: {t}: the stock text is not the twin's ({s})", .{ spec.k, @errorName(err) }),
++            };
++            defer a.free(text);
++            var dst: [xk.max_outputs][:0]u8 = undefined;
++            var n_dst: usize = 0;
++            defer for (dst[0..n_dst]) |d| a.free(d);
++            for (e.outputs, 0..) |o, i| {
++                dst[i] = try std.fmt.allocPrintSentinel(a, "{s}_dst", .{o.name}, 0);
++                n_dst += 1;
++                in_names[e.inputs.len + i] = dst[i].ptr;
++            }
++            const n_in = e.inputs.len + e.outputs.len + 1;
++            in_names[n_in - 1] = "dep";
++            const twin_name = try std.fmt.allocPrintSentinel(a, "{s}_into", .{e.mlx_name}, 0);
++            defer a.free(twin_name);
++            const out_names = [_][*:0]const u8{"carrier"};
++            const k = kset.newKernel(twin_name.ptr, in_names[0..n_in], &out_names, text.ptr, hdr.ptr, e.ensure_row_contiguous) orelse
++                return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: {t}: its twin's mlx_fast_metal_kernel_new failed", .{spec.k});
++            self.kernels.set(t, k);
++        }
++        return self;
++    }
++    pub fn deinit(self: *IntoTwins) void {
++        for (std.enums.values(IntoTwin)) |t| {
++            const k = self.kernels.get(t);
++            if (k.ctx != null) mtl.mlx_fast_metal_kernel_free(k);
++            self.kernels.set(t, .{ .ctx = null });
++        }
++    }
++    /// One launch of twin `t` at its stock entry's rule for `vars` on `s`: returns its one output (a write-into twin's
++    /// carrier, a dep twin's stock output; a new array the caller owns).
++    pub fn launch(self: *const IntoTwins, s: mlx.mlx_stream, t: IntoTwin, vars: *const Vars, inputs: []const mlx.mlx_array) !mlx.mlx_array {
++        const spec = into_specs.get(t);
++        const e = self.reg.get(spec.k);
++        const cfg = xk.launchFor(e, vars, null) catch unreachable;
++        const one = [_]c_int{1};
++        var shape: []const c_int = &one;
++        var dtype: mlx.mlx_dtype = .uint32;
++        if (spec.dep_only) {
++            std.debug.assert(inputs.len == e.inputs.len + 1 and cfg.n_out == 1);
++            shape = cfg.out_shapes[0][0..cfg.out_ranks[0]];
++            dtype = cfg.out_dtypes[0];
++        } else std.debug.assert(inputs.len == e.inputs.len + e.outputs.len + 1);
++        const c = try kset.buildConfig(.{ .grid = cfg.grid, .threadgroup = cfg.threadgroup, .out_shapes = &.{shape}, .out_dtypes = &.{dtype}, .template = cfg.template });
++        defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
++        var out: [1]mlx.mlx_array = undefined;
++        try kset.applyConfig(self.kernels.get(t), c, inputs, &out, s);
++        return out[0];
++    }
++    /// At construction: each twin launched once at one row on `s` and evaluated (zeros; its wave table that of one
++    /// expert at slot 0, at `tiles_gu` / `tiles_dn` threadgroups an M tile), so MLX compiles every twin now and a twin
++    /// that does not compile or complete refuses the load by name.
++    pub fn compileAll(self: *const IntoTwins, s: mlx.mlx_stream, tiles_gu: u32, tiles_dn: u32, diag: ?*Diag) !void {
++        const one_expert = [_]WaveExpert{.{ .slot = 0, .rows = 1 }};
++        const gu = digTableBm(&one_expert, tiles_gu, 128);
++        const dn = digTableBm(&one_expert, tiles_dn, 128);
++        for (std.enums.values(IntoTwin)) |t| {
++            const spec = into_specs.get(t);
++            const e = self.reg.get(spec.k);
++            const tbl = switch (t) {
++                .gemm_dn_k3, .gemm_dn_k2, .widen1 => &dn,
++                else => &gu,
++            };
++            var vars: Vars = .initFill(1);
++            vars.set(.tgs, tbl.tgs);
++            var ins: [xk.max_inputs]mlx.mlx_array = undefined;
++            var n: usize = 0;
++            defer for (ins[0..n]) |x| {
++                _ = mlx.mlx_array_free(x);
++            };
++            for (e.inputs) |*arg| {
++                if (arg.role == .static) return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: {t}: static input {s}, no compile launch", .{ spec.k, arg.name });
++                ins[n] = if (arg.role == .table) mlx.mlx_array_new_data(&tbl.table, &[_]c_int{80}, 1, .int32) else try zerosAt(arg.shape, arg.dtype, &vars, s);
++                n += 1;
++            }
++            if (!spec.dep_only) for (e.outputs) |*o| {
++                ins[n] = try zerosAt(o.shape, o.dtype, &vars, s);
++                n += 1;
++            };
++            ins[n] = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{1}, 1, .uint32);
++            n += 1;
++            const out = self.launch(s, t, &vars, ins[0..n]) catch
++                return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: {t}: its twin's launch failed at construction", .{spec.k});
++            defer _ = mlx.mlx_array_free(out);
++            mlx.check(mlx.mlx_array_eval(out)) catch
++                return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: {t}: its twin did not compile or complete a launch", .{spec.k});
++        }
++    }
++    fn zerosAt(shape: []const xk.Dim, dt: Dtype, vars: *const Vars, s: mlx.mlx_stream) !mlx.mlx_array {
++        var sh: [xk.max_rank]c_int = undefined;
++        for (shape, 0..) |d, i| sh[i] = @intCast(d.eval(vars));
++        var z = mlx.mlx_array_new();
++        errdefer _ = mlx.mlx_array_free(z);
++        try mlx.check(mlx.mlx_zeros(&z, &sh, shape.len, dt, s));
++        return z;
++    }
++};
+ /// The lane of record's `Tcq3FusedPrefillDispatch...__dig2_onepass_exl3.__call__` over one call's
+ /// routed rows (one route per layer, as the lane has one dispatcher per layer): experts grouped
+ /// by slot in first-appearance order, snake-ordered (largest, smallest, ...; stable), packed
+@@ -987,6 +1170,11 @@
+         tiles_w: u32,
+         rows_hi: u64,
+         down: DownStage = downChain,
++        /// MLX_SERVE_DSV41_SCRATCH_WAVES (`Accepted.routeScratchWaves`): an uncarried call's waves launch these twins into
++        /// the per-prompt regions; `arena_waves` counts them (a wave's set is its count's parity: two in flight never
++        /// share one).
++        into: ?*const IntoTwins = null,
++        arena_waves: u64 = 0,
+         /// one wave's launches: the take2 retune, the gate|up GEMM, onepass, then the down stage's (2 stock, 1 fused)
+         wave_launches: u32 = 5,
+         a: Allocator,
+@@ -1077,6 +1265,20 @@
+                 try self.parts.ensureUnusedCapacity(a, 1);
+                 try self.flight.ensureUnusedCapacity(a, 1);
+                 const m = g.mark();
++                // MLX_SERVE_DSV41_SCRATCH_WAVES: an uncarried call's wave (not solo) on the regions, the stock words (in check
++                // the stock wave served, every launch compared).
++                if (comptime G.T == mlx.mlx_array) if (self.into) |tw| if (!carried and !solo) {
++                    if (try self.submitArena(g, tw, act, bank, ex[0 .. i - first], self.ridx.items[r0..off], self.rhs.items[r0..off])) |ya| {
++                        self.parts.appendAssumeCapacity(g.keep(ya));
++                        try g.asyncEval(&.{ya});
++                        self.flight.appendAssumeCapacity(g.keep(ya));
++                        g.resetTo(m);
++                        continue;
++                    }
++                };
++                if (comptime G.T == mlx.mlx_array) if (self.into != null) {
++                    sw.waves_fresh += 1;
++                };
+                 const y = try self.submit(g, act, bank, ex[0 .. i - first], self.ridx.items[r0..off], self.rhs.items[r0..off]);
+                 self.parts.appendAssumeCapacity(g.keep(y));
+                 if (solo) {
+@@ -1160,6 +1362,67 @@
+             const hz = try self.dig.gateUpOnePass(g, act, ridx_a, rhs_a, .{ .tbl = tgu, .tgs = tg.tgs }, bank.gate, bank.up, bank.down.rin);
+             const y = try self.down(self, g, hz[0], bank, ex, rhs_a);
+             return g.reshape(y, &.{ n, hidden });
++        }
++        /// MLX_SERVE_DSV41_SCRATCH_WAVES: `submit`'s launches as their twins (`tw`) on the wave's set (its count's parity),
++        /// each binding the launch before's carrier as `dep`; null where the regions do not take the wave (the caller
++        /// submits it fresh). Returns the wave's y as `submit` returns it ([R, 5120], rot_widen1's dep twin's output). In
++        /// `check` the stock launches run beside them on the same host tables, each region's rows are compared with the
++        /// stock output they stand for (`sw.compare`, by launch) and the stock y is returned (the fresh wave served).
++        fn submitArena(self: *Self, g: *G, tw: *const IntoTwins, act: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, ridx: []const i32, rhs: []const u32) !?G.T {
++            const n: c_int = @intCast(ridx.len);
++            const v = (try sw.views(@intCast(self.arena_waves & 1), @intCast(ridx.len))) orelse return null;
++            // the regions' handles join the wave's scope (freed at its reset); one not taken yet is freed here on an error
++            var hs = [_]G.T{ v.x0, v.x1, v.zg, v.zu, v.hd, v.z };
++            for (&hs, 0..) |*h, i| h.* = g.adopt(h.*) catch |e| {
++                for (hs[i..]) |r| _ = mlx.mlx_array_free(r);
++                return e;
++            };
++            const x0, const x1, const zg, const zu, const hd, const z = hs;
++            self.arena_waves += 1;
++            sw.waves_in += 1;
++            const tg = digTableBm(ex, self.tiles_gu, DigX(G).m_tile);
++            const tgu = try g.hostArray(std.mem.sliceAsBytes(&tg.table), &.{80}, .int32);
++            const ridx_a = try g.hostArray(std.mem.sliceAsBytes(ridx), &.{n}, .int32);
++            const rhs_a = try g.hostArray(std.mem.sliceAsBytes(rhs), &.{n}, .uint32);
++            const rows = rowsVars(ridx.len);
++            var gu = rows;
++            gu.set(.tgs, tg.tgs);
++            const gu_k2 = kIndexOf(G, g, bank.gate.code) == 1;
++            const dn_k2 = kIndexOf(G, g, bank.down.code) == 1;
++            const c1 = try intoLaunch(g, tw, .take2v, &rows, &.{ act, ridx_a, rhs_a, tgu, bank.gate.rin, bank.up.rin, x0, x1, v.dep });
++            const c2 = try intoLaunch(g, tw, if (gu_k2) .gemm_gu_k2 else .gemm_gu_k3, &gu, &.{ x0, x1, bank.gate.code, bank.up.code, tgu, zg, zu, c1 });
++            const c3 = try intoLaunch(g, tw, .onepass, &rows, &.{ zg, zu, rhs_a, tgu, bank.gate.rout, bank.up.rout, bank.down.rin, hd, c2 });
++            const td = digTableBm(ex, self.tiles_dn, DigX(G).m_tile);
++            const tdn = try g.hostArray(std.mem.sliceAsBytes(&td.table), &.{80}, .int32);
++            var dn = rows;
++            dn.set(.tgs, td.tgs);
++            const c4 = try intoLaunch(g, tw, if (dn_k2) .gemm_dn_k2 else .gemm_dn_k3, &dn, &.{ hd, bank.down.code, tdn, z, c3 });
++            const y = try intoLaunch(g, tw, .widen1, &rows, &.{ z, rhs_a, tdn, bank.down.rout, c4 });
++            if (sw.mode != .check) return try g.reshape(y, &.{ n, hidden });
++            // check: the stock chain on the same tables, every launch's output against the region rows it stands for
++            const xs = try self.dig.take2(g, act, ridx_a, rhs_a, tgu, bank.gate.rin, bank.up.rin);
++            const zs = try self.dig.gemmGateUp(g, xs[0], xs[1], bank.gate.code, bank.up.code, tgu, tg.tgs);
++            const hs_ = try self.dig.onePass(g, zs[0], zs[1], rhs_a, tgu, bank.gate.rout, bank.up.rout, bank.down.rin);
++            const zd = try self.dig.gemmDown(g, hs_, bank.down.code, tdn, td.tgs);
++            const ys = try self.dig.widen1(g, zd, rhs_a, tdn, bank.down.rout);
++            try g.evalAll(&.{ y, ys, xs[0], xs[1], zs[0], zs[1], hs_, zd });
++            const n_rows: u32 = @intCast(ridx.len);
++            try sw.compare(g.s, .x0, x0, n_rows, xs[0]);
++            try sw.compare(g.s, .x1, x1, n_rows, xs[1]);
++            try sw.compare(g.s, .zg, zg, n_rows, zs[0]);
++            try sw.compare(g.s, .zu, zu, n_rows, zs[1]);
++            try sw.compare(g.s, .hd, hd, n_rows, hs_);
++            try sw.compare(g.s, .z, z, n_rows, zd);
++            try sw.compare(g.s, .y, y, n_rows, ys);
++            return try g.reshape(ys, &.{ n, hidden });
++        }
++        /// One twin launch whose output joins the wave's scope.
++        fn intoLaunch(g: *G, tw: *const IntoTwins, t: IntoTwin, vars: *const Vars, inputs: []const G.T) !G.T {
++            const c = try tw.launch(g.s, t, vars, inputs);
++            return g.adopt(c) catch |e| {
++                _ = mlx.mlx_array_free(c);
++                return e;
++            };
+         }
+         /// Stock: the 128-row down text over its 80-tile table, then rot_widen1 (the table's slot column).
+         fn downChain(self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T) anyerror!G.T {
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig	2026-11-01 09:24:16
++++ b/sdk/weights/streamed/exl3_source.zig	2026-11-01 09:24:16
+@@ -17,6 +17,8 @@
+ /// `_RECORD`, `_LABEL`).
+ const expert_usage = sdk_ext.expert.usage;
+ const usage_cfg = &@import("mlx_host").expert_usage_cfg.setting;
++/// MLX_SERVE_DSV41_SCRATCH_WAVES (the plugin's src/scratch_waves.zig): the prefill waves' per-prompt regions.
++const scratch_waves = @import("mlx_host").scratch_waves;
+ const usage_arch = "deepseek_v41";
+ /// The decode route recorder (`expert.routes`), armed by turboexl3_ds41's `MLX_SERVE_DSV41_ROUTES` in its route-recording
+ /// builds (`recording`); every other build compiles none of it.
+@@ -216,6 +218,9 @@
+         try self.q.routeForms(&self.g, forms);
+         try self.q.compileTexts(self.set, &xq.banked_texts, &diag);
+         try self.q.routeBanked(&self.g);
++        // MLX_SERVE_DSV41_SCRATCH_WAVES: the waves' write-into twins derived from the pinned stock texts and compiled now,
++        // every layer's uncarried waves on them; a twin that does not derive or compile refuses the load by name.
++        if (scratch_waves.on()) try self.q.routeScratchWaves(&self.g, &diag);
+         // JOINLESS (MLX_SERVE_DSV41_JOINLESS): the combine on the set the quant accepted, its bf16 text compiled and launched
+         // once now; ROUTED_ONE's wide calls end on their own path, so the pair is refused by name.
+         if (joinless.mode != .off) {
+@@ -378,6 +383,7 @@
+     }
+     pub fn deinit(self: *Source) void {
+         _ = mlx.mlx_synchronize(self.g.s);
++        scratch_waves.releaseAll();
+         self.source.dropNext();
+         switch (self.hook) {
+             inline else => |*h| h.deinit(),
+@@ -408,6 +414,9 @@
+         const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
+         self.t3_state.n = 0;
+         const pio = prompt_io.on and self.phase == .prompt;
++        // MLX_SERVE_DSV41_SCRATCH_WAVES: a wide prompt call's waves may take the regions.
++        const arena = self.scratchBegin(ids);
++        defer if (arena) scratch_waves.callEnd();
+         // DEC_PREFETCH: the next decoder layers' fills posted once the call (its reads drained) is done.
+         defer if (dec_prefetch.on and self.phase == .prompt) self.postFills();
+         if (pio) try self.pioStart(layer, x, ids);
+@@ -421,6 +430,19 @@
+         const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
+         return g.keep(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false));
+     }
++    /// MLX_SERVE_DSV41_SCRATCH_WAVES: a wide prompt call (more routed rows than `decode_route_ids`) begins: the regions
++    /// made or kept (`scratch_waves.callBegin`); false (the fresh path) off, in decode, for a narrow call, or where the
++    /// regions do not fit.
++    fn scratchBegin(self: *Source, ids: T) bool {
++        if (!scratch_waves.on() or self.phase != .prompt) return false;
++        const sh = self.g.shapeOf(ids);
++        const routed: usize = @intCast(sh.dim(0) * sh.dim(1));
++        if (routed <= decode_route_ids) return false;
++        return scratch_waves.callBegin() catch |e| blk: {
++            std.log.warn("streamed exl3: the prefill waves' regions were refused ({s}); the call's waves take fresh buffers", .{@errorName(e)});
++            break :blk false;
++        };
++    }
+     /// JOINLESS's combine is built (`MLX_SERVE_DSV41_JOINLESS` on or check): `rowsShared` serves the wide calls.
+     pub fn joinlessOn(self: *const Source) bool {
+         return self.jl != null;
+@@ -447,6 +469,8 @@
+         const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
+         self.t3_state.n = 0;
+         const pio = prompt_io.on and self.phase == .prompt;
++        const arena = self.scratchBegin(ids);
++        defer if (arena) scratch_waves.callEnd();
+         defer if (dec_prefetch.on and self.phase == .prompt) self.postFills();
+         if (pio) try self.pioStart(layer, x, ids);
+         defer if (pio) prompt_io.callEnd(self.pioCounters());
+@@ -585,6 +609,8 @@
+                         // MLX_SERVE_DSV41_DIRECT_PARTS is the prompt's: decode's reads (the grow's fills, its misses)
+                         // stage and copy, as without it.
+                         self.stream.directPartsLive(false);
++                        // MLX_SERVE_DSV41_SCRATCH_WAVES: the prompt's regions let go (MLX keeps a buffer while a command uses it).
++                        scratch_waves.releaseAll();
+                         self.released = (try h.releaseTransient()) > 0;
+                         _ = mlx.mlx_synchronize(self.g.s);
+                         self.g.clearCache();
