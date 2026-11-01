@@ -1,0 +1,120 @@
+--- a/env.zig
++++ b/env.zig
+@@ -290,6 +290,7 @@
+     pub const MLX_SERVE_DSV41_SHARED_HOIST: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode layer's shared expert committed on its own when the routed call returns (turboexl3_ds41): it runs behind the device hit wave, while a layer with misses waits on their bytes; the same kernels, served bytes unchanged (=0: in the layer's last stretch)" };
+     pub const MLX_SERVE_DSV41_ROUTES: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode route recorder (turboexl3_ds41's route-recording builds only, zig build -Droute-rec=true): an absolute directory; each request's decode routes (expert.routes' file) and its rounds' tokens written there at its end" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
++    pub const MLX_SERVE_DSV41_T3_GROUP: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode hit wave on turboexl3's grouped banked decode (turboexl3_ds41, with MLX_SERVE_DSV41_ROUTED=turboexl3): its GEMVs share one weight decode among up to four row-slots of one expert, and the device route's pairs whose expert no bank holds run no expert in it (their rows come from the miss parts, as before); served bytes unchanged (=0: the banked texts, a miss pair computed from base row 0)" };
+     pub const MLX_SERVE_DSV41_TIMELINE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode verify GPU timeline (turboexl3_ds41's profile builds only, zig build -Dplugin-profile=true): an absolute directory; each request's VERIFY_GPU_TIMELINE line logged and its command buffers, verify stamps and rounds written there at its end" };
+     pub const MLX_SERVE_DSV41_WOA_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' EXL3 wo_a (turboexl3_ds41): on, over runs of 4096 rows of the attention spans, one grouped linear a run, each slice decoded once a run (a reorder-level rounding: MLX's GEMM at another M); 0: span by span; check: both, compared word for word, the span-by-span result served ([woa-rows] lines)" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+--- a/sdk/weights/streamed/expert/stream.zig
++++ b/sdk/weights/streamed/expert/stream.zig
+@@ -105,10 +105,11 @@
+     };
+ }
+ /// DEVROUTE's resident map of one layer from its policy: each resident expert's persistent slot as its packed
+-/// (bank << 24 | row) through `src.slotRef`; non-resident experts 0.
+-pub fn lutOf(pol: *const expert_policy.LayerPolicy, src: anytype, layer: u32, out: []u32) void {
++/// (bank << 24 | row) through `src.slotRef`; non-resident experts `missing` (the math's: 0, base row 0, or an id its
++/// banked texts skip).
++pub fn lutOf(pol: *const expert_policy.LayerPolicy, src: anytype, layer: u32, out: []u32, missing: u32) void {
+     for (out, 0..) |*o, e| {
+-        o.* = 0;
++        o.* = missing;
+         if (e >= pol.n_experts) continue;
+         const s = pol.slotOf(@intCast(e)) orelse continue;
+         if (s >= pol.capacity) continue;
+@@ -159,9 +160,10 @@
+         return .{ .refs = call.refs[0..call.n_ids], .waves = call.waves[0..call.n_ids], .n_parts = call.route.?.n_parts };
+     }
+     /// DEVROUTE: layer `layer`'s resident map as the device reads it: `out[e]` = the packed (bank << 24 | row) of
+-    /// expert e's persistent slot, else 0 (a miss: the device row is computed from base row 0 and never joined).
+-    pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32) void {
+-        lutOf(&self.stream.layers[layer].policy, self.stream, layer, out);
++    /// expert e's persistent slot, else `missing` (a miss: the device row is computed from base row 0 at 0, or skipped
++    /// at the math's skip id, and never joined).
++    pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32, missing: u32) void {
++        lutOf(&self.stream.layers[layer].policy, self.stream, layer, out, missing);
+     }
+     /// The decode phase (the grown banks; DEVROUTE's LUTs exist).
+     pub fn decoding(self: *const StreamSource) bool {
+--- a/sdk/weights/streamed/experts.zig
++++ b/sdk/weights/streamed/experts.zig
+@@ -312,8 +312,8 @@
+         return .{ .gu = lo + 1, .down_first = lo + 2, .n_parts = call.n_parts };
+     }
+     /// DEVROUTE: as `StreamSource.residentLut`.
+-    pub fn residentLut(self: *const FakeSource, layer: u32, out: []u32) void {
+-        lutOf(&self.policies[layer], self, layer, out);
++    pub fn residentLut(self: *const FakeSource, layer: u32, out: []u32, missing: u32) void {
++        lutOf(&self.policies[layer], self, layer, out, missing);
+     }
+     pub fn decoding(self: *const FakeSource) bool {
+         return self.phase == .decode;
+@@ -934,10 +934,15 @@
+                 };
+             }
+             for (self.dev_lut, self.dev_parity, 0..) |pair, *par, l| {
+-                for (pair) |x| self.source.residentLut(@intCast(l), std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(x)))));
++                for (pair) |x| self.source.residentLut(@intCast(l), std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(x)))), self.lutMissing());
+                 par.* = 0;
+             }
+         }
++        /// DEVROUTE: a non-resident expert's LUT entry, the math's (`lutMissing`: an id its banked texts skip, so a miss
++        /// pair's device row runs no expert) or 0 (base row 0: the row is computed and never joined).
++        fn lutMissing(self: *const Self) u32 {
++            return if (comptime @hasDecl(M, "lutMissing")) self.math.lutMissing() else 0;
++        }
+         /// DEVROUTE: layer `layer`'s LUT for its next call, from the policy after this call's route; that call reads it.
+         fn devLutAfterRoute(self: *Self, g: *G, layer: u32) !void {
+             if (comptime !(@hasDecl(S, "residentLut") and @hasDecl(S, "decoding"))) {
+@@ -946,12 +951,12 @@
+         }
+         fn devLutAfterRouteIn(self: *Self, g: *G, layer: u32) !void {
+             const next = self.dev_parity[layer] +% 1;
+-            self.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next])))));
++            self.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next])))), self.lutMissing());
+             self.dev_parity[layer] = next;
+         }
+         /// DEVROUTE: the call's every routed pair through the banked texts, the slots from the layer's LUT on the device
+-        /// (hits: their resident (bank, row), the host's plan's same; misses: base row 0, never joined); `[n * k, hidden]`
+-        /// in routed order.
++        /// (hits: their resident (bank, row), the host's plan's same; misses: the math's `lutMissing`, base row 0 or a
++        /// skipped row-slot, never joined); `[n * k, hidden]` in routed order.
+         fn devWave(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !T {
+             if (comptime !hasBanked()) {
+                 return error.DevrouteNeedsBanked;
+@@ -2568,7 +2573,7 @@
+             if (devroute) {
+                 out.flipped[call] = ex.dev_parity[0] != parity0;
+                 var want: [16]u32 = undefined;
+-                src.residentLut(0, &want);
++                src.residentLut(0, &want, ex.lutMissing());
+                 const got = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[0][ex.dev_parity[0]]))));
+                 out.lut_ok[call] = std.mem.eql(u32, &want, got);
+             }
+--- a/sdk/weights/streamed/mimo/stream_source.zig
++++ b/sdk/weights/streamed/mimo/stream_source.zig
+@@ -280,14 +280,15 @@
+             }
+             // ── HITPASS (DEVROUTE, design-decode-fusion 2d) ──
+             /// Absolute layer `layer`'s resident map as the device reads it: `out[e]` = the packed (bank << 24 | row) of expert
+-            /// e's persistent slot, else 0 (a miss: its device row reads base row 0 and is never joined). DSV's `lutOf` over the
+-            /// relative layer's policy; the dense layers (below `first_moe_layer`) have no policy and map every expert to 0.
+-            /// The scheduler writes it only after a route (the policy changes only in `route`), never per dispatch.
+-            pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32) void {
+-                if (layer < self.stream.bank.first_moe_layer) return @memset(out, 0);
++            /// e's persistent slot, else `missing` (a miss: its device row reads base row 0 at 0 and is never joined). DSV's
++            /// `lutOf` over the relative layer's policy; the dense layers (below `first_moe_layer`) have no policy and map every
++            /// expert to `missing`. The scheduler writes it only after a route (the policy changes only in `route`), never per
++            /// dispatch.
++            pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32, missing: u32) void {
++                if (layer < self.stream.bank.first_moe_layer) return @memset(out, missing);
+                 if (comptime diag.compiled) if (self.missfree) |mf| if (self.decoding()) return self.missFreeLut(mf, layer, out);
+                 const rel = self.relativeLayer(layer);
+-                @import("../expert/stream.zig").lutOf(&self.stream.layers[rel].policy, self.stream, rel, out);
++                @import("../expert/stream.zig").lutOf(&self.stream.layers[rel].policy, self.stream, rel, out, missing);
+             }
+             // ── end HITPASS ──
+             pub fn relativeLayer(self: *const StreamSource, layer: u32) u32 {

@@ -60,6 +60,9 @@ pub const late_gemv = @import("src/late_gemv.zig");
 /// A decode layer's shared expert committed as soon as its routed call returns (`MLX_SERVE_DSV41_SHARED_HOIST`,
 /// src/shared_hoist.zig), read by the copied model.
 pub const shared_hoist = @import("src/shared_hoist.zig");
+/// The t3 route's hit wave on turboexl3's grouped banked decode (`MLX_SERVE_DSV41_T3_GROUP`, src/t3_group.zig), read by
+/// src/routed_t3.zig: turboexl3's banked group and DEVROUTE's id for a miss pair.
+pub const t3_group = @import("src/t3_group.zig");
 /// A wide prompt layer's EXL3 `wo_a` over runs of its attention spans' rows (`MLX_SERVE_DSV41_WOA_ROWS`, src/woa_rows.zig),
 /// read by the copied model.
 pub const woa_rows = @import("src/woa_rows.zig");
@@ -144,6 +147,21 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // The streamed bank's slot rows fit within the host's ceiling, not only the device's working set.
     bill.host_ceiling = &shims.memoryCeiling;
     routed_t3.enabled = config.routedT3(env.span(.MLX_SERVE_DSV41_ROUTED));
+    // Before the model's load: the t3 math compiles the banked kernels at turboexl3's banked group when the bank opens.
+    t3_group.configure(env.span(.MLX_SERVE_DSV41_T3_GROUP), routed_t3.enabled) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_T3_GROUP is set to something other than 0 (unset: on with MLX_SERVE_DSV41_ROUTED=turboexl3, 0: the banked texts): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    routed_t3.configureGroup() catch |e| {
+        log.err("[turboexl3_ds41] turboexl3 refused its banked group {d} ({s}): the load is refused\n", .{ t3_group.bankedGroup(), @errorName(e) });
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     routed_one.mode = routed_one.modeOf(env.span(.MLX_SERVE_DSV41_ROUTED_ONE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ROUTED_ONE is none of 0, 1, resident, check: the load is refused\n", .{});
         out.* = switch (e) {
@@ -279,6 +297,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     log.info("[turboexl3_ds41] read-ahead prediction: {s}\n", .{if (ra_fused.on) "on the fused hc kernels (MLX_SERVE_DSV41_RA_FUSED=0: the op chain)" else "the op chain (MLX_SERVE_DSV41_RA_FUSED=0)"});
     log.info("[turboexl3_ds41] decode lookahead's next-layer scores: {s}\n", .{if (late_gemv.on) "MLX's wide GEMV in the weights' half type (MLX_SERVE_DSV41_LATE_GEMV=0: the f32 product)" else "the f32 product (MLX_SERVE_DSV41_LATE_GEMV=0)"});
     log.info("[turboexl3_ds41] decode layers' shared expert: {s}\n", .{if (shared_hoist.on) "committed behind the hit wave (MLX_SERVE_DSV41_SHARED_HOIST=0: in the layer's last stretch)" else "in the layer's last stretch (MLX_SERVE_DSV41_SHARED_HOIST=0)"});
+    if (routed_t3.enabled) log.info("[turboexl3_ds41] t3 hit wave: {s}\n", .{if (t3_group.on) "turboexl3's grouped banked decode, up to four row-slots of one expert a weight decode, the device route's miss pairs skipped (MLX_SERVE_DSV41_T3_GROUP=0: the banked texts)" else "the banked texts (MLX_SERVE_DSV41_T3_GROUP=0)"});
     switch (woa_rows.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' wo_a span by span (MLX_SERVE_DSV41_WOA_ROWS=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' wo_a over runs of {d} rows, one grouped linear a run (MLX_SERVE_DSV41_WOA_ROWS=0: span by span)\n", .{woa_rows.rows}),

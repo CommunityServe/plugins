@@ -191,4 +191,5 @@ test {
     _ = @import("src/verify_tl.zig");
     _ = @import("src/late_gemv.zig");
     _ = @import("src/shared_hoist.zig");
+    _ = @import("src/t3_group.zig");
 }

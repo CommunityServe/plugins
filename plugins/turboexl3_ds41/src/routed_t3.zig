@@ -12,9 +12,18 @@
 const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
 const t3 = @import("turboexl3");
+const t3_group = @import("t3_group.zig");
 
 /// Set at load from `MLX_SERVE_DSV41_ROUTED` (`config.routedT3`), before the bank opens.
 pub var enabled: bool = false;
+
+/// At load, after `MLX_SERVE_DSV41_T3_GROUP` (src/t3_group.zig) and before the bank opens (`warm` builds the banked
+/// kernels at it): turboexl3's banked GEMVs at the setting's row-slots of one packed id per lead.
+pub fn configureGroup() error{InvalidTurboexl3Config}!void {
+    var c = t3.config.get().*;
+    c.banked_group = t3_group.bankedGroup();
+    try t3.configure(c);
+}
 
 /// The streamer's math over backend `G` (its `ops.MlxOps`), slot arrays `Proj` ({code, rout, rin}), a bank's three
 /// `Bank`, a prompt call's `PrefillRows`, and `Stock`, the streamer's own math (its `QuantMath`), which runs all but the
@@ -78,6 +87,14 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
 
         /// The streamer's banked route (its hook's `banked`, and DEVROUTE's device wave over it).
         pub const has_banked = true;
+
+        /// DEVROUTE's LUT entry for a pair whose expert no bank holds: turboexl3's skip id on its grouped decode
+        /// (`MLX_SERVE_DSV41_T3_GROUP`: the row-slot runs no expert, its row 0), else 0 (base row 0, computed). The miss
+        /// part's row replaces it in the join either way.
+        pub fn lutMissing(self: *const Self) u32 {
+            _ = self;
+            return if (t3_group.on) t3.banked_skip_id else 0;
+        }
 
         /// A wave's gate|up: nothing runs yet; `x` [pairs, hidden] (row-slot r's row) is what `downBanked` receives. The
         /// banked call reads every projection's arrays (its gate|up finish reads the down's suh), and a gated miss part's

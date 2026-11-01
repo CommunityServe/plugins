@@ -205,6 +205,22 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   verifies, the usage seed with SEED_FREE, ROUTED=turboexl3, A B B A): 40.0 and 40.1 tok/s on the card's decode against
   39.3 and 39.2, 47.0 and 47.0 greedy against 46.1 and 45.6, the misses a round the same (62.4 greedy, 82.3 card; 63.5
   and 83.1 in the last arm), the texts the same in every arm.
+- `MLX_SERVE_DSV41_T3_GROUP` (src/t3_group.zig, patches/turboexl3-zzz8b-t3-group.patch; on with
+  `MLX_SERVE_DSV41_ROUTED=turboexl3`, `=0` off): the t3 route's device hit wave on turboexl3's grouped banked decode
+  (`Config.banked_group` 4, turboexl3 65c72d1). A verify's 36 routed pairs a layer name about 23 distinct experts
+  (recorded routes: p10 18, p90 29). The banked GEMVs shared a weight decode between at most two row-slots of one
+  expert; the grouped ones share it among up to four. DEVROUTE's LUT also sends a pair whose expert no bank holds to
+  turboexl3's skip id, so its device row runs no expert, where it was computed from base row 0. The miss part's row
+  replaces it in the join, as before, and every other row is the banked call's byte for byte (turboexl3's GPU test,
+  window 32), so the served bytes are the same.
+  - Window 32's microbench, 36 row-slots (34 hits in the recorded routes' p10, median and p90 profiles, plus 2
+    misses), µs a call: 1024, 1090 and 1253 at K3 against 1112, 1176 and 1315 today; 983, 1062 and 1227 at K2 against
+    1059, 1127 and 1263.
+  - Served on the full pack (M5 Max, w-20261101-0641; code-ctx16384, card then greedy, fixed full-block verifies, the
+    usage seed with SEED_FREE, ROUTED=turboexl3, A B B A): 39.2 and 39.8 tok/s on the card's decode against 40.1 and
+    39.7, 46.9 and 46.6 greedy against 46.8 and 46.3, the texts the same in every arm. A wash at today's misses: the
+    hit wave's saving turns into the miss parts' byte wait while the decode's reads are bound by the drive. It removes
+    work and pays as misses fall.
 - `MLX_SERVE_DSV41_WOA_ROWS` (src/woa_rows.zig, patches/turboexl3-zzz7-woa-rows.patch; on, `=0` off, `check` both): a
   wide layer's EXL3 `wo_a` over runs of 4096 rows of its attention spans. `=0`: each 256-row span runs its own grouped
   linear as its attention ends: at prefill rows turboexl3 decodes each of the 8 slices' trellis to W_hat and multiplies
