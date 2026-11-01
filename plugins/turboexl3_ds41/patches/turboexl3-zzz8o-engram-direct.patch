@@ -1,0 +1,283 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -278,6 +278,7 @@
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_DIR: Var = .{ .kind = .kill, .type = .text, .default = "the pack", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): the absolute directory its expert-usage-v1.json is read from" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_LABEL: Var = .{ .kind = .kill, .type = .text, .default = "unlabeled", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): the recorded prompt set's name, the file's provenance; needs MLX_SERVE_DSV41_EXPERT_USAGE_RECORD" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_RECORD: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): an absolute file path; each request's routed experts per layer counted into it (expert-usage-v1.json's form), written at the request's end" };
++    pub const MLX_SERVE_DSV41_ENGRAM_DIRECT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram tables (turboexl3_ds41): a prompt's rows read once a table (its spans' ids made distinct) and past the page cache, each row's bytes from the file system blocks that hold them, on up to 64 threads; the same bytes (=0: span by span through the page cache)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+     pub const MLX_SERVE_DSV41_JOINLESS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' routed sum and shared expert (turboexl3_ds41): on, one kernel combines them reading each routed row where its wave wrote it, no joins of the waves' outputs, the same f32 words; 0: the joins and the op chain; check: both, compared word for word, the op chain's served ([joinless] lines)" };
+     pub const MLX_SERVE_DSV41_LATE_GEMV: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode lookahead's next-layer scores as a product in the router weights' half type (turboexl3_ds41): MLX's wide GEMV, one weight pass for a verify's rows; the read-ahead's ranking only, served bytes unchanged (=0: the f32 product)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41/engram.zig
+--- a/plugins/deepseek_v41/engram.zig
++++ b/plugins/deepseek_v41/engram.zig
+@@ -10,6 +10,9 @@
+ const weights_load = @import("../../sdk/weights/load.zig");
+ const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
+ const qwen4_ple = @import("../qwen4_exp/ple_table.zig");
++/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DIRECT, the plugin's src/engram_direct.zig): the tables read past the page
++/// cache through their blocks; the reads' counters and the [engram] line.
++const edir = @import("../../../engram_direct.zig");
+ pub const MAX_LAYERS = 4;
+ pub const MAX_NGRAM = 8;
+ pub const MAX_HEADS = 16;
+@@ -235,6 +238,8 @@
+     slen: usize,
+     b_off: u64 = 0,
+     pub fn close(self: *Table) void {
++        // MLX_SERVE_DSV41_ENGRAM_DIRECT: the descriptor's block registration dropped with it.
++        edir.unregister(self.fd);
+         crt.close(self.fd);
+     }
+     /// Bytes this table occupies inside the pack's safetensors shards (read by
+@@ -409,6 +414,54 @@
+         }
+         return .{ .w = w, .s = sc, .b = bi };
+     }
++    /// MLX_SERVE_DSV41_ENGRAM_DIRECT: `ids` (sorted, distinct) read past the cache on up to `PAR_THREADS_DIRECT`
++    /// threads, each a contiguous run of them: a row's codes through the blocks that hold them, its scales (and biases)
++    /// from the block the run read last when it holds them, so neighbouring rows' scales cost one read. Rows in `ids`'s
++    /// order.
++    fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
++        const n = ids.len;
++        const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
++        errdefer gpa.free(w);
++        const sc = try gpa.alignedAlloc(u8, .@"4", n * self.slen);
++        errdefer gpa.free(sc);
++        const bi = try gpa.alignedAlloc(u8, .@"4", if (self.mode == .affine) n * self.slen else 0);
++        errdefer gpa.free(bi);
++        const Runs = struct {
++            t: *const Table,
++            ids: []const u32,
++            w: []u8,
++            s: []u8,
++            b: []u8,
++            bad: std.atomic.Value(bool) = .init(false),
++            fn go(r: *@This(), first: usize, last: usize) void {
++                var sb: edir.Block = .{};
++                var bb: edir.Block = .{};
++                const tb = r.t;
++                for (first..last) |i| {
++                    const row: u64 = r.ids[i];
++                    _ = edir.rows.fetchAdd(1, .monotonic);
++                    if (row >= tb.rows or
++                        !edir.readRow(tb.fd, r.w[i * tb.wlen ..][0..tb.wlen], tb.w_off + row * tb.w_stride) or
++                        !sb.read(tb.fd, r.s[i * tb.slen ..][0..tb.slen], tb.s_off + row * tb.s_stride) or
++                        (tb.mode == .affine and !bb.read(tb.fd, r.b[i * tb.slen ..][0..tb.slen], tb.b_off + row * tb.s_stride)))
++                    {
++                        r.bad.store(true, .release);
++                        return;
++                    }
++                }
++            }
++        };
++        var runs: Runs = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
++        const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, @as(usize, PAR_THREADS_DIRECT));
++        var threads: [PAR_THREADS_DIRECT]?std.Thread = @splat(null);
++        for (threads[1..parts], 1..) |*slot, k| slot.* = std.Thread.spawn(.{}, Runs.go, .{ &runs, k * n / parts, (k + 1) * n / parts }) catch null;
++        runs.go(0, n / parts);
++        for (threads[1..parts], 1..) |th, k| {
++            if (th) |thread| thread.join() else runs.go(k * n / parts, (k + 1) * n / parts);
++        }
++        if (runs.bad.load(.acquire)) return error.EngramRead;
++        return .{ .w = w, .s = sc, .b = bi };
++    }
+     fn readAll(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
+         const n = ids.len;
+         const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
+@@ -426,9 +479,10 @@
+             return .{ .w = w, .s = sc, .b = bi };
+         }
+         // A DSpark verify's 6 x 24 rows wait at the first Engram layer: 16 rows per thread, this one included.
+-        const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, PAR_THREADS);
++        // MLX_SERVE_DSV41_ENGRAM_DIRECT: a direct read waits on the drive, not on a page fault: twice the threads.
++        const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, @as(usize, if (edir.on) PAR_THREADS_DIRECT else PAR_THREADS));
+         if (parts > 1) {
+-            var threads: [PAR_THREADS]?std.Thread = @splat(null);
++            var threads: [PAR_THREADS_DIRECT]?std.Thread = @splat(null);
+             for (threads[1..parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, Job.runVoid, .{ &job, k, parts }) catch null;
+             var failed = !job.run(0, parts, false);
+             for (threads[1..parts], 1..) |t, k| {
+@@ -497,14 +551,16 @@
+         /// keep the SSD's queue full, and the advice doubles the requests.
+         fn run(self: *const Job, first: usize, stride: usize, advise_first: bool) bool {
+             const t = self.t;
+-            if (advise_first) t.advise(self.ids, first, stride);
++            // MLX_SERVE_DSV41_ENGRAM_DIRECT: no advice for a file read past the cache.
++            if (advise_first and !edir.on) t.advise(self.ids, first, stride);
+             var i = first;
+             while (i < self.ids.len) : (i += stride) {
+                 const r: u64 = self.ids[i];
++                _ = edir.rows.fetchAdd(1, .monotonic);
+                 if (r >= t.rows or
+-                    !preadAll(t.fd, self.w[i * t.wlen ..][0..t.wlen], t.w_off + r * t.w_stride) or
+-                    !preadAll(t.fd, self.s[i * t.slen ..][0..t.slen], t.s_off + r * t.s_stride) or
+-                    (t.mode == .affine and !preadAll(t.fd, self.b[i * t.slen ..][0..t.slen], t.b_off + r * t.s_stride)))
++                    !edir.readRow(t.fd, self.w[i * t.wlen ..][0..t.wlen], t.w_off + r * t.w_stride) or
++                    !edir.readRow(t.fd, self.s[i * t.slen ..][0..t.slen], t.s_off + r * t.s_stride) or
++                    (t.mode == .affine and !edir.readRow(t.fd, self.b[i * t.slen ..][0..t.slen], t.b_off + r * t.s_stride)))
+                 {
+                     @constCast(&self.bad).store(true, .release);
+                     return false;
+@@ -525,6 +581,9 @@
+     nc: usize,
+     stop: std.atomic.Value(bool) = .init(false),
+     thread: ?std.Thread = null,
++    /// MLX_SERVE_DSV41_ENGRAM_DIRECT's [engram] line: the thread's start and the reads' counters then.
++    t0: u64 = 0,
++    c0: edir.Snapshot = .{ .rows = 0, .distinct = 0, .calls = 0, .bytes = 0, .wait_ns = .{ 0, 0 } },
+     /// `ids` is `[len][tables.len][nc]` row ids (`Hash.rows`).
+     pub const Spec = struct { at: usize, len: usize, ids: []const u32 };
+     const Grid = struct {
+@@ -532,6 +591,8 @@
+         len: usize,
+         ids: []u32,
+         items: []Item,
++        /// MLX_SERVE_DSV41_ENGRAM_DIRECT's [engram] line: each table's spans read, ns from the thread's start.
++        done_ns: [MAX_LAYERS]u64 = @splat(0),
+     };
+     const Item = struct {
+         raw: ?Table.Raw = null,
+@@ -560,7 +621,7 @@
+             g.* = .{ .at = sp.at, .len = sp.len, .ids = ids, .items = items };
+             made += 1;
+         }
+-        self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc };
++        self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc, .t0 = edir.now(), .c0 = edir.snapshot() };
+         self.thread = try std.Thread.spawn(.{}, run, .{self});
+         return self;
+     }
+@@ -572,14 +633,78 @@
+     fn run(self: *Prefetch) void {
+         for (self.grids) |*g| {
+             const n_spans = g.items.len / self.tables.len;
+-            for (self.tables, 0..) |table, layer| for (0..n_spans) |k| {
++            for (self.tables, 0..) |table, layer| {
+                 if (self.stop.load(.acquire)) return;
+-                const item = &g.items[layer * n_spans + k];
+-                item.raw = self.readSpan(g, table, layer, k) catch null;
+-                item.state.store(if (item.raw != null) done else failed, .release);
+-            };
++                // MLX_SERVE_DSV41_ENGRAM_DIRECT: a prompt grid's table read whole (its distinct rows once, past the
++                // cache); a decode token's span by span as before.
++                if (edir.on and g.len >= grid_rows) self.readGridTable(g, table, layer, n_spans) else for (0..n_spans) |k| {
++                    if (self.stop.load(.acquire)) return;
++                    const item = &g.items[layer * n_spans + k];
++                    item.raw = self.readSpan(g, table, layer, k) catch null;
++                    item.state.store(if (item.raw != null) done else failed, .release);
++                }
++                if (layer < MAX_LAYERS) g.done_ns[layer] = edir.now() -| self.t0;
++            }
+         }
+     }
++    /// MLX_SERVE_DSV41_ENGRAM_DIRECT: table `layer`'s rows of the whole grid: its ids sorted and made distinct, read
++    /// once (`Table.readSorted`), then each span's rows copied out of them; every span of the table done together (the
++    /// layer reads them all before its eval). A failed read fails every span of the table, as a failed span read fails
++    /// that span.
++    fn readGridTable(self: *Prefetch, g: *Grid, table: *const Table, layer: usize, n_spans: usize) void {
++        const nc = self.nc;
++        const nt = self.tables.len;
++        const all = self.gpa.alloc(u32, g.len * nc) catch return failTable(g, layer, n_spans);
++        defer self.gpa.free(all);
++        for (0..g.len) |tok| @memcpy(all[tok * nc ..][0..nc], g.ids[(tok * nt + layer) * nc ..][0..nc]);
++        const uniq = self.gpa.dupe(u32, all) catch return failTable(g, layer, n_spans);
++        defer self.gpa.free(uniq);
++        std.mem.sort(u32, uniq, {}, std.sort.asc(u32));
++        var nu: usize = 0;
++        for (0..uniq.len) |i| {
++            if (nu == 0 or uniq[nu - 1] != uniq[i]) {
++                uniq[nu] = uniq[i];
++                nu += 1;
++            }
++        }
++        _ = edir.distinct.fetchAdd(nu, .monotonic);
++        const u = table.readSorted(self.gpa, uniq[0..nu]) catch return failTable(g, layer, n_spans);
++        defer u.deinit(self.gpa);
++        for (0..n_spans) |k| {
++            const lo = k * self.span;
++            const hi = @min(g.len, lo + self.span);
++            const item = &g.items[layer * n_spans + k];
++            item.raw = spanRows(self.gpa, table, uniq[0..nu], u, all[lo * nc .. hi * nc]) catch null;
++            item.state.store(if (item.raw != null) done else failed, .release);
++        }
++    }
++    fn failTable(g: *Grid, layer: usize, n_spans: usize) void {
++        for (0..n_spans) |k| g.items[layer * n_spans + k].state.store(failed, .release);
++    }
++    /// The rows of `ids` (each one of `uniq`, sorted) copied out of `u` (`uniq`'s rows in order): a new `Raw` the
++    /// caller frees, laid out as `Table.read` lays out `ids`'s.
++    fn spanRows(gpa: std.mem.Allocator, table: *const Table, uniq: []const u32, u: Table.Raw, ids: []const u32) !Table.Raw {
++        const n = ids.len;
++        const w = try gpa.alignedAlloc(u8, .@"4", n * table.wlen);
++        errdefer gpa.free(w);
++        const sc = try gpa.alignedAlloc(u8, .@"4", n * table.slen);
++        errdefer gpa.free(sc);
++        const bi = try gpa.alignedAlloc(u8, .@"4", if (table.mode == .affine) n * table.slen else 0);
++        errdefer gpa.free(bi);
++        for (ids, 0..) |id, i| {
++            var lo: usize = 0;
++            var hi: usize = uniq.len;
++            while (lo < hi) {
++                const mid = lo + (hi - lo) / 2;
++                if (uniq[mid] < id) lo = mid + 1 else hi = mid;
++            }
++            if (lo == uniq.len or uniq[lo] != id) return error.EngramRead;
++            @memcpy(w[i * table.wlen ..][0..table.wlen], u.w[lo * table.wlen ..][0..table.wlen]);
++            @memcpy(sc[i * table.slen ..][0..table.slen], u.s[lo * table.slen ..][0..table.slen]);
++            if (bi.len > 0) @memcpy(bi[i * table.slen ..][0..table.slen], u.b[lo * table.slen ..][0..table.slen]);
++        }
++        return .{ .w = w, .s = sc, .b = bi };
++    }
+     fn readSpan(self: *Prefetch, g: *const Grid, table: *const Table, layer: usize, k: usize) !Table.Raw {
+         const lo = k * self.span;
+         const hi = @min(g.len, lo + self.span);
+@@ -597,7 +722,12 @@
+     pub fn take(self: *Prefetch, at: usize, layer: usize, k: usize) !Table.Raw {
+         for (self.grids) |*g| if (g.at == at) {
+             const item = &g.items[layer * (g.items.len / self.tables.len) + k];
+-            while (item.state.load(.acquire) == pending) std.Thread.yield() catch {};
++            // MLX_SERVE_DSV41_ENGRAM_DIRECT's [engram] line: the model's wait on a span not read yet.
++            if (item.state.load(.acquire) == pending) {
++                const t = edir.now();
++                while (item.state.load(.acquire) == pending) std.Thread.yield() catch {};
++                edir.waited(layer, edir.now() -| t);
++            }
+             const raw = item.raw orelse return error.EngramRead;
+             item.raw = null;
+             return raw;
+@@ -608,6 +738,14 @@
+     pub fn finish(self: *Prefetch) void {
+         self.stop.store(true, .release);
+         if (self.thread) |t| t.join();
++        // MLX_SERVE_DSV41_ENGRAM_DIRECT's [engram] line, for a prompt's grids (not a decode token's): each table's read
++        // time from the thread's start (table 0: the first Engram layer's), the reads since then (rows, IOs, MB the IOs
++        // asked of the file: past the cache, what the drive read), and the model's waits on each table (table 0's: the
++        // first Engram layer's stall). A grid read ahead for the next chunk shares the counters.
++        for (self.grids) |g| if (g.len >= 1024) {
++            const c = edir.snapshot();
++            std.debug.print("[engram] at={d} len={d} table0_ms={d:.1} table1_ms={d:.1} rows={d} distinct={d} ios={d} read_mb={d:.1} wait0_ms={d:.1} wait1_ms={d:.1} direct={d}\n", .{ g.at, g.len, @as(f64, @floatFromInt(g.done_ns[0])) / 1e6, @as(f64, @floatFromInt(g.done_ns[1])) / 1e6, c.rows -| self.c0.rows, c.distinct -| self.c0.distinct, c.calls -| self.c0.calls, @as(f64, @floatFromInt(c.bytes -| self.c0.bytes)) / (1 << 20), @as(f64, @floatFromInt(c.wait_ns[0] -| self.c0.wait_ns[0])) / 1e6, @as(f64, @floatFromInt(c.wait_ns[1] -| self.c0.wait_ns[1])) / 1e6, @intFromBool(edir.on) });
++        };
+         for (self.grids) |g| freeGrid(self.gpa, g);
+         self.gpa.free(self.grids);
+         self.gpa.free(self.tables);
+@@ -621,6 +759,10 @@
+ extern "c" fn dispatch_apply_f(iterations: usize, queue: ?*anyopaque, context: ?*anyopaque, work: *const fn (?*anyopaque, usize) callconv(.c) void) void;
+ const PAR_ROWS_PER_THREAD = 16;
+ const PAR_THREADS = 32;
++/// MLX_SERVE_DSV41_ENGRAM_DIRECT: a prompt span's read threads when the reads go past the cache.
++const PAR_THREADS_DIRECT = 64;
++/// MLX_SERVE_DSV41_ENGRAM_DIRECT: a grid of at least this many tokens (a prompt's) reads each table whole.
++const grid_rows = 1024;
+ fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
+     return crt.pread(fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
+ }
+@@ -639,6 +781,8 @@
+     if (fd < 0) return error.FileNotFound;
+     // Rows are read at random: read-ahead would pull their neighbours in.
+     if (comptime builtin.os.tag.isDarwin()) _ = std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0));
++    // MLX_SERVE_DSV41_ENGRAM_DIRECT: the file read past the page cache, through its blocks.
++    edir.register(fd);
+     return fd;
+ }
+ const testing = std.testing;

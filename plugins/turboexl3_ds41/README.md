@@ -426,6 +426,21 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   its gate/up start. A classic bank runs the classic path; an older build refuses an a4k bank by name (its segment table).
   `zig build test`'s a4k gate reads the same records laid out both ways through every route of the copied pool and
   finds the same slot bytes (`zig build test -Da4k-gate=<classic>:<a4k>` adds two real packs).
+- `MLX_SERVE_DSV41_ENGRAM_DIRECT` (src/engram_direct.zig, patches/turboexl3-zzz8o-engram-direct.patch; on, `=0`
+  off): a prompt's Engram rows read once per table and past the page cache. The pack's tables (oMLX's lossless
+  layout) keep a row's e4m3 codes (256 B) and e8m0 scales (8 B) in two regions of one file. Off, a prompt grid's rows
+  are read span by span (256 tokens), each span's distinct rows by two preads a row through the page cache: a 16K-token
+  prompt's 587,099 row reads (1,174,198 IOs) page in ~8 GiB of file cache (+7.97 GiB cold, +7.19 GiB new text), and
+  with the pack's files evicted layer 1 waits ~1.1 s for its table. On, a prompt grid's table is read whole: every
+  span's ids sorted and made distinct (310,174 rows for the two tables), the distinct rows read past the cache
+  (F_NOCACHE, the file system blocks that hold them, APFS 4,096 B) on up to 64 threads, each a contiguous run of the
+  sorted rows that keeps its last scale block for the rows after it (588,276 IOs, 2,373 MB), then each span's rows
+  copied out of them; a decode token's rows as before. A `[engram] at= len= table0_ms= table1_ms= rows= distinct= ios=
+  read_mb= wait0_ms= wait1_ms= direct=` line for each prompt grid either way. Exact: the same bytes land in the same
+  rows. en2 (w-pio-20261101-1523, ABBA, margin 3, EVICT, FCACHE, texts identical in every arm): cold 1185.6 / 1256.0 /
+  1252.6 / 1191.6 tok/s (a1 b1 b2 a2: +5.53%), new text 1213.3 / 1300.0 / 1299.5 / 1265.8 (+4.86%); the file cache
+  grows +0.03 / 0.00 GiB on (+7.97 / +7.19 off), the live peak ~8 GiB lower; layer 1's wait 887-899 ms (1059-1174
+  off), table 0 read in 1495-1505 ms (1783-1786).
 
 ## The pack
 

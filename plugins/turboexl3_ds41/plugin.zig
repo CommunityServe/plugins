@@ -93,6 +93,9 @@ pub const stage = @import("src/stage.zig");
 /// A wide prompt layer's predicted transient loads read during the call before it, into the windows that call's groups
 /// let go (`MLX_SERVE_DSV41_STAGE_NEXT`, src/stage_next.zig), read by the copied model, stream and source.
 pub const stage_next = @import("src/stage_next.zig");
+/// The Engram tables read past the page cache, through their blocks (`MLX_SERVE_DSV41_ENGRAM_DIRECT`,
+/// src/engram_direct.zig), read by the copied Engram tables.
+pub const engram_direct = @import("src/engram_direct.zig");
 /// The wide prompt layers' per-prompt regions (src/scratch.zig), read by the copied model and stream.
 pub const scratch = @import("src/scratch.zig");
 /// A wide prompt call's DIG-X waves write into per-prompt regions (`MLX_SERVE_DSV41_SCRATCH_WAVES`,
@@ -296,6 +299,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    engram_direct.configure(env.span(.MLX_SERVE_DSV41_ENGRAM_DIRECT)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_DIRECT is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     joinless.configure(env.span(.MLX_SERVE_DSV41_JOINLESS)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_JOINLESS is neither 0 nor check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -447,6 +457,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     else
         log.info("[turboexl3_ds41] wide prompt layers' read-ahead and staging posted at the layer's start (MLX_SERVE_DSV41_STAGE_NEXT=0)\n", .{});
     if (stage_next.on) log.info("[turboexl3_ds41] {s}\n", .{if (stage_next.skip_own) "a wide prompt layer the call before it read ahead for skips its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own: its own too)" else "every wide prompt layer also runs its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own)"});
+    if (engram_direct.on) log.info("[turboexl3_ds41] a prompt's Engram rows read once a table, past the page cache through their file system blocks, on up to 64 threads (MLX_SERVE_DSV41_ENGRAM_DIRECT=0: span by span through the page cache)\n", .{}) else log.info("[turboexl3_ds41] Engram rows read span by span through the page cache (MLX_SERVE_DSV41_ENGRAM_DIRECT=0)\n", .{});
     switch (joinless.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt calls' routed outputs joined, the routed sum and shared expert by the op chain (MLX_SERVE_DSV41_JOINLESS=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt calls' routed sum and shared expert in one combine over the waves' outputs, no joins (MLX_SERVE_DSV41_JOINLESS=0: the joins and the op chain)\n", .{}),
