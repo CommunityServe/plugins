@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/attention.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
+//! copied_from: src/plugins/minimax_m3/attention.zig@dc508a5da248397f6c952e75839f1de58aab5be2
 //! Serial text attention with per-index-head sparse block masks. Index keys are
 //! retained even before sparsity activates, so later queries can select old blocks.
 const std = @import("std");
@@ -91,20 +91,27 @@ pub fn forwardRows(g: *ops.G, a: std.mem.Allocator, c: *const C, w: Weights, cac
     }
     var i: usize = if (dense > 1) dense else 0;
     var since: usize = 0;
+    var group = g.mark();
+    const group_rows = @import("prefill_step.zig").fallbackRows(c.index_n_heads, c.index_head_dim, c.n_heads, position + n);
     while (i < n) {
         const pos = position + @as(u32, @intCast(i));
         const r: c_int = @intCast(i);
         const tile = if (cache.bits == 0 and c.index_n_heads == c.n_kv_heads and pos >= budget) @import("prefill_step.zig").sparseTileRows(c.index_n_heads, c.index_block_size, position + n, n - i) else 0;
         if (tile > 0) {
+            if (since > 0) try settle(g, outputs[count - since .. count], group);
+            since = 0;
             const m: c_int = @intCast(tile);
+            // A tile's scratch is freed once its rows are evaluated, so one tile's is live at a time (`sparseTileBytes`).
+            const tile_mark = g.mark();
             const qs = try g.slice(q, &.{ 0, 0, r, 0 }, &.{ 1, @intCast(c.n_heads), r + m, @intCast(c.head_dim) }, &.{ 1, 1, 1, 1 });
             const iqs = try g.slice(iq.?, &.{ 0, 0, r, 0 }, &.{ 1, @intCast(c.index_n_heads), r + m, @intCast(c.index_head_dim) }, &.{ 1, 1, 1, 1 });
             outputs[count] = try sparseRows(g, c, qs, iqs, try cache.view(g, pos + @as(u32, @intCast(m))), pos);
-            try g.evalAll(outputs[count .. count + 1]);
+            try settle(g, outputs[count .. count + 1], tile_mark);
             count += 1;
             i += @intCast(m);
             continue;
         }
+        if (since == 0) group = g.mark();
         const qi = try g.slice(q, &.{ 0, 0, r, 0 }, &.{ 1, @intCast(c.n_heads), r + 1, @intCast(c.head_dim) }, &.{ 1, 1, 1, 1 });
         const iqi = if (pos / c.index_block_size + 1 > c.index_topk_blocks)
             try g.slice(iq.?, &.{ 0, 0, r, 0 }, &.{ 1, @intCast(c.index_n_heads), r + 1, @intCast(c.index_head_dim) }, &.{ 1, 1, 1, 1 })
@@ -115,10 +122,24 @@ pub fn forwardRows(g: *ops.G, a: std.mem.Allocator, c: *const C, w: Weights, cac
         count += 1;
         since += 1;
         i += 1;
-        // Bounds the graph a long span builds before its layer's eval.
-        if (since % 64 == 0) try g.evalAll(outputs[count - 64 .. count]);
+        // Bounds the graph a long span builds before its layer's eval, and frees the group's scratch (`fallbackBytes`).
+        if (since == group_rows) {
+            try settle(g, outputs[count - since .. count], group);
+            since = 0;
+        }
     }
     return ops.linear(g, if (count == 1) outputs[0] else try g.concat(outputs[0..count], 0), w.o);
+}
+/// Evaluates `rows` (all made after `m`), frees every other array made since `m`, and keeps `rows` in the scope.
+fn settle(g: *ops.G, rows: []ops.T, m: anytype) !void {
+    try g.evalAll(rows);
+    for (rows) |*x| x.* = g.keep(x.*);
+    g.resetTo(m);
+    // A failed adopt frees its own input; only the rows after it are still unowned.
+    for (rows, 0..) |*x, k| x.* = g.adopt(x.*) catch |e| {
+        for (rows[k + 1 ..]) |rest| g.release(rest);
+        return e;
+    };
 }
 /// Rows past the block budget, each choosing its blocks by `reference.selectSparseBlocks`' rule (block maxima of the
 /// causal index scores, the initial and local blocks forced, score descending then the lower block), then one masked
@@ -488,4 +509,70 @@ test "MiniMax GPU sparse tile rows choose the reference's blocks and attend as t
             }
         }
     }
+}
+test "MiniMax GPU sparse tiles free their scratch: one more tile leaves one more live array" {
+    if (sdk.mlx.noGpuBackend() or sdk.mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try ops.G.init(a, s);
+    defer g.deinit();
+    const h = 512;
+    const start = 300;
+    const c: C = .{ .hidden_size = h, .n_heads = 4, .n_kv_heads = 1, .head_dim = 128, .index_n_heads = 1, .index_head_dim = 128, .index_block_size = 128, .index_topk_blocks = 2 };
+    const zero = try g.zeros(&.{128}, .bfloat16);
+    const lin = struct {
+        fn of(gg: *ops.G, o: c_int, i: c_int) !ops.Linear {
+            return .{ .weight = try gg.astype(try gg.full(&.{ o, i }, try gg.scalar(1.0 / 64.0, .float32), .float32), .bfloat16) };
+        }
+    };
+    const w: Weights = .{ .q = try lin.of(&g, 4 * 128, h), .k = try lin.of(&g, 128, h), .v = try lin.of(&g, 128, h), .o = try lin.of(&g, h, 4 * 128), .q_norm = zero, .k_norm = zero, .index_q = try lin.of(&g, 128, h), .index_k = try lin.of(&g, 128, h), .index_q_norm = zero, .index_k_norm = zero };
+    const prefix = try g.astype(try g.full(&.{ 1, 1, start, 128 }, try g.scalar(0.25, .float32), .float32), .bfloat16);
+    var live: [2]usize = undefined;
+    // 344 rows are two tiles (256 + 88), 600 rows three (256 + 256 + 88).
+    for ([_]c_int{ 344, 600 }, &live) |rows, *grown| {
+        var cache: Cache = .{ .limit = 1024 };
+        defer cache.clear(&g);
+        _ = try cache.append(&g, prefix, prefix, prefix);
+        const input = try g.astype(try g.full(&.{ rows, h }, try g.scalar(0.5, .float32), .float32), .bfloat16);
+        const before = g.mark();
+        const y = try forwardRows(&g, a, &c, w, &cache, input, start);
+        try g.evalAll(&.{y});
+        grown.* = g.mark().n - before.n;
+        g.resetTo(before);
+    }
+    try std.testing.expect(live[1] <= live[0] + 2);
+}
+test "MiniMax GPU row-by-row prompt rows free their scratch: a Q8 cache keeps one 64-row group of outputs a group" {
+    if (sdk.mlx.noGpuBackend() or sdk.mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try ops.G.init(a, s);
+    defer g.deinit();
+    const h = 512;
+    const start = 300;
+    const c: C = .{ .hidden_size = h, .n_heads = 4, .n_kv_heads = 1, .head_dim = 128, .index_n_heads = 1, .index_head_dim = 128, .index_block_size = 128, .index_topk_blocks = 2 };
+    const zero = try g.zeros(&.{128}, .bfloat16);
+    const lin = struct {
+        fn of(gg: *ops.G, o: c_int, i: c_int) !ops.Linear {
+            return .{ .weight = try gg.astype(try gg.full(&.{ o, i }, try gg.scalar(1.0 / 64.0, .float32), .float32), .bfloat16) };
+        }
+    };
+    const w: Weights = .{ .q = try lin.of(&g, 4 * 128, h), .k = try lin.of(&g, 128, h), .v = try lin.of(&g, 128, h), .o = try lin.of(&g, h, 4 * 128), .q_norm = zero, .k_norm = zero, .index_q = try lin.of(&g, 128, h), .index_k = try lin.of(&g, 128, h), .index_q_norm = zero, .index_k_norm = zero };
+    const prefix = try g.astype(try g.full(&.{ 1, 1, start, 128 }, try g.scalar(0.25, .float32), .float32), .bfloat16);
+    var live: [2]usize = undefined;
+    // A Q8 cache attends row by row: 128 rows are two groups of 64, 192 rows three.
+    for ([_]c_int{ 128, 192 }, &live) |rows, *grown| {
+        var cache: Cache = .{ .limit = 1024, .bits = 8 };
+        defer cache.clear(&g);
+        _ = try cache.append(&g, prefix, prefix, prefix);
+        const input = try g.astype(try g.full(&.{ rows, h }, try g.scalar(0.5, .float32), .float32), .bfloat16);
+        const before = g.mark();
+        const y = try forwardRows(&g, a, &c, w, &cache, input, start);
+        try g.evalAll(&.{y});
+        grown.* = g.mark().n - before.n;
+        g.resetTo(before);
+    }
+    try std.testing.expect(live[1] <= live[0] + 64 + 2);
 }

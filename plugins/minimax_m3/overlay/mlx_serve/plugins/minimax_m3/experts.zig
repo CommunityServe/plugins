@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/experts.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
+//! copied_from: src/plugins/minimax_m3/experts.zig@dc508a5da248397f6c952e75839f1de58aab5be2
 //! Bounded MiniMax demand reads through the SDK stream. Every route is evaluated
 //! before its slots are unpinned; NVFP4 gathers retain the shared global-scale math.
 const std = @import("std");
@@ -118,16 +118,8 @@ pub fn Backend(comptime B: type, comptime F: type) type {
                 if (self.stream.phase != .prefill) return error.MiniMaxChunkPhase;
                 const rel = layer - self.owner.geometry.first_moe_layer;
                 const a = self.a;
-                var seen: [256]bool = @splat(false);
                 var order: [256]u16 = undefined;
-                var distinct: usize = 0;
-                for (ids) |id| {
-                    if (id >= c.n_routed_experts) return error.MiniMaxRouteWidth;
-                    if (seen[id]) continue;
-                    seen[id] = true;
-                    order[distinct] = id;
-                    distinct += 1;
-                }
+                const distinct = try @import("prefill_step.zig").seedSpan(self.stream, rel, ids, c.n_routed_experts, &order);
                 var out = try SpanOut.init(a, ids.len);
                 defer out.deinit(a);
                 const pairs = try a.alloc(u32, ids.len);
@@ -138,7 +130,6 @@ pub fn Backend(comptime B: type, comptime F: type) type {
                 while (batch_at < distinct) {
                     const batch = order[batch_at..@min(distinct, batch_at + chunk_routes)];
                     batch_at += batch.len;
-                    try self.stream.seedPrefill(rel, batch);
                     const route = try self.stream.route(rel, batch, &.{});
                     var released = false;
                     errdefer {
@@ -224,6 +215,7 @@ pub fn Backend(comptime B: type, comptime F: type) type {
             /// The pairs in `pairs` (ascending), `refs[i]` pair i's slot: each bank's pairs gather as one batch of rows.
             pub fn gather(self: *SpanOut, a: std.mem.Allocator, g: *ops.G, c: *const C, x: ops.T, pairs: []const u32, refs: []const StreamType.SlotRef, banks: SlotBanks) !void {
                 const first = self.pieces.items.len;
+                const batch_mark = g.mark();
                 const tokens = try a.alloc(u32, pairs.len);
                 defer a.free(tokens);
                 const slots = try a.alloc(u32, pairs.len);
@@ -247,8 +239,16 @@ pub fn Backend(comptime B: type, comptime F: type) type {
                     try self.pieces.append(a, try g.reshape(down, &.{ @intCast(n), @intCast(c.hidden_size) }));
                     self.rows += @intCast(n);
                 }
-                // The slots are released after this batch: its gathers run now.
+                // The slots are released after this batch: its gathers run now. Only its outputs stay live.
                 try g.evalAll(self.pieces.items[first..]);
+                for (self.pieces.items[first..]) |*piece| piece.* = g.keep(piece.*);
+                g.resetTo(batch_mark);
+                // A failed adopt frees its own input; only the pieces after it are still unowned.
+                for (self.pieces.items[first..], first..) |*piece, i| piece.* = g.adopt(piece.*) catch |e| {
+                    for (self.pieces.items[i + 1 ..]) |rest| g.release(rest);
+                    self.pieces.shrinkRetainingCapacity(first);
+                    return e;
+                };
             }
             /// Bias, BF16 weighting and the left-associated sum in the router's order, as `combine` does for one token.
             pub fn finish(self: *SpanOut, a: std.mem.Allocator, g: *ops.G, c: *const C, ids: []const u16, weights: []const f32, down_bias: ?ops.T) !ops.T {

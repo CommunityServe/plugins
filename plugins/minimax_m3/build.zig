@@ -89,6 +89,7 @@ const mlx_free_filters = [_][]const u8{
     "MiniMax forwards shared usage",
     "MiniMax load refuses a device",
     "MiniMax OQ3 prepared config",
+    "MiniMax span seed",
     "released Flash config",
     "config refuses changed math",
     "config reads a smaller model",

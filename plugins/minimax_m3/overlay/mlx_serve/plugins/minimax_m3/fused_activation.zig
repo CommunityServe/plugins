@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/fused_activation.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
+//! copied_from: src/plugins/minimax_m3/fused_activation.zig@dc508a5da248397f6c952e75839f1de58aab5be2
 //! Decode-sized SwiGLU-OAI, with a rounding point after every original operation.
 const std = @import("std");
 const sdk = @import("mlx_stream").sdk;

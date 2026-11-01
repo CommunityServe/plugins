@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/config.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
+//! copied_from: src/plugins/minimax_m3/config.zig@dc508a5da248397f6c952e75839f1de58aab5be2
 //! MiniMax M3.1 Flash's prepared text pack claim and host facts.
 const std = @import("std");
 const abi = @import("mlx_serve").abi.plugin;
