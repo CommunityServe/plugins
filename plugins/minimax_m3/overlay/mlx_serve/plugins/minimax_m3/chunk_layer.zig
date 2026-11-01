@@ -1,5 +1,5 @@
-//! copied_from: src/plugins/minimax_m3/chunk_layer.zig@37e90382b439f163474f99d3c78522ae88caaf12
-//! Layer-major prompt tiles; every resident projection retains its serial M=1 kernel.
+//! copied_from: src/plugins/minimax_m3/chunk_layer.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
+//! Prompt tiles; every resident projection retains its serial M=1 kernel.
 const std = @import("std");
 const ops = @import("ops.zig");
 const attention = @import("attention.zig");
@@ -58,6 +58,57 @@ pub fn forwardLayers(g: *ops.G, a: std.mem.Allocator, c: *const C, layers: []con
                 try source.apply(g, c, @intCast(index), h, routes.ids[0..routes.n], routes.weights[0..routes.n], layer.down_bias);
             y = try g.add(routed, y);
             if (comptime @hasDecl(@TypeOf(source.*), "observeRoutes")) try source.observeRoutes(index, position, routes);
+        }
+        const output = try g.add(next, y);
+        try g.evalAll(&.{output});
+        if (comptime @hasDecl(@TypeOf(source.*), "observeLayer")) try source.observeLayer(g, index, position, output);
+        const held = g.keep(output);
+        g.resetTo(mark);
+        g.release(x);
+        x = held;
+    }
+    return x;
+}
+/// The router on every row of a span at once: `ids`/`weights` take each row's top four in `routeRows`' order.
+pub fn routeSpan(g: *ops.G, c: *const C, x: ops.T, router: ops.T, correction: ops.T, ids: []u16, weights: []f32) !void {
+    const rows: c_int = g.shapeOf(x).d[0];
+    const scores = try g.sigmoid(try g.astype(try ops.linear(g, try g.astype(x, g.dtypeOf(router)), router), .float32));
+    const ranked = try g.argpartition(try g.mul(try g.add(scores, correction), try g.scalar(-1, .float32)), 3, -1);
+    const selected = try g.slice(ranked, &.{ 0, 0 }, &.{ rows, 4 }, &.{ 1, 1 });
+    var mix = try g.takeAlongAxis(scores, selected, -1);
+    mix = try g.div(mix, try g.add(try g.sum(mix, -1, true), try g.scalar(1e-20, .float32)));
+    mix = try g.astype(try g.mul(mix, try g.scalar(c.routed_scaling_factor, .float32)), g.dtypeOf(x));
+    _ = try g.hostIds(try g.astype(selected, .int32), ids);
+    _ = try g.hostF32(try g.astype(mix, .float32), weights);
+}
+/// A prompt span layer-major: all its rows through one layer before the next, every resident projection batched over
+/// the rows and the layer's experts routed once for the span (`source.applySpan`).
+pub fn forwardSpanLayers(g: *ops.G, a: std.mem.Allocator, c: *const C, layers: []const Layer, caches: []attention.Cache, input: ops.T, position: u32, source: anytype) !ops.T {
+    const rows: usize = @intCast(g.shapeOf(input).d[0]);
+    const ids = try a.alloc(u16, 4 * rows);
+    defer a.free(ids);
+    const weights = try a.alloc(f32, 4 * rows);
+    defer a.free(weights);
+    var x = g.keep(input);
+    errdefer g.release(x);
+    for (layers, caches, 0..) |layer, *cache, index| {
+        const mark = g.mark();
+        const next = try g.add(x, try attention.forwardRows(g, a, c, layer.attn, cache, try ops.norm(g, x, layer.input_norm, c), position));
+        const h = try ops.norm(g, next, layer.post_norm, c);
+        var y = try layer.mlp.apply(g, h, c);
+        if (layer.router) |router| {
+            try routeSpan(g, c, h, router, layer.correction orelse return error.MiniMaxRouterCorrectionMissing, ids, weights);
+            if (comptime @hasDecl(@TypeOf(source.*), "observeRoutes")) {
+                var at: usize = 0;
+                while (at < rows) : (at += 8) {
+                    const n: usize = @min(rows - at, 8);
+                    var routes: Routes = .{ .n = 4 * n };
+                    @memcpy(routes.ids[0 .. 4 * n], ids[4 * at ..][0 .. 4 * n]);
+                    @memcpy(routes.weights[0 .. 4 * n], weights[4 * at ..][0 .. 4 * n]);
+                    try source.observeRoutes(index, position + @as(u32, @intCast(at)), routes);
+                }
+            }
+            y = try g.add(try source.applySpan(g, c, @intCast(index), h, ids, weights, layer.down_bias), y);
         }
         const output = try g.add(next, y);
         try g.evalAll(&.{output});

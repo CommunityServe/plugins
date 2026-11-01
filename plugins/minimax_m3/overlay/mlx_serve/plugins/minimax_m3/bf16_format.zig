@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/bf16_format.zig@37e90382b439f163474f99d3c78522ae88caaf12
+//! copied_from: src/plugins/minimax_m3/bf16_format.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
 const ops = @import("ops.zig");
 const bank = @import("bf16_bank.zig");
 /// x [rows, 1, in] through the slots `ids` of one BF16 projection [slots, out, in] (MLX's gather_mm).

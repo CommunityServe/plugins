@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/legacy.zig@37e90382b439f163474f99d3c78522ae88caaf12
+//! copied_from: src/plugins/minimax_m3/legacy.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
 //! MiniMax M3.1 Flash load config: settings, load facts, the memory bill and the reader staging.
 const std = @import("std");
 const sdk = @import("mlx_stream").sdk;
@@ -76,12 +76,14 @@ pub fn memoryBill(a: std.mem.Allocator, io: std.Io, c: *const Config) !sdk.Memor
     const kv_copy = kv / c.model.n_layers;
     const reader = readerStagingBytes(&geometry);
     const scratch = @import("experts.zig").chunk_routes * slots + 256 * @as(u64, c.model.hidden_size) + 8 * @as(u64, c.model.n_heads) * c.context;
+    const span = @import("prefill_step.zig").spanBytes(c.model.hidden_size, c.context);
     const terms = try a.dupe(sdk.MemoryBill.Term, &.{
         .{ .name = "residents", .bytes = .{ residents, residents }, .at_construction = true },
         .{ .name = "kv_and_index", .bytes = .{ kv, kv }, .at_construction = false },
         .{ .name = "kv_append", .bytes = .{ kv_copy, kv_copy }, .at_construction = false },
         .{ .name = "reader_staging", .bytes = .{ reader, reader }, .at_construction = true },
         .{ .name = "serial_scratch", .bytes = .{ scratch, scratch }, .at_construction = false },
+        .{ .name = "prefill_span", .bytes = .{ span, 0 }, .at_construction = false },
         .{ .name = "mlx_runtime_allowance", .bytes = .{ 1 << 30, 1 << 30 }, .at_construction = false },
     });
     return .{ .terms = terms, .per_row = slots * geometry.num_moe_layers };

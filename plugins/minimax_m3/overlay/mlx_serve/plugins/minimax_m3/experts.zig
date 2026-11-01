@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/experts.zig@37e90382b439f163474f99d3c78522ae88caaf12
+//! copied_from: src/plugins/minimax_m3/experts.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
 //! Bounded MiniMax demand reads through the SDK stream. Every route is evaluated
 //! before its slots are unpinned; NVFP4 gathers retain the shared global-scale math.
 const std = @import("std");
@@ -40,7 +40,8 @@ pub fn Backend(comptime B: type, comptime F: type) type {
                     .decode_route_ids = 4,
                     .transient_rows = chunk_routes,
                     .records_per_part = 4,
-                    .pool = .{ .workers = 2, .tickets = 64 },
+                    // Two reads (gate|up, down) a missed record: a span's batch can miss all its ids, with headroom.
+                    .pool = .{ .workers = 2, .tickets = 8 * chunk_routes },
                     .staging_from_bank = true,
                     .slot_memory = .{ .mlx = s },
                 });
@@ -110,6 +111,61 @@ pub fn Backend(comptime B: type, comptime F: type) type {
                 try self.stream.flush();
                 return result;
             }
+            /// Every row of a prompt span through one layer's experts: each distinct expert is routed once for the
+            /// span (batches of distinct ids, so a span reads a missing expert once, not once per tile).
+            pub fn applySpan(self: *SourceType, g: *ops.G, c: *const C, layer: u32, x: ops.T, ids: []const u16, weights: []const f32, down_bias: ?ops.T) !ops.T {
+                if (ids.len == 0 or ids.len % 4 != 0 or weights.len != ids.len) return error.MiniMaxRouteWidth;
+                if (self.stream.phase != .prefill) return error.MiniMaxChunkPhase;
+                const rel = layer - self.owner.geometry.first_moe_layer;
+                const a = self.a;
+                var seen: [256]bool = @splat(false);
+                var order: [256]u16 = undefined;
+                var distinct: usize = 0;
+                for (ids) |id| {
+                    if (id >= c.n_routed_experts) return error.MiniMaxRouteWidth;
+                    if (seen[id]) continue;
+                    seen[id] = true;
+                    order[distinct] = id;
+                    distinct += 1;
+                }
+                var out = try SpanOut.init(a, ids.len);
+                defer out.deinit(a);
+                const pairs = try a.alloc(u32, ids.len);
+                defer a.free(pairs);
+                const pair_refs = try a.alloc(StreamType.SlotRef, ids.len);
+                defer a.free(pair_refs);
+                var batch_at: usize = 0;
+                while (batch_at < distinct) {
+                    const batch = order[batch_at..@min(distinct, batch_at + chunk_routes)];
+                    batch_at += batch.len;
+                    try self.stream.seedPrefill(rel, batch);
+                    const route = try self.stream.route(rel, batch, &.{});
+                    var released = false;
+                    errdefer {
+                        _ = sdk.mlx.mlx_synchronize(g.s);
+                        if (!released) self.stream.release(route);
+                        self.stream.flush() catch {};
+                    }
+                    for (0..route.n_parts) |part| try self.stream.waitDown(route, @intCast(part));
+                    var refs: [StreamType.max_route_ids]StreamType.SlotRef = undefined;
+                    _ = self.stream.refsOf(route, &refs);
+                    var n: usize = 0;
+                    for (ids, 0..) |id, p| for (batch, 0..) |b, i| if (b == id) {
+                        pairs[n] = @intCast(p);
+                        pair_refs[n] = refs[i];
+                        n += 1;
+                        break;
+                    };
+                    const arrays: SlotBanks = .{ .base = self.stream.bankArrays(rel, .base), .ext = self.stream.bankArrays(rel, .ext), .transient = self.stream.bankArrays(rel, .transient) };
+                    try out.gather(a, g, c, x, pairs[0..n], pair_refs[0..n], arrays);
+                    self.stream.release(route);
+                    released = true;
+                    try self.stream.flush();
+                }
+                const result = try out.finish(a, g, c, ids, weights, down_bias);
+                try g.evalAll(&.{result});
+                return result;
+            }
         };
         pub const SlotBanks = struct {
             base: ?B.BankArrays = null,
@@ -152,6 +208,76 @@ pub fn Backend(comptime B: type, comptime F: type) type {
             for (0..rows) |token| mixed[token] = try combine(g, ids[token * 4 ..][0..4], weights[token * 4 ..][0..4], outputs[token * 4 ..][0..4], down_bias);
             return g.concat(mixed[0..rows], 0);
         }
+        /// A span's routed outputs, gathered a slot batch at a time: pair p is token p / 4's (p % 4)-th route.
+        pub const SpanOut = struct {
+            pieces: std.ArrayList(ops.T) = .empty,
+            /// Pair p's row in the pieces, concatenated in order.
+            at: []u32,
+            rows: u32 = 0,
+            pub fn init(a: std.mem.Allocator, pairs: usize) !SpanOut {
+                return .{ .at = try a.alloc(u32, pairs) };
+            }
+            pub fn deinit(self: *SpanOut, a: std.mem.Allocator) void {
+                self.pieces.deinit(a);
+                a.free(self.at);
+            }
+            /// The pairs in `pairs` (ascending), `refs[i]` pair i's slot: each bank's pairs gather as one batch of rows.
+            pub fn gather(self: *SpanOut, a: std.mem.Allocator, g: *ops.G, c: *const C, x: ops.T, pairs: []const u32, refs: []const StreamType.SlotRef, banks: SlotBanks) !void {
+                const first = self.pieces.items.len;
+                const tokens = try a.alloc(u32, pairs.len);
+                defer a.free(tokens);
+                const slots = try a.alloc(u32, pairs.len);
+                defer a.free(slots);
+                for ([_]StreamType.BankKind{ .base, .ext, .transient }) |kind| {
+                    var n: usize = 0;
+                    for (pairs, refs) |pair, ref| if (ref.bank == kind) {
+                        tokens[n] = pair / 4;
+                        slots[n] = ref.row;
+                        self.at[pair] = self.rows + @as(u32, @intCast(n));
+                        n += 1;
+                    };
+                    if (n == 0) continue;
+                    const arrays = try banks.get(kind);
+                    const token_ids = try g.hostArray(std.mem.sliceAsBytes(tokens[0..n]), &.{@intCast(n)}, .uint32);
+                    const input = try g.reshape(try g.take(x, token_ids, 0), &.{ @intCast(n), 1, @intCast(c.hidden_size) });
+                    const slot_ids = try g.hostArray(std.mem.sliceAsBytes(slots[0..n]), &.{@intCast(n)}, .uint32);
+                    const gate = try F.gather(g, input, arrays.gate, slot_ids);
+                    const up = try F.gather(g, input, arrays.up, slot_ids);
+                    const down = try F.gather(g, try ops.activate(g, gate, up, c), arrays.down, slot_ids);
+                    try self.pieces.append(a, try g.reshape(down, &.{ @intCast(n), @intCast(c.hidden_size) }));
+                    self.rows += @intCast(n);
+                }
+                // The slots are released after this batch: its gathers run now.
+                try g.evalAll(self.pieces.items[first..]);
+            }
+            /// Bias, BF16 weighting and the left-associated sum in the router's order, as `combine` does for one token.
+            pub fn finish(self: *SpanOut, a: std.mem.Allocator, g: *ops.G, c: *const C, ids: []const u16, weights: []const f32, down_bias: ?ops.T) !ops.T {
+                const n = ids.len;
+                const all = if (self.pieces.items.len == 1) self.pieces.items[0] else try g.concat(self.pieces.items, 0);
+                var y = try g.take(all, try g.hostArray(std.mem.sliceAsBytes(self.at), &.{@intCast(n)}, .uint32), 0);
+                if (down_bias) |bias| {
+                    const eids = try a.alloc(u32, n);
+                    defer a.free(eids);
+                    for (eids, ids) |*e, id| e.* = id;
+                    y = try g.add(y, try g.take(bias, try g.hostArray(std.mem.sliceAsBytes(eids), &.{@intCast(n)}, .uint32), 0));
+                }
+                const dt = g.dtypeOf(y);
+                const scale = if (dt == .bfloat16) blk: {
+                    const bits = try a.alloc(u16, n);
+                    defer a.free(bits);
+                    for (bits, weights) |*b, w| b.* = @import("mlx_stream").ops.bf16Bits(w);
+                    break :blk try g.hostArray(std.mem.sliceAsBytes(bits), &.{ @intCast(n), 1 }, .bfloat16);
+                } else try g.astype(try g.hostArray(std.mem.sliceAsBytes(weights), &.{ @intCast(n), 1 }, .float32), dt);
+                y = try g.reshape(try g.mul(y, scale), &.{ @intCast(n / 4), 4, @intCast(c.hidden_size) });
+                var sum: ?ops.T = null;
+                for (0..4) |k| {
+                    const kk: c_int = @intCast(k);
+                    const yk = try g.reshape(try g.slice(y, &.{ 0, kk, 0 }, &.{ @intCast(n / 4), kk + 1, @intCast(c.hidden_size) }, &.{ 1, 1, 1 }), &.{ @intCast(n / 4), @intCast(c.hidden_size) });
+                    sum = if (sum) |prev| try g.add(prev, yk) else yk;
+                }
+                return sum.?;
+            }
+        };
         fn grouped(g: *ops.G, c: *const C, x: ops.T, refs: []const StreamType.SlotRef, banks: SlotBanks) ![4]ops.T {
             const groups = try Grouping(StreamType.SlotRef).init(refs);
             const input = try g.reshape(x, &.{ 1, 1, @intCast(c.hidden_size) });
@@ -196,6 +322,7 @@ pub const S = NV.StreamType;
 pub const Banks = NV.SlotBanks;
 pub const applyBankOne = NV.applyOne;
 pub const applyBankRows = NV.applyRows;
+pub const BankSpanOut = NV.SpanOut;
 const groupedOutputs = NV.grouped;
 const mixOutputs = NV.combine;
 pub const Source = struct {
@@ -250,6 +377,11 @@ pub const Source = struct {
     pub fn applyChunk(self: *Source, g: *ops.G, c: *const C, layer: u32, x: ops.T, ids: []const u16, weights: []const f32, bias: ?ops.T) !ops.T {
         return switch (self.backend) {
             inline else => |source| source.applyChunk(g, c, layer, x, ids, weights, bias),
+        };
+    }
+    pub fn applySpan(self: *Source, g: *ops.G, c: *const C, layer: u32, x: ops.T, ids: []const u16, weights: []const f32, bias: ?ops.T) !ops.T {
+        return switch (self.backend) {
+            inline else => |source| source.applySpan(g, c, layer, x, ids, weights, bias),
         };
     }
     pub fn stats(self: *Source) @import("mlx_stream").sdk_ext.expert.Stats {

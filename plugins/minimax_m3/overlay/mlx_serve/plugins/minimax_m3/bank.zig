@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/bank.zig@37e90382b439f163474f99d3c78522ae88caaf12
+//! copied_from: src/plugins/minimax_m3/bank.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
 //! MiniMax uses the shared nine-part NVFP4 wire format. The reader and dequantization
 //! are deliberately shared with GLM: only the routed topology differs.
 const std = @import("std");

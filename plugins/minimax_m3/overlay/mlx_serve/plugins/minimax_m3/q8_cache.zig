@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/q8_cache.zig@37e90382b439f163474f99d3c78522ae88caaf12
+//! copied_from: src/plugins/minimax_m3/q8_cache.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
 //! Opt-in symmetric Q8 cache operations. Only new rows are quantized; index
 //! scores and selected-block attention restore values in registers on M2 SIMD.
 const std = @import("std");

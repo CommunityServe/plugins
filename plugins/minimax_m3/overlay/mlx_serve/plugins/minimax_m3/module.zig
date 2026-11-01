@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/module.zig@37e90382b439f163474f99d3c78522ae88caaf12
+//! copied_from: src/plugins/minimax_m3/module.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
 //! MiniMax M3.1 Flash text execution. The first implementation uses serial prompt
 //! tokens, bounded expert slots and exact per-index-head sparse block selection.
 const std = @import("std");
@@ -156,7 +156,8 @@ pub const Module = struct {
             self.requestEnd();
         }
         for (ids) |id| if (id >= self.c.model.vocab_size) return error.MiniMaxTokenOutOfRange;
-        const logits = try @import("prefill_step.zig").run(ops.T, self, ids);
+        const prefill_step = @import("prefill_step.zig");
+        const logits = try prefill_step.run(ops.T, self, ids, prefill_step.span_tokens);
         errdefer self.g.release(logits);
         try self.source.beginDecode();
         return logits;
@@ -195,7 +196,7 @@ pub const Module = struct {
         return self.forwardSpan(&ids, head, false);
     }
     pub fn chunk(self: *Module, ids: []const u32, head: bool) !ops.T {
-        if (ids.len == 0 or ids.len > 8 or @as(u64, self.pos) + ids.len > self.c.context) return error.MiniMaxChunkShape;
+        if (ids.len == 0 or ids.len > @import("prefill_step.zig").span_tokens or @as(u64, self.pos) + ids.len > self.c.context) return error.MiniMaxChunkShape;
         return self.forwardSpan(ids, head, true);
     }
     fn forwardSpan(self: *Module, ids: []const u32, head: bool, comptime chunked: bool) !ops.T {
@@ -203,7 +204,8 @@ pub const Module = struct {
         const mark = g.mark();
         defer g.resetTo(mark);
         const idx = try g.hostArray(std.mem.sliceAsBytes(ids), &.{@intCast(ids.len)}, .uint32);
-        const x = try chunk_layer.forwardLayers(g, self.a, &self.c.model, self.layers, self.caches, try ops.embeddingRows(g, self.embedding, idx, self.c.model.hidden_size), self.pos, self.source, chunked);
+        const rows = try ops.embeddingRows(g, self.embedding, idx, self.c.model.hidden_size);
+        const x = if (chunked) try chunk_layer.forwardSpanLayers(g, self.a, &self.c.model, self.layers, self.caches, rows, self.pos, self.source) else try chunk_layer.forwardLayers(g, self.a, &self.c.model, self.layers, self.caches, rows, self.pos, self.source, false);
         defer g.release(x);
         const last = if (head and ids.len > 1) try ops.row(g, x, @intCast(ids.len - 1)) else x;
         const result = if (head) try ops.linear(g, try ops.norm(g, last, self.norm, &self.c.model), self.head) else x;

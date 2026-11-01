@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/plugin.zig@37e90382b439f163474f99d3c78522ae88caaf12
+//! copied_from: src/plugins/minimax_m3/plugin.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
 //! MiniMax M3.1 Flash's prepared text expert banks behind the model table.
 const std = @import("std");
 const abi = @import("mlx_serve").abi.plugin;
@@ -102,8 +102,7 @@ fn attnKeys(_: *const abi.Parsed, seq: u64) callconv(.c) u64 {
 fn prefillBytes(p: *const abi.Parsed, seq: u64, _: u32, kv_bits: u8, _: u64) callconv(.c) u64 {
     const c = config.of(p).model;
     const kv = kvTokenBytes(&c, kv_bits) *| seq;
-    const rows: u64 = @min(seq, 8);
-    const scratch = 256 * @as(u64, c.hidden_size) + 8 * @as(u64, c.n_heads) * seq + rows * 4 * c.hidden_size * 4;
+    const scratch = 256 * @as(u64, c.hidden_size) + 8 * @as(u64, c.n_heads) * seq + @import("prefill_step.zig").spanBytes(c.hidden_size, seq);
     return (kv +| scratch +| (1 << 30)) *| 5 / 4;
 }
 fn residentBytes(p: *const abi.Parsed, dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {

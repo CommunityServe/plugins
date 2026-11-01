@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/chunk_oracle.zig@37e90382b439f163474f99d3c78522ae88caaf12
+//! copied_from: src/plugins/minimax_m3/chunk_oracle.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
 //! Device oracle for the production layer driver, with small synthetic resident/expert banks.
 const std = @import("std");
 const sdk = @import("mlx_stream").sdk;
@@ -8,7 +8,8 @@ const experts = @import("experts.zig");
 const layer = @import("chunk_layer.zig");
 const C = @import("geometry.zig").Config;
 const h = 512;
-const tokens = 8;
+/// Two tiles (8 + 5) for the span path.
+const tokens = 13;
 const layers = 2;
 const start = 127;
 const Fixture = struct {
@@ -82,6 +83,23 @@ const Source = struct {
         try g.evalAll(&.{y});
         return y;
     }
+    pub fn applySpan(self: *Source, g: *ops.G, c: *const C, _: u32, x: ops.T, ids: []const u16, weights: []const f32, bias: ?ops.T) !ops.T {
+        const a = std.testing.allocator;
+        var out = try experts.BankSpanOut.init(a, ids.len);
+        defer out.deinit(a);
+        const pairs = try a.alloc(u32, ids.len);
+        defer a.free(pairs);
+        const slots = try a.alloc(experts.S.SlotRef, ids.len);
+        defer a.free(slots);
+        for (ids, pairs, slots, 0..) |id, *p, *ref, i| {
+            p.* = @intCast(i);
+            ref.* = .{ .bank = if (id < 4) .base else .transient, .row = id % 4 };
+        }
+        try out.gather(a, g, c, x, pairs, slots, self.banks);
+        const y = try out.finish(a, g, c, ids, weights, bias);
+        try g.evalAll(&.{y});
+        return y;
+    }
     pub fn observeRoutes(self: *Source, index: usize, position: u32, routes: layer.Routes) !void {
         const at = index * tokens * 4 + (position - start) * 4;
         @memcpy(self.ids[at..][0..routes.n], routes.ids[0..routes.n]);
@@ -93,7 +111,7 @@ const Source = struct {
         _ = try g.hostF32(try g.astype(value, .float32), self.values[at..][0 .. n * h]);
     }
 };
-test "MiniMax GPU chunk layers match serial routing hidden states final logits and cache" {
+test "MiniMax GPU chunk tiles and a layer-major span match serial routing hidden states final logits and cache" {
     if (sdk.mlx.noGpuBackend() or sdk.mlx.virtualGpu()) return error.SkipZigTest;
     const stream = sdk.mlx.mlx_default_gpu_stream_new();
     defer _ = sdk.mlx.mlx_stream_free(stream);
@@ -110,14 +128,17 @@ test "MiniMax GPU chunk layers match serial routing hidden states final logits a
         defer for (&serial_cache) |*cache| cache.clear(&g);
         var chunk_cache: [layers]attention.Cache = @splat(.{ .limit = 256 });
         defer for (&chunk_cache) |*cache| cache.clear(&g);
+        var span_cache: [layers]attention.Cache = @splat(.{ .limit = 256 });
+        defer for (&span_cache) |*cache| cache.clear(&g);
         const prefix_values = try std.testing.allocator.alloc(f32, start * 128);
         defer std.testing.allocator.free(prefix_values);
         for (prefix_values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) / 64;
         const prefix = try g.astype(try g.hostArray(std.mem.sliceAsBytes(prefix_values), &.{ 1, 1, start, 128 }, .float32), .bfloat16);
         const seed_mark = g.mark();
-        for (&serial_cache, &chunk_cache) |*one, *many| {
+        for (&serial_cache, &chunk_cache, &span_cache) |*one, *many, *span| {
             _ = try one.append(&g, prefix, prefix, prefix);
             _ = try many.append(&g, prefix, prefix, prefix);
+            _ = try span.append(&g, prefix, prefix, prefix);
         }
         g.resetTo(seed_mark);
         var input_values: [tokens * h]f32 = undefined;
@@ -129,6 +150,10 @@ test "MiniMax GPU chunk layers match serial routing hidden states final logits a
         defer std.testing.allocator.free(chunk_values);
         @memset(serial_values, std.math.nan(f32));
         @memset(chunk_values, std.math.nan(f32));
+        const span_values = try std.testing.allocator.alloc(f32, layers * tokens * h);
+        defer std.testing.allocator.free(span_values);
+        @memset(span_values, std.math.nan(f32));
+        var spanned: Source = .{ .banks = banks, .values = span_values };
         var one: Source = .{ .banks = banks, .values = serial_values };
         var many: Source = .{ .banks = banks, .values = chunk_values };
         var serial_last: ?ops.T = null;
@@ -140,13 +165,26 @@ test "MiniMax GPU chunk layers match serial routing hidden states final logits a
             serial_last = try layer.forwardLayers(&g, std.testing.allocator, &.{ .hidden_size = h, .intermediate_size = h, .dense_intermediate_size = h, .shared_intermediate_size = h, .n_layers = layers, .n_heads = 4, .n_kv_heads = 1, .head_dim = 128, .n_routed_experts = 8, .index_n_heads = 1, .index_head_dim = 128, .index_block_size = 128, .index_topk_blocks = 1 }, &model, &serial_cache, try ops.row(&g, input, @intCast(i)), @intCast(start + i), &one, false);
             g.resetTo(wave);
         }
-        const output = try layer.forwardLayers(&g, std.testing.allocator, &.{ .hidden_size = h, .intermediate_size = h, .dense_intermediate_size = h, .shared_intermediate_size = h, .n_layers = layers, .n_heads = 4, .n_kv_heads = 1, .head_dim = 128, .n_routed_experts = 8, .index_n_heads = 1, .index_head_dim = 128, .index_block_size = 128, .index_topk_blocks = 1 }, &model, &chunk_cache, input, start, &many, true);
+        const cfg: C = .{ .hidden_size = h, .intermediate_size = h, .dense_intermediate_size = h, .shared_intermediate_size = h, .n_layers = layers, .n_heads = 4, .n_kv_heads = 1, .head_dim = 128, .n_routed_experts = 8, .index_n_heads = 1, .index_head_dim = 128, .index_block_size = 128, .index_topk_blocks = 1 };
+        var tile_last: ?ops.T = null;
+        defer if (tile_last) |value| g.release(value);
+        var at: usize = 0;
+        while (at < tokens) : (at += 8) {
+            const n = @min(tokens - at, 8);
+            if (tile_last) |value| g.release(value);
+            tile_last = null;
+            tile_last = try layer.forwardLayers(&g, std.testing.allocator, &cfg, &model, &chunk_cache, try g.slice(input, &.{ @intCast(at), 0 }, &.{ @intCast(at + n), h }, &.{ 1, 1 }), @intCast(start + at), &many, true);
+        }
+        const output = try layer.forwardSpanLayers(&g, std.testing.allocator, &cfg, &model, &span_cache, input, start, &spanned);
         defer g.release(output);
         for (one.ids) |id| try std.testing.expect(id < 8);
         for (serial_values) |value| try std.testing.expect(std.math.isFinite(value));
         try std.testing.expectEqualSlices(u16, &one.ids, &many.ids);
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&one.weights), std.mem.sliceAsBytes(&many.weights));
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial_values), std.mem.sliceAsBytes(chunk_values));
+        try std.testing.expectEqualSlices(u16, &one.ids, &spanned.ids);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&one.weights), std.mem.sliceAsBytes(&spanned.weights));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial_values), std.mem.sliceAsBytes(span_values));
         const head = try Fixture.matrix(&g, 16, h, false);
         const norm = try g.zeros(&.{h}, .bfloat16);
         const c: C = .{};
@@ -157,20 +195,22 @@ test "MiniMax GPU chunk layers match serial routing hidden states final logits a
         _ = try g.hostF32(try g.astype(expected_logits, .float32), &expected);
         _ = try g.hostF32(try g.astype(actual_logits, .float32), &actual);
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&actual));
-        for (&serial_cache, &chunk_cache) |*sc, *cc| {
-            try std.testing.expectEqual(@as(u32, start + tokens), sc.len);
-            try std.testing.expectEqual(sc.len, cc.len);
-            const sv = try sc.view(&g, sc.len);
-            const cv = try cc.view(&g, cc.len);
-            for ([_]ops.T{ sv.k, sv.v, sv.index_k }, [_]ops.T{ cv.k, cv.v, cv.index_k }) |svalue, cvalue| {
-                const n: usize = @intCast(sdk.mlx.mlx_array_size(svalue));
-                const sdata = try std.testing.allocator.alloc(f32, n);
-                defer std.testing.allocator.free(sdata);
-                const cdata = try std.testing.allocator.alloc(f32, n);
-                defer std.testing.allocator.free(cdata);
-                _ = try g.hostF32(try g.astype(svalue, .float32), sdata);
-                _ = try g.hostF32(try g.astype(cvalue, .float32), cdata);
-                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(sdata), std.mem.sliceAsBytes(cdata));
+        for (&serial_cache, &chunk_cache, &span_cache) |*sc, *chunked, *spanc| {
+            for ([_]*attention.Cache{ chunked, spanc }) |cc| {
+                try std.testing.expectEqual(@as(u32, start + tokens), sc.len);
+                try std.testing.expectEqual(sc.len, cc.len);
+                const sv = try sc.view(&g, sc.len);
+                const cv = try cc.view(&g, cc.len);
+                for ([_]ops.T{ sv.k, sv.v, sv.index_k }, [_]ops.T{ cv.k, cv.v, cv.index_k }) |svalue, cvalue| {
+                    const n: usize = @intCast(sdk.mlx.mlx_array_size(svalue));
+                    const sdata = try std.testing.allocator.alloc(f32, n);
+                    defer std.testing.allocator.free(sdata);
+                    const cdata = try std.testing.allocator.alloc(f32, n);
+                    defer std.testing.allocator.free(cdata);
+                    _ = try g.hostF32(try g.astype(svalue, .float32), sdata);
+                    _ = try g.hostF32(try g.astype(cvalue, .float32), cdata);
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(sdata), std.mem.sliceAsBytes(cdata));
+                }
             }
         }
     }

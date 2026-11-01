@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/attention.zig@37e90382b439f163474f99d3c78522ae88caaf12
+//! copied_from: src/plugins/minimax_m3/attention.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
 //! Serial text attention with per-index-head sparse block masks. Index keys are
 //! retained even before sparsity activates, so later queries can select old blocks.
 const std = @import("std");
@@ -51,6 +51,43 @@ pub fn forwardChunk(g: *ops.G, a: std.mem.Allocator, c: *const C, w: Weights, ca
         outputs[i] = try ops.linear(g, try g.reshape(attended, &.{ 1, @intCast(c.n_heads * c.head_dim) }), w.o);
     }
     return if (n == 1) outputs[0] else g.concat(outputs[0..n], 0);
+}
+/// `[rows, n * d]` to `[1, n, rows, d]`.
+fn headRows(g: *ops.G, x: ops.T, rows: usize, n: u32, d: u32) !ops.T {
+    return g.transposeAxes(try g.reshape(x, &.{ 1, @intCast(rows), @intCast(n), @intCast(d) }), &.{ 0, 2, 1, 3 });
+}
+/// A prompt span's rows with every projection, norm and RoPE batched (M = rows): the weights stream once a span, not
+/// once a row. Each query still attends its own causal prefix of the cache.
+pub fn forwardRows(g: *ops.G, a: std.mem.Allocator, c: *const C, w: Weights, cache: *Cache, x: ops.T, position: u32) !ops.T {
+    const sx = g.shapeOf(x);
+    if (sx.n != 2 or sx.d[0] < 1 or sx.d[1] != c.hidden_size or position != cache.len) return error.MiniMaxAttentionChunk;
+    const n: usize = @intCast(sx.d[0]);
+    const index_rope = @min(c.rotary_dim, c.index_head_dim);
+    const q = try ops.rope(g, try ops.norm(g, try headRows(g, try ops.linear(g, x, w.q), n, c.n_heads, c.head_dim), w.q_norm, c), c.rotary_dim, c, position);
+    const k = try ops.rope(g, try ops.norm(g, try headRows(g, try ops.linear(g, x, w.k), n, c.n_kv_heads, c.head_dim), w.k_norm, c), c.rotary_dim, c, position);
+    const v = try headRows(g, try ops.linear(g, x, w.v), n, c.n_kv_heads, c.head_dim);
+    const ik = try ops.rope(g, try ops.norm(g, try headRows(g, try ops.linear(g, x, w.index_k), n, 1, c.index_head_dim), w.index_k_norm, c), index_rope, c, position);
+    const last = position + @as(u32, @intCast(n - 1));
+    const iq = if (last / c.index_block_size + 1 > c.index_topk_blocks)
+        try ops.rope(g, try ops.norm(g, try headRows(g, try ops.linear(g, x, w.index_q), n, c.index_n_heads, c.index_head_dim), w.index_q_norm, c), index_rope, c, position)
+    else
+        null;
+    _ = try cache.append(g, k, v, ik);
+    const outputs = try a.alloc(ops.T, n);
+    defer a.free(outputs);
+    for (0..n) |i| {
+        const pos = position + @as(u32, @intCast(i));
+        const r: c_int = @intCast(i);
+        const qi = try g.slice(q, &.{ 0, 0, r, 0 }, &.{ 1, @intCast(c.n_heads), r + 1, @intCast(c.head_dim) }, &.{ 1, 1, 1, 1 });
+        const iqi = if (pos / c.index_block_size + 1 > c.index_topk_blocks)
+            try g.slice(iq.?, &.{ 0, 0, r, 0 }, &.{ 1, @intCast(c.index_n_heads), r + 1, @intCast(c.index_head_dim) }, &.{ 1, 1, 1, 1 })
+        else
+            null;
+        const attended = try attend(g, a, c, qi, iqi, try cache.view(g, pos + 1), pos);
+        try g.evalAll(&.{attended});
+        outputs[i] = try g.reshape(attended, &.{ 1, @intCast(c.n_heads * c.head_dim) });
+    }
+    return ops.linear(g, if (n == 1) outputs[0] else try g.concat(outputs, 0), w.o);
 }
 fn attend(g: *ops.G, a: std.mem.Allocator, c: *const C, q: ops.T, iq: ?ops.T, view: Cache.View, position: u32) !ops.T {
     var mask: ops.T = .{};
