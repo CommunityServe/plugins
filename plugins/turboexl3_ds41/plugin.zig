@@ -106,6 +106,9 @@ pub const engram_decode = @import("src/engram_decode.zig");
 /// A greedy round's next draft launched at the end of the round before it (`MLX_SERVE_DSV41_DRAFT_AHEAD`,
 /// src/draft_ahead.zig).
 pub const draft_ahead = @import("src/draft_ahead.zig");
+/// Decode's window 0 at a few rows, its memory the bank's decode slot rows (`MLX_SERVE_DSV41_DECODE_WINDOW`,
+/// src/decode_window.zig), read by the copied streamer's bill and grow.
+pub const decode_window = @import("src/decode_window.zig");
 /// The wide prompt layers' per-prompt regions (src/scratch.zig), read by the copied model and stream.
 pub const scratch = @import("src/scratch.zig");
 /// A wide prompt call's DIG-X waves write into per-prompt regions (`MLX_SERVE_DSV41_SCRATCH_WAVES`,
@@ -357,6 +360,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    // Before the model's load: the bank's bill and the stream's grow read the window's rows.
+    decode_window.configure(env.span(.MLX_SERVE_DSV41_DECODE_WINDOW)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_WINDOW is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     scratch_x1.configure(env.span(.MLX_SERVE_DSV41_SCRATCH)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -539,6 +550,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] a greedy round's next draft launched at the end of the round before it (MLX_SERVE_DSV41_DRAFT_AHEAD; =0 off): from its next token once its state is committed, when the next plan is the stages' block; the next round takes it when it fits; [draft-ahead] at each request's end\n", .{}),
         .check => log.info("[turboexl3_ds41] a greedy round's next draft launched ahead, checked (MLX_SERVE_DSV41_DRAFT_AHEAD=check): the next round makes its own too, compares ids and confidences word for word and serves its own; [draft-ahead] checks= words= differ= at each request's end\n", .{}),
     }
+    switch (decode_window.mode) {
+        .off => log.info("[turboexl3_ds41] decode's window 0 at the widest decode route's rows (MLX_SERVE_DSV41_DECODE_WINDOW=0); [mem-decode] off\n", .{}),
+        .on => log.info("[turboexl3_ds41] decode's window 0 at {d} rows (MLX_SERVE_DSV41_DECODE_WINDOW; =0 off): a decode plan admits its declined misses past them, the window's memory the bank's decode slot rows; the [bank-bill] load line, [mem-decode] at each request's end\n", .{decode_window.window_rows}),
+        .check => log.info("[turboexl3_ds41] decode's window 0 at {d} rows, checked (MLX_SERVE_DSV41_DECODE_WINDOW=check): as =1, the plans left past the window counted ([mem-decode] overflow=, 0 by construction)\n", .{decode_window.window_rows}),
+    }
     switch (engram_decode.mode) {
         .off => log.info("[turboexl3_ds41] a decode read's Engram rows read from the tables every time (MLX_SERVE_DSV41_ENGRAM_DECODE=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] Engram rows kept across a conversation's turns (MLX_SERVE_DSV41_ENGRAM_DECODE; =0 off): an LRU of {d} MiB (MLX_SERVE_DSV41_ENGRAM_LRU_MB) billed at load, {s}every row a decode read reads put in; a decode read takes the rows it holds and reads the others on a {d}-thread pool; a round's bonus token's rows read while its draft runs; [engram-decode] lines at each request's end\n", .{ engram_decode.lru_mb, if (engram_direct.on) "a prompt grid's distinct rows and " else "(no prompt rows: MLX_SERVE_DSV41_ENGRAM_DIRECT=0) ", engram_decode.pool_threads }),
@@ -700,7 +716,36 @@ fn roundState(m: *ds.Model, f: *const abi.Forward, out: *const abi.ForwardOut) u
     const st = if (m.mdl.dec_state) |*s| s else return .{ .refused = Verdict.refuse(.failed, "turboexl3_ds41: a round needs the prompt's state") };
     if (f.positions.len > 0 and st.n != f.positions.slice()[0]) return .{ .refused = Verdict.refuse(.failed, "turboexl3_ds41: the position does not follow the model's state") };
     settlePending(&drafter.?);
+    // MLX_SERVE_DSV41_DECODE_WINDOW: MLX's peak over the request's decode, from its first round (`[mem-decode]`).
+    if (decode_window.on() and !mem_decode_armed) {
+        _ = mlx.mlx_reset_peak_memory();
+        mem_decode_armed = true;
+    }
     return .{ .st = st };
+}
+
+/// MLX_SERVE_DSV41_DECODE_WINDOW: MLX's peak reset for this request's decode (at its first round; `resumePrompt` clears it).
+var mem_decode_armed = false;
+
+/// MLX_SERVE_DSV41_DECODE_WINDOW's `[mem-decode]` snapshot: MLX's bytes now and since the decode's first round, the
+/// footprint, and the stream's decode admissions.
+fn memDecodeSnap(m: *ds.Model) decode_window.Snap {
+    var active: usize = 0;
+    var cache: usize = 0;
+    var peak: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    _ = mlx.mlx_get_peak_memory(&peak);
+    var s: decode_window.Snap = .{ .active = active, .cache = cache, .peak = peak, .footprint = decode_window.footprint(), .declined = 0, .forced = 0, .overflow = 0, .window = 0 };
+    const r = m.mdl.streamed orelse return s;
+    if (r.math != .source) return s;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    const d = src.stream.decodeAdmissions();
+    s.declined = d.declined;
+    s.forced = d.forced;
+    s.overflow = d.overflow;
+    s.window = d.window;
+    return s;
 }
 
 const Drafted = struct { d: dsv41.DsparkDraft, round: Round };
@@ -960,6 +1005,8 @@ var req_kept: usize = 0;
 
 /// The built-in's resume: the drafter's request begins on the prompt prefix the state kept.
 fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
+    // MLX_SERVE_DSV41_DECODE_WINDOW: the next request's decode peak taken from its own first round.
+    mem_decode_armed = false;
     // MLX_SERVE_DSV41_DRAFT_AHEAD: a new prompt's state takes no launched draft.
     dropAhead();
     const n = ds.table.cache.resume_prompt.?(mp, slot, prompt, media_rows);
@@ -995,7 +1042,8 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     // MLX_SERVE_DSV41_DRAFT_AHEAD: the request's last round's launched draft has no round after it.
     dropAhead();
     const dal = draft_ahead.meters(meter_buf[n0 + dp.len + swl.len + edl.len ..]);
-    const n = n0 + dp.len + swl.len + edl.len + dal.len;
+    const mdl_line = if (decode_window.on()) decode_window.meters(memDecodeSnap(model(mp)), meter_buf[n0 + dp.len + swl.len + edl.len + dal.len ..]) else meter_buf[0..0];
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }

@@ -488,6 +488,24 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   (+0.54%), card 44.33 -> 44.53 (+0.45%); 107 drafts launched ahead a greedy request, 106 taken. `[round-io]`
   `round_ms` (a round's draft start to its commit) drops more, 89.60 -> 86.79 ms greedy, as the launch now comes after
   the commit, outside that span: tok/s is the measure.
+- `MLX_SERVE_DSV41_DECODE_WINDOW` (src/decode_window.zig, patches/turboexl3-zzz8w-decode-window.patch; on, `=0` off,
+  `=check` on and checked): decode's window 0 at 4 rows, not the widest decode route's 48. At the phase change the
+  stream frees the prompt's transient scratch and allocates window 0, the rows a decode plan's transient loads take:
+  48 x (13.3 + 8.9 MB) = 1.066 GB on the 2.81 bpw pack, billed before the decode slot rows. A transient load is a miss
+  the decode admission declines (it ranks below every resident it could evict); the 16K card's greedy decode declines
+  none (ed1's b1: 4,165 misses, 4,165 evictions). On, window 0 holds 4 rows, a decode plan admits its declined misses
+  past them over the lowest-ranked residents the route does not use (`LayerPolicy.admitPast`, the pinned last), and the
+  bill gives the freed ~977 MB to the decode slot rows (about two more a layer); taken where every layer keeps 96
+  decode rows or more, else the widest route's window. `=check` counts the plans left past the window (`overflow`, 0 by
+  construction). A `[bank-bill]` load line gives the bill's terms (the working set, ceiling, margins, host and LRU
+  bytes, memory in use, each phase's working set, windows, staging, rows and their remainders), and `[mem-decode]
+  window= declined= forced= overflow= mlx_active_mb= mlx_cache_mb= mlx_peak_mb= footprint_mb=` each request's (MLX's
+  peak over its decode, from the first round). Exact: a route's bytes are the records' wherever they sit; only which
+  rows hold them moves, and only on a route past the window. wz1 (w-20261101-2308, two binaries, ABBA + BAAB, margin 2,
+  EVICT, COOL; a: ctl23, b: ctl23 + this code; texts identical in every arm and mode, overflow 0, no declined miss):
+  greedy 56.20 -> 56.93 tok/s (+1.29%), card 44.23 -> 44.68 (+1.02%); decode rows 176 -> 178 (a2 175), misses a
+  greedy round 39.2 -> 37.7 (card 58.3 -> 57.3). At decode MLX holds 97,056 MiB active and ~0.1 GiB cached, its peak
+  51 MiB over active; the process footprint 98,127 MiB (MLX's and ~0.95 GiB of the host's).
 - `MLX_SERVE_DSV41_SCRATCH_ATTN` (src/scratch_attn.zig, src/attn_twins.zig, patches/turboexl3-zzz8p-scratch-attn.patch;
   on, `=0` off, `=check`): a wide prompt layer's attention spans write their scores (f32 [L, H, NK]) and probabilities
   (f16) into a ring of two per-prompt slots (S and P, 256 x 64 x 640 words a slot, 126 MB) instead of fresh MLX buffers:

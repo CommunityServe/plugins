@@ -215,6 +215,7 @@ test {
     _ = @import("src/engram_direct.zig");
     _ = @import("src/engram_decode.zig");
     _ = @import("src/draft_ahead.zig");
+    _ = @import("src/decode_window.zig");
     _ = @import("src/scratch.zig");
     _ = @import("src/scratch_waves.zig");
     _ = @import("src/wave_twins.zig");
