@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/cache.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
+//! copied_from: src/plugins/minimax_m3/cache.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
 //! Head-major capacity KV/index storage. Three dense or six Q8 owning handles
 //! survive a layer wave. Valid-row views must be released before the next write
 //! so MLX can donate the buffer rather than copy its full capacity.

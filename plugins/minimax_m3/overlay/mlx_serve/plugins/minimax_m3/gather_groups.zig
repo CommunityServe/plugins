@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/gather_groups.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
+//! copied_from: src/plugins/minimax_m3/gather_groups.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
 const std = @import("std");
 pub fn Grouping(comptime Ref: type) type {
     return GroupingCapacity(Ref, 4);

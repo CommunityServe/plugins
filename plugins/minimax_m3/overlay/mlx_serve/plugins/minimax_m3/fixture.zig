@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/fixture.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
+//! copied_from: src/plugins/minimax_m3/fixture.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
 //! The tiny pack the conformance suite runs (`plugin.zig` `conformanceFixture`): the released text architecture at
 //! fixture size (`fixture_config.json`: hidden 512, five layers, three dense then two MoE, eight query heads over four
 //! KV heads of 128, eight experts), BF16 residents and an NVFP4 expert bank in the prepared pack's layout

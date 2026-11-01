@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/plugin.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
+//! copied_from: src/plugins/minimax_m3/plugin.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
 //! MiniMax M3.1 Flash's prepared text expert banks behind the model table.
 const std = @import("std");
 const abi = @import("mlx_serve").abi.plugin;

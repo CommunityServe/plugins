@@ -14,6 +14,7 @@ plugins/minimax_m3/chunk_layer.zig
 plugins/minimax_m3/config.zig
 plugins/minimax_m3/experts.zig
 plugins/minimax_m3/fixture.zig
+plugins/minimax_m3/fused_activation.zig
 plugins/minimax_m3/gather_groups.zig
 plugins/minimax_m3/geometry.zig
 plugins/minimax_m3/legacy.zig

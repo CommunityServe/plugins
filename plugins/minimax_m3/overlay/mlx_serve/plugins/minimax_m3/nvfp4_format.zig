@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/nvfp4_format.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
+//! copied_from: src/plugins/minimax_m3/nvfp4_format.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
 const std = @import("std");
 const mlx = @import("mlx_stream").sdk.mlx;
 const ops = @import("mlx_stream").ops;

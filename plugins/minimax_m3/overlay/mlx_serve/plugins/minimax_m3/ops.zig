@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/ops.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
+//! copied_from: src/plugins/minimax_m3/ops.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
 //! MiniMax text graph primitives over the shared MLX backend.
 const std = @import("std");
 const sdk = @import("mlx_stream").sdk;
@@ -84,6 +84,12 @@ pub fn rope(g: *G, x: T, dims: u32, c: *const C, position: u32) !T {
 }
 /// SwiGLUOAI clips gate only above, clips up on both sides, and includes beta.
 pub fn activate(g: *G, gate: T, up: T, c: *const C) !T {
+    const fused = @import("fused_activation.zig");
+    if (fused.supports(g, gate, up)) return fused.run(g, gate, up, c);
+    return activateReference(g, gate, up, c);
+}
+/// The op chain `fused_activation.zig` must reproduce bit for bit.
+pub fn activateReference(g: *G, gate: T, up: T, c: *const C) !T {
     const dt = g.dtypeOf(gate);
     const limit = try g.scalar(c.swiglu_limit, dt);
     const gc = try g.minimum(gate, limit);

@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/chunk_oracle.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
+//! copied_from: src/plugins/minimax_m3/chunk_oracle.zig@dfd8741b6296d23ebb3c27f172409fcabcb67ed8
 //! Device oracle for the production layer driver, with small synthetic resident/expert banks.
 const std = @import("std");
 const sdk = @import("mlx_stream").sdk;
