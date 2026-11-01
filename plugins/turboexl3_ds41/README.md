@@ -205,6 +205,21 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   verifies, the usage seed with SEED_FREE, ROUTED=turboexl3, A B B A): 40.0 and 40.1 tok/s on the card's decode against
   39.3 and 39.2, 47.0 and 47.0 greedy against 46.1 and 45.6, the misses a round the same (62.4 greedy, 82.3 card; 63.5
   and 83.1 in the last arm), the texts the same in every arm.
+- `MLX_SERVE_DSV41_WOA_ROWS` (src/woa_rows.zig, patches/turboexl3-zzz7-woa-rows.patch; on, `=0` off, `check` both): a
+  wide layer's EXL3 `wo_a` over runs of 4096 rows of its attention spans. `=0`: each 256-row span runs its own grouped
+  linear as its attention ends: at prefill rows turboexl3 decodes each of the 8 slices' trellis to W_hat and multiplies
+  at M = 256, so a 16K-row layer decodes every slice 64 times and runs 512 small GEMMs. On, the spans' grouped heads are
+  joined in runs of 4096 rows, one grouped linear a run: each slice decoded once a run, its GEMM at M = 4096. The
+  prepare, the decode and the finish give the same words; MLX's GEMM at the other M rounds a row's sums in another
+  order. `check` runs both on every run, serves the span-by-span result and logs `[woa-rows] check layer= runs= equal=
+  differ= max_abs=` a layer. A run holds its spans' grouped heads, their join and the grouped linear's copy of them
+  (about 0.8 GB), within the prompt bill's term for the chunk's grouped heads.
+- On against `=0` on the full pack (M5 Max, w-pio-20261101-0624; code-ctx16384 cold, then a new 16K text, the usage seed
+  with SEED_FREE, A B B A): 1028.0 and 1028.5 tok/s cold prefill against 1016.8 and 1010.9 (+1.4%); new text 1019.7 and
+  1036.0 against 1017.7 and 1032.5. Not bit-exact, a reorder-level change: every layer's runs differ from span by span
+  in about 2% of their words, by at most one bf16 ulp (max_abs 7.8e-3), and the seeded 32-token text changes (md5
+  a323144e8b, "Return values without equality duplicates, keeping first-seen order.", becomes efeb6f4ecd, "Return values
+  with equality-based duplicates removed, keeping first order."): the reference text from here on.
 
 ## The pack
 

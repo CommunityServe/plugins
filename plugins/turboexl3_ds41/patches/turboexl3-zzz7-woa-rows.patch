@@ -1,0 +1,123 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -290,6 +290,7 @@
+     pub const MLX_SERVE_DSV41_ROUTES: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode route recorder (turboexl3_ds41's route-recording builds only, zig build -Droute-rec=true): an absolute directory; each request's decode routes (expert.routes' file) and its rounds' tokens written there at its end" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+     pub const MLX_SERVE_DSV41_TIMELINE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode verify GPU timeline (turboexl3_ds41's profile builds only, zig build -Dplugin-profile=true): an absolute directory; each request's VERIFY_GPU_TIMELINE line logged and its command buffers, verify stamps and rounds written there at its end" };
++    pub const MLX_SERVE_DSV41_WOA_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' EXL3 wo_a (turboexl3_ds41): on, over runs of 4096 rows of the attention spans, one grouped linear a run, each slice decoded once a run (a reorder-level rounding: MLX's GEMM at another M); 0: span by span; check: both, compared word for word, the span-by-span result served ([woa-rows] lines)" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
+     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -41,6 +41,8 @@
+ /// turboexl3_ds41's src/ra_fused.zig (`MLX_SERVE_DSV41_RA_FUSED`): the read-ahead's prediction on the fused hc kernels.
+ const raf = @import("../../../ra_fused.zig");
+ const shoist = @import("../../../shared_hoist.zig");
++/// turboexl3_ds41's src/woa_rows.zig (`MLX_SERVE_DSV41_WOA_ROWS`): a wide layer's EXL3 `wo_a` over runs of its spans' rows.
++const woa = @import("../../../woa_rows.zig");
+ /// The CED decoder prefetch (turboexl3_ds41's src/dec_prefetch.zig, `MLX_SERVE_DSV41_DEC_PREFETCH`).
+ const dp = @import("../../../dec_prefetch.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+@@ -3889,10 +3891,21 @@
+     pio.wide(li, .qkv);
+     const heads = try gpa.alloc(A, n_spans);
+     defer gpa.free(heads);
++    var n_heads: usize = 0;
+     const og: c_int = @intCast(m.cfg.dsv4_o_groups);
+     // The chunk's spans share one dequantized `wo_a` (`DENSE_ROWS`).
+     var woa_dense = none;
+-    for (heads, 0..) |*o, k| {
++    // MLX_SERVE_DSV41_WOA_ROWS: an EXL3 `wo_a` over runs of `woa.spansPer` spans' grouped heads, one grouped linear a run
++    // (`woaRun`); a run of one span is the span-by-span path.
++    const run: usize = if (woa.mode != .off and ly.wo_a.x3 != null) @min(n_spans, woa.spansPer(sp.span)) else 1;
++    const run_heads = try gpa.alloc(A, run);
++    defer gpa.free(run_heads);
++    var in_run: usize = 0;
++    // The run's spans' grouped heads, dropped once the run's `wo_a` is built.
++    var run_scope: ?Scope = null;
++    defer if (run_scope) |*r| r.deinit();
++    var woa_check: WoaCheck = .{};
++    for (0..n_spans) |k| {
+         const lo, const hi = sp.bounds(k);
+         // A span's core intermediates are dropped once built, as in the per-span path.
+         var ssc = Scope.init(gpa, m.s);
+@@ -3900,17 +3913,33 @@
+         var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor };
+         const span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
+         var o_k = try attention(&ssc, m, st, li, try ssc.slice(pa.h, 0, lo, hi), sp.p0 + lo, &sh, span_pj);
+-        // Each span takes its own `wo_a`: the rows the chunk's `wo_b` reads, not the heads, are joined. Heads the core
+-        // handed back plain are roped and grouped here.
++        // Each span (or each run of spans) takes its own `wo_a`: the rows the chunk's `wo_b` reads, not the heads, are
++        // joined. Heads the core handed back plain are roped and grouped here.
+         if (!sh.grouped) o_k = try ssc.transpose(try ssc.reshape(try ropeTail(&ssc, m, o_k, ropeFor(m, li).inv, try ssc.i(ci(sp.p0 + lo)), 1.0), &.{ ci(hi - lo), og, -1 }), &.{ 1, 0, 2 });
+-        if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
+-        o.* = try sc.keep(ssc.out(try attnOutA(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null)));
+-        try prof.mark(.attn_out, &.{o.*});
++        if (run > 1) {
++            if (run_scope == null) run_scope = Scope.init(gpa, m.s);
++            run_heads[in_run] = try run_scope.?.keep(ssc.out(o_k));
++            in_run += 1;
++            if (in_run == run or k + 1 == n_spans) {
++                heads[n_heads] = try sc.keep(try woaRun(&run_scope.?, m, ly, run_heads[0..in_run], &woa_check));
++                try prof.mark(.attn_out, heads[n_heads..][0..1]);
++                n_heads += 1;
++                in_run = 0;
++                run_scope.?.deinit();
++                run_scope = null;
++            }
++        } else {
++            if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
++            heads[n_heads] = try sc.keep(ssc.out(try attnOutA(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null)));
++            try prof.mark(.attn_out, heads[n_heads..][0..1]);
++            n_heads += 1;
++        }
+         hold(&sp.topks[k], sh.topk);
+         hold(&sp.cands[k], sh.cand);
+     }
++    if (woa.mode == .check and run > 1) woa.report(li, woa_check.runs, woa_check.equal, woa_check.differ, woa_check.max_abs);
+     pio.wide(li, .attn);
+-    const y = try ly.wo_b.apply(&sc, try sc.concat(heads, 0));
++    const y = try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
+     try prof.mark(.attn_out, &.{y});
+     pio.wide(li, .wob);
+     const pf = try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
+@@ -3934,6 +3963,36 @@
+             hold(&sp.pres[k], try gsc.slice(pf.sp.pre, 0, a, b));
+         }
+     }
++}
++/// `MLX_SERVE_DSV41_WOA_ROWS=check` over a layer's runs: the runs compared, those equal bit for bit, the elements that
++/// differ and the largest absolute difference.
++const WoaCheck = struct { runs: usize = 0, equal: usize = 0, differ: u64 = 0, max_abs: f32 = 0 };
++/// MLX_SERVE_DSV41_WOA_ROWS: one run's `wo_a` over its spans' grouped heads `parts` (`[og, rows_k, in]` each), their rows
++/// joined (`[og, rows, in]`) through one `attnOutA`: `[rows, og * o_lora]` in `m.act`. With `check`, also each span's own
++/// `attnOutA`, the two compared word for word into `tally`, and the spans' served. A handle the caller frees.
++fn woaRun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, parts: []const A, tally: *WoaCheck) !A {
++    const joined = try attnOutA(sc, m, ly, try sc.concat(parts, 1), null);
++    if (woa.mode != .check) return sc.out(joined);
++    const spanwise_parts = try sc.a.alloc(A, parts.len);
++    defer sc.a.free(spanwise_parts);
++    for (parts, spanwise_parts) |p, *o| o.* = try attnOutA(sc, m, ly, p, null);
++    const spanwise = try sc.concat(spanwise_parts, 0);
++    // Word for word: both outputs' bits as unsigned words of their width; the largest difference in f32.
++    const words: mlx.mlx_dtype = if (mlx.mlx_array_dtype(joined) == .float32) .uint32 else .uint16;
++    const eq = try sc.op2(mlx.mlx_equal, try sc.view(joined, words), try sc.view(spanwise, words));
++    const n_eq = try sc.sum(try sc.astype(try sc.reshape(eq, &.{-1}), .int32), 0, false);
++    const max_d = try sc.max(try sc.reshape(try sc.op1(mlx.mlx_abs, try sc.sub(try sc.astype(joined, .float32), try sc.astype(spanwise, .float32))), &.{-1}), 0, false);
++    try evalAll(&.{ n_eq, max_d });
++    var same: i32 = 0;
++    try mlx.check(mlx.mlx_array_item_int32(&same, n_eq));
++    const differ: u64 = @as(u64, mlx.mlx_array_size(joined)) - @as(u64, @intCast(same));
++    var biggest: f32 = 0;
++    try mlx.check(mlx.mlx_array_item_float32(&biggest, max_d));
++    tally.runs += 1;
++    tally.equal += @intFromBool(differ == 0);
++    tally.differ += differ;
++    tally.max_abs = @max(tally.max_abs, biggest);
++    return sc.out(spanwise);
+ }
+ /// A streamed prompt call's routes of layer `li` predicted before its attention (the FFN's input taken as the stream
+ /// collapsed with the previous mix), handed to the source to read while the attention runs. `hp`: that input already

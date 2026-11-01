@@ -186,6 +186,7 @@ test {
     _ = @import("src/decode_rows.zig");
     _ = @import("src/seed_free.zig");
     _ = @import("src/ra_fused.zig");
+    _ = @import("src/woa_rows.zig");
     _ = @import("src/verify_tl.zig");
     _ = @import("src/late_gemv.zig");
     _ = @import("src/shared_hoist.zig");
