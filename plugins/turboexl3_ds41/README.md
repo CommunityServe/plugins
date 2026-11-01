@@ -451,6 +451,27 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   canonical pack, b: this build on the repacked one; texts identical in every arm): cold 1347.0 / 1417.6 / 1416.4 /
   1349.9 tok/s (a1 b1 b2 a2: +5.08%), new text 1414.3 / 1501.1 / 1496.5 / 1425.4 (+5.56%); the b arms' ios equal
   their rows (310,174; 276,588), table 0 read in 951 ms (1532), layer 1's wait 365 ms (940).
+- `MLX_SERVE_DSV41_ENGRAM_DECODE` and `MLX_SERVE_DSV41_ENGRAM_LRU_MB` (src/engram_decode.zig,
+  patches/turboexl3-zzz8u-engram-lru.patch; on, `=0` off, `=check` on and checked; the LRU's MiB, 1 to 16384, 256
+  unset): Engram rows kept across a conversation's turns. A DSpark verify's 6 rows read 24 n-gram ids a table past the
+  page cache, on the prefetch thread from the forward's start, a row a GCD work item (about 9-10 reads in flight); the
+  first Engram layer waits for the first table's: ~2.0 ms a round, the GPU idle ~1.0 ms of it (tp1, w-20261101-1811:
+  0.98 ms median at layer 1's entry, the verify's largest gap). On, one LRU of rows over the tables (keyed by table and
+  id; its rows and their index within the MiB, billed at the load beside the host's bytes, the load line giving the
+  prompt / decode slot rows they cost), kept across requests: a prompt grid's distinct rows go in as ENGRAM_DIRECT's
+  whole-table read hands its spans over (310,174 rows over the two tables for a 16K-token prompt), and so does every
+  row a decode read reads; a decode read takes the rows the LRU holds and reads the others on a pool of 64 threads,
+  each read (a repacked table's record, else a row's codes or its scales) a work item; a round's bonus token (`t1`,
+  known before its draft runs) has its rows read when the round starts, on a GCD worker a table, into the LRU.
+  `=check` reads every row of a decode read on the pool, compares the ones the LRU held and serves the read ones.
+  `[engram-decode] mode= lru_mb= lru_rows= lru_cap= prompt_rows= inserted= evictions= hits= misses= early= early_busy=
+  early_failed= checked= differ= pool=` at each request's end; `[round-io]` gives each round's `engram_hits=`,
+  `engram_ios=` (the tables' read calls), `lru_evictions=` and `engram_wait_ms=` (the first Engram layer's wait) in
+  both modes. Exact: a row's bytes are the table's whichever way they come. ed1 (w-20261101-2125, two binaries, ABBA +
+  BAAB, margin 2, EVICT, COOL; a: ctl21, b: ctl21 + this code, both on the canonical pack in oMLX's layout; texts
+  identical in every arm and mode, the check arm's differ 0): greedy 56.15 -> 56.53 tok/s (+0.67%, round 89.43 ->
+  88.85 ms), card +0.23%, a second turn +0.65%; the first Engram layer's wait 0.016 ms a greedy round in the b arms
+  (0.734 in the check arm, which reads every row); the bank's decode rows 178 -> 177 (the LRU's 256 MiB).
 - `MLX_SERVE_DSV41_SCRATCH_ATTN` (src/scratch_attn.zig, src/attn_twins.zig, patches/turboexl3-zzz8p-scratch-attn.patch;
   on, `=0` off, `=check`): a wide prompt layer's attention spans write their scores (f32 [L, H, NK]) and probabilities
   (f16) into a ring of two per-prompt slots (S and P, 256 x 64 x 640 words a slot, 126 MB) instead of fresh MLX buffers:

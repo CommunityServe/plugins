@@ -99,6 +99,10 @@ pub const scratch_x1 = @import("src/scratch_x1.zig");
 /// The Engram tables read past the page cache, through their blocks (`MLX_SERVE_DSV41_ENGRAM_DIRECT`,
 /// src/engram_direct.zig), read by the copied Engram tables.
 pub const engram_direct = @import("src/engram_direct.zig");
+/// Engram rows kept across a conversation's turns (`MLX_SERVE_DSV41_ENGRAM_DECODE`, `MLX_SERVE_DSV41_ENGRAM_LRU_MB`,
+/// src/engram_decode.zig): an LRU a prompt grid's rows, the decode reads' and the rounds' bonus rows go into, a decode
+/// read's misses read on a pool; read by the copied Engram tables and model.
+pub const engram_decode = @import("src/engram_decode.zig");
 /// The wide prompt layers' per-prompt regions (src/scratch.zig), read by the copied model and stream.
 pub const scratch = @import("src/scratch.zig");
 /// A wide prompt call's DIG-X waves write into per-prompt regions (`MLX_SERVE_DSV41_SCRATCH_WAVES`,
@@ -327,6 +331,22 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    engram_decode.mode = engram_decode.parse(env.span(.MLX_SERVE_DSV41_ENGRAM_DECODE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_DECODE is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    engram_decode.lru_mb = engram_decode.parseMb(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_LRU_MB is not a whole number of MiB from 1 to 16384 (unset: 256): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the model's load: the bank's bill takes the LRU's bytes beside the host's (the load line says the rows).
+    bill.engram_store_bytes = engram_decode.billBytes();
     scratch_x1.configure(env.span(.MLX_SERVE_DSV41_SCRATCH)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -503,6 +523,12 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] wide prompt layers' read-ahead and staging posted at the layer's start (MLX_SERVE_DSV41_STAGE_NEXT=0)\n", .{});
     if (stage_next.on) log.info("[turboexl3_ds41] {s}\n", .{if (stage_next.skip_own) "a wide prompt layer the call before it read ahead for skips its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own: its own too)" else "every wide prompt layer also runs its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own)"});
     if (engram_direct.on) log.info("[turboexl3_ds41] a prompt's Engram rows read once a table, past the page cache through their file system blocks, on up to 64 threads (MLX_SERVE_DSV41_ENGRAM_DIRECT=0: span by span through the page cache)\n", .{}) else log.info("[turboexl3_ds41] Engram rows read span by span through the page cache (MLX_SERVE_DSV41_ENGRAM_DIRECT=0)\n", .{});
+    engram_decode.start();
+    switch (engram_decode.mode) {
+        .off => log.info("[turboexl3_ds41] a decode read's Engram rows read from the tables every time (MLX_SERVE_DSV41_ENGRAM_DECODE=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] Engram rows kept across a conversation's turns (MLX_SERVE_DSV41_ENGRAM_DECODE; =0 off): an LRU of {d} MiB (MLX_SERVE_DSV41_ENGRAM_LRU_MB) billed at load, {s}every row a decode read reads put in; a decode read takes the rows it holds and reads the others on a {d}-thread pool; a round's bonus token's rows read while its draft runs; [engram-decode] lines at each request's end\n", .{ engram_decode.lru_mb, if (engram_direct.on) "a prompt grid's distinct rows and " else "(no prompt rows: MLX_SERVE_DSV41_ENGRAM_DIRECT=0) ", engram_decode.pool_threads }),
+        .check => log.info("[turboexl3_ds41] Engram rows kept across a conversation's turns, checked (MLX_SERVE_DSV41_ENGRAM_DECODE=check): the LRU of {d} MiB as with =1, every row of a decode read read on the pool, the held ones compared, the read ones served; [engram-decode] checked= differ= at each request's end\n", .{engram_decode.lru_mb}),
+    }
     switch (scratch_x1.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' streams after the attention in a fresh array each layer (MLX_SERVE_DSV41_SCRATCH=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' streams after the attention written into one per-prompt buffer (MLX_SERVE_DSV41_SCRATCH; =0: a fresh array each layer)\n", .{}),
@@ -567,24 +593,30 @@ fn partsSnap(m: *ds.Model) ?direct_parts.Snap {
 /// The stream's counters and the process's disk reads now (`round_io`).
 fn ioSnap(m: *ds.Model) round_io.Snap {
     const pr = round_io.proc();
-    const r = m.mdl.streamed orelse return .{ .phys = pr.phys, .pageins = pr.pageins };
-    if (r.math != .source) return .{ .phys = pr.phys, .pageins = pr.pageins };
-    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
-    const s = src.stats();
-    return .{
-        .misses = s.expert_cache_misses,
-        .hits = s.expert_cache_hits,
-        .demand = s.expert_bytes_read,
-        .spec = s.spec_bytes,
-        .abandoned = s.spec_abandoned_bytes,
-        .claimed = s.claimed,
-        .issued = s.spec_issued,
-        .wall_ns = s.read_wall_ns,
-        .wait_ns = s.read_wait_ns,
-        .adopt = s.adopt_bytes,
+    // The Engram reads' (both modes): the LRU's hits and evictions, the tables' read calls, the first Engram layer's waits.
+    var o: round_io.Snap = .{
         .phys = pr.phys,
         .pageins = pr.pageins,
+        .engram_hits = engram_decode.hits.load(.monotonic),
+        .engram_ios = engram_direct.calls.load(.monotonic),
+        .lru_evictions = engram_decode.evictions.load(.monotonic),
+        .engram_wait_ns = engram_direct.wait_ns[0].load(.monotonic),
     };
+    const r = m.mdl.streamed orelse return o;
+    if (r.math != .source) return o;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    const s = src.stats();
+    o.misses = s.expert_cache_misses;
+    o.hits = s.expert_cache_hits;
+    o.demand = s.expert_bytes_read;
+    o.spec = s.spec_bytes;
+    o.abandoned = s.spec_abandoned_bytes;
+    o.claimed = s.claimed;
+    o.issued = s.spec_issued;
+    o.wall_ns = s.read_wall_ns;
+    o.wait_ns = s.read_wait_ns;
+    o.adopt = s.adopt_bytes;
+    return o;
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {
@@ -665,6 +697,8 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
     const max = @min(dsv41.maxVerifyDrafts(m.mdl), @as(usize, accept_cap), abi.max_round_tokens - 1);
     const plan = dr.plan(st.n, t1, max, accept_cap, m.mdl.ds_block);
     if (plan == .stage) {
+        // MLX_SERVE_DSV41_ENGRAM_DECODE: the bonus token's Engram rows read while the draft runs.
+        dsv41.engramEarly(m.mdl, st, t1);
         var d = try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
         errdefer d.deinit(gpa);
         d.len = dr.cut(d.confidence[0..@min(d.len, max)]);
@@ -856,12 +890,13 @@ fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: ab
     return n;
 }
 
-var meter_buf: [131072]u8 = undefined;
+var meter_buf: [262144]u8 = undefined;
 
 /// The request's DSpark rounds beside the engine's `[spec-stats]`, which counts every native round a stage round; the
 /// stage profiler's lines (src/stage_prof.zig) when it is on; the expert stream's counters since the last request, and
-/// the one-call path's (src/routed_one.zig) when it is on; the Markov chain's drafts (src/markov.zig) when it is on; each
-/// round's stream traffic (src/round_io.zig) with the DSpark profile.
+/// the one-call path's (src/routed_one.zig) when it is on; the Markov chain's drafts (src/markov.zig) when it is on; the
+/// Engram LRU's (src/engram_decode.zig) when it is on; each round's stream traffic (src/round_io.zig) with the DSpark
+/// profile.
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = slot;
     ptlWrite(model(mp));
@@ -875,7 +910,8 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const n0 = head.len + mid.len + tail.len;
     const dp = if (partsSnap(model(mp))) |ps| direct_parts.meters(ps, meter_buf[n0..]) else meter_buf[n0..n0];
     const swl = scratch_waves.meters(meter_buf[n0 + dp.len ..]);
-    const n = n0 + dp.len + swl.len;
+    const edl = engram_decode.meters(meter_buf[n0 + dp.len + swl.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }

@@ -1,0 +1,222 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -279,6 +279,8 @@
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_DIR: Var = .{ .kind = .kill, .type = .text, .default = "the pack", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): the absolute directory its expert-usage-v1.json is read from" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_LABEL: Var = .{ .kind = .kill, .type = .text, .default = "unlabeled", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): the recorded prompt set's name, the file's provenance; needs MLX_SERVE_DSV41_EXPERT_USAGE_RECORD" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_RECORD: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): an absolute file path; each request's routed experts per layer counted into it (expert-usage-v1.json's form), written at the request's end" };
++    pub const MLX_SERVE_DSV41_ENGRAM_DECODE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram rows kept across a conversation's turns (turboexl3_ds41): an LRU of rows over the tables (MLX_SERVE_DSV41_ENGRAM_LRU_MB, billed at load) that a prompt grid's distinct rows and every row a decode read reads go into, a decode read taking the rows it holds and reading the others on a 64-thread pool, a round's bonus token's rows read while its draft runs; the same bytes (unset or 1: on; 0: off; check: on, every row of a decode read read again and the held ones compared, the read bytes served, [engram-decode] lines)" };
++    pub const MLX_SERVE_DSV41_ENGRAM_LRU_MB: Var = .{ .kind = .kill, .type = .text, .default = "256", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram LRU's size in MiB with MLX_SERVE_DSV41_ENGRAM_DECODE on (turboexl3_ds41): its rows and their index, 1 to 16384, billed at load beside the host's bytes" };
+     pub const MLX_SERVE_DSV41_ENGRAM_DIRECT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram tables (turboexl3_ds41): a prompt's rows read once a table (its spans' ids made distinct) and past the page cache, each row's bytes from the file system blocks that hold them, on up to 64 threads; the same bytes (=0: span by span through the page cache)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+     pub const MLX_SERVE_DSV41_JOINLESS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' routed sum and shared expert (turboexl3_ds41): on, one kernel combines them reading each routed row where its wave wrote it, no joins of the waves' outputs, the same f32 words; 0: the joins and the op chain; check: both, compared word for word, the op chain's served ([joinless] lines)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/bill.zig
+--- a/plugins/deepseek_v41/bill.zig
++++ b/plugins/deepseek_v41/bill.zig
+@@ -26,15 +26,18 @@
+ /// What the box keeps unplanned beside the host's wired-limit margin: the stop under the ceiling, and the host side
+ /// of the process (its heap and the stream's read buffers).
+ pub const stream_host_bytes: u64 = 2_000_000_000 + (1 << 30);
++/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DECODE, the plugin's src/engram_decode.zig): the Engram LRU's bytes, set at the
++/// load before the bank opens (0 off), billed beside `stream_host_bytes`.
++pub var engram_store_bytes: u64 = 0;
+ /// The bytes a streamed bank's slot rows may take in each phase: the GPU working set less `wired_margin` (the host's
+ /// `--wired-margin-gib`) and `stream_host_bytes`, the memory in use now (the residents loaded, every other process)
+ /// and the phase's working set at `context` positions (a prompt: one `stream_call_rows` call's; decode: the state at
+ /// `context + stream_generation`).
+ pub fn streamBudget(config: *const cfg_mod.Config, context: u64, wired_margin: u64) struct { prompt: u64, decode: u64 } {
+     const in_use = system.getTotalMemBytes() -| system.getAvailableMemBytes();
+-    var box = @as(u64, mlx.maxRecommendedWorkingSet()) -| wired_margin -| stream_host_bytes -| in_use;
++    var box = @as(u64, mlx.maxRecommendedWorkingSet()) -| wired_margin -| stream_host_bytes -| engram_store_bytes -| in_use;
+     // An outside plugin's room is also within the host's ceiling (`Host.memory_ceiling`, net of what is resident).
+-    if (host_ceiling) |ceiling| box = @min(box, ceiling() -| wired_margin -| stream_host_bytes);
++    if (host_ceiling) |ceiling| box = @min(box, ceiling() -| wired_margin -| stream_host_bytes -| engram_store_bytes);
+     return .{
+         .prompt = box -| prefillAt(config, context, stream_call_rows),
+         .decode = box -| prefillAt(config, context + stream_generation, 1),
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -72,6 +72,9 @@
+ const one_plan = @import("../../../one_plan.zig");
+ /// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
+ const markov = @import("../../../markov.zig");
++/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DECODE, the plugin's src/engram_decode.zig): a round's bonus token's Engram
++/// rows read while its draft runs (`engramEarly`).
++const edec = @import("../../../engram_decode.zig");
+ const A = mlx.mlx_array;
+ const S = mlx.mlx_stream;
+ const Config = @import("config.zig").Config;
+@@ -3863,6 +3866,18 @@
+     hs.rows(st.hist.items, comp_ids, out);
+     try st.hist.appendSlice(st.gpa, comp_ids);
+     return out;
++}
++/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DECODE): the Engram rows of `t1`, the round's bonus token and its verify's first
++/// row at `st.n`, read now on GCD workers into the plugin's Engram LRU, a table each, for that verify (the round's draft
++/// runs meanwhile); the history is not touched. A no-op off, on a pair's worker or without Engram layers.
++pub fn engramEarly(m: *const Dsv41Model, st: *const State, t1: u32) void {
++    if (!edec.on() or m.pair != null or m.engrams.len == 0) return;
++    const hs = &(m.hash orelse return);
++    const nc = hs.cols();
++    var out: [engram.MAX_LAYERS * engram.MAX_COLS]u32 = undefined;
++    const comp = [_]u32{m.compressedId(t1, false)};
++    hs.rows(st.hist.items, &comp, out[0 .. hs.n_layers * nc]);
++    for (m.engrams, 0..) |*e, k| e.table.readEarly(k, out[k * nc ..][0..nc]);
+ }
+ /// The Engram rows of `ids` (the chunk at `st.n - ids.len`, whose hash is `rows`) as a prefetch: the one the
+ /// previous chunk started for it, or a new one; either way the prompt's next chunk is read behind. `m.ahead`
+diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41/engram.zig
+--- a/plugins/deepseek_v41/engram.zig
++++ b/plugins/deepseek_v41/engram.zig
+@@ -13,6 +13,9 @@
+ /// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DIRECT, the plugin's src/engram_direct.zig): the tables read past the page
+ /// cache through their blocks; the reads' counters and the [engram] line.
+ const edir = @import("../../../engram_direct.zig");
++/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DECODE, the plugin's src/engram_decode.zig): the Engram LRU a decode read takes
++/// its rows from, its misses read on a pool; a prompt grid's rows and the rounds' bonus rows go into it.
++const edec = @import("../../../engram_decode.zig");
+ pub const MAX_LAYERS = 4;
+ pub const MAX_NGRAM = 8;
+ pub const MAX_HEADS = 16;
+@@ -238,6 +241,8 @@
+     slen: usize,
+     b_off: u64 = 0,
+     pub fn close(self: *Table) void {
++        // MLX_SERVE_DSV41_ENGRAM_DECODE: the LRU let go of (its early reads in flight waited for).
++        edec.forget(self.fd);
+         // MLX_SERVE_DSV41_ENGRAM_DIRECT: the descriptor's block registration dropped with it.
+         edir.unregister(self.fd);
+         crt.close(self.fd);
+@@ -487,6 +492,11 @@
+         errdefer gpa.free(bi);
+         const job: Job = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
+         if (builtin.os.tag.isDarwin() and n <= GCD_ROWS) {
++            // MLX_SERVE_DSV41_ENGRAM_DECODE: the rows the LRU holds copied out of it, the others read on its pool.
++            if (edec.on()) {
++                try self.readHeld(gpa, &job);
++                return .{ .w = w, .s = sc, .b = bi };
++            }
+             // A decode token's or verify's rows wait at the first Engram layer while the GPU idles: a row a work item on
+             // GCD's pooled workers, no thread to spawn. A prompt's thousands go to threads that advise all theirs first.
+             dispatch_apply_f(n, dispatch_get_global_queue(qos_user_initiated, 0), @constCast(&job), Job.applyOne);
+@@ -507,6 +517,54 @@
+         } else if (!job.run(0, 1, true)) return error.EngramRead;
+         return .{ .w = w, .s = sc, .b = bi };
+     }
++    /// MLX_SERVE_DSV41_ENGRAM_DECODE: `job`'s rows (at most `GCD_ROWS`) the LRU holds copied out of it, the others read
++    /// on the LRU's pool, each read (a repacked table's record, else a row's codes, scales or biases) a work item, then
++    /// put in the LRU; `check`: every row read, the held rows' LRU bytes compared with the read ones, the read ones served.
++    fn readHeld(self: *const Table, gpa: std.mem.Allocator, job: *const Job) !void {
++        const n = job.ids.len;
++        const bl: usize = if (self.mode == .affine) self.slen else 0;
++        const parts: usize = if (self.records()) 1 else if (self.mode == .affine) 3 else 2;
++        var held: [GCD_ROWS]bool = undefined;
++        var pos: [GCD_ROWS]u32 = undefined;
++        var np: usize = 0;
++        if (edec.mode == .check) {
++            const kw = try gpa.alloc(u8, n * self.wlen);
++            defer gpa.free(kw);
++            const ks = try gpa.alloc(u8, n * self.slen);
++            defer gpa.free(ks);
++            const kb = try gpa.alloc(u8, n * bl);
++            defer gpa.free(kb);
++            _ = edec.take(self.fd, job.ids, self.wlen, self.slen, bl, kw, ks, kb, held[0..n]);
++            for (0..n) |i| pos[i] = @intCast(i);
++            const all: Job.Parts = .{ .job = job, .pos = pos[0..n], .parts = parts };
++            edec.parallel(&all, n * parts, Job.Parts.one);
++            if (job.bad.load(.acquire)) return error.EngramRead;
++            edec.compare(held[0..n], self.wlen, self.slen, bl, job.w, job.s, job.b, kw, ks, kb);
++            edec.putMisses(self.fd, job.ids, held[0..n], self.wlen, self.slen, bl, job.w, job.s, job.b);
++            return;
++        }
++        if (edec.take(self.fd, job.ids, self.wlen, self.slen, bl, job.w, job.s, job.b, held[0..n]) == n) return;
++        for (held[0..n], 0..) |h, i| if (!h) {
++            pos[np] = @intCast(i);
++            np += 1;
++        };
++        const rest: Job.Parts = .{ .job = job, .pos = pos[0..np], .parts = parts };
++        edec.parallel(&rest, np * parts, Job.Parts.one);
++        if (job.bad.load(.acquire)) return error.EngramRead;
++        edec.putMisses(self.fd, job.ids, held[0..n], self.wlen, self.slen, bl, job.w, job.s, job.b);
++    }
++    /// MLX_SERVE_DSV41_ENGRAM_DECODE: `ids`' rows read on a GCD worker into the LRU, for the verify that reads them next
++    /// (src/engram_decode.zig `early`, the table's own slot `slot`); returns at once.
++    pub fn readEarly(self: *const Table, slot: usize, ids: []const u32) void {
++        edec.early(slot, self, readInto, self.fd, self.wlen, self.slen, if (self.mode == .affine) self.slen else 0, ids);
++    }
++    /// `ids`' rows into `w`, `s` and `b` (`Table.read`'s layout), a row a GCD work item; false on a failed read.
++    fn readInto(ctx: *const anyopaque, ids: []const u32, w: []u8, s: []u8, b: []u8) bool {
++        const self: *const Table = @ptrCast(@alignCast(ctx));
++        const job: Job = .{ .t = self, .ids = ids, .w = w, .s = s, .b = b };
++        dispatch_apply_f(ids.len, dispatch_get_global_queue(qos_user_initiated, 0), @constCast(&job), Job.applyOne);
++        return !job.bad.load(.acquire);
++    }
+     /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (caller frees).
+     pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+         const wcols: c_int = @intCast(self.wlen / 4);
+@@ -561,6 +619,33 @@
+         fn runVoid(self: *const Job, first: usize, stride: usize) void {
+             _ = self.run(first, stride, false);
+         }
++        /// MLX_SERVE_DSV41_ENGRAM_DECODE: one read of the job's rows at `pos`, a work item of the LRU's pool: item `i` is
++        /// row `pos[i / parts]`'s record (a repacked table, `parts` 1), else its codes, scales or biases (`i % parts`).
++        const Parts = struct {
++            job: *const Job,
++            pos: []const u32,
++            parts: usize,
++            fn one(ctx: *const anyopaque, i: usize) void {
++                const p: *const Parts = @ptrCast(@alignCast(ctx));
++                const j = p.job;
++                const t = j.t;
++                const k: usize = p.pos[i / p.parts];
++                const r: u64 = j.ids[k];
++                const part = i % p.parts;
++                if (part == 0) _ = edir.rows.fetchAdd(1, .monotonic);
++                if (!(r < t.rows and readPart(t, j, k, r, part))) @constCast(&j.bad).store(true, .release);
++            }
++            /// Row `r`'s read `part` into the job's row `k`: a repacked table's record (`records`), its codes then its
++            /// scales, in one read; else its codes, scales or biases.
++            fn readPart(t: *const Table, j: *const Job, k: usize, r: u64, part: usize) bool {
++                if (t.records()) return edir.readRecord(t.fd, j.w[k * t.wlen ..][0..t.wlen], j.s[k * t.slen ..][0..t.slen], t.w_off + r * t.w_stride);
++                return switch (part) {
++                    0 => edir.readRow(t.fd, j.w[k * t.wlen ..][0..t.wlen], t.w_off + r * t.w_stride),
++                    1 => edir.readRow(t.fd, j.s[k * t.slen ..][0..t.slen], t.s_off + r * t.s_stride),
++                    else => edir.readRow(t.fd, j.b[k * t.slen ..][0..t.slen], t.b_off + r * t.s_stride),
++                };
++            }
++        };
+         /// Every `stride`-th row from `first` (`advise_first`: asked of the kernel first): preads run in parallel where
+         /// faults on one mapping would serialize. A prompt's threads skip the advice: at 32 of them the preads alone
+         /// keep the SSD's queue full, and the advice doubles the requests.
+@@ -701,6 +786,8 @@
+             item.raw = spanRows(self.gpa, table, uniq[0..nu], u, all[lo * nc .. hi * nc]) catch null;
+             item.state.store(if (item.raw != null) done else failed, .release);
+         }
++        // MLX_SERVE_DSV41_ENGRAM_DECODE: the grid's distinct rows into the LRU, once its spans are handed over.
++        edec.keep(table.fd, table.wlen, table.slen, if (table.mode == .affine) table.slen else 0, uniq[0..nu], u.w, u.s, u.b);
+     }
+     fn failTable(g: *Grid, layer: usize, n_spans: usize) void {
+         for (0..n_spans) |k| g.items[layer * n_spans + k].state.store(failed, .release);
+diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41/plugin.zig
+--- a/plugins/deepseek_v41/plugin.zig
++++ b/plugins/deepseek_v41/plugin.zig
+@@ -263,8 +263,18 @@
+         if (fit.rows.prompt >= bill_mod.stream_min_rows) break rung;
+     } else bill_mod.stream_context;
+     const budget = bill_mod.streamBudget(c, context, wired_margin);
++    // turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DECODE): the rows the bill keeps without the Engram LRU's bytes, for the load
++    // line (before the bank's rows take their memory).
++    const store = bill_mod.engram_store_bytes;
++    const bare_fit: ?streamed.Exl3.Bill = if (store > 0) bare: {
++        bill_mod.engram_store_bytes = 0;
++        defer bill_mod.engram_store_bytes = store;
++        const nb = bill_mod.streamBudget(c, context, wired_margin);
++        break :bare streamed.Exl3.billOf(gpa, io, dir, geo, .{ .prompt = nb.prompt, .decode = nb.decode }) catch null;
++    } else null;
+     const b = try streamed.Exl3.Source.open(gpa, io, dir, m.s, geo, gates, .{ .prompt = budget.prompt, .decode = budget.decode });
+     std.log.info("deepseek_v41: streamed experts, {d} prompt / {d} decode slot rows per layer for a {d}-token context ({d} B a row)", .{ b.bill.rows.prompt, b.bill.rows.decode, context, b.bill.row_bytes });
++    if (bare_fit) |f| std.log.info("deepseek_v41: the Engram LRU's {d} MiB (MLX_SERVE_DSV41_ENGRAM_DECODE) costs {d} prompt / {d} decode slot rows per layer: {d} / {d} without it", .{ store >> 20, f.rows.prompt -| b.bill.rows.prompt, f.rows.decode -| b.bill.rows.decode, f.rows.prompt, f.rows.decode });
+     m.bank = .{ .exl3 = b };
+     m.bank_context = context;
+     mdl.streamed = streamed.exl3Routed(b);
