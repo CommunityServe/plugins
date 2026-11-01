@@ -1,0 +1,85 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -294,7 +294,7 @@
+     pub const MLX_SERVE_DSV41_SHARED_HOIST: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode layer's shared expert committed on its own when the routed call returns (turboexl3_ds41): it runs behind the device hit wave, while a layer with misses waits on their bytes; the same kernels, served bytes unchanged (=0: in the layer's last stretch)" };
+     pub const MLX_SERVE_DSV41_ROUTES: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode route recorder (turboexl3_ds41's route-recording builds only, zig build -Droute-rec=true): an absolute directory; each request's decode routes (expert.routes' file) and its rounds' tokens written there at its end" };
+     pub const MLX_SERVE_DSV41_STAGE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' staging (turboexl3_ds41): on, the prediction's stream misses read into the transient windows the call's first stream groups take while the layer's attention runs, the call adopting them (its first stream groups the staged ones it routes, each filled from the rest), the same records and a reorder of the groups; 0: each stream group read by its own route" };
+-    pub const MLX_SERVE_DSV41_STAGE_NEXT: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 next wide prompt layer's staging (turboexl3_ds41, with MLX_SERVE_DSV41_STAGE): predicted from this layer's FFN rows, its read-ahead and its predicted transient loads read during this layer's call, into its persistent rows and the windows the call's groups let go; reads only, the same words (=0: at the layer's start)" };
++    pub const MLX_SERVE_DSV41_STAGE_NEXT: Var = .{ .kind = .kill, .type = .text, .default = "only", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 next wide prompt layer's staging (turboexl3_ds41, with MLX_SERVE_DSV41_STAGE): predicted from this layer's FFN rows, its read-ahead and its predicted transient loads read during this layer's call, into its persistent rows and the windows the call's groups let go, the next layer then running no read-ahead of its own; reads only, the same words (=own: its own read-ahead too; =0: at the layer's start)" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+     pub const MLX_SERVE_DSV41_T3_GROUP: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode hit wave on turboexl3's grouped banked decode (turboexl3_ds41, with MLX_SERVE_DSV41_ROUTED=turboexl3): its GEMVs share one weight decode among up to four row-slots of one expert, and the device route's pairs whose expert no bank holds run no expert in it (their rows come from the miss parts, as before); served bytes unchanged (=0: the banked texts, a miss pair computed from base row 0)" };
+     pub const MLX_SERVE_DSV41_TAIL_FUSE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layer tail (turboexl3_ds41): the joinless combine and the hc expand as one kernel, the same words, no f32 sum or rounded copy in memory (=0: the chain; check: the chain served, the kernel compared over each wide call's first and last rows, [tail-fuse] check lines); with MLX_SERVE_DSV41_JOINLESS on" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -3911,7 +3911,7 @@
+     const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
+     for (lo..hi) |li| {
+         prof.layer();
+-        if (wide) try wideLayer(m, gpa, st, sp, li, li + 1 < hi) else for (0..n_spans) |k| {
++        if (wide) try wideLayer(m, gpa, st, sp, li, li + 1 < hi, li > lo) else for (0..n_spans) |k| {
+             // A span's intermediates are dropped as soon as it is built, so the
+             // layer's evaluation frees each one when its consumers are done.
+             var sc = Scope.init(gpa, m.s);
+@@ -4022,8 +4022,9 @@
+ /// Layer `li` over a wide chunk: the row-wise stages (hc mixes, projections, `attnOut`, the FFN half) run
+ /// once over all of the chunk's rows, attention's state-bound core per span, the MoE over `moe_rows` at a
+ /// time. A span-wide linear fills a few threadgroups per GPU core; the chunk's rows fill the GPU. New streams and mixes land in `sp.xs` / `sp.pres`.
+-/// `next_wide`: layer `li + 1` runs wide over the same spans next (MLX_SERVE_DSV41_STAGE_NEXT predicts it here).
+-fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, li: usize, next_wide: bool) !void {
++/// `next_wide`: layer `li + 1` runs wide over the same spans next (MLX_SERVE_DSV41_STAGE_NEXT predicts it here);
++/// `prev_wide`: layer `li - 1` ran wide over them just before (and predicted this one).
++fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, li: usize, next_wide: bool, prev_wide: bool) !void {
+     // turboexl3_ds41 (MLX_SERVE_DSV41_PROMPT_TL, with PROMPT_IO): the layer's `pre` stage starts.
+     pio.layerBegin(li);
+     const n_spans = sp.xs.len;
+@@ -4043,7 +4044,11 @@
+     // MLX_SERVE_DSV41_RA_FUSED: the attention-side mix first, and the read-ahead's prediction from one more pass of its
+     // norm kernel under the FFN's norm (the same collapse of the same rows with the same previous mix), not the op chain.
+     // The attention's input is the same kernels' over the same arrays; only the predicted experts may round apart.
+-    const fused = raf.on and m.streamed != null and m.streamed.?.read_ahead_fn != null;
++    // MLX_SERVE_DSV41_STAGE_NEXT (`only`, the default; `=own` keeps it): a layer the call before it read ahead for runs no
++    // read-ahead of its own (the attention's input then comes from the unfused kernels: the same kernels over the same
++    // arrays).
++    const ra_own = !(snext.on and snext.skip_own and prev_wide);
++    const fused = raf.on and m.streamed != null and m.streamed.?.read_ahead_fn != null and ra_own;
+     var pa: Normed = undefined;
+     var hp = none;
+     if (fused) {
+@@ -4052,7 +4057,7 @@
+         pa = try hcNorm(&sc, m, z, x, pres, ly.attn_norm, eps);
+         hp = (try hcNorm(&sc, m, z, x, pres, ly.ffn_norm, eps)).h;
+     }
+-    if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, x, pres, hp, sp.img, ra, src.ctx);
++    if (ra_own) if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, x, pres, hp, sp.img, ra, src.ctx);
+     if ((pio.on or dp.on) and pio.tail > 0) try predictDecoder(&sc, m, sp, li, x, pres);
+     try prof.mark(.read_ahead, &.{ x, pres });
+     if (!fused) pa = try hcPreNormWide(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm);
+diff -ruN -x .generated a/sdk/weights/streamed/expert/stream.zig b/sdk/weights/streamed/expert/stream.zig
+--- a/sdk/weights/streamed/expert/stream.zig
++++ b/sdk/weights/streamed/expert/stream.zig
+@@ -244,6 +244,8 @@
+     /// MLX_SERVE_DSV41_STAGE_NEXT: `layer`'s call has its routes' ids on the host: the next layer's held prediction starts
+     /// on the GPU behind it (nothing waits).
+     pub fn nextStart(self: *StreamSource, layer: u32) !void {
++        // A staging planned for this layer that no read-ahead of its own took becomes its own now.
++        try self.stream.promoteFor(layer);
+         if (self.next_ids.ctx == null or self.next_layer != layer + 1) return;
+         const vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{self.next_ids}, 1);
+         defer _ = mlx.mlx_vector_array_free(vec);
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+@@ -2216,6 +2216,11 @@
+                 self.next_posted = @splat(false);
+                 return true;
+             }
++            /// MLX_SERVE_DSV41_STAGE_NEXT: `layer`'s planned staging taken as its own at its call's start, when no read-ahead of
++            /// its own took it (`stageGroups`; MLX_SERVE_DSV41_STAGE_NEXT's default, `only`).
++            pub fn promoteFor(self: *Stream, layer: u32) Error!void {
++                if (self.next_planned and self.next.layer == layer) _ = try self.promoteNext();
++            }
+             /// MLX_SERVE_DSV41_STAGE_NEXT: a planned staging's posted windows landed (`landWindowOf`) and the plan dropped.
+             fn landNext(self: *Stream) Error!void {
+                 if (!self.next_planned) return;

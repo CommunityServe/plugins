@@ -271,7 +271,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     stage_next.configure(env.span(.MLX_SERVE_DSV41_STAGE_NEXT)) catch |e| {
-        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE_NEXT is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE_NEXT is none of 0, 1, only, own (unset: only): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -426,6 +426,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] wide prompt layers' read-ahead and predicted transient loads posted during the call before them, into its persistent rows and the windows its groups let go ({s}); [prompt-io] early= with PROMPT_IO\n", .{if (stage.on) "MLX_SERVE_DSV41_STAGE_NEXT=0: at the layer's start" else "no effect: MLX_SERVE_DSV41_STAGE=0"})
     else
         log.info("[turboexl3_ds41] wide prompt layers' read-ahead and staging posted at the layer's start (MLX_SERVE_DSV41_STAGE_NEXT=0)\n", .{});
+    if (stage_next.on) log.info("[turboexl3_ds41] {s}\n", .{if (stage_next.skip_own) "a wide prompt layer the call before it read ahead for skips its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own: its own too)" else "every wide prompt layer also runs its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own)"});
     switch (joinless.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt calls' routed outputs joined, the routed sum and shared expert by the op chain (MLX_SERVE_DSV41_JOINLESS=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt calls' routed sum and shared expert in one combine over the waves' outputs, no joins (MLX_SERVE_DSV41_JOINLESS=0: the joins and the op chain)\n", .{}),

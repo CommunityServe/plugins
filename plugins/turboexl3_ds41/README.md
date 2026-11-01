@@ -357,8 +357,8 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   the encoder: 205.3 GB on against 229.3 (w-pio-20261101-0953, a profile build). Exact: `check` (w-pio-20261101-0953)
   compared 2,564,014,080 tail words and 23,135,944,704 score words over both requests, none different, and every arm's
   texts are the policy-off references (cold d081845201, new-text slice 3 4d5b401f3c).
-- `MLX_SERVE_DSV41_STAGE_NEXT` (src/stage_next.zig, patches/turboexl3-zzz8j-stage-next.patch; on, `=0` off; with
-  `MLX_SERVE_DSV41_STAGE`): a wide prompt layer's read-ahead and predicted transient loads read during the call before
+- `MLX_SERVE_DSV41_STAGE_NEXT` (src/stage_next.zig, patches/turboexl3-zzz8j-stage-next.patch; on, `=0` off, `=own` as
+  this patch left it; with `MLX_SERVE_DSV41_STAGE`): a wide prompt layer's read-ahead and predicted transient loads read during the call before
   it. `=0`: staging posts a layer's stream misses at the layer's start, so they read under its attention (~4.5 GB a
   16K-row layer, ~340 ms at the drive's rate against ~250 ms of attention) and its call waits on the rest, while the
   drive idles from the call before's last reads to this layer's start (~5.5 s of a cold 16K prompt's encoder): a shorter
@@ -381,6 +381,18 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   against 1281.2 and 1280.6 (+0.3%). Over the cold request's encoder the moe stage took 4489 and 4431 ms against 4930
   and 4968, the host's waits on bytes 536 and 595 against 1048 and 1077; 4434 and 4427 of the 4638 and 4630 staged
   records were posted during the call before theirs, 3965 and 3944 adopted (85%). Exact: the texts are the policy-off
+  references in every arm (cold d081845201, new-text slice 3 4d5b401f3c).
+- `MLX_SERVE_DSV41_STAGE_NEXT=only` (patches/turboexl3-zzz8k-stage-next-only.patch; the default, also `=1`; `=own`
+  every wide layer's own read-ahead too, `=0` off): a wide prompt layer the call before it read ahead for runs no
+  read-ahead of its own (RA_FUSED's prediction from its input, read back at its start: ~17-20 ms of host wait a 16K-row
+  layer, and its norm and router passes on the GPU); its attention's input comes from the unfused kernels (the same
+  kernels over the same arrays), its staging is taken at its call's start (`Stream.promoteFor`) and its P1 records are
+  the early ones. The first wide layer of a pass reads ahead as before.
+- `only` against `own` (w-pio-20261101-1135, on 5ed23c2; usage seed with SEED_FREE, the DSpark verify policy and copy
+  rounds off, A B B A): 1293.2 and 1285.8 tok/s cold prefill against 1259.6 and 1256.3 (+2.5%); new text 1307.0 and
+  1306.6 against 1282.2 and 1283.6 (+1.9%). Over the cold request's encoder the moe stage took 4388 and 4404 ms against
+  4438 and 4470, the host's waits on bytes 526 and 559 against 603 and 603, 91.86 GB read against 95.23 and 867
+  read-ahead records posted against 1082; adoption held (3954 against 3944). Exact: the texts are the policy-off
   references in every arm (cold d081845201, new-text slice 3 4d5b401f3c).
 
 ## The pack
