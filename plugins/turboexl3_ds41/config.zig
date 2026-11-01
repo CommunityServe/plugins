@@ -176,4 +176,5 @@ test {
     _ = @import("src/rounds.zig");
     _ = @import("src/stage_prof.zig");
     _ = @import("src/one_plan.zig");
+    _ = @import("src/markov_plan.zig");
 }

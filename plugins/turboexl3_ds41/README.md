@@ -74,6 +74,23 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
     a gap or a failed forward drops it, and with it the copies, until the next prompt.
   - Each request's rounds are logged beside the engine's `[spec-stats]` (`dspark rounds:`, `dspark policy:` with the
     measured ladder in `ladder_ms`); each round's phases go to `[dspark-prof]` (diag `dspark-profile`).
+- The DSpark draft's Markov chain (src/markov.zig, its MLX-free plan src/markov_plan.zig, the kernels
+  src/kernels/markov_*.metal, the hook in patches/turboexl3-z-markov.patch) runs in B + 1 launches a draft, in place of
+  five op groups a position (a take, the [1, rank] x [rank, vocab] matmul, a cast, the add, an argmax), with the op
+  chain's bytes. Position k is one launch: each threadgroup reduces the previous position's threadgroup bests to its
+  token (MLX's argmax order: NaN first, then the larger value, then the lower index), sums its rows of the bigram bias
+  as MLX's gemv sums them (lane and element order, the shuffle-down tree, the round to the activation dtype), adds the
+  logits row in f32 and keeps its best (value, index) pair. A last launch gives the tokens and the confidence head's
+  logit (MLX's dot_product, where every product is exact: the head's weights 16-bit floats' values, else MLX's ops
+  give it). An odd position reads the rows from the far end, those the position before read last. Window 17 held the
+  tokens, every biased row and the confidence logits bit for bit to MLX's op chain and to an exact emulation of its
+  gemv (the TEST pack's Markov and confidence weights; ties across threadgroups, NaNs and -0 planted), and timed the
+  chain at 575.6 us a draft (median, after a 512 MB read) against the op chain's 842.0 on the M5 Max. In the server
+  (the TEST pack, full-block verifies), `check` found every token and all 204,908,800 biased row elements of 317 drafts
+  equal, the greedy text was the op chain's, and the stage profiler's `markov` went from 0.896 to 0.637 ms a draft.
+  `MLX_SERVE_DSV41_MARKOV=0` runs the op chain, `flat` the kernels without the zig-zag, `check` both every draft (the
+  op chain's served) and logs `[markov]` at each request's end with what differed. The patch sorts last: its hunks sit
+  on the stage profiler's in the draft.
 - `MLX_SERVE_DSV41_COMPILE=0` runs every decode stretch eager instead of compiled.
 - `MLX_SERVE_DSV41_STAGE_PROF=1` (src/stage_prof.zig, hooks in patches/turboexl3-stage-prof.patch) times each
   forward by stage, a sync at each stage's end, and logs at each request's end one `[stage-prof]` line per kind and

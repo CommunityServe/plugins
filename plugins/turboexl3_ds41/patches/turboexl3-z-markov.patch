@@ -1,0 +1,69 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -272,6 +272,7 @@
+     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
++    pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -38,6 +38,8 @@
+ const prof = @import("../../../stage_prof.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+ const one_plan = @import("../../../one_plan.zig");
++/// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
++const markov = @import("../../../markov.zig");
+ const A = mlx.mlx_array;
+ const S = mlx.mlx_stream;
+ const Config = @import("config.zig").Config;
+@@ -4813,10 +4815,20 @@
+     try prof.mark(.head, &.{logits});
+     var cur = try sc.ints(ids[0..1], &.{1});
+     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
++    // The fused chain (`markov.chain`: the op chain's bytes in B + 1 launches), null with the setting off or for a draft
++    // it does not take; `check` runs the op chain below too, serves it and compares the two.
++    const check = markov.mode == .check;
++    const fused: ?markov.Out = if (markov.on()) try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = cur, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .want_conf = want_conf, .keep = keep_logits or check }) else null;
++    if (fused) |f| {
++        _ = try sc.keep(f.toks);
++        if (f.conf) |fc| _ = try sc.keep(fc);
++        if (f.rows) |fr| _ = try sc.keep(fr);
++    }
++    const ops = fused == null or check;
+     var toks: [16]A = undefined;
+     var confs: [16]A = undefined;
+     var rows_k: [16]A = undefined;
+-    for (0..B) |k| {
++    if (ops) for (0..B) |k| {
+         const e = try sc.take(ds.markov_embed, cur, 0); // [1, rank]
+         const me = try sc.astype(e, .float32);
+         const bias = try sc.astype(try sc.matmul(try sc.astype(e, m.act), try sc.t2(ds.markov_head)), .float32);
+@@ -4825,11 +4837,19 @@
+         if (want_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.slice(hout, 0, k, k + 1), .float32), me }, -1), try sc.t2(ds.conf));
+         cur = try sc.astype(try sc.argmax(row, -1), .int32);
+         toks[k] = cur;
+-    }
+-    const all = try sc.concat(toks[0..B], 0);
+-    const rows_all = if (keep_logits) try sc.concat(rows_k[0..B], 0) else all;
+-    var ev = [_]A{ all, if (want_conf) try sc.concat(confs[0..B], 0) else all, rows_all };
++    };
++    const all = if (ops) try sc.concat(toks[0..B], 0) else fused.?.toks;
++    // The confidence head where the fused chain leaves it to MLX's ops (`markov.Out.conf` null): the op chain's ops on
++    // the token before each position.
++    const conf_ops = want_conf and (ops or fused.?.conf == null);
++    if (conf_ops and !ops) for (0..B) |k| {
++        const me = try sc.astype(try sc.take(ds.markov_embed, if (k == 0) cur else try sc.slice(all, 0, k - 1, k), 0), .float32);
++        confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.slice(hout, 0, k, k + 1), .float32), me }, -1), try sc.t2(ds.conf));
++    };
++    const rows_all = if (!keep_logits and !check) all else if (ops) try sc.concat(rows_k[0..B], 0) else fused.?.rows.?;
++    var ev = [_]A{ all, if (!want_conf) all else if (conf_ops) try sc.concat(confs[0..B], 0) else fused.?.conf.?, rows_all };
+     try evalAll(&ev);
++    if (check) if (fused) |f| try markov.compare(f, all, if (want_conf) ev[1] else null, rows_all);
+     const out_ids = try gpa.alloc(u32, B + 1);
+     errdefer gpa.free(out_ids);
+     out_ids[0] = t1;

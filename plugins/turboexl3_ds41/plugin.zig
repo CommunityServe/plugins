@@ -21,6 +21,9 @@ pub const routed_t3 = @import("src/routed_t3.zig");
 /// A wide prompt call's resident routed experts as one turboexl3 call, when `MLX_SERVE_DSV41_ROUTED_ONE` asks
 /// (src/routed_one.zig, read by the copied streamer's source).
 pub const routed_one = @import("src/routed_one.zig");
+/// The DSpark draft's Markov chain in B + 1 launches (src/markov.zig, called by the copied model's draft;
+/// `MLX_SERVE_DSV41_MARKOV`).
+const markov = @import("src/markov.zig");
 const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
 const v4plugin = @import("src/mlx_serve/plugins/deepseek_v4/plugin.zig");
@@ -100,6 +103,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    markov.mode = markov.modeOf(env.span(.MLX_SERVE_DSV41_MARKOV)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_MARKOV is none of 1, 0, flat, check: the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    markov.tally = .{};
     // Before the model's load, which compiles its decode stretches only when the stage profiler is off.
     stage_prof.configure(env.span(.MLX_SERVE_DSV41_STAGE_PROF));
     var own = ctx.*;
@@ -112,12 +123,28 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     // The policy reads each draft's confidence, as the engine has its built-in model's stages do.
     model(mp).mdl.ds_want_conf = on.policy;
+    // The fused Markov chain's kernels built now, not in the first draft.
+    if (model(mp).mdl.dspark) |*w| {
+        const mm = model(mp).mdl;
+        markov.warm(mm.s, w.markov_embed, w.markov_head, w.conf, mm.act, mm.ds_block, mm.cfg.hidden_size, mm.ds_want_conf or std.math.isFinite(mm.ds_conf_thr)) catch |e| {
+            log.err("[turboexl3_ds41] the fused Markov chain's kernels did not build ({s}): the load is refused (MLX_SERVE_DSV41_MARKOV=0 runs the op chain)\n", .{@errorName(e)});
+            ds.table.unload(mp);
+            out.* = Verdict.refuse(.failed, "turboexl3_ds41: the fused Markov chain's kernels did not build");
+            return null;
+        };
+    }
     dropPending();
     if (drafter) |*d| d.deinit();
     drafter = rounds.Drafter.init(gpa, on);
     log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on" else "off (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
+    log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {
+        .on => "fused, B + 1 launches a draft (MLX_SERVE_DSV41_MARKOV=0: the op chain)",
+        .flat => "fused, no zig-zag (MLX_SERVE_DSV41_MARKOV=flat)",
+        .check => "fused and the op chain, compared every draft; the op chain's served (MLX_SERVE_DSV41_MARKOV=check); [markov] lines at each request's end",
+        .off => "the op chain (MLX_SERVE_DSV41_MARKOV=0)",
+    }});
     return mp;
 }
 
@@ -362,13 +389,14 @@ var meter_buf: [2048]u8 = undefined;
 
 /// The request's DSpark rounds beside the engine's `[spec-stats]`, which counts every native round a stage round; the
 /// stage profiler's lines (src/stage_prof.zig) when it is on; the expert stream's counters since the last request, and
-/// the one-call path's (src/routed_one.zig) when it is on.
+/// the one-call path's (src/routed_one.zig) when it is on; the Markov chain's drafts (src/markov.zig) when it is on.
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = slot;
     stage_prof.requestEnd();
     const head = if (drafter) |*d| d.meters(&meter_buf) else meter_buf[0..0];
-    const tail = streamMeters(model(mp), meter_buf[head.len..]);
-    out.* = abi.Str.of(meter_buf[0 .. head.len + tail.len]);
+    const mid = streamMeters(model(mp), meter_buf[head.len..]);
+    const tail = markov.meters(meter_buf[head.len + mid.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. head.len + mid.len + tail.len]);
 }
 
 const Exl3Source = @import("src/mlx_serve/sdk/weights/streamed.zig").Exl3.Source;
