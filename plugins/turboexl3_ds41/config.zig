@@ -193,4 +193,6 @@ test {
     _ = @import("src/late_gemv.zig");
     _ = @import("src/shared_hoist.zig");
     _ = @import("src/t3_group.zig");
+    _ = @import("src/embed_pread.zig");
+    _ = @import("src/vision_lazy.zig");
 }

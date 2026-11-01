@@ -63,6 +63,12 @@ pub const shared_hoist = @import("src/shared_hoist.zig");
 /// The t3 route's hit wave on turboexl3's grouped banked decode (`MLX_SERVE_DSV41_T3_GROUP`, src/t3_group.zig), read by
 /// src/routed_t3.zig: turboexl3's banked group and DEVROUTE's id for a miss pair.
 pub const t3_group = @import("src/t3_group.zig");
+/// The embedding table read from the pack per lookup (`MLX_SERVE_DSV41_EMBED_PREAD`, src/embed_pread.zig), read by the
+/// copied model.
+pub const embed_pread = @import("src/embed_pread.zig");
+/// The vision tower read from the pack for each image (`MLX_SERVE_DSV41_VISION_LAZY`, src/vision_lazy.zig), read by the
+/// copied model's load and media hook.
+pub const vision_lazy = @import("src/vision_lazy.zig");
 /// A wide prompt layer's EXL3 `wo_a` over runs of its attention spans' rows (`MLX_SERVE_DSV41_WOA_ROWS`, src/woa_rows.zig),
 /// read by the copied model.
 pub const woa_rows = @import("src/woa_rows.zig");
@@ -153,6 +159,22 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // Before the model's load: the t3 math compiles the banked kernels at turboexl3's banked group when the bank opens.
     t3_group.configure(env.span(.MLX_SERVE_DSV41_T3_GROUP), routed_t3.enabled) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_T3_GROUP is set to something other than 0 (unset: on with MLX_SERVE_DSV41_ROUTED=turboexl3, 0: the banked texts): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the model's load: it leaves the embedding table and the vision tower on disk unless these say 0 (the bank,
+    // sized from the memory in use when it opens, then takes their bytes as slot rows).
+    embed_pread.configure(env.span(.MLX_SERVE_DSV41_EMBED_PREAD)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_EMBED_PREAD is set to something other than 0 (unset: read from the pack, 0: resident): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    vision_lazy.configure(env.span(.MLX_SERVE_DSV41_VISION_LAZY)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_VISION_LAZY is set to something other than 0 (unset: read for each image, 0: resident): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -314,6 +336,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     log.info("[turboexl3_ds41] read-ahead prediction: {s}\n", .{if (ra_fused.on) "on the fused hc kernels (MLX_SERVE_DSV41_RA_FUSED=0: the op chain)" else "the op chain (MLX_SERVE_DSV41_RA_FUSED=0)"});
     log.info("[turboexl3_ds41] decode lookahead's next-layer scores: {s}\n", .{if (late_gemv.on) "MLX's wide GEMV in the weights' half type (MLX_SERVE_DSV41_LATE_GEMV=0: the f32 product)" else "the f32 product (MLX_SERVE_DSV41_LATE_GEMV=0)"});
     log.info("[turboexl3_ds41] decode layers' shared expert: {s}\n", .{if (shared_hoist.on) "committed behind the hit wave (MLX_SERVE_DSV41_SHARED_HOIST=0: in the layer's last stretch)" else "in the layer's last stretch (MLX_SERVE_DSV41_SHARED_HOIST=0)"});
+    log.info("[turboexl3_ds41] embedding table: {s}\n", .{if (embed_pread.on) "read from the pack at each lookup, not resident (MLX_SERVE_DSV41_EMBED_PREAD=0: resident)" else "resident (MLX_SERVE_DSV41_EMBED_PREAD=0)"});
+    log.info("[turboexl3_ds41] vision tower: {s}\n", .{if (vision_lazy.on) "read from the pack for each image, not resident (MLX_SERVE_DSV41_VISION_LAZY=0: resident)" else "resident (MLX_SERVE_DSV41_VISION_LAZY=0)"});
     if (routed_t3.enabled) log.info("[turboexl3_ds41] t3 hit wave: {s}\n", .{if (t3_group.on) "turboexl3's grouped banked decode, up to four row-slots of one expert a weight decode, the device route's miss pairs skipped (MLX_SERVE_DSV41_T3_GROUP=0: the banked texts)" else "the banked texts (MLX_SERVE_DSV41_T3_GROUP=0)"});
     switch (woa_rows.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' wo_a span by span (MLX_SERVE_DSV41_WOA_ROWS=0)\n", .{}),

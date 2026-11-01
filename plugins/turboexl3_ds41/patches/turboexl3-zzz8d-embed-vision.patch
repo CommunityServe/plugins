@@ -1,0 +1,281 @@
+--- a/env.zig
++++ b/env.zig
+@@ -273,6 +273,7 @@
+     pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
+     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
++    pub const MLX_SERVE_DSV41_EMBED_PREAD: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 token embedding table read from the pack by pread at each lookup, not resident (turboexl3_ds41): its 1.3 GB become streamed slot rows; the rows are the table's bytes, served bytes unchanged (=0: resident)" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_DIR: Var = .{ .kind = .kill, .type = .text, .default = "the pack", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): the absolute directory its expert-usage-v1.json is read from" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_LABEL: Var = .{ .kind = .kill, .type = .text, .default = "unlabeled", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): the recorded prompt set's name, the file's provenance; needs MLX_SERVE_DSV41_EXPERT_USAGE_RECORD" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_RECORD: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): an absolute file path; each request's routed experts per layer counted into it (expert-usage-v1.json's form), written at the request's end" };
+@@ -293,6 +294,7 @@
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+     pub const MLX_SERVE_DSV41_T3_GROUP: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode hit wave on turboexl3's grouped banked decode (turboexl3_ds41, with MLX_SERVE_DSV41_ROUTED=turboexl3): its GEMVs share one weight decode among up to four row-slots of one expert, and the device route's pairs whose expert no bank holds run no expert in it (their rows come from the miss parts, as before); served bytes unchanged (=0: the banked texts, a miss pair computed from base row 0)" };
+     pub const MLX_SERVE_DSV41_TIMELINE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode verify GPU timeline (turboexl3_ds41's profile builds only, zig build -Dplugin-profile=true): an absolute directory; each request's VERIFY_GPU_TIMELINE line logged and its command buffers, verify stamps and rounds written there at its end" };
++    pub const MLX_SERVE_DSV41_VISION_LAZY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 vision tower read from the pack for each image and freed after, not resident (turboexl3_ds41): its 0.9 GB become streamed slot rows; the bank holds its prompt rows while the tower is loaded; an image's rows unchanged (=0: resident)" };
+     pub const MLX_SERVE_DSV41_WOA_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' EXL3 wo_a (turboexl3_ds41): on, over runs of 4096 rows of the attention spans, one grouped linear a run, each slice decoded once a run (a reorder-level rounding: MLX's GEMM at another M); 0: span by span; check: both, compared word for word, the span-by-span result served ([woa-rows] lines)" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -41,6 +41,8 @@
+ /// turboexl3_ds41's src/ra_fused.zig (`MLX_SERVE_DSV41_RA_FUSED`): the read-ahead's prediction on the fused hc kernels.
+ const raf = @import("../../../ra_fused.zig");
+ const shoist = @import("../../../shared_hoist.zig");
++/// turboexl3_ds41's src/embed_pread.zig (`MLX_SERVE_DSV41_EMBED_PREAD`): the embedding table read from the pack per lookup.
++const ep = @import("../../../embed_pread.zig");
+ /// turboexl3_ds41's src/woa_rows.zig (`MLX_SERVE_DSV41_WOA_ROWS`): a wide layer's EXL3 `wo_a` over runs of its spans' rows.
+ const woa = @import("../../../woa_rows.zig");
+ /// turboexl3_ds41's src/joinless.zig (`MLX_SERVE_DSV41_JOINLESS`): a wide call's routed sum and the shared expert in one
+@@ -368,6 +370,8 @@
+     cfg: Config,
+     act: mlx.mlx_dtype,
+     embed: Lin,
++    /// turboexl3_ds41 (MLX_SERVE_DSV41_EMBED_PREAD): the embedding rows read from the pack at each lookup (`embed` unset).
++    embed_tab: ?ep.Table = null,
+     head: Lin,
+     norm: A,
+     /// The trunk, then the DSpark stages.
+@@ -469,6 +473,7 @@
+         self.dropAhead();
+         self.gpa.free(self.prompt);
+         for (self.engrams) |*e| e.table.close();
++        if (self.embed_tab) |*t| t.close();
+         self.gpa.free(self.engrams);
+         self.gpa.free(self.token_map);
+         for (self.owned.items) |x| _ = mlx.mlx_array_free(x);
+@@ -1339,7 +1344,7 @@
+ pub fn loadPack(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, vision: bool) !Weights {
+     // An EXL3 pack keeps its f16 suh and svh as stored (turboexl3 reads them f16), and its routed trunk experts stream
+     // from the bank: a shard that still holds them loads none of them.
+-    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .index_owners = true, .keep_f16 = true, .skip = &routedTrunkExpert });
++    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .index_owners = true, .keep_f16 = true, .skip = &packSkips });
+     errdefer w.deinit();
+     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/engram/engram-residents.safetensors", .{dir}, 0);
+     defer gpa.free(path);
+@@ -1349,6 +1354,25 @@
+     try weights_load.loadSafetensorsFile(gpa, &w, path, s, .{});
+     return w;
+ }
++/// What the load leaves on disk: the routed trunk experts (the streamed bank serves them), the vision tower's unread
++/// split copies (`visionUnread`) and, with turboexl3_ds41's MLX_SERVE_DSV41_EMBED_PREAD, the embedding table (read by
++/// pread at each lookup, `Dsv41Model.embed_tab`).
++fn packSkips(key: []const u8) bool {
++    if (routedTrunkExpert(key) or visionUnread(key)) return true;
++    const k = if (std.mem.startsWith(u8, key, weights_load.dsv41_text_prefix)) key[weights_load.dsv41_text_prefix.len..] else key;
++    return ep.on and std.mem.eql(u8, k, ep.tensor);
++}
++/// turboexl3_ds41: the vision tower's split EXL3 copies (`attn.q_proj` / `k_proj` / `v_proj`, `mlp.gate_proj` /
++/// `up_proj`), which the repack ships beside the fused `attn.wqkv` and `mlp.w1` the tower reads (vision.zig): never read,
++/// so never loaded (0.21 GB in the full pack).
++pub fn visionUnread(key: []const u8) bool {
++    const k = if (std.mem.startsWith(u8, key, weights_load.dsv41_text_prefix)) key[weights_load.dsv41_text_prefix.len..] else key;
++    if (!std.mem.startsWith(u8, k, "vision.blocks.")) return false;
++    for ([_][]const u8{ ".attn.q_proj.", ".attn.k_proj.", ".attn.v_proj.", ".mlp.gate_proj.", ".mlp.up_proj." }) |part| {
++        if (std.mem.indexOf(u8, k, part) != null) return true;
++    }
++    return false;
++}
+ /// A trunk layer's routed expert (`layers.<l>.ffn.experts.`), which the streamed bank serves.
+ fn routedTrunkExpert(key: []const u8) bool {
+     const k = if (std.mem.startsWith(u8, key, weights_load.dsv41_text_prefix)) key[weights_load.dsv41_text_prefix.len..] else key;
+@@ -1456,7 +1480,12 @@
+         m.head = .{ .w = none };
+         m.norm = none;
+     } else {
+-        m.embed = try getLin(w, cfg.hidden_size, "embed", .{});
++        if (ep.on) {
++            m.embed = .{ .w = none };
++            m.embed_tab = try ep.Table.open(gpa, opts.pack_dir orelse return error.Dsv41EmbedPreadNoPack, @intCast(cfg.vocab_size), @intCast(cfg.hidden_size));
++            log.info("deepseek_v41: embedding rows read from the pack at each lookup, not resident (MLX_SERVE_DSV41_EMBED_PREAD)\n", .{});
++        } else m.embed = try getLin(w, cfg.hidden_size, "embed", .{});
++        errdefer if (m.embed_tab) |*t| t.close();
+         m.head = try getLin(w, cfg.hidden_size, "head", .{});
+         if (m.head.x3 != null) log.info("deepseek_v41: lm head EXL3, as shipped\n", .{}) else if (m.head.s.ctx == null) {
+             if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
+@@ -3498,6 +3527,16 @@
+     const first = try sc.op2(mlx.mlx_equal, try sc.arange(0, hc), try sc.i(0));
+     return sc.broadcast(try sc.astype(first, .float32), &.{ ci(L), ci(hc) });
+ }
++/// The embedding rows of host `ids` in `dt`: the resident table's, or with turboexl3_ds41's MLX_SERVE_DSV41_EMBED_PREAD
++/// the table's rows read from the pack (`embed_tab`), the same bf16 bytes.
++fn embedIds(m: *const Dsv41Model, sc: *Scope, ids: []const u32, dt: mlx.mlx_dtype) !A {
++    const t = m.embed_tab orelse return m.embed.rows(sc, try sc.ints(@ptrCast(ids), &.{ci(ids.len)}), dt);
++    const buf = try m.gpa.alloc(u8, ids.len * t.row_bytes);
++    defer m.gpa.free(buf);
++    try t.read(m.gpa, ids, buf);
++    const x = try sc.keep(mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ ci(ids.len), @intCast(t.hidden) }, 2, .bfloat16));
++    return sc.astype(x, dt);
++}
+ /// `t`'s one integer value; waits for the batch that computes `t` only (no new op on it).
+ fn hostToken(t: A) !u32 {
+     try mlx.check(mlx.mlx_array_eval(t));
+@@ -3628,7 +3667,16 @@
+             .host => |h| try sc.ints(@ptrCast(h), &.{ci(L)}),
+             .gpu => |t| try sc.reshape(t, &.{1}),
+         };
+-        var emb = try m.embed.rows(&sc, id_arr, m.act);
++        // turboexl3_ds41 (MLX_SERVE_DSV41_EMBED_PREAD): rows read from the pack take the ids on the host (a decode token
++        // still on the GPU is read back).
++        var gid: [1]u32 = undefined;
++        var emb = if (m.embed_tab == null) try m.embed.rows(&sc, id_arr, m.act) else try embedIds(m, &sc, switch (ids) {
++            .host => |h| h,
++            .gpu => |t| blk: {
++                gid[0] = try hostToken(t);
++                break :blk &gid;
++            },
++        }, m.act);
+         if (vision) |vr| if (ids == .host and c.image_token_id != 0 and std.mem.indexOfScalar(u32, ids.host, c.image_token_id) != null) {
+             // The span's positions take the encoder's rows (delimiters included) in order, and are marked
+             // for the VL routing bias and the Engram pass-through.
+@@ -4831,7 +4879,7 @@
+     {
+         var sc = Scope.init(gpa, m.s);
+         defer sc.deinit();
+-        const emb = try m.embed.rows(&sc, try sc.ints(@ptrCast(toks), &.{ci(N)}), m.act);
++        const emb = try embedIds(m, &sc, toks, m.act);
+         for (0..N) |k| {
+             hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, k, k + 1), 1), &.{ 1, ci(c.dsv4_hc_mult), ci(c.hidden_size) }));
+             hold(&sp.pres[k], try onehotPre(&sc, m, 1));
+@@ -4972,7 +5020,9 @@
+     const ds = &m.dspark.?;
+     var ids: [16]i32 = undefined;
+     for (0..B) |k| ids[k] = @intCast(if (k == 0) t1 else c.dsv4_dspark_noise_token_id);
+-    const emb = try m.embed.rows(&sc, try sc.ints(ids[0..B], &.{ci(B)}), m.act);
++    var uids: [16]u32 = undefined;
++    for (uids[0..B], ids[0..B]) |*u, v| u.* = @intCast(v);
++    const emb = try embedIds(m, &sc, uids[0..B], m.act);
+     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(d) });
+     var pre = try onehotPre(&sc, m, B);
+     try prof.mark(.embed, &.{ x, pre });
+--- a/plugins/deepseek_v41/media.zig
++++ b/plugins/deepseek_v41/media.zig
+@@ -7,6 +7,9 @@
+ const mlx = @import("mlx_serve").mlx;
+ const vision = @import("vision.zig");
+ const config = @import("config.zig");
++const weights_load = @import("../../sdk/weights/load.zig");
++const log = @import("../../sdk/util/log.zig");
++const dsv41 = @import("deepseek_v41.zig");
+ const Verdict = abi.Verdict;
+ const gpa = std.heap.c_allocator;
+ /// The span an image of ViT grid `gh x gw` takes in the prompt.
+@@ -37,10 +40,50 @@
+ }
+ pub fn tower(mp: *anyopaque, item: *const abi.MediaItem, out: *abi.Array) callconv(.c) Verdict {
+     const m: *@import("plugin.zig").Model = @ptrCast(@alignCast(mp));
++    if (m.tower == null) if (m.vision_dir) |dir| return lazyTower(m, dir, item, out);
+     const t = &(m.tower orelse return Verdict.refuse(.unsupported, "deepseek_v41: this pack has no vision tower"));
+     const rows = t.forward(.{ .ctx = item.pixels.ctx }, item.grid[1], item.grid[2]) catch return Verdict.refuse(.failed, "deepseek_v41: the vision tower failed");
+     out.* = .{ .ctx = rows.ctx };
+     return .ok;
++}
++/// turboexl3_ds41 (MLX_SERVE_DSV41_VISION_LAZY): the tower read from the pack for this image and freed before the hook
++/// returns. A decode-phase bank holds its prompt rows meanwhile (the prompt's working set, unused until a prompt's wide
++/// calls, holds the tower) and grows its rows again after, so a decode call between two hooks finds the bank it left.
++fn lazyTower(m: *@import("plugin.zig").Model, dir: [:0]const u8, item: *const abi.MediaItem, out: *abi.Array) Verdict {
++    const decoding = @import("plugin.zig").bankDecoding(m);
++    if (decoding) m.mdl.streamed.?.phase(true) catch |e| return lazyFailed(e);
++    const rows = lazyRows(m, dir, item) catch |e| {
++        if (decoding) m.mdl.streamed.?.phase(false) catch {};
++        return lazyFailed(e);
++    };
++    // the tower's buffers back to the system before the bank grows again
++    _ = mlx.mlx_clear_cache();
++    if (decoding) m.mdl.streamed.?.phase(false) catch |e| {
++        _ = mlx.mlx_array_free(rows);
++        return lazyFailed(e);
++    };
++    out.* = .{ .ctx = rows.ctx };
++    return .ok;
++}
++/// The image's span on a tower made from the pack's vision weights alone, computed before the tower goes.
++fn lazyRows(m: *@import("plugin.zig").Model, dir: []const u8, item: *const abi.MediaItem) !mlx.mlx_array {
++    const io = std.Io.Threaded.global_single_threaded.io();
++    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = true, .dsv41 = true, .index_owners = true, .keep_f16 = true, .skip = &notVision });
++    defer w.deinit();
++    var t = try vision.Dsv41Vision.init(gpa, m.cfg, &w);
++    defer t.deinit();
++    const rows = try t.forward(.{ .ctx = item.pixels.ctx }, item.grid[1], item.grid[2]);
++    errdefer _ = mlx.mlx_array_free(rows);
++    try mlx.check(mlx.mlx_array_eval(rows));
++    return rows;
++}
++fn notVision(key: []const u8) bool {
++    const k = if (std.mem.startsWith(u8, key, weights_load.dsv41_text_prefix)) key[weights_load.dsv41_text_prefix.len..] else key;
++    return !weights_load.dsv41VisionKey(k) or dsv41.visionUnread(key);
++}
++fn lazyFailed(e: anyerror) Verdict {
++    log.err("deepseek_v41: the vision tower read for this image failed ({s})\n", .{@errorName(e)});
++    return Verdict.refuse(.failed, "deepseek_v41: the vision tower failed");
+ }
+ pub fn placeholderRows(p: *const abi.Parsed, item: *const abi.MediaItem, _: *const abi.TextTokens, out: [*]u32, cap: u32) callconv(.c) u32 {
+     const n = @min(item.rows, cap);
+--- a/plugins/deepseek_v41/plugin.zig
++++ b/plugins/deepseek_v41/plugin.zig
+@@ -11,6 +11,8 @@
+ const dsv41 = @import("deepseek_v41.zig");
+ const vision = @import("vision.zig");
+ const media = @import("media.zig");
++/// turboexl3_ds41's src/vision_lazy.zig (`MLX_SERVE_DSV41_VISION_LAZY`): the tower read from the pack for each image.
++const vl = @import("../../../vision_lazy.zig");
+ const bill_mod = @import("bill.zig");
+ const fixture = @import("../deepseek_v4/fixture.zig");
+ const v4plugin = @import("../deepseek_v4/plugin.zig");
+@@ -71,6 +73,9 @@
+     weights: Weights,
+     mdl: *dsv41.Dsv41Model,
+     tower: ?vision.Dsv41Vision,
++    /// turboexl3_ds41 (MLX_SERVE_DSV41_VISION_LAZY): the pack whose vision tower the media hook reads for each image
++    /// (`tower` then null).
++    vision_dir: ?[:0]u8,
+     caps: abi.Caps,
+     s: mlx.mlx_stream,
+     /// A streamed pack's expert bank, and the prompt positions its slot rows were billed for.
+@@ -215,7 +220,9 @@
+     m.cfg = c.*;
+     // The driver's map never holds the vision tower (the engine's encoder reads it and hands its rows to `forward`).
+     const taken = if (ctx.weights) |w| Resident.take(w) else null;
+-    m.weights = taken orelse try dsv41.loadPack(io, gpa, ctx.model_dir.slice(), c.dsv41_vision);
++    // turboexl3_ds41 (MLX_SERVE_DSV41_VISION_LAZY): the tower left on disk, read for each image (`media.tower`).
++    const lazy_tower = vl.on and c.dsv41_vision and taken == null;
++    m.weights = taken orelse try dsv41.loadPack(io, gpa, ctx.model_dir.slice(), c.dsv41_vision and !lazy_tower);
+     errdefer m.weights.deinit();
+     // The worker's layers when the driver's load planned a Thunderbolt pair.
+     const pair: ?dsv41.Pair = if (ctx.pair_remote.count > 0) .{ .lo = ctx.pair_remote.first, .hi = ctx.pair_remote.first + ctx.pair_remote.count, .worker = false } else null;
+@@ -232,7 +239,10 @@
+         if (c.dsv41_exl3_bank) try openBank(m, io, dir, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
+     }
+     errdefer closeBank(m);
+-    m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
++    m.vision_dir = if (lazy_tower) try gpa.dupeSentinel(u8, ctx.model_dir.slice(), 0) else null;
++    errdefer if (m.vision_dir) |d| gpa.free(d);
++    m.tower = if (c.dsv41_vision and taken == null and !lazy_tower) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
++    if (lazy_tower) std.log.info("deepseek_v41: the vision tower is read from the pack for each image, not resident (MLX_SERVE_DSV41_VISION_LAZY)", .{});
+     return m;
+ }
+ /// The pack's EXL3 bank at the slot rows the box holds beside the residents and a request of the model's `ctx_size`,
+@@ -281,6 +291,15 @@
+     }
+     m.bank = null;
+ }
++/// turboexl3_ds41 (MLX_SERVE_DSV41_VISION_LAZY): whether the EXL3 bank holds its decode rows now.
++pub fn bankDecoding(m: *const Model) bool {
++    if (comptime !build_options.mlx_stream) return false;
++    const b = m.bank orelse return false;
++    return switch (b) {
++        .exl3 => |x| x.phase == .decode,
++        .pack => false,
++    };
++}
+ /// The per-model `ctx_size` setting: the prompt positions a streamed bank bills.
+ fn ctxSetting(settings_json: []const u8) ?u64 {
+     if (settings_json.len == 0) return null;
+@@ -293,6 +312,7 @@
+     const m: *Model = @ptrCast(@alignCast(mp));
+     closeBank(m);
+     if (m.tower) |*t| t.deinit();
++    if (m.vision_dir) |d| gpa.free(d);
+     var it = m.parked.valueIterator();
+     while (it.next()) |k| k.deinit();
+     m.parked.deinit(gpa);

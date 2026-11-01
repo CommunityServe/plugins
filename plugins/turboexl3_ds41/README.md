@@ -258,6 +258,26 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
 - On against `=0` (w-pio-20261101-0630; as above, WOA_ROWS off in every arm): 1123.8 and 1123.3 tok/s cold prefill
   against 1016.2 and 1013.3 (+10.7%); new text 1132.8 and 1153.7 against 1017.6 and 1029.3 (+11%). Exact: the seeded
   text is the same in every arm (md5 a323144e8b), and `check` compared 52 wide calls word for word with none different.
+- `MLX_SERVE_DSV41_EMBED_PREAD` (src/embed_pread.zig, patches/turboexl3-zzz8d-embed-vision.patch; on, `=0` resident):
+  the token embedding table (`embed.weight`, bf16 [129280, 5120], 1.32 GB) stays on disk and its rows are read by pread
+  at each lookup, each distinct id once, in parallel (GCD). A decode round looks up the verify's 6 ids and the draft's
+  first id, a 16K prompt its distinct ids; the page cache keeps the hot rows. The rows are the table's bytes, so the
+  served bytes are the same. A plain decode token still on the GPU is read back first.
+- `MLX_SERVE_DSV41_VISION_LAZY` (src/vision_lazy.zig, the same patch; on, `=0` resident): the vision tower (`vision.*`,
+  `aligner.*`, `image_*`, 0.94 GB) stays on disk; the media hook reads it for each image, encodes, evaluates the rows
+  and frees the tower before it returns. Image encodes run between other slots' steps, so a bank holding its decode
+  rows drops to its prompt rows while the tower is loaded (the prompt's working set, unused until a prompt's wide calls,
+  holds it) and grows them back after. The tower's arithmetic is the resident tower's.
+- The load also leaves on disk the tower's split EXL3 copies the repack ships beside the fused `attn.wqkv` and
+  `mlp.w1` the tower reads (`attn.q_proj` / `k_proj` / `v_proj`, `mlp.gate_proj` / `up_proj`: 0.21 GB, never read).
+- The streamed bank is sized from the memory in use when it opens, so those bytes become slot rows. Both on against
+  both off on the full pack (M5 Max, w-20261101-0744; code-ctx16384, card cold then greedy, fixed full-block verifies,
+  the usage seed with SEED_FREE, ROUTED=turboexl3, A B B A): 128 / 150 prompt / decode slot rows against 125 / 147;
+  41.6 and 41.6 tok/s on the card's decode against 41.1 and 40.6, 48.0 and 47.9 greedy against 47.2 and 46.4; misses a
+  round 78.4 / 60.0 (card / greedy) against 81.4 / 62.9; cold prefill 1136.1 and 1138.4 tok/s against 1132.3 (the
+  window's first server, Engram-cold, read 1057.1). The card and greedy texts are the same in every arm. An image
+  request (448x448, a red disc) returned HTTP 200 on the resident and the lazy tower alike, the same reasoning head;
+  its 64 tokens all went to reasoning, so the answer itself was not read in that window.
 
 ## The pack
 
