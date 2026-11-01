@@ -1,0 +1,207 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -277,6 +277,7 @@
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_LABEL: Var = .{ .kind = .kill, .type = .text, .default = "unlabeled", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): the recorded prompt set's name, the file's provenance; needs MLX_SERVE_DSV41_EXPERT_USAGE_RECORD" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_RECORD: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): an absolute file path; each request's routed experts per layer counted into it (expert-usage-v1.json's form), written at the request's end" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
++    pub const MLX_SERVE_DSV41_JOINLESS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' routed sum and shared expert (turboexl3_ds41): on, one kernel combines them reading each routed row where its wave wrote it, no joins of the waves' outputs, the same f32 words; 0: the joins and the op chain; check: both, compared word for word, the op chain's served ([joinless] lines)" };
+     pub const MLX_SERVE_DSV41_LATE_GEMV: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode lookahead's next-layer scores as a product in the router weights' half type (turboexl3_ds41): MLX's wide GEMV, one weight pass for a verify's rows; the read-ahead's ranking only, served bytes unchanged (=0: the f32 product)" };
+     pub const MLX_SERVE_DSV41_LOOKAHEAD: Var = .{ .kind = .kill, .type = .text, .default = "2 (records read ahead a layer call; idle rule 0)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's expert lookahead (turboexl3_ds41): <budget>[:<idle>], the records read ahead a layer call 0 to 4 (0: the predictor off) and the idle rule 0 or 1; the served bytes are the same at every setting" };
+     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -43,6 +43,9 @@
+ const shoist = @import("../../../shared_hoist.zig");
+ /// turboexl3_ds41's src/woa_rows.zig (`MLX_SERVE_DSV41_WOA_ROWS`): a wide layer's EXL3 `wo_a` over runs of its spans' rows.
+ const woa = @import("../../../woa_rows.zig");
++/// turboexl3_ds41's src/joinless.zig (`MLX_SERVE_DSV41_JOINLESS`): a wide call's routed sum and the shared expert in one
++/// combine over the call's unjoined outputs (the source's `source_shared`).
++const jless = @import("../../../joinless.zig");
+ /// The CED decoder prefetch (turboexl3_ds41's src/dec_prefetch.zig, `MLX_SERVE_DSV41_DEC_PREFETCH`).
+ const dp = @import("../../../dec_prefetch.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+@@ -3279,6 +3282,14 @@
+     try prof.mark(.router, &.{ r.idx, r.wts });
+     // The DSpark stages' experts stay resident.
+     if (li < m.n_layers) if (m.streamed) |src| {
++        // MLX_SERVE_DSV41_JOINLESS: a wide call's routed sum and the shared expert in one combine (the same f32 words).
++        if (src.math == .source and jless.mode != .off and dim(r.idx, 0) * dim(r.idx, 1) > src.decode_ids) if (src.source_shared) |f| {
++            const sy = try shared(sc, m, ly, x);
++            try prof.mark(.shared, &.{sy});
++            const y = try sc.keep(try f(src.ctx, @intCast(li), x, r.idx, r.wts, try sc.astype(sy, .float32)).get());
++            try prof.mark(.routed, &.{y});
++            return sc.astype(y, m.act);
++        };
+         if (src.math == .source) return withShared(sc, m, ly, x, try sc.keep(try src.math.source(src.ctx, @intCast(li), x, r.idx, r.wts).get()));
+         if (dim(r.idx, 0) * dim(r.idx, 1) > src.decode_ids) return slotWide(sc, m, src, li, x, r.idx, r.wts, try shared(sc, m, ly, x));
+         const sl = try fetchSlots(sc, m, src, li, r.idx);
+diff -ruN -x .generated a/sdk/weights/routed.zig b/sdk/weights/routed.zig
+--- a/sdk/weights/routed.zig
++++ b/sdk/weights/routed.zig
+@@ -33,6 +33,10 @@
+     read_ahead_fn: ?*const fn (*anyopaque, u32, []const u16) Ret(void) = null,
+     /// Routed ids a decode-phase call takes: a wider call is a prompt pass, which a source refuses in decode.
+     decode_ids: usize = max_call_ids,
++    /// turboexl3_ds41 (`MLX_SERVE_DSV41_JOINLESS`): a wide call's (more than `decode_ids` ids) routed sum plus the
++    /// shared expert's rows (`[n, hidden]` f32, the last argument) as one combine over the call's unjoined outputs:
++    /// `source`'s sum + the shared rows, word for word. Null: the source has none.
++    source_shared: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
+     pub fn settle(r: Routed) !void {
+         return r.settle_fn(r.ctx).get();
+     }
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -48,6 +48,11 @@
+ const dec_prefetch = @import("mlx_host").dec_prefetch;
+ /// `MLX_SERVE_DSV41_SEED_FREE` (the plugin's src/seed_free.zig): the usage seed's rows free until a route uses them.
+ const seed_free = @import("mlx_host").seed_free;
++/// `MLX_SERVE_DSV41_JOINLESS` (the plugin's src/joinless.zig): a wide prompt call's routed sum and the layer's shared
++/// expert in one combine over the call's unjoined outputs (`rowsShared`), the kernel set's JOINLESS combine.
++const joinless = @import("mlx_host").joinless;
++const dsv41_routes = @import("../../quant/exl3/stream/kernel_routes.zig");
++const Combine = dsv41_routes.JoinlessCombine(G);
+ pub const Gate = Hook.Gate;
+ pub const Phase = enum { prompt, decode };
+ /// The trunk's MoE geometry the bank must match.
+@@ -151,6 +156,8 @@
+     released: bool = false,
+     /// `expert_usage_record`'s recorder: each request's routed experts counted, its file written at the request's end.
+     usage_rec: ?*expert_usage.Recorder = null,
++    /// JOINLESS's combine (`MLX_SERVE_DSV41_JOINLESS` on or check), built and compiled at the load; null: off.
++    jl: ?Combine = null,
+     /// The bank in `dir` at the rows `budget` holds, streamed on `s` (the trunk's stream). `gates`: every routed layer's
+     /// router (its arrays borrowed for the source's life).
+     pub fn open(a: std.mem.Allocator, io: std.Io, dir: []const u8, s: mlx.mlx_stream, geo: Geometry, gates: []const Gate, budget: Budget) !*Source {
+@@ -165,6 +172,7 @@
+         self.phase = .prompt;
+         self.usage_rec = null;
+         self.released = false;
++        self.jl = null;
+         self.bank = try expert_bank.Bank.open(a, io, dir, implementedOf(geo), null);
+         errdefer self.bank.deinit();
+         self.bill = try billBank(&self.bank, budget);
+@@ -197,6 +205,19 @@
+         try self.q.routeForms(&self.g, forms);
+         try self.q.compileTexts(self.set, &xq.banked_texts, &diag);
+         try self.q.routeBanked(&self.g);
++        // JOINLESS (MLX_SERVE_DSV41_JOINLESS): the combine on the set the quant accepted, its bf16 text compiled and launched
++        // once now; ROUTED_ONE's wide calls end on their own path, so the pair is refused by name.
++        if (joinless.mode != .off) {
++            if (routed_one.on()) {
++                std.log.err("streamed exl3: MLX_SERVE_DSV41_JOINLESS needs MLX_SERVE_DSV41_ROUTED_ONE off (its wide calls end on their own path)", .{});
++                return error.JoinlessRoutedOne;
++            }
++            var jgeo = dsv41_routes.PrefillGeometry.derived;
++            jgeo.hidden = geo.hidden_size;
++            jgeo.n_experts_per_tok = geo.n_experts_per_tok;
++            self.jl = try Combine.init(&self.set.reg, &jgeo, &diag);
++            try self.set.selfCheck(a, &.{.dsv41_jl_combine_bf16}, .compile, &self.q.report, &diag);
++        }
+         const event = try expert_event.createMetal();
+         self.stream = try expert_stream.Stream.init(a, &self.bank, .{
+             .rows = self.prompt_rows,
+@@ -381,6 +402,67 @@
+         const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
+         return g.keep(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false));
+     }
++    /// JOINLESS's combine is built (`MLX_SERVE_DSV41_JOINLESS` on or check): `rowsShared` serves the wide calls.
++    pub fn joinlessOn(self: *const Source) bool {
++        return self.jl != null;
++    }
++    /// JOINLESS, a wide prompt call (more than `decode_route_ids` ids): `rows` plus `shared` (the layer's shared expert
++    /// rows, f32 `[n, hidden]`) as one combine over the call's unjoined outputs, f32 `[n, hidden]`: the words of `rows`'s
++    /// sum + `shared`, without the joins. `check`: the op chain built beside it from the same outputs, compared and served.
++    pub fn rowsShared(self: *Source, layer: u32, x: T, idx: T, wts: T, shared: T) !T {
++        const comb = self.jl orelse return error.JoinlessOff;
++        self.t3_state.begin();
++        const g = &self.g;
++        defer g.reset();
++        const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
++        self.t3_state.n = 0;
++        const pio = prompt_io.on and self.phase == .prompt;
++        defer if (dec_prefetch.on and self.phase == .prompt) self.postFills();
++        if (pio) try self.pioStart(layer, x, ids);
++        defer if (pio) prompt_io.callEnd(self.pioCounters());
++        const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
++        switch (self.hook) {
++            inline else => |*h| {
++                const hk = h.at(layer);
++                const parts = try hk.routedParts(g, x, ids);
++                // The combine holds its sources until it is evaluated.
++                defer hk.releaseParts(g);
++                for (parts.outs) |o| if (g.dtypeOf(o) != g.dtypeOf(parts.outs[0])) return error.JoinlessMixedSources;
++                const y = try comb.call(g, parts.outs, parts.loc, w, shared);
++                if (joinless.mode == .check) return g.keep(try self.joinlessCheck(layer, parts.outs, parts.loc, w, shared, y));
++                return g.keep(y);
++            },
++        }
++    }
++    /// JOINLESS `check`: the op chain over the same outputs (joined in source order and the table's rows taken, then
++    /// `rows`'s widen, weight and sum and the model's f32 add of `shared`), compared with the combine's `y` word for word
++    /// on the device; one `[joinless] check` line. Returns the op chain's.
++    fn joinlessCheck(self: *Source, layer: u32, outs: []const T, loc: T, w: T, shared: T, y: T) !T {
++        const g = &self.g;
++        const n = g.shapeOf(w).dim(0);
++        const k = g.shapeOf(w).dim(1);
++        const hidden = g.shapeOf(y).dim(1);
++        var rows_of: [Combine.sources]u32 = undefined;
++        var first_of: [Combine.sources]i32 = undefined;
++        for (outs, rows_of[0..outs.len]) |o, *r| r.* = @intCast(g.shapeOf(o).dim(0));
++        _ = joinless.firstRows(rows_of[0..outs.len], first_of[0..outs.len]);
++        const first = try g.hostArray(std.mem.sliceAsBytes(first_of[0..outs.len]), &.{@intCast(outs.len)}, .int32);
++        const src = try g.reshape(try g.slice(loc, &.{ 0, 0, 0 }, &.{ n, k, 1 }, &.{ 1, 1, 1 }), &.{n * k});
++        const row = try g.reshape(try g.slice(loc, &.{ 0, 0, 1 }, &.{ n, k, 2 }, &.{ 1, 1, 1 }), &.{n * k});
++        const at = try g.add(try g.take(first, src, 0), row);
++        const routed = try g.reshape(try g.take(try g.concat(outs, 0), at, 0), &.{ n, k, hidden });
++        const chain = try g.add(try g.sum(try g.mul(try g.astype(routed, .float32), try g.expandDims(w, -1)), -2, false), shared);
++        const same = try g.equal(try viewAs(g, y, .uint32), try viewAs(g, chain, .uint32));
++        const n_same = try g.astype(try g.sum(try g.astype(try g.reshape(same, &.{-1}), .uint32), 0, false), .uint32);
++        const max_d = try g.max(try g.reshape(try g.abs(try g.sub(y, chain)), &.{-1}), 0, false);
++        try g.evalAll(&.{ n_same, max_d });
++        var same_of: [1]u32 = undefined;
++        var max_of: [1]f32 = undefined;
++        const words: u64 = @as(u64, @intCast(n)) * @as(u64, @intCast(hidden));
++        const equal_words: u64 = (try g.readU32(n_same, &same_of))[0];
++        joinless.report(layer, @intCast(n), outs.len, words, words - equal_words, (try g.hostF32(max_d, &max_of))[0]);
++        return chain;
++    }
+     /// `MLX_SERVE_DSV41_PROMPT_IO`: a prompt's routed call of `layer` begins; its routes are evaluated now (the wait the
+     /// streamer's barrier takes next), and a decoder layer's read back for the probe before the call routes them.
+     fn pioStart(self: *Source, layer: u32, x: T, ids: T) !void {
+@@ -484,6 +566,15 @@
+         return self.source.stats();
+     }
+ };
++/// `x`'s words as `dt` (MLX's view: the same buffer, bitcast), in `g`'s scope.
++fn viewAs(g: *G, x: T, dt: mlx.mlx_dtype) !T {
++    var r = mlx.mlx_array_new();
++    mlx.check(mlx.mlx_view(&r, x, dt, g.s)) catch |e| {
++        _ = mlx.mlx_array_free(r);
++        return e;
++    };
++    return g.adopt(r);
++}
+ /// A synthetic EXL3 bank for fixtures (`expert/bank.zig` `writeSynth`).
+ pub const writeSynth = expert_bank.writeSynth;
+ const testing = std.testing;
+diff -ruN -x .generated a/sdk/weights/streamed.zig b/sdk/weights/streamed.zig
+--- a/sdk/weights/streamed.zig
++++ b/sdk/weights/streamed.zig
+@@ -66,8 +66,13 @@
+             const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
+             return .of(s.readAhead(layer, experts));
+         }
++        fn rowsShared(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array, shared: mlx.mlx_array) routed.Ret(mlx.mlx_array) {
++            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.rowsShared(layer, x, idx, wts, shared));
++        }
+     };
+-    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead, .decode_ids = Exl3.decode_route_ids };
++    // turboexl3_ds41 (MLX_SERVE_DSV41_JOINLESS): the joinless combine, when the source built it.
++    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead, .decode_ids = Exl3.decode_route_ids, .source_shared = if (src.joinlessOn()) &C.rowsShared else null };
+ }
+ /// GLM-5.3-Flash's EXL3 bank (`streamed/glm5n_source.zig`): the source returns routed sums.
+ pub const Glm5n = if (build_options.mlx_stream) plugin.glm5n_source else struct {};

@@ -220,6 +220,20 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   in about 2% of their words, by at most one bf16 ulp (max_abs 7.8e-3), and the seeded 32-token text changes (md5
   a323144e8b, "Return values without equality duplicates, keeping first-seen order.", becomes efeb6f4ecd, "Return values
   with equality-based duplicates removed, keeping first order."): the reference text from here on.
+- `MLX_SERVE_DSV41_JOINLESS` (src/joinless.zig, patches/turboexl3-zzz8-joinless.patch; on, `=0` off, `check` both): a
+  wide prompt call's routed sum and the layer's shared expert in one combine. `=0`: the streamer joins each bank call's
+  wave outputs (a concatenate and a take, each evaluated inside the routed call), then the call's outputs again into
+  [rows * 6, 5120] in routed order; the source widens them to f32, weights them and sums the six, and the model adds the
+  shared expert in f32: about 18 GB of reads and writes a 16K-row layer, 14 GB of it in the layer's last eval. On keeps
+  the waves' outputs as they are (the smallest concatenated into the 24th source above 24) and runs the kernel set's
+  JOINLESS combine (`dsv41_jl_combine_bf16`): each routed row read where its wave wrote it, weighted, the six folded in
+  MLX's column reduce order and the shared rows added, uncontracted: the op chain's f32 words. `check` builds both from
+  the same outputs, serves the op chain's and logs `[joinless] check layer= rows= sources= words= differ= max_abs=` a
+  wide call; it holds both paths' buffers at once (at 16K rows it lifted a window's accounted memory past 112 GiB), so
+  it is a diagnostic for a test step or a small window, not a measured one. Refused with `MLX_SERVE_DSV41_ROUTED_ONE`.
+- On against `=0` (w-pio-20261101-0630; as above, WOA_ROWS off in every arm): 1123.8 and 1123.3 tok/s cold prefill
+  against 1016.2 and 1013.3 (+10.7%); new text 1132.8 and 1153.7 against 1017.6 and 1029.3 (+11%). Exact: the seeded
+  text is the same in every arm (md5 a323144e8b), and `check` compared 52 wide calls word for word with none different.
 
 ## The pack
 

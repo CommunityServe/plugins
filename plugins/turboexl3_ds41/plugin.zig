@@ -63,6 +63,9 @@ pub const shared_hoist = @import("src/shared_hoist.zig");
 /// A wide prompt layer's EXL3 `wo_a` over runs of its attention spans' rows (`MLX_SERVE_DSV41_WOA_ROWS`, src/woa_rows.zig),
 /// read by the copied model.
 pub const woa_rows = @import("src/woa_rows.zig");
+/// A wide prompt call's routed sum and the layer's shared expert in one combine over the call's unjoined outputs
+/// (`MLX_SERVE_DSV41_JOINLESS`, src/joinless.zig), read by the copied model and the copied stream's source.
+pub const joinless = @import("src/joinless.zig");
 /// A profile build (`zig build -Dplugin-profile=true`, never served): the copied stream's profile probes compiled in (its
 /// `sdk` reads this through this root) and the decode verify's GPU timeline (`MLX_SERVE_DSV41_TIMELINE`,
 /// src/verify_tl.zig).
@@ -192,6 +195,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    joinless.configure(env.span(.MLX_SERVE_DSV41_JOINLESS)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_JOINLESS is neither 0 nor check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1: the load is refused\n", .{});
         out.* = switch (e) {
@@ -273,6 +283,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] wide prompt layers' wo_a span by span (MLX_SERVE_DSV41_WOA_ROWS=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' wo_a over runs of {d} rows, one grouped linear a run (MLX_SERVE_DSV41_WOA_ROWS=0: span by span)\n", .{woa_rows.rows}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' wo_a over runs of {d} rows and span by span, compared word for word, the span-by-span result served (MLX_SERVE_DSV41_WOA_ROWS=check): a [woa-rows] check line a layer\n", .{woa_rows.rows}),
+    }
+    switch (joinless.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt calls' routed outputs joined, the routed sum and shared expert by the op chain (MLX_SERVE_DSV41_JOINLESS=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt calls' routed sum and shared expert in one combine over the waves' outputs, no joins (MLX_SERVE_DSV41_JOINLESS=0: the joins and the op chain)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt calls' routed sum and shared expert in one combine and by the op chain, compared word for word, the op chain's served (MLX_SERVE_DSV41_JOINLESS=check): a [joinless] check line a wide call\n", .{}),
     }
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {
