@@ -1,0 +1,103 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -294,6 +294,7 @@
+     pub const MLX_SERVE_DSV41_SCRATCH_ATTN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' attention spans (turboexl3_ds41): 1, each span's scores and probabilities in a ring of two per-prompt slots, the gather's launches as write-into twins of their stock texts (compiled at load); check, the fresh launches served and the ring's scores, probabilities and heads compared word for word ([scratch-attn] check lines); the same words (0: fresh buffers)" };
+     pub const MLX_SERVE_DSV41_SCRATCH_HEADS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' WOA_ROWS runs (turboexl3_ds41, with MLX_SERVE_DSV41_SCRATCH_ATTN on, the default): on (also 1), a full run's grouped heads written by pv's twin straight into a run region as [rows, og, in] and the run's wo_a reading it (no join, no transpose); check, the join served and each full run's region compared word for word; the same words (0: the join)" };
+     pub const MLX_SERVE_DSV41_SCRATCH_WAVES: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prefill waves' per-prompt regions (turboexl3_ds41): on (the default; unset, empty or 1), a wide prompt call's DIG-X waves launch write-into twins of their stock texts (derived and compiled at load) on two sets of regions (by the wave's parity), not fresh buffers for their intermediates, the same words; check, the fresh waves served and every launch's region output compared with the fresh one (words, max abs, max ulps); 0: fresh buffers" };
++    pub const MLX_SERVE_DSV41_SCRATCH: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' streams after the attention (turboexl3_ds41): written into one per-prompt buffer, not a fresh MLX allocation each layer; the same words (=0: a fresh array each layer; =check: the fresh array served and the region's compared with it word for word)" };
+     pub const MLX_SERVE_DSV41_SEED_FREE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 usage seed's rows free until routed (turboexl3_ds41): the prompt's read-ahead may take a row the load's seed filled that no route has used, for an expert its prediction ranks before the seeded one, and the CED decoder prefetch one whose expert its prediction does not name" };
+     pub const MLX_SERVE_DSV41_SHARED_HOIST: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode layer's shared expert committed on its own when the routed call returns (turboexl3_ds41): it runs behind the device hit wave, while a layer with misses waits on their bytes; the same kernels, served bytes unchanged (=0: in the layer's last stretch)" };
+     pub const MLX_SERVE_DSV41_ROUTES: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode route recorder (turboexl3_ds41's route-recording builds only, zig build -Droute-rec=true): an absolute directory; each request's decode routes (expert.routes' file) and its rounds' tokens written there at its end" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -64,6 +64,10 @@
+ /// The next wide layer's predicted transient loads staged during this layer's call (turboexl3_ds41's src/stage_next.zig,
+ /// `MLX_SERVE_DSV41_STAGE_NEXT`).
+ const snext = @import("../../../stage_next.zig");
++/// The wide prompt layers' per-prompt regions (turboexl3_ds41's src/scratch.zig) and the one for a wide layer's
++/// streams after its attention (src/scratch_x1.zig, `MLX_SERVE_DSV41_SCRATCH`).
++const scratch = @import("../../../scratch.zig");
++const sx1 = @import("../../../scratch_x1.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+ const one_plan = @import("../../../one_plan.zig");
+ /// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
+@@ -485,6 +489,8 @@
+         self.ahead = null;
+     }
+     pub fn deinit(self: *Dsv41Model) void {
++        // MLX_SERVE_DSV41_SCRATCH: the prompt's regions let go with the model.
++        sx1.releaseAll();
+         if (self.dec_state) |*st| st.deinit();
+         self.dropAhead();
+         self.gpa.free(self.prompt);
+@@ -2261,6 +2267,38 @@
+     try prof.mark(.ffn_hc, &.{ s.x1, s.sp.pre, s.sp.post, s.sp.comb, s.h });
+     return s;
+ }
++/// MLX_SERVE_DSV41_SCRATCH: rows from which a wide layer's streams after its attention go into the prompt's x1 region.
++const scratch_rows = 4096;
++/// MLX_SERVE_DSV41_SCRATCH: `hcExpandPreNorm` of a wide layer whose streams `x1` are written into the prompt's x1
++/// region (`hcExpandScratch`), the norms reading its published alias.
++fn hcExpandPreNormScratch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !Staged {
++    // A region the regions' cap leaves no room for: the fresh array, as `hcExpandPreNorm`.
++    const x1 = if (try hcExpandScratch(sc, x, y, sp)) |v| v else try hcExpand(sc, x, y, sp);
++    const r = try hcPreNormWide(sc, m, x1, cpre, hc, norm_w);
++    const s: Staged = .{ .x1 = x1, .sp = r.sp, .h = r.h };
++    try prof.mark(.ffn_hc, &.{ s.x1, s.sp.pre, s.sp.post, s.sp.comb, s.h });
++    return s;
++}
++/// MLX_SERVE_DSV41_SCRATCH: `hcExpand` with its words written into the prompt's x1 region (glm5's expand into it,
++/// behind the region's last reader), returned as the region's published alias (its readers ordered after the write by
++/// MLX's fence on the writer's pass); null when the regions' cap leaves no room for it; `check`: `hcExpand`'s array
++/// served, the region's compared with it word for word (a `[scratch] check` line).
++fn hcExpandScratch(sc: *Scope, x: A, y: A, sp: *const Split) !?A {
++    const L = dim(x, 0);
++    const dt = mlx.mlx_array_dtype(x);
++    const region = (try sx1.x1.ensure(mlx.getShape(x), dt)) orelse return null;
++    const x4 = try sc.reshape(x, &.{ 1, ci(L), ci(dim(x, 1)), ci(dim(x, 2)) });
++    // glm5's expand reads `y` in the streams' dtype (its own cast, as `hcExpand` hands it).
++    const y4 = try sc.astype(try sc.expand(y, 0), dt);
++    try sx1.x1.wrote(try sc.keep(try sx1.expandInto(sc.s, y4, x4, sp.post, sp.comb, region, sx1.x1.after(x4))));
++    const x1 = try sc.keep(try sx1.x1.publish(sc.s));
++    if (sx1.mode != .check) return x1;
++    const fresh = try hcExpand(sc, x, y, sp);
++    var t: scratch.Tally = .{};
++    try scratch.compare(sc.s, x1, fresh, &t);
++    std.debug.print("[scratch] check region=x1 rows={d} words={d} differ={d}\n", .{ L, t.words, t.differ });
++    return fresh;
++}
+ /// The hc split of the mixes `z` and the collapse of `x` with `cpre`, rms-normed.
+ pub fn hcNorm(sc: *Scope, m: *const Dsv41Model, z: A, x: A, cpre: A, norm_w: A, eps: A) !Normed {
+     const L = dim(x, 0);
+@@ -3903,6 +3941,8 @@
+     // The stage profiler's forward: a decode token the engine's sampler made runs before its clock starts.
+     try prof.begin(m.s, if (st.verify != null) .verify else if (L == 1) .decode else .prompt, L, if (ids == .gpu) &.{ids.gpu} else &.{});
+     defer prof.end();
++    // MLX_SERVE_DSV41_SCRATCH: the prompt's regions let go before a decode forward.
++    if (L <= region_rows) sx1.releaseAll();
+     if (m.streamed) |src| try src.phase(L > region_rows);
+     // MLX_SERVE_DSV41_SCRATCH_ATTN: the ring's regions let go at the decode phase change.
+     if (L <= region_rows) sat.releaseAll();
+@@ -4331,7 +4371,10 @@
+     const y = try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
+     try prof.mark(.attn_out, &.{y});
+     pio.wide(li, .wob);
+-    const pf = try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
++    // MLX_SERVE_DSV41_SCRATCH: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
++    // group, so that group's output is the region's last reader's).
++    const x1_scratch = sx1.mode != .off and m.streamed != null and sp.L >= scratch_rows and mlx.streamIsGpu(m.s);
++    const pf = if (x1_scratch) try hcExpandPreNormScratch(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm) else try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
+     pio.wide(li, .ffn);
+     // A streamed bank reads each layer's experts once per call: one MoE over all of its rows.
+     const group = if (m.streamed != null) n_spans else @max(1, m.moe_rows / sp.span);
+@@ -4352,6 +4395,8 @@
+             try nf(src.ctx, .{ .layer = @intCast(li + 1) }, try predictNext(&gsc, m, li, hg, img)).get();
+         // MLX_SERVE_DSV41_TAIL_FUSE: the routed call's combine and the hc expand in one kernel (the same words).
+         const xg = if (try moeExpand(&gsc, m, li, hg, img, x1g, &sf)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
++        // MLX_SERVE_DSV41_SCRATCH: the region's next writer waits for this, its last reader.
++        if (x1_scratch and k1 == n_spans) try sx1.x1.released(xg);
+         try prof.mark(.combine, &.{xg});
+         for (k0..k1) |k| {
+             const a, const b = sp.bounds(k);
