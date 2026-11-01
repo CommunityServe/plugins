@@ -1,0 +1,98 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -279,6 +279,7 @@
+     pub const MLX_SERVE_DSV41_LOOKAHEAD: Var = .{ .kind = .kill, .type = .text, .default = "2 (records read ahead a layer call; idle rule 0)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's expert lookahead (turboexl3_ds41): <budget>[:<idle>], the records read ahead a layer call 0 to 4 (0: the predictor off) and the idle rule 0 or 1; the served bytes are the same at every setting" };
+     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
+     pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end, and a [prompt-io] wide line a wide layer; =2 also splits the read-ahead's wait by a sync at each step" };
++    pub const MLX_SERVE_DSV41_RA_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' read-ahead prediction on the fused hc kernels (turboexl3_ds41): the attention-side mix first, the prediction from one more pass of its norm kernel under the FFN's norm; served bytes unchanged (=0: the op chain)" };
+     pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -38,6 +38,8 @@
+ const prof = @import("../../../stage_prof.zig");
+ /// The prompt timeline (turboexl3_ds41's src/prompt_io.zig, `MLX_SERVE_DSV41_PROMPT_IO`): off, every hook returns at once.
+ const pio = @import("../../../prompt_io.zig");
++/// turboexl3_ds41's src/ra_fused.zig (`MLX_SERVE_DSV41_RA_FUSED`): the read-ahead's prediction on the fused hc kernels.
++const raf = @import("../../../ra_fused.zig");
+ /// The CED decoder prefetch (turboexl3_ds41's src/dec_prefetch.zig, `MLX_SERVE_DSV41_DEC_PREFETCH`).
+ const dp = @import("../../../dec_prefetch.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+@@ -1934,13 +1936,17 @@
+ }
+ /// `hcPreNorm` for blocks of many rows, where throughput rules: the mix and norm kernels.
+ pub fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, norm_w: A) !Normed {
++    const eps = try hcEps(sc, m);
++    return hcNorm(sc, m, try hcMixWide(sc, m, x, hc, eps), x, cpre, norm_w, eps);
++}
++/// `hcPreNormWide`'s mix kernel: `x`'s mix logits `[L, mix]` f32, which `hcNorm` turns into the split.
++pub fn hcMixWide(sc: *Scope, m: *const Dsv41Model, x: A, hc: *const Hc, eps: A) !A {
+     const L = dim(x, 0);
+     const mix = dim(hc.fn_w, 0);
+     const tg = m.hc_tg;
+     const cols = for (hc_mix_cols) |c| {
+         if (mix % c == 0) break c;
+     } else unreachable;
+-    const eps = try hcEps(sc, m);
+     var zv = mlx.mlx_vector_array_new();
+     defer _ = mlx.mlx_vector_array_free(zv);
+     {
+@@ -1957,8 +1963,7 @@
+         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&zv, m.hc_mix_kernel, iv, cfg, sc.s));
+     }
+     var z = mlx.mlx_array_new();
+-    _ = try sc.res(mlx.mlx_vector_array_get(&z, zv, 0), &z);
+-    return hcNorm(sc, m, z, x, cpre, norm_w, eps);
++    return sc.res(mlx.mlx_vector_array_get(&z, zv, 0), &z);
+ }
+ /// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1/M2): launches every hc kernel once at
+ /// `m.hc_tg` threads and halves it until they run.
+@@ -3852,10 +3857,22 @@
+     for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
+     const x = try sc.concat(parts, 0);
+     const pres = try sc.concat(sp.pres, 0);
+-    if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, x, pres, sp.img, ra, src.ctx);
++    // MLX_SERVE_DSV41_RA_FUSED: the attention-side mix first, and the read-ahead's prediction from one more pass of its
++    // norm kernel under the FFN's norm (the same collapse of the same rows with the same previous mix), not the op chain.
++    // The attention's input is the same kernels' over the same arrays; only the predicted experts may round apart.
++    const fused = raf.on and m.streamed != null and m.streamed.?.read_ahead_fn != null;
++    var pa: Normed = undefined;
++    var hp = none;
++    if (fused) {
++        const eps = try hcEps(&sc, m);
++        const z = try hcMixWide(&sc, m, x, &ly.hc_attn, eps);
++        pa = try hcNorm(&sc, m, z, x, pres, ly.attn_norm, eps);
++        hp = (try hcNorm(&sc, m, z, x, pres, ly.ffn_norm, eps)).h;
++    }
++    if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, x, pres, hp, sp.img, ra, src.ctx);
+     if ((pio.on or dp.on) and pio.tail > 0) try predictDecoder(&sc, m, sp, li, x, pres);
+     try prof.mark(.read_ahead, &.{ x, pres });
+-    const pa = try hcPreNormWide(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm);
++    if (!fused) pa = try hcPreNormWide(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm);
+     try prof.mark(.attn_hc, &.{ pa.sp.pre, pa.sp.post, pa.sp.comb, pa.h });
+     pio.wide(li, .hc);
+     const pos = try sc.i(ci(sp.p0));
+@@ -3910,8 +3927,9 @@
+     }
+ }
+ /// A streamed prompt call's routes of layer `li` predicted before its attention (the FFN's input taken as the stream
+-/// collapsed with the previous mix), handed to the source to read while the attention runs.
+-fn readAhead(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, li: usize, x: A, pre: A, img: A, ra: anytype, ctx: *anyopaque) !void {
++/// collapsed with the previous mix), handed to the source to read while the attention runs. `hp`: that input already
++/// built (`MLX_SERVE_DSV41_RA_FUSED`), else (none) the op chain builds it.
++fn readAhead(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, li: usize, x: A, pre: A, hp: A, img: A, ra: anytype, ctx: *anyopaque) !void {
+     const t0: u64 = if (pio.on) pio.now() else 0;
+     defer if (pio.on) pio.readAhead(li, t0, pio.now());
+     // MLX_SERVE_DSV41_PROMPT_IO=2: the wait split by an eval at each step, the stream's rows, then its collapse.
+@@ -3919,7 +3937,7 @@
+         try evalAll(&.{ x, pre });
+         pio.raStep(li, .cat);
+     }
+-    const h = try sc.rms(try hcCollapse(sc, x, pre), ly.ffn_norm, m.cfg.rms_norm_eps);
++    const h = if (hp.ctx != null) hp else try sc.rms(try hcCollapse(sc, x, pre), ly.ffn_norm, m.cfg.rms_norm_eps);
+     if (pio.split_ra) {
+         try evalAll(&.{h});
+         pio.raStep(li, .col);

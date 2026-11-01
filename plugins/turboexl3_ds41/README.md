@@ -162,6 +162,15 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   their collapse, `ra_route_ms` the router), two more syncs a wide layer. On the full pack's cold code-ctx16384 prompt
   (w-pio-20261101-0409) the waits summed 1.07 to 1.25 s over the encoder's layers 1 to 19, the host work 2 ms and the
   graph builds about 40 ms.
+- `MLX_SERVE_DSV41_RA_FUSED` (src/ra_fused.zig, patches/turboexl3-zz9-ra-fused.patch; on, `=0` the op chain): a wide
+  layer's read-ahead prediction on the fused hc kernels. The prediction is the router over the stream collapsed with the previous mix and
+  normed for the FFN: the same collapse of the same rows with the same mix as the attention's input, normed by the other
+  weight. The layer runs the attention-side mix kernel first and takes the prediction from one more pass of the norm
+  kernel, where the op chain (the stream to f32, a batched matmul, a norm) built it. The attention's input and the routed
+  calls are the same kernels over the same arrays; only the experts the read-ahead reads may round apart. Cold
+  code-ctx16384 prompt on the full pack (M5 Max, w-pio-20261101-0433, the usage seed with SEED_FREE in every arm): 1019.0
+  and 1021.9 tok/s against 984.1 and 988.0 with the op chain, the collapse step 14 to 18 ms a layer against 31 to 33, the
+  seeded 32-token text the same in every arm.
 
 ## The pack
 
