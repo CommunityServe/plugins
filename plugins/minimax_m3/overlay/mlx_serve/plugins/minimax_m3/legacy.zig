@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/legacy.zig@90fb57282d374c0989a46503b12f4fd9be300963
+//! copied_from: src/plugins/minimax_m3/legacy.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
 //! MiniMax M3.1 Flash load config: settings, load facts, the memory bill and the reader staging.
 const std = @import("std");
 const sdk = @import("mlx_stream").sdk;

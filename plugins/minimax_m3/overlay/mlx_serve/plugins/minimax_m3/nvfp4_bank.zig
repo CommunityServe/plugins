@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/nvfp4_bank.zig@90fb57282d374c0989a46503b12f4fd9be300963
+//! copied_from: src/plugins/minimax_m3/nvfp4_bank.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
 //! MiniMax M3.1 Flash routed experts as an NVFP4 expert bank: `experts.bin` beside `expert-manifest.json`, the pack's
 //! ModelOpt NVFP4 bytes copied as they are into MLX's nvfp4 layout (group 16, bits 4).
 //!

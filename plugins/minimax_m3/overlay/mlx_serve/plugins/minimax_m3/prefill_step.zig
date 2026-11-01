@@ -1,7 +1,7 @@
-//! copied_from: src/plugins/minimax_m3/prefill_step.zig@90fb57282d374c0989a46503b12f4fd9be300963
+//! copied_from: src/plugins/minimax_m3/prefill_step.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
 const std = @import("std");
 /// Prompt rows a span holds: one layer-major pass reads each missing expert once a span.
-pub const span_tokens = 2048;
+pub const span_tokens = 4096;
 /// A span's hidden rows through one layer: the tiles, their concatenations and four routed outputs a row.
 pub fn spanBytes(hidden: u64, seq: u64) u64 {
     return @as(u64, @min(seq, span_tokens)) * 40 * hidden;

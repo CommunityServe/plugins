@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/chunk_layer.zig@90fb57282d374c0989a46503b12f4fd9be300963
+//! copied_from: src/plugins/minimax_m3/chunk_layer.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
 //! Prompt tiles; every resident projection retains its serial M=1 kernel.
 const std = @import("std");
 const ops = @import("ops.zig");

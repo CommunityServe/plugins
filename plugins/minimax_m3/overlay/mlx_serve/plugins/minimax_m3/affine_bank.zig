@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/affine_bank.zig@90fb57282d374c0989a46503b12f4fd9be300963
+//! copied_from: src/plugins/minimax_m3/affine_bank.zig@b20ebdd16e8e262f5e13f2b24ef33cc4ad09aa1f
 const std = @import("std");
 const shared = @import("affine_layout.zig");
 const sdk = @import("mlx_stream").sdk;
