@@ -1,0 +1,401 @@
+diff -ruN -x .generated a/sdk/weights/streamed/expert/a4k.zig b/sdk/weights/streamed/expert/a4k.zig
+--- a/sdk/weights/streamed/expert/a4k.zig	1969-12-31 18:00:00
++++ b/sdk/weights/streamed/expert/a4k.zig	2026-11-01 08:24:05
+@@ -0,0 +1,103 @@
++//! The a4k record layout of an EXL3 v2 expert bank (`sidecar.layout` "a4k" in expert-manifest-v2.json; turboexl3_ds41's
++//! zzzzt): each record's nine segments at offsets that put every code on a 4 KiB block, so the read pool's PARTS route
++//! (MLX_SERVE_DSV41_DIRECT_PARTS) reads all three codes straight into their slot rows (the classic layout puts only the
++//! gate's code on the block: the up and down codes sit 2,560 and 1,024 B off it). On disk: a zero lead of (-(the gate/up
++//! span's scales)) mod 4096, the gate/up span [gate.rout gate.rin up.rout up.rin gate.code up.code], then the down span
++//! [down.code down.rout down.rin], the record padded to 4096. Each span stays contiguous and the down span follows the
++//! gate/up span, as the pool reads a span (its parts back to back) and pre-reads (the down range at the gate/up range's
++//! end). The segments' lengths, dtypes and shapes are the classic layout's; only the offsets and the order on disk
++//! differ. std only: the bank (expert/bank.zig), the read pool's records (sdk_ext/expert/io.zig) and the plugin's byte
++//! gate (src/a4k_test.zig) share it.
++const std = @import("std");
++
++pub const n_components = 9;
++pub const gu_components = 6;
++pub const block: u64 = 4096;
++/// The a4k order on disk of the components (bank.zig's `Component` order: gate code, rout, rin, up ..., down ...).
++pub const disk_order = [n_components]u8{ 1, 2, 4, 5, 0, 3, 6, 7, 8 };
++/// The components' own order: a classic bank's order on disk.
++pub const identity = [n_components]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8 };
++
++pub const Geometry = struct {
++    /// Each component's offset in its record (component order).
++    offsets: [n_components]u64,
++    /// The zero bytes before the gate/up span.
++    lead: u64,
++    /// One past the record's last segment.
++    extent: u64,
++    /// The record in the file: `extent` padded to `block`.
++    record_bytes: u64,
++};
++
++/// The a4k offsets of a record whose segments are `lengths` long (component order), or null where a code's length is not
++/// a multiple of `block` (no code could then start on the block in every record).
++pub fn geometry(lengths: [n_components]u64) ?Geometry {
++    for ([_]usize{ 0, 3, 6 }) |c| if (lengths[c] == 0 or lengths[c] % block != 0) return null;
++    var smalls: u64 = 0;
++    for (disk_order[0..4]) |c| smalls += lengths[c];
++    const lead = (block - smalls % block) % block;
++    var g: Geometry = .{ .offsets = undefined, .lead = lead, .extent = 0, .record_bytes = 0 };
++    var off = lead;
++    for (disk_order) |c| {
++        g.offsets[c] = off;
++        off += lengths[c];
++    }
++    g.extent = off;
++    g.record_bytes = std.mem.alignForward(u64, off, block);
++    return g;
++}
++
++/// One record's values (one per component, component order) in the on-disk `order`.
++pub fn toDisk(comptime T: type, comptime n: usize, x: *const [n]T, order: []const u8) [n]T {
++    var out: [n]T = undefined;
++    for (&out, order[0..n]) |*o, c| o.* = x[c];
++    return out;
++}
++
++const testing = std.testing;
++
++/// DeepSeek-V4.1's segment lengths at K (hidden 5,120, intermediate 2,304; bank.zig layerSegments).
++fn dsv41Lengths(k: u64) [n_components]u64 {
++    const code = (5120 / 16) * (2304 / 16) * 16 * k * 2;
++    return .{ code, 2304 * 2, 5120 * 2, code, 2304 * 2, 5120 * 2, code, 5120 * 2, 2304 * 2 };
++}
++
++test "a4k puts every code of DeepSeek-V4.1's K = 3 and K = 2 records on the block, the spans contiguous, 4 KiB more a record" {
++    for ([_]u64{ 3, 2 }) |k| {
++        const lens = dsv41Lengths(k);
++        const g = geometry(lens).?;
++        try testing.expectEqual(@as(u64, 3072), g.lead);
++        for ([_]usize{ 0, 3, 6 }) |c| try testing.expectEqual(@as(u64, 0), g.offsets[c] % block);
++        // the gate/up span: its parts back to back from the lead, in disk order; the down span right after it
++        var at = g.lead;
++        for (disk_order) |c| {
++            try testing.expectEqual(at, g.offsets[c]);
++            at += lens[c];
++        }
++        try testing.expectEqual(at, g.extent);
++        var logical: u64 = 0;
++        for (lens) |n| logical += n;
++        try testing.expectEqual(std.mem.alignForward(u64, logical, block) + block, g.record_bytes);
++        // the six gate/up components first on disk, the three down ones after
++        for (disk_order[0..gu_components]) |c| try testing.expect(c < gu_components);
++        for (disk_order[gu_components..]) |c| try testing.expect(c >= gu_components);
++    }
++    try testing.expectEqual(@as(u64, 13_320_192), geometry(dsv41Lengths(3)).?.record_bytes);
++    try testing.expectEqual(@as(u64, 8_896_512), geometry(dsv41Lengths(2)).?.record_bytes);
++    // a code off the block has no a4k geometry
++    var odd = dsv41Lengths(3);
++    odd[3] += 2;
++    try testing.expect(geometry(odd) == null);
++}
++
++test "a4k toDisk reorders one record's values and the identity order keeps them" {
++    const x = [n_components]u64{ 10, 11, 12, 13, 14, 15, 16, 17, 18 };
++    try testing.expectEqualSlices(u64, &.{ 11, 12, 14, 15, 10, 13, 16, 17, 18 }, &toDisk(u64, n_components, &x, &disk_order));
++    try testing.expectEqualSlices(u64, &x, &toDisk(u64, n_components, &x, &identity));
++    // a permutation: every component once
++    var seen: [n_components]bool = @splat(false);
++    for (disk_order) |c| {
++        try testing.expect(!seen[c]);
++        seen[c] = true;
++    }
++}
+diff -ruN -x .generated a/sdk/weights/streamed/expert/bank.zig b/sdk/weights/streamed/expert/bank.zig
+--- a/sdk/weights/streamed/expert/bank.zig	2026-11-01 08:24:05
++++ b/sdk/weights/streamed/expert/bank.zig	2026-11-01 08:24:05
+@@ -11,8 +11,14 @@
+ const expert_io = @import("../sdk_ext.zig").expert.io;
+ const bank_file = @import("../sdk_ext.zig").expert.bank_file;
+ const mlx = @import("sdk").mlx;
+-/// Record segments in on-disk order: the gate/up span is the first six, the
+-/// down span the last three.
++/// The a4k record layout's geometry and part order (std only; the plugin's byte gate shares it).
++pub const a4k = @import("a4k.zig");
++/// The record layout a v2 manifest declares (`sidecar.layout`; absent: classic). `classic`: bankv2.layer_segments, the nine
++/// segments back to back in component order. `a4k`: every code on a 4 KiB block (`a4k.geometry`), the parts on disk in
++/// `a4k.disk_order`.
++pub const Layout = enum { classic, a4k };
++/// Record segments in component order: the gate/up span's are the first six, the down span's the last three (in a classic
++/// bank also their order on disk; an a4k bank's order on disk is `a4k.disk_order`).
+ pub const Component = enum(u8) {
+     gate_code,
+     gate_rout,
+@@ -53,6 +59,11 @@
+     logical_bytes: u64,
+     base_offset: u64,
+     segments: [n_components]Segment,
++    /// The components' order on disk (each span's parts back to back in it): the components' own (classic) or
++    /// `a4k.disk_order`.
++    disk: [n_components]u8 = a4k.identity,
++    /// One past the record's last segment (the logical bytes in a classic record; a4k: its lead, then the segments).
++    extent: u64 = 0,
+ };
+ /// What the installed kernels decode; a bank outside it is refused.
+ pub const Implemented = struct {
+@@ -126,26 +137,45 @@
+         }
+     }
+     l.logical_bytes = off;
++    l.extent = off;
+     l.record_bytes = std.mem.alignForward(u64, off, record_alignment);
+     return l;
+ }
++/// The a4k record geometry at K: `layerSegments`' segments (lengths, dtypes, shapes, logical bytes) at `a4k.geometry`'s
++/// offsets, the parts on disk in `a4k.disk_order`, the record padded to `record_alignment`. Null where `layerSegments`
++/// is, or where a code's length is off the block.
++pub fn layerSegmentsA4k(k: u32, hidden: u64, inter: u64) ?Layer {
++    var l = layerSegments(k, hidden, inter) orelse return null;
++    var lens: [n_components]u64 = undefined;
++    for (&lens, l.segments) |*n, sg| n.* = sg.length;
++    const g = a4k.geometry(lens) orelse return null;
++    for (&l.segments, g.offsets) |*sg, off| sg.offset = off;
++    l.disk = a4k.disk_order;
++    l.extent = g.extent;
++    l.record_bytes = g.record_bytes;
++    return l;
++}
+ /// bankv2.layer_table: `out[L]` = the geometry at `ks[L]`, laid out layer-major,
+ /// expert-minor. Returns the bank's total bytes, or null (bad dims / overflow).
+ pub fn layerTable(ks: []const u32, hidden: u64, inter: u64, n_experts: u64, out: []Layer) ?u64 {
++    return layerTableIn(.classic, ks, hidden, inter, n_experts, out);
++}
++/// `layerTable` in `layout`.
++pub fn layerTableIn(layout: Layout, ks: []const u32, hidden: u64, inter: u64, n_experts: u64, out: []Layer) ?u64 {
+     var base: u64 = 0;
+     for (ks, out) |k, *l| {
+-        l.* = layerSegments(k, hidden, inter) orelse return null;
++        l.* = (if (layout == .a4k) layerSegmentsA4k(k, hidden, inter) else layerSegments(k, hidden, inter)) orelse return null;
+         l.base_offset = base;
+         const layer_bytes = std.math.mul(u64, n_experts, l.record_bytes) catch return null;
+         base = std.math.add(u64, base, layer_bytes) catch return null;
+     }
+     return base;
+ }
+-/// A record's two read ranges; their parts are the layer's segment lengths.
++/// A record's two read ranges; their parts are the layer's segment lengths, in its order on disk (`Layer.disk`).
+ pub const Spans = struct {
+-    /// Segments 0..5 (gate/up), contiguous from here.
++    /// The gate/up components' parts, contiguous from here.
+     gu_offset: u64,
+-    /// Segments 6..8 (down), contiguous from here.
++    /// The down components' parts, contiguous from here.
+     down_offset: u64,
+ };
+ /// EXL3's record topology on the reader: nine components, six in the gate/up range.
+@@ -197,6 +227,8 @@
+     sidecar: expert_io.UncachedFd = .{ .fd = -1, .size = 0 },
+     /// Bytes the records occupy (v2 `sidecar.size`, <= the file's).
+     sidecar_size: u64 = 0,
++    /// The records' layout (v2 `sidecar.layout`).
++    layout: Layout = .classic,
+     /// sha256 of the padded record (v2) and of its logical bytes (v1).
+     pub const Digests = struct { padded: [32]u8, logical: [32]u8 };
+     /// Parses and checks both manifests and opens experts.bin, once; any
+@@ -229,9 +261,14 @@
+     }
+     pub fn spans(self: *const Bank, layer: u32, expert: u32) Spans {
+         const off = self.recordOffset(layer, expert);
+-        const segs = &self.layers[layer].segments;
+-        return .{ .gu_offset = off + segs[0].offset, .down_offset = off + segs[gu_components].offset };
++        const l = &self.layers[layer];
++        return .{ .gu_offset = off + l.segments[l.disk[0]].offset, .down_offset = off + l.segments[l.disk[gu_components]].offset };
+     }
++    /// The read pool's part order (`expert_io.Options.disk_order`): an a4k bank's, null in a classic one (the
++    /// components' own order).
++    pub fn diskOrder(self: *const Bank) ?[n_components]u8 {
++        return if (self.layout == .a4k) a4k.disk_order else null;
++    }
+     pub fn digest(self: *const Bank, layer: u32, expert: u32) *const Digests {
+         return &self.digests[@as(usize, layer) * self.n_experts + expert];
+     }
+@@ -251,6 +288,11 @@
+         self.hidden = d.hidden;
+         self.inter = d.inter;
+         self.n_experts = @intCast(d.n_experts);
++        const sc = v2.sidecar orelse return refuse(diag, error.ManifestSyntax, "v2: no sidecar", .{});
++        var layout: Layout = .classic;
++        if (sc.layout) |name| layout = std.meta.stringToEnum(Layout, name) orelse
++            return refuse(diag, error.SidecarGeometry, "v2: sidecar layout \"{s}\" is neither classic nor a4k", .{name});
++        self.layout = layout;
+         const table = v2.layers orelse return refuse(diag, error.ManifestSyntax, "v2: no layer table", .{});
+         if (table.len != d.n_layers) return refuse(diag, error.LayerGeometry, "v2: {d} layer entries != dims.n_layers {d}", .{ table.len, d.n_layers });
+         const ks = try a.alloc(u32, table.len);
+@@ -261,13 +303,12 @@
+             k.* = @intCast(t.K);
+         }
+         self.layers = try a.alloc(Layer, table.len);
+-        const total = layerTable(ks, d.hidden, d.inter, d.n_experts, self.layers) orelse return refuse(diag, error.DimsInvalid, "v2: bank size overflows", .{});
++        const total = layerTableIn(layout, ks, d.hidden, d.inter, d.n_experts, self.layers) orelse return refuse(diag, error.DimsInvalid, "v2: bank size overflows (or an {t} code off the block)", .{layout});
+         for (table, self.layers, 0..) |t, *want, li| {
+             if (!segmentsMatch(t.segments, want, 0) or t.record_bytes != want.record_bytes or t.logical_bytes != want.logical_bytes)
+-                return refuse(diag, error.LayerGeometry, "v2: layer {d} segment table / record size differs from the v2 geometry for K={d}", .{ li, t.K });
++                return refuse(diag, error.LayerGeometry, "v2: layer {d} segment table / record size differs from the {t} v2 geometry for K={d}", .{ li, layout, t.K });
+             if (t.base_offset != want.base_offset) return refuse(diag, error.LayerGeometry, "v2: layer {d} base_offset {d} != {d}", .{ li, t.base_offset, want.base_offset });
+         }
+-        const sc = v2.sidecar orelse return refuse(diag, error.ManifestSyntax, "v2: no sidecar", .{});
+         if (sc.size != total) return refuse(diag, error.SidecarGeometry, "v2: sidecar.size {d} != {d}", .{ sc.size, total });
+         if (sc.alignment != record_alignment) return refuse(diag, error.SidecarGeometry, "v2: sidecar alignment {d} != {d}", .{ sc.alignment, record_alignment });
+         if (!bank_file.plainName(sc.file)) return refuse(diag, error.SidecarGeometry, "v2: sidecar file \"{s}\" is not a plain file name", .{sc.file});
+@@ -401,7 +442,7 @@
+ };
+ const SegJson = struct { component: []const u8, dtype: []const u8, shape: []const u64, offset: u64, length: u64 };
+ const V1SegJson = struct { component: []const u8, dtype: []const u8, shape: []const u64, offset: u64, length: u64, shard: []const u8 };
+-const SidecarJson = struct { file: []const u8, alignment: u64, size: u64 };
++const SidecarJson = struct { file: []const u8, alignment: u64, size: u64, layout: ?[]const u8 = null };
+ const V1RecordJson = struct {
+     layer: u64,
+     expert: u64,
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weights/streamed/sdk_ext/expert/io.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/io.zig	2026-11-01 08:24:04
++++ b/sdk/weights/streamed/sdk_ext/expert/io.zig	2026-11-01 08:24:05
+@@ -198,7 +198,13 @@
+     /// the others staged and copied. 0 (the default): off. `direct` wins when both are set.
+     parts_block: u64 = 0,
+     spec: ?Spec = null,
++    /// The records' part order on disk, its first `components` entries (a bank whose parts are not in its components'
++    /// order: an a4k EXL3 bank, expert/a4k.zig); null (the default): the components' own order. `Records` hands the C
++    /// pool every record's rows and lengths in this order, so each range's parts are read back to back as they lie.
++    disk_order: ?[max_disk_components]u8 = null,
+ };
++/// The most components a record of a bank with its own order on disk (`Options.disk_order`) has.
++pub const max_disk_components = 16;
+ /// A speculative staging slot: the page-rounded record plus two pages.
+ pub fn slotBytes(record_bytes: u64, page: u64) u64 {
+     return std.mem.alignForward(u64, record_bytes, page) + 2 * page;
+@@ -297,6 +303,8 @@
+     /// Demand's tickets end here.
+     demand_tickets: u32 = 0,
+     record_bytes: u64 = 0,
++    /// `Options.disk_order`, for `Records`.
++    disk_order: ?[max_disk_components]u8 = null,
+     /// Starts the process's pool (the speculative class, when given, is
+     /// configured first). Staging, status words, counters and the log live
+     /// here and stay put until `stop`.
+@@ -323,7 +331,7 @@
+         @memset(log_arr, 0);
+         @memset(published, false);
+         const demand: u32 = opt.tickets - opt.reserve;
+-        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand };
++        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand, .disk_order = opt.disk_order };
+         var bufs: [max_spec]u64 = undefined;
+         var threads: i32 = 0;
+         var slot_bytes: u64 = 0;
+@@ -505,6 +513,14 @@
+     return struct {
+         /// One record's destinations, a row address per component.
+         pub const Rows = [components]u64;
++        /// One record's values (rows or lengths, component order) in the pool's order on disk (`Options.disk_order`; the
++        /// components' own without one): what the C pool reads a range's parts back to back in.
++        fn onDisk(pool: *const Pool, x: *const Rows) Rows {
++            const order = pool.disk_order orelse return x.*;
++            var out: Rows = undefined;
++            for (&out, order[0..components]) |*o, k| o.* = x[k];
++            return out;
++        }
+         /// One submit: `rows.len` records, every gate/up span (`gu_offsets`, `gate_up` parts) then every down span, each
+         /// part `lens[c]` bytes into `rows[i][c]`, each span a job of its own (idle workers read them side by side, each
+         /// its own status). Returns the first of its 2n tickets.
+@@ -548,13 +564,15 @@
+             const first = pool.claimTickets(lo, hi, next, count);
+             var offsets: [2 * max_items]i64 = undefined;
+             var row_ptrs: [max_items][*]const u64 = undefined;
++            var drows: [max_items]Rows = undefined;
+             for (0..n) |i| {
+                 offsets[i] = @intCast(gu_offsets[i]);
+                 offsets[n + i] = @intCast(down_offsets[i]);
+-                row_ptrs[i] = &rows[i];
++                drows[i] = onDisk(pool, &rows[i]);
++                row_ptrs[i] = &drows[i];
+             }
+             var lens_i: [components]i64 = undefined;
+-            for (lens.*, &lens_i) |l, *li| li.* = @intCast(l);
++            for (onDisk(pool, lens), &lens_i) |l, *li| li.* = @intCast(l);
+             try submitted(pool, first, count, c.q3ld_submit(fd.fd, @intCast(fd.size), no_deadline, @intCast(n), gate_up, components - gate_up, &offsets, &row_ptrs, &lens_i, first), next);
+             return first;
+         }
+@@ -571,17 +589,15 @@
+         /// Arms the pre-read class with one geometry's component lengths (needs the speculative class). The pool
+         /// binds a demand range to a pre-range only at this topology and these lengths.
+         pub fn armPreRead(pool: *Pool, lens: *const Rows) !void {
+-            _ = pool;
+             var l: [components]i64 = undefined;
+-            for (lens, &l) |x, *y| y.* = @intCast(x);
++            for (onDisk(pool, lens), &l) |x, *y| y.* = @intCast(x);
+             if (c.q3ld_pre_config(gate_up, components - gate_up, &l) != 0) return error.PreReadRefused;
+         }
+         /// A layer call's certain misses (record bases, route order) before its plan, as gate/up and down ranges of
+         /// `lens`; `tag` = the call's settle value. Returns how many ranges were queued.
+         pub fn preRead(pool: *Pool, fd: UncachedFd, tag: i64, bases: []const i64, lens: *const Rows) !u32 {
+-            _ = pool;
+             var l: [components]i64 = undefined;
+-            for (lens, &l) |x, *y| y.* = @intCast(x);
++            for (onDisk(pool, lens), &l) |x, *y| y.* = @intCast(x);
+             const rc = c.q3ld_pre_read_lens(fd.fd, @intCast(fd.size), tag, @intCast(bases.len), bases.ptr, &l);
+             if (rc < 0) return error.PreReadRefused;
+             return @intCast(rc);
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/stream.zig	2026-11-01 08:24:04
++++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig	2026-11-01 08:24:05
+@@ -43,10 +43,24 @@
+         pub fn miniStride(l: *const Layer) u64 {
+             return if (comptime @hasField(Layer, "minis")) l.record_bytes else 0;
+         }
+-        /// A routed id's span in the file: its records back to back (the speculative class reads it whole).
++        /// A routed id's span in the file: its records back to back (the speculative class reads it whole), the last one to
++        /// its last segment's end (`extentOf`).
+         pub fn spanOf(l: *const Layer) u64 {
+-            return (minisOf(l) - 1) * miniStride(l) + l.logical_bytes;
++            return (minisOf(l) - 1) * miniStride(l) + extentOf(l);
+         }
++        /// One record's bytes from its start to its last segment's end: `Layer.extent` where the bank declares it (an a4k
++        /// record's lead, then its segments), else its logical bytes (the segments back to back from the record's start).
++        pub fn extentOf(l: *const Layer) u64 {
++            return if (comptime @hasField(Layer, "extent")) @max(l.extent, l.logical_bytes) else l.logical_bytes;
++        }
++        /// Where a record's gate/up range and its down range start in it: the first part of each in the bank's order on
++        /// disk (`Layer.disk` where the bank declares it, else the components' own order).
++        pub fn guStart(l: *const Layer) u64 {
++            return if (comptime @hasField(Layer, "disk")) l.segments[l.disk[0]].offset else l.segments[0].offset;
++        }
++        pub fn downStart(l: *const Layer) u64 {
++            return if (comptime @hasField(Layer, "disk")) l.segments[l.disk[gu_components]].offset else l.segments[gu_components].offset;
++        }
+         /// The most records a routed id may have (a read job holds `expert_io.max_items` records).
+         pub const max_minis = expert_io.max_items;
+         /// The most records any layer's routed id has.
+@@ -868,7 +882,7 @@
+                     if (la.preread) for (bank.layers) |l| {
+                         var gu: u64 = 0;
+                         for (l.segments[0..gu_components]) |sg| gu += sg.length;
+-                        if (l.segments[0].offset != 0 or l.segments[gu_components].offset != gu) return error.MixedGeometry;
++                        if (downStart(&l) != guStart(&l) + gu) return error.MixedGeometry;
+                         if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
+                     };
+                 }
+@@ -982,6 +996,12 @@
+                     const ne: usize = bank.n_experts;
+                     fl.* = .{ .loads = fill_loads[i * ne ..][0..ne], .reads = fill_reads[i * ne ..][0..ne], .parts = fill_parts[i * fill_parts_n ..][0..fill_parts_n] };
+                 }
++                // A bank whose parts lie in their own order on disk (an a4k bank): the pool reads each range's parts in it.
++                if (comptime @hasDecl(B.Bank, "diskOrder")) if (bank.diskOrder()) |d| {
++                    var order: [expert_io.max_disk_components]u8 = @splat(0);
++                    @memcpy(order[0..d.len], &d);
++                    pool_opt.disk_order = order;
++                };
+                 const pool = try expert_io.Pool.start(a, pool_opt);
+                 errdefer pool.stop();
+                 if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);
+@@ -1563,7 +1583,7 @@
+                 var bases: [expert_lookahead.max_candidates * max_minis]i64 = undefined;
+                 var n: usize = 0;
+                 for (misses) |e| for (0..minisOf(geom)) |m| {
+-                    bases[n] = @intCast(self.bank.recordOffset(layer, e) + @as(u64, @intCast(m)) * miniStride(geom));
++                    bases[n] = @intCast(self.bank.recordOffset(layer, e) + guStart(geom) + @as(u64, @intCast(m)) * miniStride(geom));
+                     n += 1;
+                 };
+                 _ = B.Records.preRead(self.pool, self.bank.sidecar, tag, bases[0..n], &self.layers[layer].lens) catch

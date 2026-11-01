@@ -396,6 +396,18 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   read-ahead records posted against 1082; adoption held (3954 against 3944). Exact: the texts are the policy-off
   references in every arm (cold d081845201, new-text slice 3 4d5b401f3c).
 
+- An a4k bank (patches/turboexl3-zzz8m-a4k.patch, src/mlx_serve/sdk/weights/streamed/expert/a4k.zig; the manifest declares
+  it, `expert-manifest-v2.json`'s `sidecar.layout` "a4k"): each record's three codes start on a 4 KiB block, so the
+  PARTS route reads every code straight into its slot row (99.7% of a record) where the classic layout reads the gate's
+  code alone (33%). On disk a record is a zero lead of 3,072 B, the gate/up span [gate rout, gate rin, up rout, up rin,
+  gate code, up code], then the down span [down code, down rout, down rin], padded to 4 KiB: 4,096 B more a record
+  (+62.9 MB a bank). The segments' bytes, lengths and shapes are the classic ones; the bank parses the layout and checks
+  its table against `a4k.geometry`, the read pool gets each record's rows and lengths in the order on disk
+  (`expert_io.Options.disk_order`), the speculative class reads a record to its last segment and the pre-read class from
+  its gate/up start. A classic bank runs the classic path; an older build refuses an a4k bank by name (its segment table).
+  `zig build test`'s a4k gate reads the same records laid out both ways through every route of the copied pool and
+  finds the same slot bytes (`zig build test -Da4k-gate=<classic>:<a4k>` adds two real packs).
+
 ## The pack
 
 - `config.json` keeps exllamav3's `quantization_config` (codebook mul1) and names the Engram tables, which stay in

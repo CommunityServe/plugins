@@ -104,6 +104,24 @@ pub fn build(b: *std.Build) void {
     parts_gate.root_module.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" } });
     parts_gate.root_module.addIncludePath(b.path(csrc));
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(parts_gate).step);
+    // The a4k record layout's byte gate (zzzzt): the copied read pool's C file alone (no MLX) reading the same records laid
+    // out classic and a4k (src/mlx_serve/sdk/weights/streamed/expert/a4k.zig) through the staging, PARTS, speculative and
+    // pre-read routes, the same slot bytes (src/a4k_test.zig); A4K_GATE_PACKS=<classic>:<a4k> adds two real packs.
+    const a4k_gate = b.addTest(.{ .name = "a4k", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/a4k_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    a4k_gate.root_module.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" } });
+    a4k_gate.root_module.addIncludePath(b.path(csrc));
+    const a4k_run = b.addRunArtifact(a4k_gate);
+    // -Da4k-gate=<classic pack>:<a4k pack>: the real-file gate reads both packs' experts.bin (always run when given).
+    if (b.option([]const u8, "a4k-gate", "Two pack dirs <classic>:<a4k>: src/a4k_test.zig's real-file gate reads both experts.bin")) |packs| {
+        a4k_run.setEnvironmentVariable("A4K_GATE_PACKS", packs);
+        a4k_run.has_side_effects = true;
+    }
+    b.top_level_steps.get("test").?.step.dependOn(&a4k_run.step);
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/turboexl3_sdk.zig"),
         .target = target,
