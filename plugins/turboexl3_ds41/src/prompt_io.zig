@@ -23,11 +23,15 @@
 
 const std = @import("std");
 
-/// The switch (`configure`, at load).
+/// The switch (`configure`, at load). `2` also splits each wide layer's read-ahead wait (`split_ra`).
 pub var on: bool = false;
+/// `MLX_SERVE_DSV41_PROMPT_IO=2`: the model's read-ahead evaluates the stream's rows, then their collapse, before its
+/// routes (`raStep`), so the `[prompt-io] wide` line splits its wait; two more syncs a wide layer, nothing else changes.
+pub var split_ra: bool = false;
 
 pub fn configure(value: ?[]const u8) void {
     on = if (value) |v| v.len > 0 and v[0] != '0' else false;
+    split_ra = if (value) |v| std.mem.eql(u8, v, "2") else false;
     reset();
     prev = @splat(@splat(0));
     prev_n = @splat(0);
@@ -83,6 +87,12 @@ const Call = struct {
     t1: u64 = 0,
     /// the layer's start (the previous call's end, or the prompt's first hook)
     t_layer: u64 = 0,
+    /// a wide layer's read-ahead routes read back (`raEval`, 0: none), and its graph's steps built (`wide`, 0: none)
+    ra_eval: u64 = 0,
+    /// with `split_ra`: the read-ahead's stream rows and their collapse evaluated (`raStep`, 0: none)
+    ra_cat: u64 = 0,
+    ra_col: u64 = 0,
+    g: [n_wide]u64 = @splat(0),
     c_layer: Counters = .{},
     c0: Counters = .{},
     c1: Counters = .{},
@@ -109,6 +119,13 @@ var dropped: usize = 0;
 /// The model's read-ahead of the layer about to call (its start and end), consumed by the call.
 var ra_layer: ?u16 = null;
 var ra_t: [2]u64 = .{ 0, 0 };
+/// The wide layer about to call: its read-ahead's routes read back, and its graph's steps built (`wide`).
+var ra_eval_layer: ?u16 = null;
+var ra_step_layer: ?u16 = null;
+var ra_step_t: [2]u64 = .{ 0, 0 };
+var ra_eval_t: u64 = 0;
+var wide_layer: ?u16 = null;
+var wide_t: [n_wide]u64 = @splat(0);
 /// The probe's votes per decoder layer, at each probe layer; which were taken this prompt.
 var votes: [2][max_layers][max_experts]u16 = undefined;
 var voted_in: [2][max_layers]bool = @splat(@splat(false));
@@ -130,6 +147,9 @@ pub fn reset() void {
     n_calls = 0;
     dropped = 0;
     ra_layer = null;
+    ra_eval_layer = null;
+    ra_step_layer = null;
+    wide_layer = null;
     voted_in = @splat(@splat(false));
     n_probes = 0;
 }
@@ -146,6 +166,43 @@ pub fn readAhead(layer: usize, t0: u64, t1: u64) void {
     if (!on) return;
     ra_layer = @intCast(layer);
     ra_t = .{ t0, t1 };
+}
+
+/// A wide layer's graph, step by step as the model builds it before its routed call (host clock; nothing evaluates
+/// between the steps): the attention-side mix and norm, the projections, every span's attention and output groups, the
+/// output projection, the FFN-side mix and norm. The `[prompt-io] wide` line gives each step's build time and the read-
+/// ahead's split into its routes' wait and its host work.
+pub const Wide = enum { hc, qkv, attn, wob, ffn };
+const n_wide = std.enums.values(Wide).len;
+
+pub fn wide(layer: usize, w: Wide) void {
+    if (!on) return;
+    const l: u16 = @intCast(layer);
+    if (wide_layer == null or wide_layer.? != l) {
+        wide_layer = l;
+        wide_t = @splat(0);
+    }
+    wide_t[@intFromEnum(w)] = now();
+}
+
+/// `split_ra`: the read-ahead of `layer` has its stream's rows (`cat`), then their collapse (`col`), evaluated.
+pub const RaStep = enum { cat, col };
+
+pub fn raStep(layer: usize, st: RaStep) void {
+    if (!on) return;
+    const l: u16 = @intCast(layer);
+    if (ra_step_layer == null or ra_step_layer.? != l) {
+        ra_step_layer = l;
+        ra_step_t = .{ 0, 0 };
+    }
+    ra_step_t[@intFromEnum(st)] = now();
+}
+
+/// The model's read-ahead of `layer` has its routes back (the host's own work follows).
+pub fn raEval(layer: usize) void {
+    if (!on) return;
+    ra_eval_layer = @intCast(layer);
+    ra_eval_t = now();
 }
 
 /// A routed call of the prompt begins: `c` the stream's counters now.
@@ -166,6 +223,19 @@ pub fn callStart(layer: usize, rows: usize, c: Counters) void {
         r.ra1 = ra_t[1];
     };
     ra_layer = null;
+    if (ra_eval_layer) |l| if (l == layer) {
+        r.ra_eval = ra_eval_t;
+    };
+    ra_eval_layer = null;
+    if (ra_step_layer) |l| if (l == layer) {
+        r.ra_cat = ra_step_t[0];
+        r.ra_col = ra_step_t[1];
+    };
+    ra_step_layer = null;
+    if (wide_layer) |l| if (l == layer) {
+        r.g = wide_t;
+    };
+    wide_layer = null;
     calls[n_calls] = r;
     n_calls += 1;
 }
@@ -297,6 +367,24 @@ const Side = struct {
 };
 
 /// The prompt ended (the source's phase change to decode): its lines, `c` the stream's counters now.
+/// A wide call's split (ns): its read-ahead's wait for its routes and its host work after, then each graph step's build
+/// (from the read-ahead's end: the mix, projections, spans, output projection, FFN-side mix) and the router's to the call.
+fn wideSteps(r: *const Call) [8]u64 {
+    var out: [8]u64 = @splat(0);
+    if (r.ra_eval != 0 and r.ra0 != 0) {
+        out[0] = r.ra_eval -| r.ra0;
+        out[1] = r.ra1 -| r.ra_eval;
+    }
+    var last = if (r.ra1 != 0) r.ra1 else r.g[0];
+    for (r.g, 0..) |t, k| {
+        if (t == 0) continue;
+        out[2 + k] = t -| last;
+        last = t;
+    }
+    out[7] = r.t0 -| last;
+    return out;
+}
+
 pub fn report(c: Counters) void {
     if (!on or !active) {
         reset();
@@ -315,6 +403,12 @@ pub fn report(c: Counters) void {
         const attn_ns = r.t_idx -| r.t0;
         const moe_ns = r.t1 -| r.t_idx;
         std.debug.print("[prompt-io] call={d} layer={d} rows={d} dec={d} uniq={d} ra_ms={d:.1} attn_ms={d:.1} moe_ms={d:.1} other_ms={d:.1} layer_ms={d:.1} read_gb={d:.3} rwall_ms={d:.1} rwait_ms={d:.1} misses={d} hits={d} ahead_hits={d} ahead_posted={d}\n", .{ i, r.layer, r.rows, @intFromBool(r.dec), dc.misses + dc.hits, ms(ra_ns), ms(attn_ns), ms(moe_ns), ms(layer_ns -| (ra_ns + attn_ns + moe_ns)), ms(layer_ns), gb(dl.bytes), ms(dl.wall_ns), ms(dl.wait_ns), dc.misses, dc.hits, dc.ahead_hits, dl.ahead_posted });
+        if (r.g[0] != 0) {
+            const steps = wideSteps(r);
+            std.debug.print("[prompt-io] wide call={d} layer={d} ra_wait_ms={d:.1} ra_host_ms={d:.1} hc_ms={d:.1} qkv_ms={d:.1} attn_ms={d:.1} wob_ms={d:.1} ffn_ms={d:.1} route_ms={d:.1}", .{ i, r.layer, ms(steps[0]), ms(steps[1]), ms(steps[2]), ms(steps[3]), ms(steps[4]), ms(steps[5]), ms(steps[6]), ms(steps[7]) });
+            if (r.ra_cat != 0 and r.ra_col != 0 and r.ra_eval != 0) std.debug.print(" ra_cat_ms={d:.1} ra_col_ms={d:.1} ra_route_ms={d:.1}", .{ ms(r.ra_cat -| r.ra0), ms(r.ra_col -| r.ra_cat), ms(r.ra_eval -| r.ra_col) });
+            std.debug.print("\n", .{});
+        }
         all.add(r);
         if (r.dec) dec.add(r) else enc.add(r);
     }
@@ -329,6 +423,35 @@ pub fn report(c: Counters) void {
         std.debug.print("[ced-probe] layer={d} actual={d} cut={d} p10={d:.2} p19={d:.2} u10={d:.2}/{d} u19={d:.2}/{d} res={d:.2} prev={s} have={d}{d}\n", .{ p.layer, p.actual, p.cut, share(p.top[0], p.actual), share(p.top[1], p.actual), share(p.voted_hit[0], p.actual), p.voted[0], share(p.voted_hit[1], p.actual), p.voted[1], share(p.res, p.actual), prev_s, @intFromBool(p.have[0]), @intFromBool(p.have[1]) });
     }
     reset();
+}
+
+test "prompt_io wide marks: a layer's call takes its own marks, another layer's are dropped, the split adds up" {
+    const was = on;
+    defer on = was;
+    on = true;
+    reset();
+    defer reset();
+    const r: Call = .{ .ra0 = 100, .ra1 = 160, .ra_eval = 140, .t0 = 400, .g = .{ 170, 200, 300, 330, 360 } };
+    const steps = wideSteps(&r);
+    try std.testing.expectEqualSlices(u64, &.{ 40, 20, 10, 30, 100, 30, 30, 40 }, &steps);
+    var sum: u64 = 0;
+    for (steps[2..]) |x| sum += x;
+    try std.testing.expectEqual(r.t0 - r.ra1, sum);
+    wide(3, .hc);
+    wide(4, .hc);
+    raEval(4);
+    callStart(4, 16384, .{});
+    try std.testing.expect(calls[0].g[0] != 0 and calls[0].ra_eval != 0);
+    wide(5, .hc);
+    callStart(6, 128, .{});
+    try std.testing.expectEqual(@as(u64, 0), calls[1].g[0]);
+    raStep(7, .cat);
+    raStep(7, .col);
+    callStart(7, 16384, .{});
+    try std.testing.expect(calls[2].ra_cat != 0 and calls[2].ra_col >= calls[2].ra_cat);
+    raStep(8, .cat);
+    callStart(9, 16384, .{});
+    try std.testing.expectEqual(@as(u64, 0), calls[3].ra_cat);
 }
 
 test "prompt_io rank: larger count first, ties by the lower id, zeros dropped" {

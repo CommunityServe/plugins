@@ -1,0 +1,62 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -278,7 +278,7 @@
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+     pub const MLX_SERVE_DSV41_LOOKAHEAD: Var = .{ .kind = .kill, .type = .text, .default = "2 (records read ahead a layer call; idle rule 0)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's expert lookahead (turboexl3_ds41): <budget>[:<idle>], the records read ahead a layer call 0 to 4 (0: the predictor off) and the idle rule 0 or 1; the served bytes are the same at every setting" };
+     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
+-    pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end" };
++    pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end, and a [prompt-io] wide line a wide layer; =2 also splits the read-ahead's wait by a sync at each step" };
+     pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -3857,8 +3857,10 @@
+     try prof.mark(.read_ahead, &.{ x, pres });
+     const pa = try hcPreNormWide(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm);
+     try prof.mark(.attn_hc, &.{ pa.sp.pre, pa.sp.post, pa.sp.comb, pa.h });
++    pio.wide(li, .hc);
+     const pos = try sc.i(ci(sp.p0));
+     const pj = try qkvProj(&sc, m, ly, ropeFor(m, li).fwd, pa.h, pos);
++    pio.wide(li, .qkv);
+     const heads = try gpa.alloc(A, n_spans);
+     defer gpa.free(heads);
+     const og: c_int = @intCast(m.cfg.dsv4_o_groups);
+@@ -3881,9 +3883,12 @@
+         hold(&sp.topks[k], sh.topk);
+         hold(&sp.cands[k], sh.cand);
+     }
++    pio.wide(li, .attn);
+     const y = try ly.wo_b.apply(&sc, try sc.concat(heads, 0));
+     try prof.mark(.attn_out, &.{y});
++    pio.wide(li, .wob);
+     const pf = try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
++    pio.wide(li, .ffn);
+     // A streamed bank reads each layer's experts once per call: one MoE over all of its rows.
+     const group = if (m.streamed != null) n_spans else @max(1, m.moe_rows / sp.span);
+     var k0: usize = 0;
+@@ -3909,12 +3914,22 @@
+ fn readAhead(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, li: usize, x: A, pre: A, img: A, ra: anytype, ctx: *anyopaque) !void {
+     const t0: u64 = if (pio.on) pio.now() else 0;
+     defer if (pio.on) pio.readAhead(li, t0, pio.now());
++    // MLX_SERVE_DSV41_PROMPT_IO=2: the wait split by an eval at each step, the stream's rows, then its collapse.
++    if (pio.split_ra) {
++        try evalAll(&.{ x, pre });
++        pio.raStep(li, .cat);
++    }
+     const h = try sc.rms(try hcCollapse(sc, x, pre), ly.ffn_norm, m.cfg.rms_norm_eps);
++    if (pio.split_ra) {
++        try evalAll(&.{h});
++        pio.raStep(li, .col);
++    }
+     const r = try route(sc, m, ly, h, img);
+     var host = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(host);
+     try mlx.check(mlx.mlx_astype(&host, r.idx, .uint32, sc.s));
+     try mlx.check(mlx.mlx_array_eval(host));
++    pio.raEval(li);
+     const n = mlx.mlx_array_size(host);
+     const ids = try sc.a.alloc(u16, n);
+     defer sc.a.free(ids);

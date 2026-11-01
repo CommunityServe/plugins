@@ -154,6 +154,14 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   resident as any other. Cold code-ctx16384 prompt on the full pack (M5 Max, w-pio-20261101-0338, a usage profile
   recorded on prompts apart from the test case): 997.3 tok/s against 991.9 and 986.4 for the seed alone; the encoder's
   read-ahead read 11.5 GB against 0.36, its read waits 0.95 s against 1.11 and 1.14. Off by default.
+- With `MLX_SERVE_DSV41_PROMPT_IO` (patches/turboexl3-zz8-prompt-wide.patch), a `[prompt-io] wide` line a wide layer
+  splits the time before its routed call: the read-ahead's wait for its predicted routes (`ra_wait_ms`) and its host
+  work after (`ra_host_ms`), then the host's build of each lazy graph step (the attention-side mix, the projections,
+  the spans' attention, the output projection, the FFN-side mix, the router to the call); nothing evaluates between
+  them. `=2` also splits the read-ahead's wait by an eval at each step (`ra_cat_ms` the stream's rows, `ra_col_ms`
+  their collapse, `ra_route_ms` the router), two more syncs a wide layer. On the full pack's cold code-ctx16384 prompt
+  (w-pio-20261101-0409) the waits summed 1.07 to 1.25 s over the encoder's layers 1 to 19, the host work 2 ms and the
+  graph builds about 40 ms.
 
 ## The pack
 
