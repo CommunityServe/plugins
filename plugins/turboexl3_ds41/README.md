@@ -443,7 +443,14 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   rows. en2 (w-pio-20261101-1523, ABBA, margin 3, EVICT, FCACHE, texts identical in every arm): cold 1185.6 / 1256.0 /
   1252.6 / 1191.6 tok/s (a1 b1 b2 a2: +5.53%), new text 1213.3 / 1300.0 / 1299.5 / 1265.8 (+4.86%); the file cache
   grows +0.03 / 0.00 GiB on (+7.97 / +7.19 off), the live peak ~8 GiB lower; layer 1's wait 887-899 ms (1059-1174
-  off), table 0 read in 1495-1505 ms (1783-1786).
+  off), table 0 read in 1495-1505 ms (1783-1786). A repacked table (`engram/engram-manifest.json`, engram_repack.py:
+  a row's codes then its scales in one 264 B record) is read a record a row, one pread through the blocks that hold it
+  (two blocks for the 6.4% of records that straddle one; src/engram_direct.zig's `readRecord`), in a whole-table read
+  and a decode token's alike (patches/turboexl3-zzz8t-engram-records.patch); a table in oMLX's layout keeps its two
+  reads. Exact: the same bytes. rp1p (w-pio-20261101-2110, two binaries, ABBA, margin 2, EVICT, COOL; a: ctl21 on the
+  canonical pack, b: this build on the repacked one; texts identical in every arm): cold 1347.0 / 1417.6 / 1416.4 /
+  1349.9 tok/s (a1 b1 b2 a2: +5.08%), new text 1414.3 / 1501.1 / 1496.5 / 1425.4 (+5.56%); the b arms' ios equal
+  their rows (310,174; 276,588), table 0 read in 951 ms (1532), layer 1's wait 365 ms (940).
 - `MLX_SERVE_DSV41_SCRATCH_ATTN` (src/scratch_attn.zig, src/attn_twins.zig, patches/turboexl3-zzz8p-scratch-attn.patch;
   on, `=0` off, `=check`): a wide prompt layer's attention spans write their scores (f32 [L, H, NK]) and probabilities
   (f16) into a ring of two per-prompt slots (S and P, 256 x 64 x 640 words a slot, 126 MB) instead of fresh MLX buffers:
