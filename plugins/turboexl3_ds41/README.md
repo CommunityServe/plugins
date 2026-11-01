@@ -441,6 +441,19 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   1252.6 / 1191.6 tok/s (a1 b1 b2 a2: +5.53%), new text 1213.3 / 1300.0 / 1299.5 / 1265.8 (+4.86%); the file cache
   grows +0.03 / 0.00 GiB on (+7.97 / +7.19 off), the live peak ~8 GiB lower; layer 1's wait 887-899 ms (1059-1174
   off), table 0 read in 1495-1505 ms (1783-1786).
+- `MLX_SERVE_DSV41_SCRATCH_ATTN` (src/scratch_attn.zig, src/attn_twins.zig, patches/turboexl3-zzz8p-scratch-attn.patch;
+  on, `=0` off, `=check`): a wide prompt layer's attention spans write their scores (f32 [L, H, NK]) and probabilities
+  (f16) into a ring of two per-prompt slots (S and P, 256 x 64 x 640 words a slot, 126 MB) instead of fresh MLX buffers:
+  a layer's spans are encoded inside its one eval, so their arrays are live together and MLX's cache cannot hand one
+  span's to the next at any cap (prf2: 66% of p missed cold, 82% new text, at 2 GiB as at 6 GiB). The gather's
+  launches are write-into twins of their stock texts, derived at load (each rebound array declared at the slot's
+  first word from a whole region, a one-word carrier output, a `dep` input) and compiled then by one launch; sm binds
+  qk's carrier, pv sm's, and a slot's next qk the slot's last pv's (span k - 2's). `check` serves the fresh launches
+  and compares each span's ring scores, probabilities and heads word for word (`[scratch-attn] check layer= s:words=
+  ,differ=,max_abs=,max_ulps=,over1= p:... o:...`). Exact: the stock statements. sa1 (w-pio-20261101-1748, ABBA,
+  margin 2, EVICT, on eeba5c8, texts identical in every arm): cold 1291.3 / 1303.5 / 1300.2 / 1296.4 tok/s (a1 b1 b2
+  a2: +0.62%), new text 1329.1 / 1351.3 / 1338.8 / 1330.5 (+1.15%); its check arm compared 66.8G words over 41 wide
+  layers' spans (s, p and the heads), 0 differing, max_ulps 0, no span fresh; the bank's rows 156 / 178 in every arm.
 
 ## The pack
 
