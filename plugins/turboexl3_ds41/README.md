@@ -454,6 +454,20 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   margin 2, EVICT, on eeba5c8, texts identical in every arm): cold 1291.3 / 1303.5 / 1300.2 / 1296.4 tok/s (a1 b1 b2
   a2: +0.62%), new text 1329.1 / 1351.3 / 1338.8 / 1330.5 (+1.15%); its check arm compared 66.8G words over 41 wide
   layers' spans (s, p and the heads), 0 differing, max_ulps 0, no span fresh; the bank's rows 156 / 178 in every arm.
+- `MLX_SERVE_DSV41_SCRATCH_HEADS` (src/scratch_attn.zig, patches/turboexl3-zzz8q-scratch-heads.patch; on, `=0`
+  off, `=check`; with `MLX_SERVE_DSV41_SCRATCH_ATTN` on, the default): phase B of the attention arena. A wide layer's WOA_ROWS run
+  (4096 rows: 16 spans) joined its spans' grouped heads with `concat` ([og, rows, in], 268 MB fresh a run) and
+  turboexl3's grouped linear then copied that join's transpose into the `[rows, og, in]` it reads. Now pv's twin
+  (derived at load: p from the ring's slot, the stock grouped store moved to the run region's `[rows, og, in]` at the
+  span's rows, the same values) writes each span's heads straight into its run's region (two by the run's parity, 537 MB),
+  the run's region is published (the host's event wait over it and the last pv carrier of each span parity) and its
+  `wo_a` reads it as it is; the region's next writers bind that `wo_a`'s output (`dep2`). A run that is not full (the
+  layer's last, 4095 rows at 16383) keeps the join. `check` serves the join and compares each full run's region with it
+  word for word (an `h:` field on the `[scratch-attn] check` line). Exact: the same words. sb1 (w-pio-20261101-1835,
+  ABBA, margin 2, EVICT, on f073b85, texts identical in every arm): cold 1302.6 / 1345.6 / 1345.3 / 1304.1 tok/s (a1 b1
+  b2 a2: +3.23%), new text 1363.7 / 1428.0 / 1407.8 / 1346.6 (+4.63%); its check arm compared 402,653,184 words a wide
+  layer (its three full runs' heads), 0 differing, over 41 check lines (120 runs on the regions, 40 joined); the bank's
+  rows 156 / 178 in every arm.
 
 ## The pack
 

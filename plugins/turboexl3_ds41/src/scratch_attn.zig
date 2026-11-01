@@ -126,6 +126,10 @@ pub fn take(rows: usize, heads: usize, nk: usize) ?u1 {
 pub fn soff(j: u1) A {
     return soffs[j];
 }
+/// Slot `j`'s first word (in S and in P).
+pub fn slotWord(j: u1) u32 {
+    return @intCast(@as(usize, j) * g_rows * g_heads * g_nk);
+}
 pub fn depFor(j: u1) A {
     return if (last_read[j].ctx != null) last_read[j] else no_dep;
 }
@@ -138,6 +142,15 @@ pub fn readBy(j: u1, carrier: A) !void {
 pub fn releaseAll() void {
     s_region.free();
     p_region.free();
+    for (&run_regions) |*r| r.free();
+    for (&run_release) |*x| drop(x);
+    for (&run_last) |*x| drop(x);
+    h_rows = 0;
+    h_groups = 0;
+    h_in = 0;
+    heads_live = false;
+    run_live = false;
+    span_live = false;
     for (&last_read) |*x| drop(x);
     for (&soffs) |*x| drop(x);
     drop(&no_dep);
@@ -161,11 +174,164 @@ fn drop(slot: *A) void {
     slot.* = none;
 }
 
+// ── MLX_SERVE_DSV41_SCRATCH_HEADS (phase B) ─────────────────────────────────────────────────────────────────────────
+// (read at load; unset, empty or `1`: on; `0`: off; `check`: the joined heads served, each full run's region compared
+// with them; anything else is refused by name; with the ring on, `MLX_SERVE_DSV41_SCRATCH_ATTN`, the default.) A wide layer's
+// WOA_ROWS run (`woa.rows` rows: 16 spans of 256) joined its spans' grouped heads with `concat` ([og, rows, in], 268 MB
+// fresh a run), and turboexl3's grouped linear then made the `[rows, og, in]` it reads from that join's transpose (another
+// copy). Phase B's pv twin writes each span's heads straight into its run's region in `[rows, og, in]` at its rows (the
+// stock grouped store moved to that layout, the same words), and the run's `wo_a` reads the region as it is: no join, no
+// transpose. Two run regions by the run's parity a layer; a run's region is published (the host's event wait over the
+// region and the last pv carrier of each span parity) for its `wo_a`, whose output the region's next writers bind
+// (`dep2`). A run that is not full (the layer's last, 4095 rows at 16383) keeps the join.
+
+pub var heads_mode: Mode = .on;
+pub fn configureHeads(value: ?[]const u8) scratch.Error!void {
+    heads_mode = try parse(value);
+}
+pub var run_regions: [slots]scratch.Region = .{ .{}, .{} };
+/// Each run region's last reader (its run's `wo_a` output): the region's next writers bind it as `dep2`.
+var run_release: [slots]A = .{ none, none };
+/// The run regions' geometry: rows, groups, a group's columns.
+var h_rows: usize = 0;
+var h_groups: usize = 0;
+var h_in: usize = 0;
+/// The layer's runs take the regions; the next run's region; the current run's and span's targets.
+var heads_live = false;
+var run_next: u1 = 0;
+var run_cur: u1 = 0;
+var run_live = false;
+var span_live = false;
+var span_row: u32 = 0;
+/// The current run's last pv carrier of each span parity (the publish gates both).
+var run_last: [slots]A = .{ none, none };
+pub var runs_in: u64 = 0;
+pub var runs_fresh: u64 = 0;
+
+/// A wide layer's runs (after `layerBegin`): the run regions made at `rows x groups x in` of `dt` (or kept); false (the
+/// join) off, without the ring live, or past the regions' cap.
+pub fn headsLayerBegin(eligible: bool, rows: usize, groups: usize, in: usize, dt: mlx.mlx_dtype) !bool {
+    heads_live = false;
+    run_next = 0;
+    run_live = false;
+    span_live = false;
+    if (heads_mode == .off or !eligible or !live) return false;
+    const shape = [_]c_int{ @intCast(rows), @intCast(groups), @intCast(in) };
+    for (&run_regions) |*r| if ((try r.ensure(&shape, dt)) == null) return false;
+    if (h_rows != rows or h_groups != groups or h_in != in) {
+        for (&run_release) |*x| drop(x);
+        h_rows = rows;
+        h_groups = groups;
+        h_in = in;
+    }
+    heads_live = true;
+    return true;
+}
+
+/// Before a span's attention: whether its run takes a region (`full`: the run has its `woa.rows` rows), whether the span
+/// starts the run, and its first row in the run.
+pub fn headsSpan(full: bool, starts_run: bool, row: usize) void {
+    if (starts_run) for (&run_last) |*x| drop(x);
+    headsSpanAt(full, starts_run, row);
+}
+
+/// `headsSpan`'s bookkeeping (no MLX call: the plugin's tests link no MLX).
+fn headsSpanAt(full: bool, starts_run: bool, row: usize) void {
+    if (starts_run) {
+        run_cur = run_next;
+        run_live = heads_live and full;
+    }
+    span_live = run_live;
+    span_row = @intCast(row);
+}
+
+/// The span's target when its heads go into the run region: the region, the span's first row, what its writer binds as
+/// `dep2` (the region's last reader, else zeros); null: the span's heads are MLX's own (the join).
+pub const Target = struct { region: A, row: u32, dep2: A };
+pub fn headsTarget() ?Target {
+    if (!span_live) return null;
+    return .{ .region = run_regions[run_cur].arr, .row = span_row, .dep2 = if (run_release[run_cur].ctx != null) run_release[run_cur] else no_dep };
+}
+/// A span's heads pv wrote the region: its carrier, by the span's ring slot `j` (the span parity).
+pub fn headsWrote(j: u1, carrier: A) !void {
+    try hold(&run_last[j], carrier);
+}
+
+/// A run's end: its region published for its `wo_a` (a new handle the caller owns; the host's event wait over the
+/// region and the last pv carrier of each span parity), the next run on the other region; null: the run kept the join.
+pub fn headsRunEnd(s: mlx.mlx_stream) !?A {
+    if (!run_live) {
+        if (heads_live) runs_fresh += 1;
+        run_next +%= 1;
+        return null;
+    }
+    run_live = false;
+    span_live = false;
+    run_next +%= 1;
+    runs_in += 1;
+    var gated: [3]A = undefined;
+    var n: usize = 1;
+    gated[0] = run_regions[run_cur].arr;
+    for (run_last) |c| {
+        if (c.ctx != null) {
+            gated[n] = c;
+            n += 1;
+        }
+    }
+    if (n == 1) return error.ScratchHeadsUnwritten;
+    var outs: [3]A = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (outs[1..]) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    errdefer _ = mlx.mlx_array_free(outs[0]);
+    if (dsv41ev_wait(&gated, n, try readyEvent(), 1, null, 0, true, s, &outs) != 0) return error.ScratchHeadsPublish;
+    return outs[0];
+}
+/// The run region `run`'s reader (its `wo_a` output): the region's next writers bind it.
+pub fn headsReleased(token: A) !void {
+    try hold(&run_release[run_cur], token);
+}
+/// The layer's end.
+pub fn headsLayerEnd() void {
+    heads_live = false;
+    run_live = false;
+    span_live = false;
+}
+
+/// The host's event wait (src/host_shims.zig) over an event already at 1 (scratch.zig's `publish`, with more gated
+/// carriers).
+extern fn dsv41ev_create_metal(start: u64, object: *u64) i32;
+extern fn dsv41ev_wait(xs: [*]const A, n: usize, event: i32, value: u64, deps: ?[*]const A, n_deps: usize, track_inputs: bool, s: mlx.mlx_stream, outs: [*]A) c_int;
+var ready_event: i32 = -1;
+fn readyEvent() !i32 {
+    if (ready_event < 0) {
+        var object: u64 = 0;
+        const id = dsv41ev_create_metal(1, &object);
+        if (id < 0) return error.ScratchHeadsEvent;
+        ready_event = id;
+    }
+    return ready_event;
+}
+
+/// `check`: a full run's region (`region`, published) against the join of its spans' heads ([og, rows, in] each), in
+/// the region's `[rows, og, in]`, word for word, into the layer's `h` stats.
+pub fn compareRun(s: mlx.mlx_stream, region: A, parts: []const A) !void {
+    const vp = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx.mlx_vector_array_free(vp);
+    var joined = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(joined);
+    try mlx.check(mlx.mlx_concatenate_axis(&joined, vp, 1, s));
+    var rows_first = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows_first);
+    try mlx.check(mlx.mlx_transpose_axes(&rows_first, joined, &[_]c_int{ 1, 0, 2 }, 3, s));
+    try compare(s, .h, region, rows_first);
+}
+
 /// `check`: a span's ring result against the fresh one, word for word: the words, those that differ, the largest
 /// absolute difference, the largest distance in units in the last place (the words' integer distance) and the words
 /// more than one ulp apart.
 pub const Stats = struct { words: u64 = 0, differ: u64 = 0, max_abs: f64 = 0, max_ulps: u64 = 0, over1: u64 = 0 };
-pub const Out = enum { s, p, o };
+pub const Out = enum { s, p, o, h };
 /// The layer's, and the totals since the load.
 pub var layer_stats: std.enums.EnumArray(Out, Stats) = .initFill(.{});
 pub var total_stats: std.enums.EnumArray(Out, Stats) = .initFill(.{});
@@ -267,7 +433,8 @@ pub fn report(layer: usize) void {
     const sl = layer_stats.get(.s);
     const pl = layer_stats.get(.p);
     const ol = layer_stats.get(.o);
-    std.debug.print("[scratch-attn] check layer={d} s:words={d},differ={d},max_abs={e},max_ulps={d},over1={d} p:words={d},differ={d},max_abs={e},max_ulps={d},over1={d} o:words={d},differ={d},max_abs={e},max_ulps={d},over1={d} spans_in={d} spans_fresh={d} total_words={d} total_differ={d}\n", .{ layer, sl.words, sl.differ, sl.max_abs, sl.max_ulps, sl.over1, pl.words, pl.differ, pl.max_abs, pl.max_ulps, pl.over1, ol.words, ol.differ, ol.max_abs, ol.max_ulps, ol.over1, spans_in, spans_fresh, words, differ });
+    const hl = layer_stats.get(.h);
+    std.debug.print("[scratch-attn] check layer={d} s:words={d},differ={d},max_abs={e},max_ulps={d},over1={d} p:words={d},differ={d},max_abs={e},max_ulps={d},over1={d} o:words={d},differ={d},max_abs={e},max_ulps={d},over1={d} h:words={d},differ={d},max_abs={e},max_ulps={d},over1={d} spans_in={d} spans_fresh={d} runs_in={d} runs_fresh={d} total_words={d} total_differ={d}\n", .{ layer, sl.words, sl.differ, sl.max_abs, sl.max_ulps, sl.over1, pl.words, pl.differ, pl.max_abs, pl.max_ulps, pl.over1, ol.words, ol.differ, ol.max_abs, ol.max_ulps, ol.over1, hl.words, hl.differ, hl.max_abs, hl.max_ulps, hl.over1, spans_in, spans_fresh, runs_in, runs_fresh, words, differ });
     layer_stats = .initFill(.{});
 }
 
@@ -282,6 +449,41 @@ test "scratch_attn setting: on unset, empty or 1; 0 off; check; anything else re
     try std.testing.expectEqual(Mode.check, mode);
     for ([_][]const u8{ "on", "2", "Check", " 1" }) |v| try std.testing.expectError(error.ScratchSetting, configure(v));
     try configure(null);
+}
+
+test "scratch_heads setting: on unset, empty or 1; 0 off; check" {
+    for ([_]?[]const u8{ null, "", "1" }) |v| {
+        try configureHeads(v);
+        try std.testing.expectEqual(Mode.on, heads_mode);
+    }
+    try configureHeads("0");
+    try std.testing.expectEqual(Mode.off, heads_mode);
+    try configureHeads("check");
+    try std.testing.expectEqual(Mode.check, heads_mode);
+    try std.testing.expectError(error.ScratchSetting, configureHeads("on"));
+    try configureHeads(null);
+}
+
+test "scratch_heads spans: a full run's spans take its region, a run that is not full keeps the join" {
+    // (pure: no MLX call; the regions' arrays stay null)
+    const saved = .{ heads_live, run_next, run_cur, run_live, span_live, span_row };
+    defer {
+        heads_live = saved[0];
+        run_next = saved[1];
+        run_cur = saved[2];
+        run_live = saved[3];
+        span_live = saved[4];
+        span_row = saved[5];
+    }
+    heads_live = true;
+    run_next = 1;
+    headsSpanAt(true, true, 0);
+    try std.testing.expect(headsTarget() != null);
+    try std.testing.expectEqual(@as(u1, 1), run_cur);
+    headsSpanAt(true, false, 256);
+    try std.testing.expectEqual(@as(u32, 256), headsTarget().?.row);
+    headsSpanAt(false, true, 0);
+    try std.testing.expect(headsTarget() == null);
 }
 
 test "scratch_attn take: none unless live; a span past a slot's geometry fresh; the slots alternate" {

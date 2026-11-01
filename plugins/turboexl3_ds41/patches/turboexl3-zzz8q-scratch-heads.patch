@@ -1,0 +1,148 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -292,6 +292,7 @@
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "turboexl3", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' decode (turboexl3, the default: turboexl3_ds41's banked decode; streamer: the streamer's own EXL3 kernels)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+     pub const MLX_SERVE_DSV41_SCRATCH_ATTN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' attention spans (turboexl3_ds41): 1, each span's scores and probabilities in a ring of two per-prompt slots, the gather's launches as write-into twins of their stock texts (compiled at load); check, the fresh launches served and the ring's scores, probabilities and heads compared word for word ([scratch-attn] check lines); the same words (0: fresh buffers)" };
++    pub const MLX_SERVE_DSV41_SCRATCH_HEADS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' WOA_ROWS runs (turboexl3_ds41, with MLX_SERVE_DSV41_SCRATCH_ATTN on, the default): on (also 1), a full run's grouped heads written by pv's twin straight into a run region as [rows, og, in] and the run's wo_a reading it (no join, no transpose); check, the join served and each full run's region compared word for word; the same words (0: the join)" };
+     pub const MLX_SERVE_DSV41_SCRATCH_WAVES: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prefill waves' per-prompt regions (turboexl3_ds41): on (the default; unset, empty or 1), a wide prompt call's DIG-X waves launch write-into twins of their stock texts (derived and compiled at load) on two sets of regions (by the wave's parity), not fresh buffers for their intermediates, the same words; check, the fresh waves served and every launch's region output compared with the fresh one (words, max abs, max ulps); 0: fresh buffers" };
+     pub const MLX_SERVE_DSV41_SEED_FREE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 usage seed's rows free until routed (turboexl3_ds41): the prompt's read-ahead may take a row the load's seed filled that no route has used, for an expert its prediction ranks before the seeded one, and the CED decoder prefetch one whose expert its prediction does not name" };
+     pub const MLX_SERVE_DSV41_SHARED_HOIST: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode layer's shared expert committed on its own when the routed call returns (turboexl3_ds41): it runs behind the device hit wave, while a layer with misses waits on their bytes; the same kernels, served bytes unchanged (=0: in the layer's last stretch)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -1194,6 +1194,8 @@
+         qk_t: mlx.mlx_fast_metal_kernel,
+         sm: mlx.mlx_fast_metal_kernel,
+         pv: mlx.mlx_fast_metal_kernel,
++        /// MLX_SERVE_DSV41_SCRATCH_HEADS: pv's twin writing a span's grouped heads into its run's region; null off.
++        pv_heads: ?mlx.mlx_fast_metal_kernel = null,
+         /// Each twin's text from the stock one (a missed anchor refuses the load by name), then built.
+         fn init() !RingTwins {
+             const a = std.heap.page_allocator;
+@@ -1214,13 +1216,29 @@
+             const sm = try buildKernel("dsv41_attn_sm_ring", &.{ "s_rg", "picks", "sink", "meta", "scal", "p_dst", "dep", "soff" }, &.{"carrier"}, t_sm.ptr, "");
+             errdefer _ = mlx.mlx_fast_metal_kernel_free(sm);
+             const pv = try buildKernel("dsv41_attn_pv_ring", &.{ "p_rg", "kw", "comp", "picks", "meta", "periods", "dep", "soff" }, &.{ "o", "carrier" }, t_pv.ptr, MPP_HEADER);
+-            return .{ .qk = qk, .qk_t = qk_t, .sm = sm, .pv = pv };
++            errdefer _ = mlx.mlx_fast_metal_kernel_free(pv);
++            return .{ .qk = qk, .qk_t = qk_t, .sm = sm, .pv = pv, .pv_heads = if (sat.heads_mode != .off) try headsTwin() else null };
+         }
++        /// MLX_SERVE_DSV41_SCRATCH_HEADS: pv's twin with its p from the ring's slot (`soff[0]`) and its grouped heads
++        /// stored into its run's region (`o_dst`, `[rows, og, in]`, the span's first row `soff[1]`): the stock grouped
++        /// store moved to that layout (the same values; a missed statement refuses the load by name), `dep2` the
++        /// region's last reader.
++        fn headsTwin() !mlx.mlx_fast_metal_kernel {
++            const a = std.heap.page_allocator;
++            const subs = [_]sat.twins.Sub{.{
++                .old = "    device OT* dst = o + (size_t(h / hg) * L + l) * size_t(hg * D) + size_t(h % hg) * D + d;\n",
++                .new = "    device OT* dst = o + (size_t(soff[1] + l) * G + size_t(h / hg)) * size_t(hg * D) + size_t(h % hg) * D + d;\n",
++            }};
++            const t = try sat.twins.deriveWith(a, ATTN_PV_SOURCE, MPP_HEADER, &.{.{ .name = "o", .mtype = "OT", .off = null }}, &.{.{ .name = "p", .mtype = "float16_t" }}, &subs, &.{"dep2"});
++            defer a.free(t);
++            return buildKernel("dsv41_attn_pv_heads", &.{ "p_rg", "kw", "comp", "picks", "meta", "periods", "dep", "soff", "o_dst", "dep2" }, &.{"carrier"}, t.ptr, MPP_HEADER);
++        }
+         fn deinit(self: *RingTwins) void {
+             _ = mlx.mlx_fast_metal_kernel_free(self.qk);
+             _ = mlx.mlx_fast_metal_kernel_free(self.qk_t);
+             _ = mlx.mlx_fast_metal_kernel_free(self.sm);
+             _ = mlx.mlx_fast_metal_kernel_free(self.pv);
++            if (self.pv_heads) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+         }
+     };
+     pub fn init() !GatherAttn {
+@@ -2447,8 +2465,25 @@
+         const r_ins: []const A = if (qt.ctx != null) &r_qk_t else &r_qk;
+         try runKernel(sc, if (qt.ctx != null) r_k.qk_t else r_k.qk, r_ins, &.{.{ .shape = r_one, .dt = .uint32 }}, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}, r_carrier[0..1]);
+         try runKernel(sc, r_k.sm, &.{ sat.s_region.arr, picks, sink, meta, r_scal, sat.p_region.arr, r_carrier[0], r_off }, &.{.{ .shape = r_one, .dt = .uint32 }}, .{ ci(H * 32), ci(L) }, &.{.{ .name = "NJ", .v = ci((NK + 31) / 32) }}, &.{.{ "PT", .float16 }}, r_carrier[1..2]);
++        // MLX_SERVE_DSV41_SCRATCH_HEADS (phase B): the span's grouped heads straight into its run's region at its rows
++        // (`[rows, og, in]`, its `wo_a` reading the region); on, its carrier stands for the heads (the run is joined
++        // from the region, never from them); `check` also runs the stock pv below, after this one, for the join served.
++        var r_pv_dep = r_carrier[1];
++        if (r_k.pv_heads) |r_kh| {
++            if (sat.headsTarget()) |r_hb| {
++                const r_hoff = try sc.keep(mlx.mlx_array_new_data(&[_]u32{ sat.slotWord(j), r_hb.row }, &[_]c_int{2}, 1, .uint32));
++                var r_hc: [1]A = .{none};
++                try runKernel(sc, r_kh, &.{ sat.p_region.arr, keys_w, comp, picks, meta, grouped.?.periods, r_carrier[1], r_hoff, r_hb.region, r_hb.dep2 }, &.{.{ .shape = r_one, .dt = .uint32 }}, .{ ci(D / 128 * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = 1 }, .{ .name = "RD", .v = r_rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, &r_hc);
++                try sat.headsWrote(j, r_hc[0]);
++                if (sat.heads_mode == .on) {
++                    try sat.readBy(j, r_hc[0]);
++                    return r_hc[0];
++                }
++                r_pv_dep = r_hc[0];
++            }
++        }
+         var r_pv: [2]A = .{ none, none };
+-        try runKernel(sc, r_k.pv, &.{ sat.p_region.arr, keys_w, comp, picks, meta, grouped.?.periods, r_carrier[1], r_off }, &.{ .{ .shape = &.{ ci(og), ci(L), ci(H / og * D) }, .dt = m.act }, .{ .shape = r_one, .dt = .uint32 } }, .{ ci(D / 128 * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = 1 }, .{ .name = "RD", .v = r_rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, &r_pv);
++        try runKernel(sc, r_k.pv, &.{ sat.p_region.arr, keys_w, comp, picks, meta, grouped.?.periods, r_pv_dep, r_off }, &.{ .{ .shape = &.{ ci(og), ci(L), ci(H / og * D) }, .dt = m.act }, .{ .shape = r_one, .dt = .uint32 } }, .{ ci(D / 128 * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = 1 }, .{ .name = "RD", .v = r_rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, &r_pv);
+         try sat.readBy(j, r_pv[1]);
+         r_heads = r_pv[0];
+         if (sat.mode == .on) return r_heads;
+@@ -4235,6 +4270,10 @@
+     var run_scope: ?Scope = null;
+     defer if (run_scope) |*r| r.deinit();
+     var woa_check: WoaCheck = .{};
++    // MLX_SERVE_DSV41_SCRATCH_HEADS (phase B): a full run's grouped heads straight into a run region (`[rows, og, in]`),
++    // its `wo_a` reading the region: no join, no transpose (with the ring on and an EXL3 `wo_a`).
++    const heads_b = run > 1 and try sat.headsLayerBegin(sat.heads_mode != .off and sat.mode == .on and ly.wo_a.x3 != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
++    defer sat.headsLayerEnd();
+     for (0..n_spans) |k| {
+         const lo, const hi = sp.bounds(k);
+         // A span's core intermediates are dropped once built, as in the per-span path.
+@@ -4244,6 +4283,11 @@
+         var span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
+         if (pj.qt.ctx != null) span_pj.qt = try ssc.slice(pj.qt, 0, lo, hi);
+         if (pj.qh.ctx != null) span_pj.qh = try ssc.slice(pj.qh, 0, lo, hi);
++        // MLX_SERVE_DSV41_SCRATCH_HEADS: whether this span's run takes a region (its `run` spans all of `sp.span` rows).
++        if (heads_b) {
++            const r0 = k - in_run;
++            sat.headsSpan(r0 + run <= n_spans and sp.bounds(r0 + run - 1)[1] - sp.bounds(r0)[0] == run * sp.span, in_run == 0, in_run * sp.span);
++        }
+         var o_k = try attention(&ssc, m, st, li, try ssc.slice(pa.h, 0, lo, hi), sp.p0 + lo, &sh, span_pj);
+         // Each span (or each run of spans) takes its own `wo_a`: the rows the chunk's `wo_b` reads, not the heads, are
+         // joined. Heads the core handed back plain are roped and grouped here.
+@@ -4253,7 +4297,18 @@
+             run_heads[in_run] = try run_scope.?.keep(ssc.out(o_k));
+             in_run += 1;
+             if (in_run == run or k + 1 == n_spans) {
+-                heads[n_heads] = try sc.keep(try woaRun(&run_scope.?, m, ly, run_heads[0..in_run], &woa_check));
++                // MLX_SERVE_DSV41_SCRATCH_HEADS: a full run's `wo_a` over its published region; `check` serves the join
++                // and compares the region with it; the region's next writers bind the run's `wo_a` output.
++                const r_region = if (heads_b) try sat.headsRunEnd(sc.s) else null;
++                if (r_region) |rg| _ = try run_scope.?.keep(rg);
++                heads[n_heads] = if (r_region != null and sat.heads_mode == .on)
++                    try sc.keep(try attnOutARun(&run_scope.?, m, ly, r_region.?))
++                else
++                    try sc.keep(try woaRun(&run_scope.?, m, ly, run_heads[0..in_run], &woa_check));
++                if (r_region) |rg| {
++                    if (sat.heads_mode == .check) try sat.compareRun(sc.s, rg, run_heads[0..in_run]);
++                    try sat.headsReleased(heads[n_heads]);
++                }
+                 try prof.mark(.attn_out, heads[n_heads..][0..1]);
+                 n_heads += 1;
+                 in_run = 0;
+@@ -4271,7 +4326,7 @@
+     }
+     if (woa.mode == .check and run > 1) woa.report(li, woa_check.runs, woa_check.equal, woa_check.differ, woa_check.max_abs);
+     if (q_tail == .check) qtail.report(li);
+-    if (sat.mode == .check and m.attn_gather != null) sat.report(li);
++    if ((sat.mode == .check or sat.heads_mode == .check) and m.attn_gather != null) sat.report(li);
+     pio.wide(li, .attn);
+     const y = try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
+     try prof.mark(.attn_out, &.{y});
+@@ -4317,6 +4372,14 @@
+ /// MLX_SERVE_DSV41_WOA_ROWS: one run's `wo_a` over its spans' grouped heads `parts` (`[og, rows_k, in]` each), their rows
+ /// joined (`[og, rows, in]`) through one `attnOutA`: `[rows, og * o_lora]` in `m.act`. With `check`, also each span's own
+ /// `attnOutA`, the two compared word for word into `tally`, and the spans' served. A handle the caller frees.
++/// MLX_SERVE_DSV41_SCRATCH_HEADS: a full run's `wo_a` over its region `x` (`[rows, og, in]`, published): turboexl3's
++/// grouped linear reads that layout as it is (no join, no transpose), `[rows, og * o_lora]` in `m.act`, a new handle
++/// the caller frees.
++fn attnOutARun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, x: A) !A {
++    const p = ly.wo_a.x3 orelse return error.ScratchHeadsNoX3;
++    const L = dim(x, 0);
++    return sc.out(try sc.astype(try sc.reshape(try sc.keep(try t3.linearGrouped(sc.s, x, p, .mul1)), &.{ ci(L), -1 }), m.act));
++}
+ fn woaRun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, parts: []const A, tally: *WoaCheck) !A {
+     const joined = try attnOutA(sc, m, ly, try sc.concat(parts, 1), null);
+     if (woa.mode != .check) return sc.out(joined);
