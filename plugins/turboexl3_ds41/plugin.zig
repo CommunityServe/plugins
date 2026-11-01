@@ -36,6 +36,10 @@ const round_io = @import("src/round_io.zig");
 /// The decode's expert lookahead (`MLX_SERVE_DSV41_LOOKAHEAD`, src/stream_lookahead.zig), read by the copied stream
 /// (exl3_source.zig, experts.zig) through this root.
 pub const stream_lookahead = @import("src/stream_lookahead.zig");
+/// mlx-serve's expert usage profile on the streamed bank (src/expert_usage_cfg.zig: `MLX_SERVE_DSV41_RESIDENT_SEED`,
+/// `MLX_SERVE_DSV41_EXPERT_USAGE_DIR`, `_RECORD`, `_LABEL`), read by the copied EXL3 source through this root: the
+/// prompt rows seeded at the load with each layer's most used experts, and each request's routed experts recorded.
+pub const expert_usage_cfg = @import("src/expert_usage_cfg.zig");
 const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
 const v4plugin = @import("src/mlx_serve/plugins/deepseek_v4/plugin.zig");
@@ -124,6 +128,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     markov.tally = .{};
     // Before the model's load: the stream sizes its lookahead when it opens.
+    expert_usage_cfg.setting = expert_usage_cfg.parse(env.span(.MLX_SERVE_DSV41_RESIDENT_SEED), env.span(.MLX_SERVE_DSV41_EXPERT_USAGE_DIR), env.span(.MLX_SERVE_DSV41_EXPERT_USAGE_RECORD), env.span(.MLX_SERVE_DSV41_EXPERT_USAGE_LABEL)) catch |e| {
+        log.err("[turboexl3_ds41] the expert usage settings are refused ({s}): MLX_SERVE_DSV41_RESIDENT_SEED is usage or none, the usage dir and record absolute paths, a label only with a record\n", .{@errorName(e)});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     stream_lookahead.setting = stream_lookahead.parse(env.span(.MLX_SERVE_DSV41_LOOKAHEAD)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_LOOKAHEAD is none of 0 to 4, with an optional :0 or :1: the load is refused\n", .{});
         out.* = switch (e) {
@@ -442,9 +453,15 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     return v;
 }
 
+/// The request's prompt and the prefix its state kept (`resumePrompt`): the usage record's token counts.
+var req_prompt: usize = 0;
+var req_kept: usize = 0;
+
 /// The built-in's resume: the drafter's request begins on the prompt prefix the state kept.
 fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
     const n = ds.table.cache.resume_prompt.?(mp, slot, prompt, media_rows);
+    req_prompt = prompt.len;
+    req_kept = @min(@as(usize, @intCast(n)), prompt.len);
     dropPending();
     if (drafter) |*d| d.begin(prompt.slice()[0..@min(@as(usize, @intCast(n)), prompt.len)]);
     return n;
@@ -459,12 +476,24 @@ var meter_buf: [131072]u8 = undefined;
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = slot;
     stage_prof.requestEnd();
+    usageEnd(model(mp));
     const head = if (drafter) |*d| d.meters(&meter_buf) else meter_buf[0..0];
     const mid = streamMeters(model(mp), meter_buf[head.len..]);
     const tail = markov.meters(meter_buf[head.len + mid.len ..]);
     const n = head.len + mid.len + tail.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
+}
+
+/// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is
+/// logged; the request already ended).
+fn usageEnd(m: *ds.Model) void {
+    if (expert_usage_cfg.setting.recordPath() == null) return;
+    const r = m.mdl.streamed orelse return;
+    if (r.math != .source) return;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    const at: usize = if (m.mdl.dec_state) |*st| st.n else 0;
+    src.usageEnd(std.Io.Threaded.global_single_threaded.io(), req_prompt -| req_kept, at -| req_prompt) catch |e| log.err("[turboexl3_ds41] the expert usage record was not written: {s}\n", .{@errorName(e)});
 }
 
 const Exl3Source = @import("src/mlx_serve/sdk/weights/streamed.zig").Exl3.Source;

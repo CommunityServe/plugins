@@ -1,0 +1,110 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -272,10 +272,14 @@
+     pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
+     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
++    pub const MLX_SERVE_DSV41_EXPERT_USAGE_DIR: Var = .{ .kind = .kill, .type = .text, .default = "the pack", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): the absolute directory its expert-usage-v1.json is read from" };
++    pub const MLX_SERVE_DSV41_EXPERT_USAGE_LABEL: Var = .{ .kind = .kill, .type = .text, .default = "unlabeled", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): the recorded prompt set's name, the file's provenance; needs MLX_SERVE_DSV41_EXPERT_USAGE_RECORD" };
++    pub const MLX_SERVE_DSV41_EXPERT_USAGE_RECORD: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): an absolute file path; each request's routed experts per layer counted into it (expert-usage-v1.json's form), written at the request's end" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+     pub const MLX_SERVE_DSV41_LOOKAHEAD: Var = .{ .kind = .kill, .type = .text, .default = "2 (records read ahead a layer call; idle rule 0)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's expert lookahead (turboexl3_ds41): <budget>[:<idle>], the records read ahead a layer call 0 to 4 (0: the predictor off) and the idle rule 0 or 1; the served bytes are the same at every setting" };
+     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
+     pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end" };
++    pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig	2026-10-31 21:56:33
++++ b/sdk/weights/streamed/exl3_source.zig	2026-10-31 21:56:33
+@@ -12,6 +12,12 @@
+ const expert_bank = @import("expert/bank.zig");
+ const expert_stream = @import("expert/stream.zig");
+ const sdk_ext = @import("sdk_ext.zig");
++/// mlx-serve's expert usage profile (`expert-usage-v1.json`): the resident seed at the load and the record, as turboexl3_ds41's
++/// src/expert_usage_cfg.zig sets them (`MLX_SERVE_DSV41_RESIDENT_SEED`, `MLX_SERVE_DSV41_EXPERT_USAGE_DIR`,
++/// `_RECORD`, `_LABEL`).
++const expert_usage = sdk_ext.expert.usage;
++const usage_cfg = &@import("mlx_host").expert_usage_cfg.setting;
++const usage_arch = "deepseek_v41";
+ const expert_event = sdk_ext.expert.event;
+ const expert_admission = @import("expert/admission.zig");
+ const xk = @import("../../quant/exl3/stream/kernels.zig");
+@@ -136,6 +142,8 @@
+     bill: Bill,
+     phase: Phase = .prompt,
+     released: bool = false,
++    /// `expert_usage_record`'s recorder: each request's routed experts counted, its file written at the request's end.
++    usage_rec: ?*expert_usage.Recorder = null,
+     /// The bank in `dir` at the rows `budget` holds, streamed on `s` (the trunk's stream). `gates`: every routed layer's
+     /// router (its arrays borrowed for the source's life).
+     pub fn open(a: std.mem.Allocator, io: std.Io, dir: []const u8, s: mlx.mlx_stream, geo: Geometry, gates: []const Gate, budget: Budget) !*Source {
+@@ -148,6 +156,7 @@
+         errdefer a.destroy(self);
+         self.a = a;
+         self.phase = .prompt;
++        self.usage_rec = null;
+         self.released = false;
+         self.bank = try expert_bank.Bank.open(a, io, dir, implementedOf(geo), null);
+         errdefer self.bank.deinit();
+@@ -216,8 +225,50 @@
+             const w = try self.hook.t3.math.warm(&self.g, self.hook.t3.banks, @intCast(geo.hidden_size), .bfloat16);
+             std.log.info("streamed exl3: turboexl3's routed kernels compiled at load: {d} calls in {d} ms", .{ w.calls, w.ms });
+         } else self.hook = .{ .stream = try Hook.initWith(a, &self.g, &self.source, Math.init(self.q, geo), geo, .{ .gates = self.gates, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true }) };
++        errdefer switch (self.hook) {
++            inline else => |*h| h.deinit(),
++        };
++        // The usage record's counting, then the resident seed (the prompt rows still empty: nothing has routed).
++        const layers: u32 = @intCast(self.stream.layers.len);
++        const experts = self.stream.bank.n_experts;
++        if (usage_cfg.recordPath()) |path| {
++            self.usage_rec = try expert_usage.Recorder.init(a, io, path, usage_arch, usage_cfg.label(), layers, experts);
++            self.stream.countRoutes();
++            std.log.info("streamed exl3: expert usage recorded to {s} (prompt set {s}), each request's routed experts counted", .{ path, usage_cfg.label() });
++        }
++        errdefer if (self.usage_rec) |r| r.deinit();
++        try self.seedUsage(a, io, dir, layers, experts);
+         return self;
+     }
++    /// The resident seed (`resident_seed`, as glm5_next: unset, `usage` when the profile's directory has
++    /// expert-usage-v1.json): each layer's empty prompt rows filled with its most used experts, read now; the first
++    /// request finds them resident. The seed changes no policy: a seeded expert is a resident as a kept one is.
++    fn seedUsage(self: *Source, a: std.mem.Allocator, io: std.Io, dir: []const u8, layers: u32, experts: u32) !void {
++        var st: expert_usage.Settings = .{};
++        st.seed = switch (usage_cfg.seed) {
++            .pack => null,
++            .usage => .usage,
++            .none => .none,
++        };
++        var d = try expert_usage.decide(a, io, &st, usage_cfg.dirOr(dir), usage_arch, layers, experts);
++        defer if (d.profile) |*p| p.deinit();
++        const t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
++        var records: u64 = 0;
++        if (d.profile) |*p| records = try self.stream.seedResidents(expert_usage.Order{ .p = p, .rows = self.prompt_rows }, expert_usage.Order.of);
++        const ms: u64 = @intCast(@max(@divTrunc(std.Io.Timestamp.now(io, .awake).toNanoseconds() - t0, std.time.ns_per_ms), 0));
++        var buf: [expert_usage.max_label + 400]u8 = undefined;
++        const seeded = expert_usage.Seeded.of(self.stream.layers, self.prompt_rows, records);
++        std.log.info("streamed exl3: {s}", .{expert_usage.seedLine(&buf, usage_arch, &d, seeded, records * (self.bill.row_bytes / layers), ms)});
++    }
++    /// `expert_usage_record`, at a request's end: its routed experts (the prompt pass's and the decode routes') added to
++    /// the record and the file written; the prompt counts zeroed after, since a next request with its prompt cached runs
++    /// no prompt pass, whose phase change zeroes them.
++    pub fn usageEnd(self: *Source, io: std.Io, prompt_tokens: u64, decode_tokens: u64) !void {
++        const r = self.usage_rec orelse return;
++        self.stream.addUsage(r.counts);
++        for (self.stream.layers) |*ls| @memset(ls.policy.prefill_freq, 0);
++        try r.endRequest(io, prompt_tokens, decode_tokens);
++    }
+     pub fn deinit(self: *Source) void {
+         _ = mlx.mlx_synchronize(self.g.s);
+         switch (self.hook) {
+@@ -234,6 +285,7 @@
+         self.a.free(self.gates);
+         self.a.free(self.prompt_rows);
+         self.a.free(self.decode_rows);
++        if (self.usage_rec) |r| r.deinit();
+         self.a.destroy(self);
+         if (comptime expert_stream.uses_reader) sdk_ext.expert.giveReader();
+     }

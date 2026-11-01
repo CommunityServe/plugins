@@ -116,6 +116,15 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   hit, the demand's bytes (and those copied out of lookahead records), the lookahead's bytes, its abandoned ones, its
   records issued and claimed, the read wall and wait times, and the process's disk reads and page-ins
   (`proc_pid_rusage`); then one line a round beside its verify time.
+- The streamed bank's resident seed and usage record (mlx-serve's `expert.usage`, its settings src/expert_usage_cfg.zig, the
+  hooks in patches/turboexl3-zz4-usage-seed.patch), as glm5_next: at the load, each layer's empty prompt rows are filled
+  with its most used experts of `expert-usage-v1.json` (read once, before the first request; a seeded expert is a resident
+  as a kept one is, the policy unchanged), when the pack has the file; `MLX_SERVE_DSV41_RESIDENT_SEED=none` turns it off,
+  `usage` refuses a pack without it, and `MLX_SERVE_DSV41_EXPERT_USAGE_DIR` reads the file from another directory.
+  `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD=<absolute path>` counts each request's routed experts per layer (the prompt pass's
+  and the decode routes') into that file at the request's end (`MLX_SERVE_DSV41_EXPERT_USAGE_LABEL` names the prompt
+  set); the counts are routes, so the seed does not bias them. The prompt residents stay across requests (`keep`), and
+  the rate tally stays off (mlx-serve's DeepSeek-V4.1 default, pending a measurement).
 
 ## The pack
 

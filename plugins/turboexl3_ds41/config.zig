@@ -181,4 +181,5 @@ test {
     _ = @import("src/dec_prefetch.zig");
     _ = @import("src/round_io.zig");
     _ = @import("src/stream_lookahead.zig");
+    _ = @import("src/expert_usage_cfg.zig");
 }
