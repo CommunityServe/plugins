@@ -1,0 +1,25 @@
+diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -21,8 +21,8 @@
+ const T = mlx.mlx_array;
+ const Math = xp.QuantMath(G, xq.Accepted(G));
+ const Hook = xp.ExpertsWith(G, xp.StreamSource, Math, .{ .prefill = true, .lookahead = true, .gated = true });
+-/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the plugin's src/routed_t3.zig): the same schedule, turboexl3's math, neither
+-/// banked waves nor the device route (both are the streamer's own kernels').
++/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the plugin's src/routed_t3.zig): the same schedule on turboexl3's math, the decode
++/// waves banked and DEVROUTE's device wave on turboexl3's banked decode, as the streamer's own kernels run them.
+ const routed_t3 = @import("mlx_host").routed_t3;
+ const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows);
+ const HookT3 = xp.ExpertsWith(G, xp.StreamSource, MathT3, .{ .prefill = true, .lookahead = true, .gated = true });
+@@ -176,8 +176,8 @@
+             self.gates_t3 = try a.alloc(HookT3.Gate, gates.len);
+             errdefer a.free(self.gates_t3);
+             for (self.gates_t3, gates) |*o, gt| o.* = .{ .w = gt.w, .bias = gt.bias };
+-            self.hook = .{ .t3 = try HookT3.initWith(a, &self.g, &self.source, .{ .state = &self.t3_state }, geo, .{ .gates = self.gates_t3, .event = event, .wide = wide, .hoist_first = true }) };
+-            std.log.info("streamed exl3: the routed experts run on turboexl3 (MLX_SERVE_DSV41_ROUTED)", .{});
++            self.hook = .{ .t3 = try HookT3.initWith(a, &self.g, &self.source, .{ .state = &self.t3_state }, geo, .{ .gates = self.gates_t3, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true }) };
++            std.log.info("streamed exl3: the routed experts run on turboexl3, the decode waves banked and the device route on its banked decode (MLX_SERVE_DSV41_ROUTED)", .{});
+         } else self.hook = .{ .stream = try Hook.initWith(a, &self.g, &self.source, Math.init(self.q, geo), geo, .{ .gates = self.gates, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true }) };
+         return self;
+     }

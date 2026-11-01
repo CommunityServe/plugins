@@ -6,10 +6,11 @@
     .dependencies = .{
         .mlx_serve_kit = .{ .path = "../../.kit/kit" },
         // turboexl3 (davidtai/turboexl3): the EXL3 kernels and its plugin-kit launcher, at its DeepSeek-V4.1 branch's
-        // 1d73f7c (PR 3: wo_a's decode on dense's multi-row GEMV, lean chunks at BT 2 in wide launches).
+        // 3f2bf14 (PR 3: the banked decode, moeClampedBanked, for the streamer's banked waves and device route; 5-row
+        // chunks on the lean text).
         .turboexl3 = .{
-            .url = "https://github.com/davidtai/turboexl3/archive/1d73f7c9138ecf3cbd9d74e01c8280499c28ec72.tar.gz",
-            .hash = "turboexl3-0.1.0-tZE8b2l7OwF-Uj4v_uSQavgCO8mmmf_6YsW9MNU-5GPM",
+            .url = "https://github.com/davidtai/turboexl3/archive/3f2bf1463f661c3172e77024dcb7227e74d0b7b6.tar.gz",
+            .hash = "turboexl3-0.1.0-tZE8b2mRPAGp_-LmXiGHJ2VUpBHsrNSxbgtK4oSBxIeO",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "scripts", "patches", "tests", "NOTICE", "README.md" },

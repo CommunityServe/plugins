@@ -1,8 +1,11 @@
 //! The routed experts' math on turboexl3, for the copied expert streamer (sdk/weights/streamed/exl3_source.zig) when
-//! `MLX_SERVE_DSV41_ROUTED=turboexl3` asks for it; the default is the streamer's own EXL3 kernels. The
-//! streamer's decode waves and prompt calls hand it each bank's routed pairs: every pair is one row of a top-1
-//! `moeClamped` call at weight 1 on the bank's slot arrays (code read as u16, rin as suh, rout as svh), in f32, as the
-//! streamer's own lane gives them. The streamer joins and weighs the pairs' rows itself.
+//! `MLX_SERVE_DSV41_ROUTED=turboexl3` asks for it; the default is the streamer's own EXL3 kernels. The streamer's decode
+//! waves run its banked route on turboexl3's banked decode (`moeClampedBankedGateUp`, `moeClampedBankedDown`): a wave's
+//! pairs over the layer's three slot banks in one call, each pair one row-slot whose id is packed (bank << 24 | slot row),
+//! DEVROUTE's device wave among them (patches/turboexl3-t3-banked.patch binds both). Its prompt calls, and a wave of a hook
+//! bound without the banked route, hand it each bank's pairs: every pair is one row of a top-1 `moeClamped` call at weight
+//! 1 on the bank's slot arrays. Either way the slot arrays are turboexl3's bank (code as the trellis, rin as suh, rout as
+//! svh) and the rows come back in f32, each pair's at weight 1; the streamer joins and weighs the pairs' rows itself.
 
 const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
@@ -21,14 +24,16 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         pub const max_decode_rows: u32 = 48;
         state: *State,
 
-        /// A decode group's gate and up arrays, from its `gateUp` to its `down`: the streamer runs a call's gate/ups
-        /// before their downs, and each group's ids are an array of their own.
+        /// A decode group's gate|up state, from its `gateUp` to its `down`: the streamer runs a call's gate/ups before their
+        /// downs, and each group's ids are an array of their own.
         pub const State = struct {
             limit: c_int,
             pending: [256]Pending = undefined,
             n: usize = 0,
         };
-        const Pending = struct { ids: ?*anyopaque, gate: Proj, up: Proj };
+        /// The stock route's gate and up arrays (its `down` runs the pairs), or the banked route's block sums of the down's
+        /// prepared input (`gateUpBanked` returns the input itself).
+        const Pending = struct { ids: ?*anyopaque, gate: Proj = undefined, up: Proj = undefined, hs: T = undefined };
 
         /// Keeps the group's gate and up for its `down`, which runs the pairs: `x` is what `down` receives.
         pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: Proj, up: Proj) !T {
@@ -41,6 +46,39 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         }
 
         pub fn down(self: *const Self, g: *G, h: T, ids: T, d: Proj) !T {
+            const p = try self.pendingOf(ids);
+            return pairs(self.state.limit, g, h, ids, .{ .gate = p.gate, .up = p.up, .down = d });
+        }
+
+        /// The streamer's banked route (its hook's `banked`, and DEVROUTE's device wave over it).
+        pub const has_banked = true;
+
+        /// A wave's gate|up over the three banks (base, ext, transient): x [pairs, hidden] (row-slot r's row), `ids` u32
+        /// [pairs] packed (bank << 24 | slot row) -> the down's prepared input; its block sums wait for `downBanked`.
+        pub fn gateUpBanked(self: *const Self, g: *G, x: T, ids: T, banks: *const [3]Bank) !T {
+            const st = self.state;
+            if (st.n == st.pending.len) return error.RoutedT3PendingFull;
+            const tb = t3Banks(banks);
+            const h = try t3.moeClampedBankedGateUp(g.s, x, &tb, ids, .mul1, st.limit);
+            const hs = g.adopt(h.hs) catch |e| {
+                _ = mlx.mlx_array_free(h.hd);
+                return e;
+            };
+            const hd = try g.adopt(h.hd);
+            st.pending[st.n] = .{ .ids = ids.ctx, .hs = hs };
+            st.n += 1;
+            return hd;
+        }
+
+        /// The wave's down: `h` (`gateUpBanked`'s) -> [pairs, hidden] f32, each pair's row at weight 1.
+        pub fn downBanked(self: *const Self, g: *G, h: T, ids: T, banks: *const [3]Bank) !T {
+            const p = try self.pendingOf(ids);
+            const tb = t3Banks(banks);
+            return g.adopt(try t3.moeClampedBankedDown(g.s, .{ .hd = h, .hs = p.hs }, &tb, ids, .mul1, self.state.limit));
+        }
+
+        /// The gate|up state of the group whose ids are `ids`, taken off the list.
+        fn pendingOf(self: *const Self, ids: T) !Pending {
             const st = self.state;
             const i = for (st.pending[0..st.n], 0..) |q, j| {
                 if (q.ids == ids.ctx) break j;
@@ -48,7 +86,20 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
             const p = st.pending[i];
             st.pending[i] = st.pending[st.n - 1];
             st.n -= 1;
-            return pairs(st.limit, g, h, ids, .{ .gate = p.gate, .up = p.up, .down = d });
+            return p;
+        }
+
+        /// The banks as turboexl3 takes them: code (I16: the banked decode reads its words as they are) as the trellis,
+        /// rin as suh, rout as svh.
+        fn t3Banks(banks: *const [3]Bank) [3]t3.Bank {
+            var out: [3]t3.Bank = undefined;
+            for (banks, &out) |b, *o| {
+                inline for (.{ "gate", "up", "down" }) |f| {
+                    const p = @field(b, f);
+                    @field(o.*, f) = .{ .trellis = p.code, .suh = p.rin, .svh = p.rout };
+                }
+            }
+            return out;
         }
 
         /// A prompt call's pairs: `rows.slot` each pair's slot row, `rows.act_row` its row of `x` (null: x's rows are
@@ -86,4 +137,3 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         }
     };
 }
-

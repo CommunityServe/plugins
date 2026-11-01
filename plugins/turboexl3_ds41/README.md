@@ -23,8 +23,11 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   - The load keeps suh/svh f16 and never reads a trunk layer's routed experts.
   - The stream budget stays within the host's ceiling.
 - The routed experts are the repack's `experts.bin` bank. The streamer's own EXL3 kernels (mul1, K2 and K3) run them;
-  `MLX_SERVE_DSV41_ROUTED=turboexl3` runs them on turboexl3's `moeClamped` instead (src/routed_t3.zig: each routed pair
-  a row of a top-1 call, on the streamer's schedule without its banked waves and device route).
+  `MLX_SERVE_DSV41_ROUTED=turboexl3` runs them on turboexl3 instead (src/routed_t3.zig), on the streamer's schedule:
+  its decode waves, banked and with the device route (patches/turboexl3-t3-banked.patch), on turboexl3's banked decode
+  (`moeClampedBankedGateUp` / `moeClampedBankedDown`: a wave's pairs over the layer's three slot banks in one call, each
+  pair `moeClamped`'s bytes at top-1 on its bank); its prompt calls on `moeClamped`, each routed pair a row of a top-1
+  call.
 - `MLX_SERVE_DSV41_ROUTED_ONE` (src/routed_one.zig, its MLX-free plan src/one_plan.zig, the hook in
   patches/turboexl3-wide-one.patch) runs a wide prompt call's resident routed experts as one turboexl3 `moeClamped`
   call over the layer's base slot bank in the router's [rows, top-k] layout, in place of the wide lane's DIG-X waves
