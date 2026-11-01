@@ -1,0 +1,233 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -284,6 +284,7 @@
+     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
+     pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end, and a [prompt-io] wide line a wide layer; =2 also splits the read-ahead's wait by a sync at each step" };
+     pub const MLX_SERVE_DSV41_PROMPT_TL: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt GPU timeline (turboexl3_ds41's profile builds only, zig build -Dplugin-profile=true; needs MLX_SERVE_DSV41_PROMPT_IO, refused with MLX_SERVE_DSV41_TIMELINE): an absolute directory; each prompt's command buffers tagged by layer and host stage (pre, attn, moe, rest) and the stages' host marks written there at the request's end" };
++    pub const MLX_SERVE_DSV41_Q_TAIL: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layer query heads (turboexl3_ds41): wq_b's output kept as the unroped heads and only their last channels roped apart, both read by the gather's scores; the same scores, one head-sized copy fewer a layer (=0: the whole roped copy; check: the copy served, the tail and the scores compared word for word, [q-tail] check lines)" };
+     pub const MLX_SERVE_DSV41_RA_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' read-ahead prediction on the fused hc kernels (turboexl3_ds41): the attention-side mix first, the prediction from one more pass of its norm kernel under the FFN's norm; served bytes unchanged (=0: the op chain)" };
+     pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -55,6 +55,9 @@
+ const dp = @import("../../../dec_prefetch.zig");
+ /// A wide layer's tail in one kernel (turboexl3_ds41's src/tail_fuse.zig, `MLX_SERVE_DSV41_TAIL_FUSE`).
+ const tfuse = @import("../../../tail_fuse.zig");
++/// A wide layer's heads left unroped, their roped last channels apart, read together by the gather's scores
++/// (turboexl3_ds41's src/q_tail.zig, `MLX_SERVE_DSV41_Q_TAIL`).
++const qtail = @import("../../../q_tail.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+ const one_plan = @import("../../../one_plan.zig");
+ /// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
+@@ -438,6 +441,8 @@
+     hc_stage_x_kernel: mlx.mlx_fast_metal_kernel,
+     hc_split_kernel: mlx.mlx_fast_metal_kernel,
+     rope_kernel: mlx.mlx_fast_metal_kernel,
++    /// MLX_SERVE_DSV41_Q_TAIL: `rope_kernel`'s roped channels alone.
++    rope_tail_only_kernel: mlx.mlx_fast_metal_kernel,
+     kv_row_kernel: mlx.mlx_fast_metal_kernel,
+     engram_kernel: mlx.mlx_fast_metal_kernel,
+     moe_gu_kernel: mlx.mlx_fast_metal_kernel,
+@@ -506,6 +511,7 @@
+         _ = mlx.mlx_fast_metal_kernel_free(self.moe_act_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(self.moe_combine_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(self.rope_kernel);
++        _ = mlx.mlx_fast_metal_kernel_free(self.rope_tail_only_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(self.kv_row_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(self.engram_kernel);
+         self.dec.deinit();
+@@ -1146,17 +1152,22 @@
+     qk: mlx.mlx_fast_metal_kernel,
+     sm: mlx.mlx_fast_metal_kernel,
+     pv: mlx.mlx_fast_metal_kernel,
++    /// MLX_SERVE_DSV41_Q_TAIL: `qk` over the unroped heads and their roped tail (turboexl3_ds41's kernels/attn_qk_t.metal).
++    qk_t: mlx.mlx_fast_metal_kernel,
+     pub fn init() !GatherAttn {
+         const qk = try buildKernel("dsv41_attn_qk", &.{ "q", "kw", "comp", "picks", "meta" }, &.{"s"}, ATTN_QK_SOURCE, MPP_HEADER);
+         errdefer _ = mlx.mlx_fast_metal_kernel_free(qk);
+         const sm = try buildKernel("dsv41_attn_sm", &.{ "s", "picks", "sink", "meta", "scal" }, &.{"p"}, ATTN_SM_SOURCE, "");
+         errdefer _ = mlx.mlx_fast_metal_kernel_free(sm);
+-        return .{ .qk = qk, .sm = sm, .pv = try buildKernel("dsv41_attn_pv", &.{ "p", "kw", "comp", "picks", "meta", "periods" }, &.{"o"}, ATTN_PV_SOURCE, MPP_HEADER) };
++        const qk_t = try buildKernel("dsv41_attn_qk_t", &.{ "q", "kw", "comp", "picks", "meta", "qt" }, &.{"s"}, qtail.attn_qk_t_source, MPP_HEADER);
++        errdefer _ = mlx.mlx_fast_metal_kernel_free(qk_t);
++        return .{ .qk = qk, .sm = sm, .qk_t = qk_t, .pv = try buildKernel("dsv41_attn_pv", &.{ "p", "kw", "comp", "picks", "meta", "periods" }, &.{"o"}, ATTN_PV_SOURCE, MPP_HEADER) };
+     }
+     pub fn deinit(self: *GatherAttn) void {
+         _ = mlx.mlx_fast_metal_kernel_free(self.qk);
+         _ = mlx.mlx_fast_metal_kernel_free(self.sm);
+         _ = mlx.mlx_fast_metal_kernel_free(self.pv);
++        _ = mlx.mlx_fast_metal_kernel_free(self.qk_t);
+     }
+ };
+ /// The indexer's scores `[L, nb]`: sum over heads of weight * relu(q_h . k_n),
+@@ -1435,6 +1446,7 @@
+         .hc_stage_x_kernel = try buildKernel("dsv41_hc_stage_x", &HC_STAGE_X_INS, &HC_STAGE_X_OUTS, HC_STAGE_X_SOURCE, ""),
+         .hc_split_kernel = try buildKernel("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, HC_SPLIT_SOURCE, ""),
+         .rope_kernel = try buildKernel("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, ROPE_TAIL_SOURCE, FP8_HEADER),
++        .rope_tail_only_kernel = try buildKernel("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, ""),
+         .kv_row_kernel = try buildKernel("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, KV_ROW_SOURCE, FP8_HEADER),
+         .engram_kernel = try buildKernel("dsv41_engram", &ENGRAM_INS, &.{"out"}, ENGRAM_SOURCE, ""),
+         .moe_gu_kernel = try buildKernel("dsv41_moe_gu", &MOE_GU_INS, &.{"out"}, MOE_GU_SOURCE, MOE_HEADER),
+@@ -1473,6 +1485,7 @@
+         _ = mlx.mlx_fast_metal_kernel_free(m.hc_stage_x_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(m.hc_split_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(m.rope_kernel);
++        _ = mlx.mlx_fast_metal_kernel_free(m.rope_tail_only_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(m.kv_row_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(m.engram_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(m.moe_gu_kernel);
+@@ -1958,6 +1971,32 @@
+     var o = mlx.mlx_array_new();
+     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+ }
++/// MLX_SERVE_DSV41_Q_TAIL: `ropeTail`'s roped channels of `x` [L, H, D] alone, [L, H, rope dims]: the same words as
++/// `ropeTail(x, periods, offset, 1.0)` there.
++pub fn ropeTailOnly(sc: *Scope, m: *const Dsv41Model, x: A, periods: A, offset: A) !A {
++    const L = dim(x, 0);
++    const H = dim(x, 1);
++    const rd: usize = @intCast(m.cfg.dsv4_rope_head_dim);
++    const n = L * H * rd;
++    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{1.0}, &[_]c_int{1}, 1, .float32));
++    const cfg = mlx.mlx_fast_metal_kernel_config_new();
++    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
++    const dt = mlx.mlx_array_dtype(x);
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(H), ci(rd) }, 3, dt));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(n), 1, 1));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(@min(n, 256)), 1, 1));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RD", ci(rd)));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HH", ci(H)));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", dt));
++    const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, periods, offset, scal }, 4);
++    defer _ = mlx.mlx_vector_array_free(iv);
++    var ov = mlx.mlx_vector_array_new();
++    defer _ = mlx.mlx_vector_array_free(ov);
++    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, m.rope_tail_only_kernel, iv, cfg, sc.s));
++    var o = mlx.mlx_array_new();
++    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
++}
+ pub fn ropeFor(m: *const Dsv41Model, li: usize) *const Rope {
+     return if (m.ratio(li) > 0) &m.rope_yarn else &m.rope_plain;
+ }
+@@ -2210,7 +2249,7 @@
+         try runRegion(sc, m, li, .q_kv, &.{ x, pos }, &a);
+         pj = .{ .q = a[0], .kv = a[1], .qr = a[2] };
+     } else pj = try qkvProj(sc, m, ly, ropeFor(m, li).fwd, x, pos);
+-    const q = pj.q;
++    var q = pj.q;
+     const qr = pj.qr;
+     const kv = pj.kv;
+     const window = c.sliding_window;
+@@ -2254,7 +2293,10 @@
+     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
+     const f16_core = m.attn_f16 and (m.act == .bfloat16 or m.act == .float16) and dim(keys_w, 0) + K <= ATTN_SOFTMAX_MAX_COLS and mlx.streamIsGpu(sc.s);
+     const want_grouped: ?Grouped = if (pre != null) .{ .periods = ropeFor(m, li).inv, .p0 = p0 } else null;
+-    const o = if (try attnGather(sc, m, ly.sink, q, keys_w, wp, comp_rows, topk, scale, want_grouped)) |g| blk: {
++    const gathered = try attnGather(sc, m, ly.sink, q, pj.qt, pj.qh, keys_w, wp, comp_rows, topk, scale, want_grouped);
++    // MLX_SERVE_DSV41_Q_TAIL on: a core other than the gather reads the whole roped heads.
++    if (gathered == null and pj.qt.ctx != null and pj.qh.ctx == null) q = try ropeTail(sc, m, q, ropeFor(m, li).fwd, pos, 1.0);
++    const o = if (gathered) |g| blk: {
+         sh.grouped = want_grouped != null;
+         break :blk g;
+     } else if (f16_core)
+@@ -2276,7 +2318,9 @@
+ /// The wide core on the matrix units, null where it does not serve (no NAX, not bf16, another head geometry): each row's
+ /// scores against its own window and selected rows, read in place, never gathered.
+ /// The heads `[L, H, D]`, or with `grouped` already inverse-roped and grouped.
+-fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, keys_w: A, wp: usize, comp_rows: A, topk: A, scale: f32, grouped: ?Grouped) !?A {
++/// `qt` (MLX_SERVE_DSV41_Q_TAIL): the heads' roped last 64 channels, `q` the unroped heads; with `qh` (`check`), `q` the
++/// roped heads, served, and `qh` the unroped ones, whose scores are compared with the served ones.
++fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, qh: A, keys_w: A, wp: usize, comp_rows: A, topk: A, scale: f32, grouped: ?Grouped) !?A {
+     const g = m.attn_gather orelse return null;
+     const L = dim(q, 0);
+     const H = dim(q, 1);
+@@ -2311,7 +2355,11 @@
+             return s.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+         }
+     }.one;
+-    const s = try run(sc, g.qk, &.{ q, keys_w, comp, picks, meta }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }});
++    const s = if (qt.ctx != null and qh.ctx == null)
++        try run(sc, g.qk_t, &.{ q, keys_w, comp, picks, meta, qt }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }})
++    else
++        try run(sc, g.qk, &.{ q, keys_w, comp, picks, meta }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }});
++    if (qh.ctx != null) try qtail.compare(sc.s, try run(sc, g.qk_t, &.{ qh, keys_w, comp, picks, meta, qt }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}), s, &qtail.scores);
+     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
+     const p = try run(sc, g.sm, &.{ s, picks, sink, meta, scal }, &.{ ci(L), ci(H), ci(NK) }, .float16, .{ ci(H * 32), ci(L) }, &.{.{ .name = "NJ", .v = ci((NK + 31) / 32) }}, &.{.{ "PT", .float16 }});
+     const periods = if (grouped) |gr| gr.periods else scal;
+@@ -2547,10 +2595,18 @@
+ pub fn attnSplits(rows: usize) c_int {
+     return @intCast(@max(1, @min(8, rows / 160)));
+ }
+-pub const Proj = struct { q: A, kv: A, qr: A };
++/// `qt` (MLX_SERVE_DSV41_Q_TAIL): the heads' roped last channels [L, H, rope dims]; `q` is then the unroped heads, or with
++/// `qh` (`check`) still the roped heads and `qh` the unroped ones.
++pub const Proj = struct { q: A, kv: A, qr: A, qt: A = none, qh: A = none };
+ /// Rows at `pos` -> the roped query heads, the window row (roped, fp8
+ /// round-trip) and the query latent the indexer reads.
+ pub fn qkvProj(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: A, pos: A) !Proj {
++    return qkvProjWith(sc, m, ly, periods, x, pos, .off);
++}
++/// `qkvProj`; `tail` (MLX_SERVE_DSV41_Q_TAIL, a wide layer's): `on` leaves the heads as `wq_b` wrote them and ropes only
++/// their last `dsv4_rope_head_dim` channels, apart (`Proj.qt`); `check` also ropes the whole heads, served, and compares
++/// the tail's words with theirs.
++pub fn qkvProjWith(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: A, pos: A, tail: qtail.Mode) !Proj {
+     const c = &m.cfg;
+     const qa, const kv = if (ly.q_kv) |*f| blk: {
+         const y = try f.apply(sc, x);
+@@ -2559,7 +2615,21 @@
+     } else .{ try ly.wq_a.apply(sc, x), try ly.wkv.apply(sc, x) };
+     const qr = try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
+     const qb = try ly.wq_b.apply(sc, qr);
+-    const q = try ropeTail(sc, m, try sc.reshape(qb, &.{ ci(dim(x, 0)), ci(c.num_attention_heads), ci(c.head_dim) }), periods, pos, 1.0);
++    const heads = try sc.reshape(qb, &.{ ci(dim(x, 0)), ci(c.num_attention_heads), ci(c.head_dim) });
++    if (tail != .off) {
++        const qt = try ropeTailOnly(sc, m, heads, periods, pos);
++        const row = try kvRow(sc, m, ly, periods, kv, pos);
++        if (tail == .check) {
++            const q = try ropeTail(sc, m, heads, periods, pos, 1.0);
++            const hd = dim(q, 2);
++            try qtail.compare(sc.s, qt, try sc.slice(q, 2, hd - dim(qt, 2), hd), &qtail.tail);
++            try prof.mark(.qkv, &.{ q, qt, row, qr });
++            return .{ .q = q, .kv = row, .qr = qr, .qt = qt, .qh = heads };
++        }
++        try prof.mark(.qkv, &.{ heads, qt, row, qr });
++        return .{ .q = heads, .kv = row, .qr = qr, .qt = qt };
++    }
++    const q = try ropeTail(sc, m, heads, periods, pos, 1.0);
+     const row = try kvRow(sc, m, ly, periods, kv, pos);
+     try prof.mark(.qkv, &.{ q, row, qr });
+     return .{ .q = q, .kv = row, .qr = qr };
+@@ -3982,7 +4052,10 @@
+     try prof.mark(.attn_hc, &.{ pa.sp.pre, pa.sp.post, pa.sp.comb, pa.h });
+     pio.wide(li, .hc);
+     const pos = try sc.i(ci(sp.p0));
+-    const pj = try qkvProj(&sc, m, ly, ropeFor(m, li).fwd, pa.h, pos);
++    // MLX_SERVE_DSV41_Q_TAIL: the heads unroped and their roped tail apart, where the gather reads them (a trace keeps the
++    // whole roped heads it records).
++    const q_tail: qtail.Mode = if (m.attn_gather != null and m.trace == null and m.cfg.dsv4_rope_head_dim == 64 and m.cfg.head_dim % 64 == 0) qtail.mode else .off;
++    const pj = try qkvProjWith(&sc, m, ly, ropeFor(m, li).fwd, pa.h, pos, q_tail);
+     pio.wide(li, .qkv);
+     const heads = try gpa.alloc(A, n_spans);
+     defer gpa.free(heads);
+@@ -4006,7 +4079,9 @@
+         var ssc = Scope.init(gpa, m.s);
+         defer ssc.deinit();
+         var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor };
+-        const span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
++        var span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
++        if (pj.qt.ctx != null) span_pj.qt = try ssc.slice(pj.qt, 0, lo, hi);
++        if (pj.qh.ctx != null) span_pj.qh = try ssc.slice(pj.qh, 0, lo, hi);
+         var o_k = try attention(&ssc, m, st, li, try ssc.slice(pa.h, 0, lo, hi), sp.p0 + lo, &sh, span_pj);
+         // Each span (or each run of spans) takes its own `wo_a`: the rows the chunk's `wo_b` reads, not the heads, are
+         // joined. Heads the core handed back plain are roped and grouped here.
+@@ -4033,6 +4108,7 @@
+         hold(&sp.cands[k], sh.cand);
+     }
+     if (woa.mode == .check and run > 1) woa.report(li, woa_check.runs, woa_check.equal, woa_check.differ, woa_check.max_abs);
++    if (q_tail == .check) qtail.report(li);
+     pio.wide(li, .attn);
+     const y = try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
+     try prof.mark(.attn_out, &.{y});

@@ -78,6 +78,9 @@ pub const joinless = @import("src/joinless.zig");
 /// A wide prompt layer's joinless combine and hc expand in one kernel (`MLX_SERVE_DSV41_TAIL_FUSE`, src/tail_fuse.zig),
 /// read by the copied model and launched by the copied stream's source.
 pub const tail_fuse = @import("src/tail_fuse.zig");
+/// A wide prompt layer's query heads kept unroped, their roped last channels apart (`MLX_SERVE_DSV41_Q_TAIL`,
+/// src/q_tail.zig), read by the copied model.
+pub const q_tail = @import("src/q_tail.zig");
 /// A wide prompt layer's input as the last wide layer's whole stream (`MLX_SERVE_DSV41_WHOLE_STREAM`, src/whole_stream.zig),
 /// read by the copied model.
 pub const whole_stream = @import("src/whole_stream.zig");
@@ -284,6 +287,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         }
         tail_fuse.mode = .off;
     }
+    q_tail.configure(env.span(.MLX_SERVE_DSV41_Q_TAIL)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_Q_TAIL is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1: the load is refused\n", .{});
         out.* = switch (e) {
@@ -400,6 +410,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] wide prompt layers' tail as the chain: the combine's f32 sum, its rounding and the hc expand ({s})\n", .{if (tail_fuse.explicit) "MLX_SERVE_DSV41_TAIL_FUSE=0" else "MLX_SERVE_DSV41_JOINLESS off: the tail kernel is the combine's"}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' joinless combine and hc expand in one kernel, the new streams written once (MLX_SERVE_DSV41_TAIL_FUSE=0: the chain)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' joinless combine and hc expand as the chain, served, and in one kernel over each call's first and last rows, compared word for word (MLX_SERVE_DSV41_TAIL_FUSE=check): a [tail-fuse] check line a wide call\n", .{}),
+    }
+    switch (q_tail.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers rope the whole query heads into a copy (MLX_SERVE_DSV41_Q_TAIL=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers keep the query heads unroped and rope their last channels apart, read together by the gather's scores (MLX_SERVE_DSV41_Q_TAIL=0: the whole roped copy)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' whole roped heads served, and the tail roped apart and the two-part scores compared with them word for word (MLX_SERVE_DSV41_Q_TAIL=check): a [q-tail] check line a wide layer\n", .{}),
     }
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {

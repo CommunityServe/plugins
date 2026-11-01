@@ -320,6 +320,24 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   (+1.5%); the guard's sampled peak 105.3 GiB. Exact: the seeded cold text is the same in every arm (md5 efeb6f4ecd), and
   `check` (w-pio-20261101-0809) compared every wide call's first and last 2048 rows, 40 calls and 3,355,443,200 words,
   with none different.
+- `MLX_SERVE_DSV41_Q_TAIL` (src/q_tail.zig, src/kernels/rope_tail_only.metal, src/kernels/attn_qk_t.metal,
+  patches/turboexl3-zzz8h-q-tail.patch; on, `=0` off, `check` checked): a wide prompt layer's query heads are not copied
+  whole to rope their last channels. `=0`: `qkvProj` writes the chunk's roped heads [rows, 64, 512] (bf16, 1.07 GB at
+  16K rows) from `wq_b`'s output: the rope kernel copies the 448 unroped channels of every head as they are and ropes
+  the last 64. On, the wide layer keeps `wq_b`'s output as the unroped heads and ropes only each head's last 64 channels
+  into [rows, 64, 64] (rope_tail.metal's arithmetic on the same pairs); the gather's score kernel reads the unroped
+  heads for its first seven 64-deep steps and the roped tail for the last: the same bf16 operands in the same steps on
+  the same tensor op, so the same scores. A span the gather declines, and a trace, get the whole roped heads as before.
+  `check` serves the whole roped heads and also ropes the tail apart and runs the two-part score kernel over every span,
+  each compared word for word with the served ones: `[q-tail] check layer= tail_words= tail_differ= score_words=
+  score_differ=` a wide layer (~0.13 GB and a span's scores more).
+- On against `=0` (w-pio-20261101-0957, on d451beb; usage seed with SEED_FREE, the DSpark verify policy and copy rounds
+  off, A B B A): 1206.3 and 1205.4 tok/s cold prefill against 1200.9 and 1195.1 (+0.66%); new text 1273.8 and 1270.0
+  against 1243.7 and 1237.8 (+2.5%). Over the cold request's encoder the attention stage ran ~410 ms shorter and the
+  moe's waits on bytes ~320 ms longer: the staged reads start where they did. The attention's fresh Metal buffers over
+  the encoder: 205.3 GB on against 229.3 (w-pio-20261101-0953, a profile build). Exact: `check` (w-pio-20261101-0953)
+  compared 2,564,014,080 tail words and 23,135,944,704 score words over both requests, none different, and every arm's
+  texts are the policy-off references (cold d081845201, new-text slice 3 4d5b401f3c).
 
 ## The pack
 
