@@ -1,0 +1,8 @@
+.{
+    .name = .minimax_m3,
+    .version = "0.1.0",
+    .fingerprint = 0x5accbc8db79864a1,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{ .mlx_serve_kit = .{ .path = "../../.kit/kit" } },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "scripts", "overlay", "tests", "NOTICE", "README.md", "plugin.json" },
+}
