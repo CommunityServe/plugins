@@ -21,6 +21,9 @@ pub const routed_t3 = @import("src/routed_t3.zig");
 /// A wide prompt call's resident routed experts as one turboexl3 call, when `MLX_SERVE_DSV41_ROUTED_ONE` asks
 /// (src/routed_one.zig, read by the copied streamer's source).
 pub const routed_one = @import("src/routed_one.zig");
+/// A prompt pass's routed calls timed and counted, and the CED decoder's experts probed, when
+/// `MLX_SERVE_DSV41_PROMPT_IO` asks (src/prompt_io.zig, hooked by the copied model and source).
+pub const prompt_io = @import("src/prompt_io.zig");
 /// The DSpark draft's Markov chain in B + 1 launches (src/markov.zig, called by the copied model's draft;
 /// `MLX_SERVE_DSV41_MARKOV`).
 const markov = @import("src/markov.zig");
@@ -113,6 +116,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     markov.tally = .{};
     // Before the model's load, which compiles its decode stretches only when the stage profiler is off.
     stage_prof.configure(env.span(.MLX_SERVE_DSV41_STAGE_PROF));
+    prompt_io.configure(env.span(.MLX_SERVE_DSV41_PROMPT_IO));
     var own = ctx.*;
     own.weights = null;
     const mp = ds.table.load(&own, out) orelse return null;
@@ -138,6 +142,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     drafter = rounds.Drafter.init(gpa, on);
     log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on" else "off (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
+    if (prompt_io.on) log.info("[turboexl3_ds41] prompt timeline on (MLX_SERVE_DSV41_PROMPT_IO): [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end\n", .{});
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {
         .on => "fused, B + 1 launches a draft (MLX_SERVE_DSV41_MARKOV=0: the op chain)",

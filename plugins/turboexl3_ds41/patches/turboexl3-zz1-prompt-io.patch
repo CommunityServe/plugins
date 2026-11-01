@@ -1,0 +1,159 @@
+diff -ruN a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -273,6 +273,7 @@
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
++    pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -36,6 +36,8 @@
+ const t3 = @import("turboexl3");
+ /// The stage profiler (turboexl3_ds41's src/stage_prof.zig, `MLX_SERVE_DSV41_STAGE_PROF`): off, every mark returns at once.
+ const prof = @import("../../../stage_prof.zig");
++/// The prompt timeline (turboexl3_ds41's src/prompt_io.zig, `MLX_SERVE_DSV41_PROMPT_IO`): off, every hook returns at once.
++const pio = @import("../../../prompt_io.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+ const one_plan = @import("../../../one_plan.zig");
+ /// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
+@@ -3658,6 +3660,12 @@
+         from = p.hi;
+     }
+     const enc_hi = if (tail != null) m.ced_split.? else m.n_layers;
++    // The prompt timeline's probe and its decoder calls: the split and the tail of a replaying chunk.
++    if (pio.on) {
++        pio.split = if (tail != null) enc_hi else 0;
++        pio.tail = tail orelse 0;
++    }
++    defer pio.tail = 0;
+     try runLayers(m, gpa, st, &sp, held, from, enc_hi);
+     if (tail) |tl| {
+         var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
+@@ -3842,6 +3850,7 @@
+     const x = try sc.concat(parts, 0);
+     const pres = try sc.concat(sp.pres, 0);
+     if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, x, pres, sp.img, ra, src.ctx);
++    if (pio.on and pio.tail > 0) try probeDecoder(&sc, m, sp, li, x, pres);
+     try prof.mark(.read_ahead, &.{ x, pres });
+     const pa = try hcPreNormWide(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm);
+     try prof.mark(.attn_hc, &.{ pa.sp.pre, pa.sp.post, pa.sp.comb, pa.h });
+@@ -3895,6 +3904,8 @@
+ /// A streamed prompt call's routes of layer `li` predicted before its attention (the FFN's input taken as the stream
+ /// collapsed with the previous mix), handed to the source to read while the attention runs.
+ fn readAhead(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, li: usize, x: A, pre: A, img: A, ra: anytype, ctx: *anyopaque) !void {
++    const t0: u64 = if (pio.on) pio.now() else 0;
++    defer if (pio.on) pio.readAhead(li, t0, pio.now());
+     const h = try sc.rms(try hcCollapse(sc, x, pre), ly.ffn_norm, m.cfg.rms_norm_eps);
+     const r = try route(sc, m, ly, h, img);
+     var host = mlx.mlx_array_new();
+@@ -3906,6 +3917,31 @@
+     defer sc.a.free(ids);
+     for (ids, (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n]) |*o, v| o.* = @intCast(v);
+     try ra(ctx, @intCast(li), ids).get();
++}
++/// The prompt timeline's probe (`MLX_SERVE_DSV41_PROMPT_IO`) at encoder layer `li`, one of `pio.probe_layers`, of a
++/// replaying chunk: every CED decoder layer's router over the tail rows' stream as it enters `li` (collapsed with its
++/// mix and normed for that layer's FFN, as the read-ahead predicts a layer's own routes), each tail row's top-k kept.
++fn probeDecoder(sc: *Scope, m: *const Dsv41Model, sp: *const Spans, li: usize, x: A, pre: A) !void {
++    const slot = for (pio.probe_layers, 0..) |pl, s| {
++        if (pl == li) break s;
++    } else return;
++    const tl = pio.tail;
++    const L = sp.L;
++    if (tl == 0 or tl > L or pio.split == 0 or li >= pio.split or m.n_layers > pio.max_layers) return;
++    const col = try hcCollapse(sc, try sc.slice(x, 0, L - tl, L), try sc.slice(pre, 0, L - tl, L));
++    const img = try sp.imgSlice(sc, L - tl, L);
++    var idxs: [pio.max_layers]A = undefined;
++    const n_dec = m.n_layers - pio.split;
++    for (pio.split..m.n_layers, 0..) |d, i| {
++        const ly = &m.layers[d];
++        idxs[i] = (try route(sc, m, ly, try sc.rms(col, ly.ffn_norm, m.cfg.rms_norm_eps), img)).idx;
++    }
++    try evalAll(idxs[0..n_dec]);
++    for (pio.split..m.n_layers, 0..) |d, i| {
++        const n = mlx.mlx_array_size(idxs[i]);
++        const data = mlx.mlx_array_data_uint32(idxs[i]) orelse return error.NoData;
++        pio.predict(slot, d, data[0..n]);
++    }
+ }
+ /// What crosses layers in `extend`: each span's stream and mix, the picks
+ /// attention layers hand down, the DSpark main rows, and the Engram row ids.
+diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -31,6 +31,8 @@
+ /// `MLX_SERVE_DSV41_ROUTED_ONE` (the plugin's src/routed_one.zig): a wide prompt call's resident experts as one turboexl3
+ /// call over the base bank, its streamed ones on this schedule (or the whole call on the wide lane, as before).
+ const routed_one = @import("mlx_host").routed_one;
++/// `MLX_SERVE_DSV41_PROMPT_IO` (the plugin's src/prompt_io.zig): a prompt's routed calls timed and counted.
++const prompt_io = @import("mlx_host").prompt_io;
+ pub const Gate = Hook.Gate;
+ pub const Phase = enum { prompt, decode };
+ /// The trunk's MoE geometry the bank must match.
+@@ -222,6 +224,9 @@
+         defer g.reset();
+         const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
+         self.t3_state.n = 0;
++        const pio = prompt_io.on and self.phase == .prompt;
++        if (pio) try self.pioStart(layer, x, ids);
++        defer if (pio) prompt_io.callEnd(self.pioCounters());
+         if (routed_one.on() and self.phase == .prompt) switch (self.hook) {
+             inline else => |*h| if (try routed_one.rows(&self.one, self.a, g, h, layer, x, ids, wts, decode_route_ids)) |y| return y,
+         };
+@@ -231,6 +236,36 @@
+         const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
+         return g.keep(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false));
+     }
++    /// `MLX_SERVE_DSV41_PROMPT_IO`: a prompt's routed call of `layer` begins; its routes are evaluated now (the wait the
++    /// streamer's barrier takes next), and a decoder layer's read back for the probe before the call routes them.
++    fn pioStart(self: *Source, layer: u32, x: T, ids: T) !void {
++        const g = &self.g;
++        prompt_io.callStart(layer, @intCast(g.shapeOf(x).dim(0)), self.pioCounters());
++        if (!prompt_io.wantsRoutes(layer)) {
++            try g.evalAll(&.{ids});
++            prompt_io.callRouted();
++            return;
++        }
++        const sh = g.shapeOf(ids);
++        const buf = try self.a.alloc(u16, @intCast(sh.dim(0) * sh.dim(1)));
++        defer self.a.free(buf);
++        const host = try g.hostIds(ids, buf);
++        prompt_io.callRouted();
++        const Res = struct {
++            s: *Source,
++            layer: u32,
++            fn of(r: @This(), e: u16) bool {
++                return r.s.source.isResident(r.layer, e);
++            }
++        };
++        const cut: u32 = if (layer < self.prompt_rows.len) self.prompt_rows[layer] else 0;
++        prompt_io.routed(layer, host, cut, Res{ .s = self, .layer = layer }, Res.of);
++    }
++    /// The stream's counters `MLX_SERVE_DSV41_PROMPT_IO` keeps.
++    fn pioCounters(self: *Source) prompt_io.Counters {
++        const s = self.source.stats();
++        return .{ .routes = s.route_calls, .hits = s.expert_cache_hits, .misses = s.expert_cache_misses, .evictions = s.expert_cache_evictions, .bytes = s.expert_bytes_read, .wait_ns = s.read_wait_ns, .wall_ns = s.read_wall_ns, .ahead_posted = s.ahead_posted, .ahead_hits = s.ahead_hits, .ahead_bytes = s.ahead_bytes, .spec_issued = s.spec_issued, .spec_landed = s.spec_landed, .claimed = s.claimed };
++    }
+     /// A prompt pass's predicted routes of `layer` (every row's ids): its experts, hottest first, read into its rows
+     /// while its attention runs.
+     pub fn readAhead(self: *Source, layer: u32, ids: []const u16) !void {
+@@ -255,12 +290,14 @@
+                 try h.flush();
+                 switch (p) {
+                     .decode => {
++                        if (prompt_io.on) prompt_io.report(self.pioCounters());
+                         self.released = (try h.releaseTransient()) > 0;
+                         _ = mlx.mlx_synchronize(self.g.s);
+                         self.g.clearCache();
+                         try h.grow(&self.g, self.decode_rows);
+                     },
+                     .prompt => {
++                        if (prompt_io.on) prompt_io.reset();
+                         // `shrink` frees the grown rows and checks MLX's active bytes dropped by them, so no command may
+                         // still hold them (the grow's own fills, a decode's last eval): a phase change right after the
+                         // load's grow otherwise fails at random with GrownRowsStillReferenced and leaves the stream failed.
