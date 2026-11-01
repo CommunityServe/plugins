@@ -429,6 +429,22 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    // MLX_SERVE_DSV41_DSPARK_POLICY: unset or `fixed` the fixed policy on sampled requests (src/rounds.zig `Fixed`), on
+    // MLX_SERVE_DSV41_DSPARK_COSTS's tables or else the built-in ones (`rounds.DEFAULT_COSTS`, fitted on this box); `1` the
+    // live policy; `0` off. A table beside a policy that reads none is refused by name, as a malformed one is.
+    const policy_raw = env.span(.MLX_SERVE_DSV41_DSPARK_POLICY);
+    const fixed_on = if (policy_raw) |v| std.mem.eql(u8, v, "fixed") else true;
+    const costs_raw = env.span(.MLX_SERVE_DSV41_DSPARK_COSTS);
+    if (!fixed_on and costs_raw != null) {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DSPARK_COSTS is the fixed policy's table, and MLX_SERVE_DSV41_DSPARK_POLICY names another (unset or =fixed reads it): the load is refused\n", .{});
+        out.* = Verdict.refuse(.unsupported, "turboexl3_ds41: DsparkCostsSetting");
+        return null;
+    }
+    const fixed: ?rounds.Fixed = if (fixed_on) rounds.Fixed.parse(costs_raw orelse rounds.DEFAULT_COSTS) catch {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DSPARK_COSTS is not v1,v2,...,vN/d (the verify ms by rows from one to N, 2 <= N <= 16, then the draft's ms) nor such tables by context U1:t1+...+tK (the bounds ascending, the last table unbounded, at most 8): the load is refused\n", .{});
+        out.* = Verdict.refuse(.unsupported, "turboexl3_ds41: DsparkCostsSetting");
+        return null;
+    } else null;
     var own = ctx.*;
     own.weights = null;
     const mp = ds.table.load(&own, out) orelse return null;
@@ -437,7 +453,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     prompt_tl.hook = if (ptl_model != null) &ptlStage else null;
     const on: rounds.Switches = .{
         .copy = config.switchOn(env.span(.MLX_SERVE_DSV41_DSPARK_COPY)),
-        .policy = config.switchOff(env.span(.MLX_SERVE_DSV41_DSPARK_POLICY)),
+        .policy = fixed_on or config.switchOff(policy_raw),
+        .fixed = fixed,
     };
     // The policy reads each draft's confidence, as the engine has its built-in model's stages do.
     model(mp).mdl.ds_want_conf = on.policy;
@@ -454,7 +471,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     dropPending();
     if (drafter) |*d| d.deinit();
     drafter = rounds.Drafter.init(gpa, on);
-    log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on (MLX_SERVE_DSV41_DSPARK_POLICY=1)" else "off: every round verifies the whole block (MLX_SERVE_DSV41_DSPARK_POLICY=1: the policy)" });
+    log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.fixed != null) (if (costs_raw != null) "fixed on sampled requests, on MLX_SERVE_DSV41_DSPARK_COSTS's tables (the cut and the backoff by context, never the clock; a greedy request's rounds verify the whole block; MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)" else "fixed on sampled requests, on the built-in tables fitted on an M5 Max (the cut and the backoff by context, never the clock; a greedy request's rounds verify the whole block; MLX_SERVE_DSV41_DSPARK_COSTS other tables, MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)") else if (on.policy) "the live policy (MLX_SERVE_DSV41_DSPARK_POLICY=1: the measured ladder and the round's wall time)" else "off: every round verifies the whole block (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
     log.info("[turboexl3_ds41] read pool parts: {s}\n", .{if (direct_parts.on) "each demand read's parts on the file's block read straight into their rows, the rest staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0: every part staged); [direct-parts] lines at each prompt's and request's end" else "every part staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0)"});
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
     if (dec_prefetch.on) log.info("[turboexl3_ds41] CED decoder prefetch on (MLX_SERVE_DSV41_DEC_PREFETCH): the decoder layers' experts predicted at encoder layer {d}, {d} layers posted per prompt call, into their free rows only\n", .{ dec_prefetch.start, dec_prefetch.per_call });
@@ -699,6 +716,7 @@ fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callco
     };
     const t1 = f.tokens.slice()[0];
     const rec = tlBegin(m);
+    drafter.?.greedy = true;
     var p = draft(m, &drafter.?, st, t1, f.accept_cap) catch |e| return roundFailed(e);
     defer p.d.deinit(gpa);
     p.round.tl = rec;
@@ -732,6 +750,7 @@ fn draftVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     };
     const t1 = f.tokens.slice()[0];
     const rec = tlBegin(m);
+    drafter.?.greedy = false;
     var p = draft(m, &drafter.?, st, t1, f.accept_cap) catch |e| return roundFailed(e);
     defer p.d.deinit(gpa);
     p.round.tl = rec;

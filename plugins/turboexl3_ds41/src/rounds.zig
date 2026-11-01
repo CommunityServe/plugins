@@ -15,8 +15,103 @@ const lookup = @import("mlx_serve/engines/mlx/spec/mtp_lookup.zig");
 const dflash = @import("mlx_serve/engines/mlx/spec/dflash/policy.zig");
 const verify = @import("mlx_serve/engines/mlx/spec/verify.zig");
 
-/// The two features (the server's environment, read at load): copy rounds, and the verify policy with its backoff.
-pub const Switches = struct { copy: bool = true, policy: bool = true };
+/// The two features (the server's environment, read at load): copy rounds, and the verify policy with its backoff. With
+/// `fixed` (`MLX_SERVE_DSV41_DSPARK_POLICY=fixed`) the policy reads a fixed cost table, never the ladder or a round's
+/// wall time: each choice is a function of the drafts' confidence and the request's own accepts, so a request's text is
+/// the same run to run.
+pub const Switches = struct { copy: bool = true, policy: bool = true, fixed: ?Fixed = null };
+
+/// The fixed policy's tables when `MLX_SERVE_DSV41_DSPARK_COSTS` gives none: fitted on the M5 Max on the a4k canonical pack
+/// (fp3, w-fp3-20261101-1906: a server on the live policy and one on the whole block, copy rounds off, at about 1K, 4K
+/// and 16K prompt tokens of Python's asyncio sources with a task of their own, kept apart from every benchmark prompt;
+/// fp3_costs.py: each ladder's cells, a missing row interpolated, fitted monotone and strictly increasing by 0.1 ms, the
+/// draft's ms from the whole block's round less its verify), bounded at 2048 and 8192 positions.
+pub const DEFAULT_COSTS = "2048:17.7,25.5,26.2,33.6,36.8,42.7/5.0+8192:42.8,60.6,74.5,84.4,88.2,96.3/5.0+37.1,70.2,70.3,104.5,104.6,104.7/4.9";
+
+/// `MLX_SERVE_DSV41_DSPARK_COSTS`: the fixed policy's tables, fitted once per box and pack (machine tuning, never on a
+/// benchmark prompt; `DEFAULT_COSTS` unset): `v1,v2,...,vN/d` for every context, or tables by context `U1:t1+U2:t2+...+tK`, each `t` a table,
+/// the bounds `U` ascending positions and the last table unbounded; a round at the state's position n reads the first
+/// table whose bound exceeds n. A table: the verify ms by rows from one (`t1` alone) to N, then the ms a stage draft
+/// takes. A block's cut never verifies more than N rows (the rows past the table cost +inf); the backoff weighs a drafted
+/// round as `d` plus its rows' verify, its tokens as one-row verifies. Sampled requests only (`Drafter.greedy`).
+pub const Fixed = struct {
+    buckets: [MAX_BUCKETS]Table = undefined,
+    n: usize = 0,
+
+    pub const MAX_BUCKETS = 8;
+    /// No bound: the last table's.
+    pub const UNBOUNDED = std.math.maxInt(u32);
+    pub const Table = struct {
+        upto: u32 = UNBOUNDED,
+        costs: dflash.Costs,
+        rows: usize,
+        draft_ms: f32,
+    };
+
+    pub const Error = error{DsparkCostsSetting};
+
+    /// Every value a positive finite ms (the draft's may be 0), 2 to `dflash.MAX_ROWS` rows a table, the bounds ascending
+    /// integers, only the last table unbounded, at most `MAX_BUCKETS` tables; anything else refused.
+    pub fn parse(value: []const u8) Error!Fixed {
+        var f: Fixed = .{};
+        var it = std.mem.splitScalar(u8, value, '+');
+        var last: u32 = 0;
+        while (it.next()) |item| {
+            if (f.n == MAX_BUCKETS) return error.DsparkCostsSetting;
+            if (f.n > 0 and f.buckets[f.n - 1].upto == UNBOUNDED) return error.DsparkCostsSetting;
+            var t = item;
+            var upto: u32 = UNBOUNDED;
+            if (std.mem.indexOfScalar(u8, item, ':')) |c| {
+                upto = std.fmt.parseInt(u32, item[0..c], 10) catch return error.DsparkCostsSetting;
+                if (upto == 0 or upto == UNBOUNDED or upto <= last) return error.DsparkCostsSetting;
+                last = upto;
+                t = item[c + 1 ..];
+            }
+            f.buckets[f.n] = try parseTable(t);
+            f.buckets[f.n].upto = upto;
+            f.n += 1;
+        }
+        if (f.n == 0 or f.buckets[f.n - 1].upto != UNBOUNDED) return error.DsparkCostsSetting;
+        return f;
+    }
+
+    fn parseTable(value: []const u8) Error!Table {
+        const slash = std.mem.indexOfScalar(u8, value, '/') orelse return error.DsparkCostsSetting;
+        var f: Table = .{ .costs = @splat(std.math.inf(f32)), .rows = 0, .draft_ms = 0 };
+        f.costs[0] = 0;
+        var it = std.mem.splitScalar(u8, value[0..slash], ',');
+        while (it.next()) |t| {
+            if (f.rows == dflash.MAX_ROWS) return error.DsparkCostsSetting;
+            const v = std.fmt.parseFloat(f32, t) catch return error.DsparkCostsSetting;
+            if (!std.math.isFinite(v) or v <= 0) return error.DsparkCostsSetting;
+            f.rows += 1;
+            f.costs[f.rows] = v;
+        }
+        if (f.rows < 2) return error.DsparkCostsSetting;
+        const d = std.fmt.parseFloat(f32, value[slash + 1 ..]) catch return error.DsparkCostsSetting;
+        if (!std.math.isFinite(d) or d < 0) return error.DsparkCostsSetting;
+        f.draft_ms = d;
+        return f;
+    }
+
+    /// The table a round at the state's position `n` reads.
+    pub fn at(f: *const Fixed, n: usize) *const Table {
+        for (f.buckets[0 .. f.n - 1]) |*t| if (n < t.upto) return t;
+        return &f.buckets[f.n - 1];
+    }
+
+    /// The tables as `1:v1,2:v2,.../d`, each bounded one led by `<U:`, joined by `+`, for the meters.
+    pub fn describe(f: *const Fixed, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        for (f.buckets[0..f.n], 0..) |*t, i| {
+            if (i > 0) w.writeAll("+") catch break;
+            if (t.upto != UNBOUNDED) w.print("<{d}:", .{t.upto}) catch break;
+            for (1..t.rows + 1) |r| w.print("{s}{d}:{d:.1}", .{ if (r == 1) "" else ",", r, t.costs[r] }) catch break;
+            w.print("/{d:.1}", .{t.draft_ms}) catch {};
+        }
+        return w.buffered();
+    }
+};
 
 /// The tokens the model's state holds, by position (the request's prompt, then what each round and forward took), in
 /// the lookup's index. A gap (positions it never saw) or a failed forward loses it until the next context.
@@ -278,6 +373,11 @@ pub const Drafter = struct {
     /// The round `cut` gave the whole block to refresh its cell: it teaches the ladder and the calibration, not the
     /// backoff, whose judgment is of the policy's own widths.
     refreshing: bool = false,
+    /// The round is a greedy request's (`draftStep`, set before `plan`): the fixed policy leaves it the whole block, no
+    /// backoff, as with the policy off (its cut changes the verify's shapes, and with them the greedy text, for no gain).
+    greedy: bool = false,
+    /// The state's position at the round's `plan`: the fixed table `cut` and `learn` read.
+    at_n: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, on: Switches) Drafter {
         return .{ .on = on, .history = History.init(gpa) };
@@ -299,15 +399,16 @@ pub const Drafter = struct {
     /// `t1`, `block` the stages' block.
     pub fn plan(self: *Drafter, n: usize, t1: u32, max: usize, remaining: u32, block: usize) Plan {
         self.refreshing = false;
+        self.at_n = n;
         if (max == 0) return .alone;
         if (self.on.copy) {
             const c = copyDrafts(&self.history, n, t1, max, remaining, block);
             if (c.len > 0) return .{ .copy = c };
         }
-        if (!self.on.policy) return .stage;
+        if (!self.on.policy or self.fixedGreedy()) return .stage;
         // The anchor goes stale only while every round verifies more than t1 (the backoff skipping none): a plain round
-        // refreshes it, and stands for one the backoff owes when it owes any.
-        if (self.ladder.due(1)) {
+        // refreshes it, and stands for one the backoff owes when it owes any. The fixed policy has no ladder to refresh.
+        if (self.on.fixed == null and self.ladder.due(1)) {
             if (self.req.drafting.owed > 0) _ = self.req.drafting.shouldDraft();
             self.ladder.ask(1);
             self.req.refreshes += 1;
@@ -325,7 +426,8 @@ pub const Drafter = struct {
     /// them the backoff's way back (a probe that verified two rows of a block worth six lost, and kept the backoff at
     /// its longest period); a stale row counts no dearer than the fresh rows around it instead (`Ladder.costs`).
     pub fn cut(self: *Drafter, conf: []const f32) usize {
-        if (!self.on.policy) return conf.len;
+        if (!self.on.policy or self.fixedGreedy()) return conf.len;
+        if (self.on.fixed) |*f| return verifyDrafts(conf, &self.req.calib, &f.at(self.at_n).costs);
         if (conf.len > 0 and self.ladder.due(conf.len + 1)) {
             self.ladder.ask(conf.len + 1);
             self.req.refreshes += 1;
@@ -353,14 +455,24 @@ pub const Drafter = struct {
             .stage => {
                 q.stage_rounds += 1;
                 q.stats.record(@intCast(drafts), accepted);
-                if (!self.on.policy) return;
+                if (!self.on.policy or self.fixedGreedy()) return;
                 for (conf, 0..) |c, k| {
                     if (k > accepted) break;
                     q.calib.observe(sigmoid(c), k < accepted);
                 }
-                if (!self.refreshing) q.drafting.record(@as(f32, @floatFromInt(accepted + 1)) * self.ladder.costs()[1], wall_ms);
+                // The fixed policy weighs the round on its table: the draft's ms and its rows' verify, never the clock.
+                if (self.on.fixed) |*f| {
+                    const t = f.at(self.at_n);
+                    q.drafting.record(@as(f32, @floatFromInt(accepted + 1)) * t.costs[1], t.draft_ms + t.costs[@min(drafts + 1, dflash.MAX_ROWS)]);
+                } else if (!self.refreshing)
+                    q.drafting.record(@as(f32, @floatFromInt(accepted + 1)) * self.ladder.costs()[1], wall_ms);
             },
         }
+    }
+
+    /// The fixed policy on a greedy request's round: the policy stands aside (`greedy`).
+    fn fixedGreedy(self: *const Drafter) bool {
+        return self.on.fixed != null and self.greedy;
     }
 
     /// The request's `[spec-stats]` lines beside the engine's own, which counts every native round a stage round; then
@@ -379,8 +491,12 @@ pub const Drafter = struct {
         if (q.stage_rounds + q.copy_rounds + q.alone_rounds == 0) return &.{};
         var w = std.Io.Writer.fixed(buf);
         w.print("[spec-stats] dspark rounds: stage_rounds={d} copy_rounds={d} copy_drafted={d} copy_accepted={d} alone_rounds={d} copy={s} policy={s}\n", .{
-            q.stage_rounds, q.copy_rounds, q.copy_drafted, q.copy_accepted, q.alone_rounds, onOff(self.on.copy), onOff(self.on.policy),
+            q.stage_rounds, q.copy_rounds, q.copy_drafted, q.copy_accepted, q.alone_rounds, onOff(self.on.copy), if (self.fixedGreedy()) "fixed: greedy, the whole block" else if (self.on.fixed != null) "fixed" else onOff(self.on.policy),
         }) catch return w.buffered();
+        if (self.on.fixed) |*f| {
+            var tb: [1600]u8 = undefined;
+            w.print("[spec-stats] dspark fixed policy: {s} costs_ms={s}\n", .{ if (self.greedy) "greedy: stood aside" else "sampled", f.describe(&tb) }) catch return w.buffered();
+        }
         var acc: [128]u8 = undefined;
         var rows: [160]u8 = undefined;
         var cells: [256]u8 = undefined;
@@ -466,6 +582,121 @@ test "the history follows the state across a request reset, a restored prefix an
     try testing.expect(!d.history.whole(d.history.size()));
     d.begin(q.ids());
     try testing.expectEqualSlices(u32, q.p[22..29], copyDrafts(&d.history, q.len, q.p[21], 7, 100, 5));
+}
+
+test "the fixed policy's table: verify ms by rows then the draft's, refused by name when malformed" {
+    const f = (try Fixed.parse("41.6,59.9,71.3,79.6,94.8,100.5/5")).at(0).*;
+    try testing.expectEqual(@as(usize, 6), f.rows);
+    try testing.expectEqual(@as(f32, 41.6), f.costs[1]);
+    try testing.expectEqual(@as(f32, 100.5), f.costs[6]);
+    try testing.expect(std.math.isInf(f.costs[7]));
+    try testing.expectEqual(@as(f32, 5), f.draft_ms);
+    _ = try Fixed.parse("57,70/0");
+    for ([_][]const u8{ "", "57", "57,70", "57/5", "57,70/", "57,70/-1", "57,-1/5", "57,0/5", "57,x/5", "57,,70/5", " 57,70/5", "57,70/5x", "57,inf/5", "57,nan/5", "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17/5" }) |v|
+        try testing.expectError(error.DsparkCostsSetting, Fixed.parse(v));
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("1:57.0,2:70.0/0.0", (try Fixed.parse("57,70/0")).describe(&buf));
+}
+
+test "the fixed policy's tables by context: the first whose bound exceeds the position, the last unbounded" {
+    const f = try Fixed.parse("2048:30,40,50/4+8192:35,46,57/4.5+45,60,72/5");
+    try testing.expectEqual(@as(usize, 3), f.n);
+    try testing.expectEqual(@as(f32, 30), f.at(0).costs[1]);
+    try testing.expectEqual(@as(f32, 30), f.at(2047).costs[1]);
+    try testing.expectEqual(@as(f32, 35), f.at(2048).costs[1]);
+    try testing.expectEqual(@as(f32, 4.5), f.at(8191).draft_ms);
+    try testing.expectEqual(@as(f32, 45), f.at(8192).costs[1]);
+    try testing.expectEqual(@as(f32, 72), f.at(1 << 20).costs[3]);
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("<2048:1:30.0,2:40.0,3:50.0/4.0+<8192:1:35.0,2:46.0,3:57.0/4.5+1:45.0,2:60.0,3:72.0/5.0", f.describe(&buf));
+    // The last table unbounded, the bounds ascending, only the last unbounded, at most eight tables.
+    for ([_][]const u8{ "2048:30,40/4", "8192:30,40/4+2048:35,46/4+45,60/5", "2048:30,40/4+2048:35,46/4+45,60/5", "30,40/4+45,60/5", "0:30,40/4+45,60/5", "x:30,40/4+45,60/5", "2048:30,40/4+", "+45,60/5", "1:1,2/0+2:1,2/0+3:1,2/0+4:1,2/0+5:1,2/0+6:1,2/0+7:1,2/0+8:1,2/0+1,2/0" }) |v|
+        try testing.expectError(error.DsparkCostsSetting, Fixed.parse(v));
+    _ = try Fixed.parse("1:1,2/0+2:1,2/0+3:1,2/0+4:1,2/0+5:1,2/0+6:1,2/0+7:1,2/0+1,2/0");
+    // A drafter reads the table of the round's position: a block a 2-row table caps at one draft, the next at the block.
+    var d = Drafter.init(testing.allocator, .{ .copy = false, .fixed = try Fixed.parse("100:30,40/4+30,40,50,60,70,80/4") });
+    defer d.deinit();
+    _ = d.plan(50, 0, 5, 100, 5);
+    try testing.expectEqual(@as(usize, 1), d.cut(&.{ 9, 9, 9, 9, 9 }));
+    _ = d.plan(500, 0, 5, 100, 5);
+    try testing.expectEqual(@as(usize, 5), d.cut(&.{ 9, 9, 9, 9, 9 }));
+}
+
+test "the built-in tables parse: three by context, each strictly increasing by rows" {
+    const f = try Fixed.parse(DEFAULT_COSTS);
+    try testing.expectEqual(@as(usize, 3), f.n);
+    try testing.expectEqual(@as(u32, 2048), f.buckets[0].upto);
+    try testing.expectEqual(@as(u32, 8192), f.buckets[1].upto);
+    try testing.expectEqual(Fixed.UNBOUNDED, f.buckets[2].upto);
+    for (f.buckets[0..f.n]) |t| {
+        try testing.expectEqual(@as(usize, 6), t.rows);
+        for (2..t.rows + 1) |r| try testing.expect(t.costs[r] > t.costs[r - 1]);
+    }
+    try testing.expectEqual(@as(f32, 17.7), f.at(100).costs[1]);
+    try testing.expectEqual(@as(f32, 96.3), f.at(4096).costs[6]);
+    try testing.expectEqual(@as(f32, 4.9), f.at(16384).draft_ms);
+}
+
+test "the fixed policy stands aside on a greedy round: the whole block, no backoff, as with the policy off" {
+    const table = try Fixed.parse("41.6,59.9,71.3,79.6,94.8,100.5/5");
+    var g = Drafter.init(testing.allocator, .{ .copy = false, .fixed = table });
+    defer g.deinit();
+    var off = Drafter.init(testing.allocator, .{ .copy = false, .policy = false });
+    defer off.deinit();
+    g.greedy = true;
+    // Rounds that keep nothing would back a sampled request's drafting off; a greedy one drafts the whole block each time.
+    for (0..40) |_| {
+        const pg = g.plan(1, 0, 5, 100, 5);
+        const po = off.plan(1, 0, 5, 100, 5);
+        try testing.expect(pg == .stage and po == .stage);
+        try testing.expectEqual(@as(usize, 5), g.cut(&.{ -4, -4, -4, -4, -4 }));
+        try testing.expectEqual(off.cut(&.{ -4, -4, -4, -4, -4 }), g.cut(&.{ -4, -4, -4, -4, -4 }));
+        g.learn(.stage, 5, &.{ -4, -4, -4, -4, -4 }, 0, 80, 85);
+        off.learn(.stage, 5, &.{ -4, -4, -4, -4, -4 }, 0, 80, 85);
+    }
+    try testing.expectEqual(@as(u64, 0), g.req.drafting.skipped);
+    // The same drafter on a sampled round takes the table's cut.
+    g.greedy = false;
+    _ = g.plan(1, 0, 5, 100, 5);
+    try testing.expectEqual(@as(usize, 0), g.cut(&.{ -4, -4, -4, -4, -4 }));
+}
+
+test "the fixed policy chooses from its table alone: the same confidence and accepts make the same rounds whatever the clock" {
+    const table = try Fixed.parse("41.6,59.9,71.3,79.6,94.8,100.5/5");
+    var a = Drafter.init(testing.allocator, .{ .copy = false, .fixed = table });
+    defer a.deinit();
+    var b = Drafter.init(testing.allocator, .{ .copy = false, .fixed = table });
+    defer b.deinit();
+    const blocks = [_][5]f32{ @splat(9), .{ 9, 9, -4, 9, 9 }, @splat(3), @splat(-4), .{ 6, 5, 4, 3, 2 }, @splat(9) };
+    const kept = [_]u32{ 5, 2, 1, 0, 3, 5 };
+    for (0..48) |i| {
+        const pa = a.plan(1, 0, 5, 100, 5);
+        const pb = b.plan(1, 0, 5, 100, 5);
+        try testing.expectEqual(std.meta.activeTag(pa), std.meta.activeTag(pb));
+        // Never a refresh: the fixed policy has no ladder cell to keep fresh.
+        try testing.expect(pa != .alone or a.req.drafting.skipped > 0);
+        const conf = &blocks[i % blocks.len];
+        const ca = if (pa == .stage) a.cut(conf) else 0;
+        const cb = if (pb == .stage) b.cut(conf) else 0;
+        try testing.expectEqual(ca, cb);
+        const acc = @min(kept[i % kept.len], @as(u32, @intCast(ca)));
+        // The clocks disagree (b's ten times a's, a stall now and then): the choices may not.
+        const ms: f32 = if (i % 7 == 3) 900 else 60;
+        a.learn(if (pa == .stage) .stage else .alone, ca, conf[0..ca], acc, ms, ms + 5);
+        b.learn(if (pb == .stage) .stage else .alone, cb, conf[0..cb], acc, 10 * ms, 10 * ms + 50);
+    }
+    try testing.expectEqual(@as(u64, 0), a.req.refreshes);
+    try testing.expectEqual(a.req.drafting.skipped, b.req.drafting.skipped);
+    // On the table it is given: a sure block whole, a doubt mid-block cut there, an unsure one t1 alone.
+    var c = Drafter.init(testing.allocator, .{ .copy = false, .fixed = table });
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 5), c.cut(&.{ 9, 9, 9, 9, 9 }));
+    try testing.expectEqual(@as(usize, 2), c.cut(&.{ 9, 9, -4, 9, 9 }));
+    try testing.expectEqual(@as(usize, 0), c.cut(&.{ -4, -4, -4, -4, -4 }));
+    // A table of three rows never verifies more than two drafts.
+    var d = Drafter.init(testing.allocator, .{ .copy = false, .fixed = try Fixed.parse("41.6,59.9,71.3/5") });
+    defer d.deinit();
+    try testing.expectEqual(@as(usize, 2), d.cut(&.{ 9, 9, 9, 9, 9 }));
 }
 
 test "the verify policy cuts the block on the ladder it is given: this plugin's steep verify verifies fewer drafts than the prior" {

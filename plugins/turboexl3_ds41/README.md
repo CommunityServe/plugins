@@ -63,9 +63,12 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
     the draft (more than the block, up to the 7 a verify carries on the bank's decode lane), with no stage forward.
     `MLX_SERVE_DSV41_DSPARK_COPY=0` turns them off.
   - The verify policy: a stage round verifies the prefix of the block whose calibrated confidence buys the most tokens
-    per ms of verify, on the verify ladder the plugin measures from its own rounds, and where drafting does not pay the
-    round verifies `t1` alone (the engine's backoff). Off by default: every round verifies the whole block;
-    `MLX_SERVE_DSV41_DSPARK_POLICY=1` turns the policy on.
+    per ms of verify, and where drafting does not pay the round verifies `t1` alone (the engine's backoff). By default
+    the fixed policy, on sampled requests only: the cut and the backoff read a cost table by context (src/rounds.zig
+    `Fixed`; the built-in `DEFAULT_COSTS`, fitted on the M5 Max, or `MLX_SERVE_DSV41_DSPARK_COSTS`'s), never the
+    measured ladder or a round's wall time, so a request's text is the same run to run; a greedy request's rounds verify
+    the whole block. `MLX_SERVE_DSV41_DSPARK_POLICY=1` is the live policy on the ladder the plugin measures from its own
+    rounds; `=0` turns it off: every round verifies the whole block.
   - The ladder (src/rounds.zig `Ladder`): the 1-row cell in ms, every other row as a ratio to it, so a level change
     the plain rounds see moves every row; each cell the lower median of its last 8 samples and the engine's prior
     ladder (one stall moves it a rank, a new level takes 4 or 5 samples); a cell unsampled for 64 rounds counts no
@@ -485,6 +488,25 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   b2 / a2 pair's +0.59% is likelier x1's own), new text 1294.4 / 1351.4 / 1350.2 / 1345.7 (+2.33%; that pair +0.33%);
   the bank's rows 156 / 178 in every arm, the file cache's growth ~0. On zzz8q the regions together (the waves' 917.5
   MB, the ring's 125.8 MB, phase B's 536.9 MB, x1's 1342.1 MB at 16,383 rows: 2.72 GiB) stay within the cap.
+- `MLX_SERVE_DSV41_DSPARK_POLICY` (src/rounds.zig `Fixed`, `DEFAULT_COSTS`; plugin.zig; patches/turboexl3-zzz8s-dspark-
+  fixed.patch for env.zig's `MLX_SERVE_DSV41_DSPARK_COSTS`; unset or `fixed` the fixed policy on sampled requests, `=1`
+  the live policy, `=0` off): the cut and the drafting backoff on a fixed cost table, never the clock. The tables by
+  context (`U1:t1+U2:t2+t3`, a round at position n on the first table whose bound exceeds it; each `t` the verify ms by
+  rows from one to N, then the draft's ms), built in as fp3's calibration on the a4k canonical pack: a server on the
+  live policy and one on the whole block at about 1K, 4K and 16K prompt tokens of Python's asyncio sources (a prompt set
+  of its own, apart from every benchmark prompt), each ladder fitted monotone and strictly increasing (fp3_costs.py):
+  `2048:17.7,25.5,26.2,33.6,36.8,42.7/5.0+8192:42.8,60.6,74.5,84.4,88.2,96.3/5.0+37.1,70.2,70.3,104.5,104.6,104.7/4.9`.
+  fp3 (w-fp3-20261101-1906, f073b85 + this code with the policy off by default; ABBA, margin 2, EVICT=1, copy rounds
+  on; each arm qbench's ten reference rows sampled as the card, then the code-ctx16384 card sampled and greedy):
+  sampled requests 28.45 / 30.97 / 31.24 / 28.98 tok/s (a1 the whole block, b1 b2 fixed, a2: +8.33%; pairs +8.88%,
+  +7.80%), the ten rows alone +7.99%, the card +6.74%; a1 = a2 and b1 = b2 byte for byte on every request (the fixed
+  policy is deterministic), the greedy card the same bytes and rounds in every arm (rows_hist 6:107). The greedy card
+  also ran 5.41% faster in b, with nothing of the policy on it: the requests before it in its server left the bank
+  warmer (5,401 misses against 5,994), so each server's history moves a later request by several percent and the
+  sampled +8.33% holds some of it; the gain is sized on fresh servers next (fp4). The gain is the backoff's on long
+  prose of low acceptance (row 0 skipped drafting in 3,413 of its 4,919 rounds); the code card keeps the whole block
+  in most rounds (rows_hist 6:106 of 169). kt2 (w-kt2-20261101-1549, the 16K table alone): +14.4% against the whole
+  block over the same rows, the row-by-row geometric mean +4.3%.
 
 ## The pack
 
@@ -496,6 +518,7 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
 
 ## Measured
 
-Nothing yet on the served pack. The copy rounds, the verify policy and its ladder have not run on a GPU; their choices
-are tested MLX-free (`zig build test`). The stage profiler has not run on a GPU either: its accounting and log lines are
+Nothing yet on the served pack. The copy rounds and the fixed verify policy ran on it in kt2 and fp3 (zzz8s's bullet
+above), the live policy and its ladder only as the fixed tables' calibration; their choices are also tested MLX-free
+(`zig build test`). The stage profiler has not run on a GPU either: its accounting and log lines are
 tested MLX-free, its hooks only built.
