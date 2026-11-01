@@ -296,6 +296,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    scratch_attn.configureHeads(env.span(.MLX_SERVE_DSV41_SCRATCH_HEADS)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_HEADS is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     stage.configure(env.span(.MLX_SERVE_DSV41_STAGE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE is not 0 (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -506,6 +513,9 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] wide prompt layers' attention spans on a ring of two per-prompt slots (MLX_SERVE_DSV41_SCRATCH_ATTN; =0: fresh buffers): each span's scores and probabilities in its slot, the gather's launches as write-into twins of their stock texts (compiled at load)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' attention spans on the ring, checked (MLX_SERVE_DSV41_SCRATCH_ATTN=check): the fresh launches served, each span's ring scores, probabilities and heads compared word for word; a [scratch-attn] check line a wide layer\n", .{}),
     }
+    if (scratch_attn.heads_mode != .off) {
+        if (scratch_attn.mode != .on) log.info("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_HEADS needs the ring (MLX_SERVE_DSV41_SCRATCH_ATTN on, the default): every run joined\n", .{}) else log.info("[turboexl3_ds41] wide prompt layers' full WOA_ROWS runs' grouped heads written straight into run regions as [rows, og, in], each run's wo_a reading its region (MLX_SERVE_DSV41_SCRATCH_HEADS{s}){s}\n", .{ if (scratch_attn.heads_mode == .on) "; =0: the join" else "=check", if (scratch_attn.heads_mode == .check) ": the join served, each full run's region compared word for word (an h: field on the [scratch-attn] check line)" else "" });
+    } else log.info("[turboexl3_ds41] wide prompt layers' WOA_ROWS runs' grouped heads joined (MLX_SERVE_DSV41_SCRATCH_HEADS=0)\n", .{});
     switch (scratch_waves.mode) {
         .off => log.info("[turboexl3_ds41] prefill waves' intermediates in fresh buffers (MLX_SERVE_DSV41_SCRATCH_WAVES=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] prefill waves into per-prompt regions (MLX_SERVE_DSV41_SCRATCH_WAVES; =0: fresh buffers): their launches as write-into twins of the stock texts (compiled at load) on two sets of a wave's intermediates at {d} rows, an uncarried call's waves on them; [scratch-waves] at each request's end\n", .{scratch_waves.set_rows}),
