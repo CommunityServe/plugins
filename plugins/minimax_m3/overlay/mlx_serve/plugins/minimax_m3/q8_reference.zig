@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/q8_reference.zig@2d42b6c7e8b4b0b0b1372789c425b966d73a9dbd
+//! copied_from: src/plugins/minimax_m3/q8_reference.zig@90fb57282d374c0989a46503b12f4fd9be300963
 const std = @import("std");
 pub const group_size = 32;
 pub fn vectorBytes(dim: u32) !u64 {

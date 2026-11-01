@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/legacy.zig@2d42b6c7e8b4b0b0b1372789c425b966d73a9dbd
+//! copied_from: src/plugins/minimax_m3/legacy.zig@90fb57282d374c0989a46503b12f4fd9be300963
 //! MiniMax M3.1 Flash load config: settings, load facts, the memory bill and the reader staging.
 const std = @import("std");
 const sdk = @import("mlx_stream").sdk;
@@ -76,7 +76,8 @@ pub fn memoryBill(a: std.mem.Allocator, io: std.Io, c: *const Config) !sdk.Memor
     const kv_copy = kv / c.model.n_layers;
     const reader = readerStagingBytes(&geometry);
     const scratch = @import("experts.zig").chunk_routes * slots + 256 * @as(u64, c.model.hidden_size) + 8 * @as(u64, c.model.n_heads) * c.context;
-    const span = @import("prefill_step.zig").spanBytes(c.model.hidden_size, c.context);
+    const span = @import("prefill_step.zig").spanBytes(c.model.hidden_size, c.context) +
+        @import("prefill_step.zig").sparseTileBytes(c.model.index_n_heads, c.model.index_block_size, c.context);
     const terms = try a.dupe(sdk.MemoryBill.Term, &.{
         .{ .name = "residents", .bytes = .{ residents, residents }, .at_construction = true },
         .{ .name = "kv_and_index", .bytes = .{ kv, kv }, .at_construction = false },

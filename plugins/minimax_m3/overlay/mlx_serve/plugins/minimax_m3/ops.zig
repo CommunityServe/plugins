@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/ops.zig@2d42b6c7e8b4b0b0b1372789c425b966d73a9dbd
+//! copied_from: src/plugins/minimax_m3/ops.zig@90fb57282d374c0989a46503b12f4fd9be300963
 //! MiniMax text graph primitives over the shared MLX backend.
 const std = @import("std");
 const sdk = @import("mlx_stream").sdk;

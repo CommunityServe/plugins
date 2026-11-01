@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/resident_header.zig@2d42b6c7e8b4b0b0b1372789c425b966d73a9dbd
+//! copied_from: src/plugins/minimax_m3/resident_header.zig@90fb57282d374c0989a46503b12f4fd9be300963
 //! MiniMax prepared pack resident-header check, before MLX loads the tensors.
 const std = @import("std");
 const io_util = @import("mlx_stream").sdk.io_util;

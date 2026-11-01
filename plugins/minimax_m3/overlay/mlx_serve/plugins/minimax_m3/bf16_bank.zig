@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/bf16_bank.zig@2d42b6c7e8b4b0b0b1372789c425b966d73a9dbd
+//! copied_from: src/plugins/minimax_m3/bf16_bank.zig@90fb57282d374c0989a46503b12f4fd9be300963
 //! MiniMax routed experts as a BF16 expert bank: `experts.bin` beside `expert-manifest.json`, one record per
 //! (MoE layer, expert) in the `bf16-gud-3part` layout: gate_proj.weight BF16 [inter, hidden], up_proj.weight BF16
 //! [inter, hidden], down_proj.weight BF16 [hidden, inter], back to back, records page-aligned. The bf16 pack the plugin
