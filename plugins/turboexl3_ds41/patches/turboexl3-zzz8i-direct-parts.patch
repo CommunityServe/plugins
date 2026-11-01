@@ -1,0 +1,404 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -271,6 +271,7 @@
+     pub const MLX_SERVE_DSV41_COMPILE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 compiled decode stretches (=0: every op eager)" };
+     pub const MLX_SERVE_DSV41_DECODE_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "split where its curves fit the pack, else flat", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode slot rows (turboexl3_ds41): unset, the flat bill's decode bytes split across the layers by its development corpus's misses-a-row curves, each layer between its prompt rows and 256, where the curves fit the pack (flat rows where they do not); flat: flat rows; split: the split required (refused by name, rows flat, where it does not fit)" };
+     pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
++    pub const MLX_SERVE_DSV41_DIRECT_PARTS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 read pool parts (turboexl3_ds41): each demand read's parts whose file offset, length and row lie on the file's block read straight into their rows (the gate's code on this pack: a third of a record no longer copied), the others staged and copied, the same bytes; [direct-parts] lines at each prompt's and request's end (=0: every part staged and copied)" };
+     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
+     pub const MLX_SERVE_DSV41_EMBED_PREAD: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 token embedding table read from the pack by pread at each lookup, not resident (turboexl3_ds41): its 1.3 GB become streamed slot rows; the rows are the table's bytes, served bytes unchanged (=0: resident)" };
+diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4.h b/sdk/weights/streamed/csrc/q3_lookahead4.h
+--- a/sdk/weights/streamed/csrc/q3_lookahead4.h
++++ b/sdk/weights/streamed/csrc/q3_lookahead4.h
+@@ -92,7 +92,13 @@
+ int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, const int64_t *tickets);
+ int32_t q3ld_ev_release(uint64_t value);    /* force every live gate <= value; forced count, -1 off */
+ int32_t q3ld_ev_state(int64_t *out);        /* 10 words; returns the live gate count */
+-int32_t q3ld_abi(void);                     /* 2026102401 */
++/* PARTS (ABI 2026110101), on a stopped pool: block 0 (off) or a power of two >= 512, the file's block; each demand
++ * range part whose file offset, length and row address are multiples of it is read straight into its row, the others
++ * staged and copied.  0 or -1. */
++int q3ld_parts_config(int64_t block);
++/* PARTS' phase switch, at any time: 1 (the default) the route as configured, 0 every range staged.  0. */
++int q3ld_parts_live(int32_t on);
++int32_t q3ld_abi(void);                     /* 2026110101 */
+ int32_t q3ld_max_gates(void);
+ int32_t q3ld_max_gate_tickets(void);
+ int32_t q3ld_max_pre(void);
+diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
+--- a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
++++ b/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
+@@ -208,6 +208,10 @@
+     SC_EV_HOST_RELEASED,  /* gates the host released (error paths) */
+     SC_EV_STOP_RELEASED,  /* live gates released at stop */
+     SC_DIRECT_RANGES,     /* demand ranges read straight into their rows (q3ld_direct_config: no staging, no copy) */
++    /* PARTS (q3ld_parts_config) */
++    SC_PARTS_DIRECT,      /* range parts read straight into their rows (offset, length and row on the block) */
++    SC_PARTS_DIRECT_BYTES,
++    SC_PARTS_STAGED_BYTES, /* bytes of the other parts of those ranges (the staging loop + the copy) */
+     SC_N
+ };
+ 
+@@ -512,17 +516,57 @@
+ static int run_range_scatter(const job_t *job, const range_t *rg, char *stage, int64_t *out);
+ static int (*run_range)(const job_t *, const range_t *, char *, int64_t *) = run_range_staged;
+ 
++/* PARTS (turboexl3_ds41 zzz8i, MLX_SERVE_DSV41_DIRECT_PARTS; ABI 2026110101): the demand ranges' per-part route, set on a
++ * stopped pool by q3ld_parts_config(block).  block > 0 (the file system block, fstatfs f_bsize: APFS 4,096 B, a power of
++ * two >= 512): a range's parts are read in file order, each part whose file offset, length and row address are
++ * multiples of `block` straight into its row (preadv, the uncached F_NOCACHE path: no staging, no copy), each run of
++ * the others through the staging loop and the copy, as the staged route reads the whole range.  The test is per part
++ * and per read: a part off the block stages.  0: off.  DIRECT, when on, proves every part aligned and wins.  Either way
++ * the file's bytes land in the rows; the route decides only the copy.  Pre-ranges (read before their rows exist) and
++ * the speculative records' copies are untouched.  Counters SC_PARTS_*. */
++static int64_t parts_block = 0;
++static int parts_live = 1;   /* q3ld_parts_live */
++static int run_range_parts(const job_t *job, const range_t *rg, char *stage, int64_t *out);
++
++/* the demand route the configuration names (caller holds mu): DIRECT, else PARTS, else the staging loop */
++static void route_pick(void) {
++    run_range = direct_reads ? run_range_direct_route : parts_block > 0 ? run_range_parts : run_range_staged;
++}
++
+ int q3ld_direct_config(int32_t on) {
+     pthread_mutex_lock(&mu);
+     if (running) { pthread_mutex_unlock(&mu); return -1; }
+     direct_reads = on != 0;
+-    run_range = direct_reads ? run_range_direct_route : run_range_staged;
++    route_pick();
+     pthread_mutex_unlock(&mu);
+     return 0;
+ }
+ 
+-/* the DIRECT read: preadv into the rows until every part is full; the status words as run_range's */
+-static int run_range_direct(const job_t *job, const range_t *rg, int64_t *out) {
++/* PARTS: block 0 (off) or a power of two >= 512, on a stopped pool.  0 or -1. */
++int q3ld_parts_config(int64_t block) {
++    pthread_mutex_lock(&mu);
++    if (running || block < 0 || (block > 0 && (block < 512 || (block & (block - 1)) != 0))) {
++        pthread_mutex_unlock(&mu);
++        return -1;
++    }
++    parts_block = block;
++    __atomic_store_n(&parts_live, 1, __ATOMIC_RELEASE);
++    route_pick();
++    pthread_mutex_unlock(&mu);
++    return 0;
++}
++
++/* PARTS' phase switch, set at any time (an atomic word each range reads as it starts): 1 (the default, again at each
++ * q3ld_parts_config and stop) the route as configured; 0 every range staged and copied, as without the route
++ * (turboexl3_ds41: the decode phase, whose demand misses wait on the drive, not on the copy).  Returns 0. */
++int q3ld_parts_live(int32_t on) {
++    __atomic_store_n(&parts_live, on != 0 ? 1 : 0, __ATOMIC_RELEASE);
++    return 0;
++}
++
++/* preadv straight into the rows until every part is full; the status words as run_range's (DIRECT's range, PARTS'
++ * block-aligned part) */
++static int read_direct(const job_t *job, const range_t *rg, int64_t *out) {
+     struct iovec iov[MAX_COMP];
+     int n = 0;
+     int64_t want = 0;
+@@ -549,9 +593,6 @@
+         while (first < n && left >= (int64_t)iov[first].iov_len) { left -= (int64_t)iov[first].iov_len; first++; }
+         if (first < n && left > 0) { iov[first].iov_base = (char *)iov[first].iov_base + left; iov[first].iov_len -= (size_t)left; }
+     }
+-    pthread_mutex_lock(&mu);
+-    sc[SC_DIRECT_RANGES] += 1;
+-    pthread_mutex_unlock(&mu);
+     out[1] = calls;
+     out[2] = returned;
+     out[3] = total;
+@@ -560,6 +601,15 @@
+     return status;
+ }
+ 
++/* the DIRECT read: preadv into the rows until every part is full; the status words as run_range's */
++static int run_range_direct(const job_t *job, const range_t *rg, int64_t *out) {
++    int status = read_direct(job, rg, out);
++    pthread_mutex_lock(&mu);
++    sc[SC_DIRECT_RANGES] += 1;
++    pthread_mutex_unlock(&mu);
++    return status;
++}
++
+ static int run_range_direct_route(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
+     (void)stage;
+     return run_range_direct(job, rg, out);
+@@ -623,6 +673,63 @@
+     return status;
+ }
+ 
++/* PARTS: a part read straight into its row: its file offset, its length and its row multiples of the block */
++static int part_direct(int64_t off, int64_t len, uint64_t dst) {
++    return len > 0 && off % parts_block == 0 && len % parts_block == 0 && dst % (uint64_t)parts_block == 0;
++}
++
++/* PARTS: the range's parts in file order, each block-aligned part read straight into its row (read_direct), each run of
++ * the others through the staging loop and the copy (run_range_staged over the run).  The status is the first failing
++ * piece's (the pieces after it are not read, as the staged loop stops), the status words the pieces' sums, t_start the
++ * first piece's. */
++static int run_range_parts(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
++    if (!__atomic_load_n(&parts_live, __ATOMIC_ACQUIRE)) return run_range_staged(job, rg, stage, out);
++    int64_t calls = 0, returned = 0, total = 0, t_start = 0, n_direct = 0, direct_bytes = 0, staged_bytes = 0;
++    int status = ST_OK;
++    int64_t pos = rg->offset;
++    int32_t d = 0;
++    out[4] = 0;
++    while (d < rg->ndst && status == ST_OK) {
++        if (!rg->len[d]) { d++; continue; }
++        const int direct = part_direct(pos, rg->len[d], rg->dst[d]);
++        range_t piece = { 0 };
++        piece.offset = pos;
++        int64_t n = 0;
++        int32_t e = d;
++        for (;;) {                                  /* the direct part alone, or the run of parts up to the next one */
++            if (rg->len[e]) {
++                piece.dst[piece.ndst] = rg->dst[e];
++                piece.len[piece.ndst] = rg->len[e];
++                piece.ndst++;
++                n += rg->len[e];
++            }
++            e++;
++            if (direct || e >= rg->ndst || part_direct(pos + n, rg->len[e], rg->dst[e])) break;
++        }
++        int64_t o[RES_W] = { 0 };
++        status = direct ? read_direct(job, &piece, o) : run_range_staged(job, &piece, stage, o);
++        calls += o[1];
++        returned += o[2];
++        total += o[3];
++        if (o[4]) out[4] = o[4];
++        if (!t_start) t_start = o[5];
++        if (direct) { n_direct += 1; direct_bytes += o[3]; } else staged_bytes += o[3];
++        pos += n;
++        d = e;
++    }
++    pthread_mutex_lock(&mu);
++    sc[SC_PARTS_DIRECT] += n_direct;
++    sc[SC_PARTS_DIRECT_BYTES] += direct_bytes;
++    sc[SC_PARTS_STAGED_BYTES] += staged_bytes;
++    pthread_mutex_unlock(&mu);
++    out[1] = calls;
++    out[2] = returned;
++    out[3] = total;
++    out[5] = t_start ? t_start : q3ld_monotonic_ns();
++    out[6] = q3ld_monotonic_ns();
++    return status;
++}
++
+ /* A PRE-RANGE: run_range verbatim (the job has no deadline), except that before the FIRST scatter copy the worker
+  * waits (holding its staged bytes) until a demand submit binds the rows, or the range is cancelled / the pool stops
+  * unbound: then PRE_DROPPED, no copy.  Every later loop step is the stock one. */
+@@ -1746,6 +1853,8 @@
+     running = 0; nworkers = 0; nspec_started = 0; __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); nspec = 0; nspec_threads = 0; spec_configured = 0;
+     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
+     direct_reads = 0;
++    parts_block = 0;
++    parts_live = 1;
+     run_range = run_range_staged;
+     free(ranges); free(queue); free(pre_of); free(sub_len); ranges = 0; queue = 0; pre_of = 0; sub_len = 0;
+     for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
+@@ -2073,7 +2182,7 @@
+ }
+ #endif
+ 
+-int32_t q3ld_abi(void) { return 2026102401; }              /* SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
++int32_t q3ld_abi(void) { return 2026110101; }              /* PARTS route; 2026102401 SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
+ int32_t q3ld_max_gates(void) { return MAX_GATES; }
+ int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
+ int32_t q3ld_max_pre(void) { return MAX_PRE; }
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -56,6 +56,9 @@
+ /// `MLX_SERVE_DSV41_STAGE` (the plugin's src/stage.zig): a wide prompt call's predicted transient loads staged in its windows
+ /// after P1's read-ahead (`Stream.stageGroups`).
+ const stage = @import("mlx_host").stage;
++/// `MLX_SERVE_DSV41_DIRECT_PARTS` (the plugin's src/direct_parts.zig): the read pool's demand ranges part by part, the
++/// block-aligned parts read straight into their rows.
++const direct_parts = @import("mlx_host").direct_parts;
+ const dsv41_routes = @import("../../quant/exl3/stream/kernel_routes.zig");
+ const Combine = dsv41_routes.JoinlessCombine(G);
+ pub const Gate = Hook.Gate;
+@@ -235,6 +238,7 @@
+             .fill_reserve = fillReserve(self.prompt_rows),
+             // MLX_SERVE_DSV41_STAGE: the staged records' tickets stay unclaimed beside every call's own (`Stream.stageGroups`).
+             .pool = .{ .tickets = if (stage.on) 2048 else 1024 },
++            .direct_parts = direct_parts.on,
+         });
+         errdefer self.stream.deinit();
+         self.stream.prompt_stage = stage.on;
+@@ -561,6 +565,10 @@
+                         try self.stream.landFills();
+                         dec_prefetch.reset();
+                         if (prompt_io.on) prompt_io.report(self.pioCounters());
++                        direct_parts.promptEnd(self.source.stats());
++                        // MLX_SERVE_DSV41_DIRECT_PARTS is the prompt's: decode's reads (the grow's fills, its misses)
++                        // stage and copy, as without it.
++                        self.stream.directPartsLive(false);
+                         self.released = (try h.releaseTransient()) > 0;
+                         _ = mlx.mlx_synchronize(self.g.s);
+                         self.g.clearCache();
+@@ -568,6 +576,8 @@
+                     },
+                     .prompt => {
+                         if (prompt_io.on) prompt_io.reset();
++                        direct_parts.promptStart(self.source.stats());
++                        self.stream.directPartsLive(true);
+                         dec_prefetch.reset();
+                         // `shrink` frees the grown rows and checks MLX's active bytes dropped by them, so no command may
+                         // still hold them (the grow's own fills, a decode's last eval): a phase change right after the
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weights/streamed/sdk_ext/expert/io.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/io.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/io.zig
+@@ -25,6 +25,8 @@
+     pub extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
+     pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
+     pub extern fn q3ld_direct_config(on: i32) c_int;
++    pub extern fn q3ld_parts_config(block: i64) c_int;
++    pub extern fn q3ld_parts_live(on: i32) c_int;
+     pub extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
+     pub extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
+     pub extern fn q3ld_submit_scatter(n: i32, ngu: i32, ndown: i32, fds: [*]const i32, sizes: [*]const i64, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
+@@ -62,9 +64,10 @@
+     pub const abi = c;
+     pub const status_words = res_w;
+ } else struct {};
+-/// The C pool's ABI (`q3ld_abi`): 2026101401, DIRECT reads as a construction-time route (2026101201: the submit-wide
+-/// WITHDRAW over the range-job queue).
+-pub const abi_version = 2026102401;
++/// The C pool's ABI (`q3ld_abi`): 2026110101, the PARTS route (`Options.parts_block`) and its counters (2026102401:
++/// SCATTER ranges; 2026101401: DIRECT reads as a construction-time route; 2026101201: the submit-wide WITHDRAW over the
++/// range-job queue).
++pub const abi_version = 2026110101;
+ pub const max_workers = 8;
+ /// Records per job (one fill unit).
+ pub const max_items = 8;
+@@ -156,8 +159,12 @@
+     ev_host_released = 69,
+     ev_stop_released = 70,
+     direct_ranges = 71,
++    /// The PARTS route: parts read straight into their rows, their bytes, and the bytes of those ranges' other parts.
++    parts_direct = 72,
++    parts_direct_bytes = 73,
++    parts_staged_bytes = 74,
+ };
+-pub const counters_n = 72;
++pub const counters_n = 75;
+ /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
+ /// read by `threads` threads in `chunk_bytes` preadv steps.
+ pub const Spec = struct {
+@@ -186,6 +193,10 @@
+     /// range: the owner proves the alignment once at construction (`checkDirectBlock` + the stream's
+     /// `checkDirectReads`), so the uncached preadv takes the drive's direct path.
+     direct: bool = false,
++    /// The PARTS route, fixed at start: the file's block (`fileBlockSize`), against which the pool tests each part of a
++    /// demand range as it reads it (its file offset, length and row): a part on the block is read straight into its row,
++    /// the others staged and copied. 0 (the default): off. `direct` wins when both are set.
++    parts_block: u64 = 0,
+     spec: ?Spec = null,
+ };
+ /// A speculative staging slot: the page-rounded record plus two pages.
+@@ -332,12 +343,20 @@
+             return error.PoolUnavailable;
+         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
+         if (c.q3ld_direct_config(@intFromBool(opt.direct)) != 0) return error.PoolUnavailable;
++        if (c.q3ld_parts_config(@intCast(opt.parts_block)) != 0) return error.PoolUnavailable;
+         var ptrs: [max_workers]u64 = undefined;
+         for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
+         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
+         if (rc == -2) _ = c.q3ld_stop(); // fewer threads than asked: join the ones that started
+         if (rc != 0) return if (rc == -1) error.PoolUnavailable else error.PoolStart;
+         return self;
++    }
++    /// The PARTS route's phase switch (`q3ld_parts_live`), at any time: false stages and copies every range from the
++    /// next one a worker starts (as without the route) until it is set again; true (the start's state) the route as
++    /// configured. Either way the rows get the file's bytes.
++    pub fn partsLive(self: *Pool, on: bool) void {
++        _ = self;
++        _ = c.q3ld_parts_live(@intFromBool(on));
+     }
+     /// After the owned consumers settle: expire unbound reads and wait for the pool's activity to stop.
+     /// Ready speculative records and their tags stay intact. A timeout refuses the phase change.
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io_stub.zig b/sdk/weights/streamed/sdk_ext/expert/io_stub.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/io_stub.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/io_stub.zig
+@@ -73,6 +73,12 @@
+     pub fn q3ld_direct_config(_: i32) c_int {
+         return -1;
+     }
++    pub fn q3ld_parts_config(_: i64) c_int {
++        return -1;
++    }
++    pub fn q3ld_parts_live(_: i32) c_int {
++        return -1;
++    }
+     pub fn q3ld_abi() i32 {
+         return 0;
+     }
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+@@ -413,6 +413,9 @@
+             /// Decode misses per completion part (a down wave and its gate).
+             records_per_part: u32 = 3,
+             pool: expert_io.Options = .{ .tickets = 1024 },
++            /// The pool's PARTS route (`expert_io.Options.parts_block`): the stream resolves the file's block at
++            /// construction, and each demand range's parts on it are read straight into their rows, the rest staged.
++            direct_parts: bool = false,
+             /// The pool's staging buffers sized from the bank (`stagingBytes`: its widest gate/up or down span,
+             /// page-rounded, plus a page of alignment) in place of `pool.staging_bytes`. A pre-read range must fit one
+             /// buffer, so a bank whose spans exceed the pool's default needs it.
+@@ -867,6 +870,13 @@
+                     try expert_io.checkDirectBlock(direct_block, std.heap.pageSize());
+                     try checkDirectReads(bank, direct_block);
+                 }
++                // The PARTS route (`Options.direct_parts`): the file's block, for the pool's per-read test of each part
++                // (its file offset, length and row). Nothing else is checked here: a part off the block stages.
++                if (opt.direct_parts and !pool_opt.direct) {
++                    const blk = expert_io.fileBlockSize(bank.sidecar) catch return error.DirectReadsBlock;
++                    try expert_io.checkDirectBlock(blk, std.heap.pageSize());
++                    pool_opt.parts_block = blk;
++                }
+                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
+                 if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
+                 errdefer if (selector) |*sel| sel.deinit(a);
+@@ -3129,6 +3139,11 @@
+                 self.read_ns += ns;
+                 if (res.preadv_calls == 0 and res.payload > 0) self.copy_only_ns += ns;
+             }
++            /// The PARTS route for the reads from here on (`expert_io.Pool.partsLive`; MLX_SERVE_DSV41_DIRECT_PARTS: the
++            /// source's prompt phase on, its decode phase off). A no-op without the route.
++            pub fn directPartsLive(self: *Stream, on: bool) void {
++                self.pool.partsLive(on);
++            }
+             pub fn stats(self: *Stream) Stats {
+                 var s = self.counters;
+                 s.expert_read_seconds = @as(f64, @floatFromInt(self.read_ns)) / 1e9;
+@@ -3142,6 +3157,8 @@
+                     .{ "gates", .ev_gates },            .{ "gates_forced", .ev_wd_forced },
+                     .{ "spec_expired", .expired },      .{ "spec_abandoned", .abandoned }, .{ "spec_discarded", .discarded },
+                     .{ "spec_cancelled", .cancelled_by_demand }, .{ "direct_ranges", .direct_ranges },
++                    .{ "parts_direct", .parts_direct }, .{ "parts_direct_bytes", .parts_direct_bytes },
++                    .{ "parts_staged_bytes", .parts_staged_bytes },
+                     .{ "spec_claimed_inflight", .claimed_inflight }, .{ "spec_abandoned_bytes", .abandoned_bytes },
+                 };
+                 inline for (pairs) |pr| @field(s, pr[0]) = @intCast(@max(p.counter(pr[1]), 0));
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert.zig b/sdk/weights/streamed/sdk_ext/expert.zig
+--- a/sdk/weights/streamed/sdk_ext/expert.zig
++++ b/sdk/weights/streamed/sdk_ext/expert.zig
+@@ -119,6 +119,11 @@
+     spec_claimed_inflight: u64 = 0,
+     spec_abandoned_bytes: u64 = 0,
+     direct_ranges: u64 = 0,
++    /// The PARTS route (`io.Options.parts_block`): parts read straight into their rows, their bytes, and the bytes of
++    /// those ranges' other parts (staged and copied).
++    parts_direct: u64 = 0,
++    parts_direct_bytes: u64 = 0,
++    parts_staged_bytes: u64 = 0,
+     adopt_ranges: u64 = 0,
+     adopt_bytes: u64 = 0,
+     /// Pre-read ranges queued, served to a demand read, dropped unbound.

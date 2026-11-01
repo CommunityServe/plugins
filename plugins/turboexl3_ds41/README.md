@@ -320,6 +320,25 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   (+1.5%); the guard's sampled peak 105.3 GiB. Exact: the seeded cold text is the same in every arm (md5 efeb6f4ecd), and
   `check` (w-pio-20261101-0809) compared every wide call's first and last 2048 rows, 40 calls and 3,355,443,200 words,
   with none different.
+- `MLX_SERVE_DSV41_DIRECT_PARTS` (src/direct_parts.zig, src/direct_parts_test.zig, patches/turboexl3-zzz8i-direct-parts.patch:
+  the copied read pool's PARTS route; on, `=0` off): a record is
+  read as its gate/up span and its down span, each in one F_NOCACHE preadv into a worker's 9 MiB staging buffer and a
+  copy of every part into its slot row. On, the pool tests each part as it reads it: a part whose file offset, length
+  and row address lie on the file's block (fstatfs f_bsize, 4,096 B) is read straight into its row (no staging, no
+  copy), each run of the others staged and copied as before. On this pack only the gate's code passes (at offset 0 of a
+  record padded to 4,096 B, 1,474,560 x K bytes; the up and down codes sit 2,560 and 1,024 B off the block): a third
+  of every prompt-phase demand read's bytes no longer copied (its routes, read-ahead and staged loads, the CED
+  decoder's replay reads); the decode phase's reads, the pre-read ranges and the lookahead's records stage as before
+  (the source switches the route off at each decode phase: decode's misses wait on the drive, not the copy). Exact: the
+  file's bytes land in the rows either way (`zig build test`'s direct_parts gate reads the pack's K = 3 and K = 2
+  records both ways and across the phase switch: the same slot bytes and status words, the counters exactly the gate
+  codes read while on). `[direct-parts] prompt|request parts= direct_gb= staged_gb=` at each prompt's and request's end.
+- On against `=0` (dp1, w-pio-20261101-1006, on d451beb with the route in both phases; staging on, policy off, A B B A):
+  1199.5 and 1200.4 tok/s cold prefill against 1195.7 and 1192.7 (+0.48%); the encoder's attention 268.0 and 267.5 ms a
+  layer against 274.2 and 275.5 (-7.1 ms); 35.81 of the cold prompt's 107.8 GB read direct; the texts the same in every
+  arm (the cold one md5 d081845201). Decode (dd1, w-20261101-1015, 16K card + greedy): the same misses a round (78.5 and
+  60.0), verify 118.1 / 99.9 ms a round against 114.8 / 99.5 at 0 and decode 40.7 / 47.9 tok/s against 41.8 / 48.1: no
+  gain there, so the route is the prompt's only.
 - `MLX_SERVE_DSV41_Q_TAIL` (src/q_tail.zig, src/kernels/rope_tail_only.metal, src/kernels/attn_qk_t.metal,
   patches/turboexl3-zzz8h-q-tail.patch; on, `=0` off, `check` checked): a wide prompt layer's query heads are not copied
   whole to rope their last channels. `=0`: `qkvProj` writes the chunk's roped heads [rows, 64, 512] (bf16, 1.07 GB at

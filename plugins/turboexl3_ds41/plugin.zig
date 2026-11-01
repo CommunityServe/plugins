@@ -27,6 +27,9 @@ pub const prompt_io = @import("src/prompt_io.zig");
 /// The CED decoder layers' experts read into their rows while the encoder runs, when `MLX_SERVE_DSV41_DEC_PREFETCH`
 /// asks (src/dec_prefetch.zig, posted by the copied source, planned by the copied model).
 pub const dec_prefetch = @import("src/dec_prefetch.zig");
+/// The read pool's demand ranges part by part, the parts on the file's block read straight into their rows
+/// (`MLX_SERVE_DSV41_DIRECT_PARTS`, src/direct_parts.zig, read by the copied source at the stream's construction).
+pub const direct_parts = @import("src/direct_parts.zig");
 /// The DSpark draft's Markov chain in B + 1 launches (src/markov.zig, called by the copied model's draft;
 /// `MLX_SERVE_DSV41_MARKOV`).
 const markov = @import("src/markov.zig");
@@ -345,6 +348,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     }
     // Before the model's load: the stream's read pool reserves the fills' tickets at its construction.
+    direct_parts.configure(env.span(.MLX_SERVE_DSV41_DIRECT_PARTS)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DIRECT_PARTS is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     dec_prefetch.configure(env.span(.MLX_SERVE_DSV41_DEC_PREFETCH)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DEC_PREFETCH is neither S nor S:K (S an encoder layer from 1, K 1..32) nor 0: the load is refused\n", .{});
         out.* = switch (e) {
@@ -378,6 +388,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (drafter) |*d| d.deinit();
     drafter = rounds.Drafter.init(gpa, on);
     log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on" else "off (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
+    log.info("[turboexl3_ds41] read pool parts: {s}\n", .{if (direct_parts.on) "each demand read's parts on the file's block read straight into their rows, the rest staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0: every part staged); [direct-parts] lines at each prompt's and request's end" else "every part staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0)"});
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
     if (dec_prefetch.on) log.info("[turboexl3_ds41] CED decoder prefetch on (MLX_SERVE_DSV41_DEC_PREFETCH): the decoder layers' experts predicted at encoder layer {d}, {d} layers posted per prompt call, into their free rows only\n", .{ dec_prefetch.start, dec_prefetch.per_call });
     if (seed_free.on) log.info("[turboexl3_ds41] usage seed's rows free until routed (MLX_SERVE_DSV41_SEED_FREE): the prompt's read-ahead and the CED decoder prefetch may take them\n", .{});
@@ -432,7 +443,16 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         round_io.start(ioSnap(model(mp)));
         log.info("[turboexl3_ds41] [round-io] on (the DSpark profile): each round's expert stream traffic and the process's disk reads beside its verify time, the decode's and the rest's at each request's end\n", .{});
     }
+    if (direct_parts.on) if (partsSnap(model(mp))) |ps| direct_parts.start(ps);
     return mp;
+}
+
+/// The stream's PARTS counters now (`direct_parts`); null without the EXL3 source.
+fn partsSnap(m: *ds.Model) ?direct_parts.Snap {
+    const r = m.mdl.streamed orelse return null;
+    if (r.math != .source) return null;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    return direct_parts.Snap.of(src.stats());
 }
 
 /// The stream's counters and the process's disk reads now (`round_io`).
@@ -741,7 +761,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const head = if (drafter) |*d| d.meters(&meter_buf) else meter_buf[0..0];
     const mid = streamMeters(model(mp), meter_buf[head.len..]);
     const tail = markov.meters(meter_buf[head.len + mid.len ..]);
-    const n = head.len + mid.len + tail.len;
+    const n0 = head.len + mid.len + tail.len;
+    const dp = if (partsSnap(model(mp))) |ps| direct_parts.meters(ps, meter_buf[n0..]) else meter_buf[n0..n0];
+    const n = n0 + dp.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }

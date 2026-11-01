@@ -93,6 +93,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(stage_rows).step);
+    // MLX_SERVE_DSV41_DIRECT_PARTS's byte gate: the copied read pool's C file alone (no MLX) reading the pack's record
+    // layout through the PARTS route and the staging route, the same slot bytes (src/direct_parts_test.zig).
+    const parts_gate = b.addTest(.{ .name = "direct_parts", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/direct_parts_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    parts_gate.root_module.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" } });
+    parts_gate.root_module.addIncludePath(b.path(csrc));
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(parts_gate).step);
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/turboexl3_sdk.zig"),
         .target = target,
