@@ -78,6 +78,9 @@ pub const joinless = @import("src/joinless.zig");
 /// A wide prompt layer's input as the last wide layer's whole stream (`MLX_SERVE_DSV41_WHOLE_STREAM`, src/whole_stream.zig),
 /// read by the copied model.
 pub const whole_stream = @import("src/whole_stream.zig");
+/// A wide prompt call's predicted transient loads read while its attention runs, into the windows its routes take
+/// (`MLX_SERVE_DSV41_STAGE`, src/stage.zig), read by the copied stream, its source and the streamer's wide call.
+pub const stage = @import("src/stage.zig");
 /// A profile build (`zig build -Dplugin-profile=true`, never served): the copied stream's profile probes compiled in (its
 /// `sdk` reads this through this root) and the decode verify's GPU timeline (`MLX_SERVE_DSV41_TIMELINE`,
 /// src/verify_tl.zig).
@@ -248,6 +251,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    stage.configure(env.span(.MLX_SERVE_DSV41_STAGE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE is not 0 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     joinless.configure(env.span(.MLX_SERVE_DSV41_JOINLESS)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_JOINLESS is neither 0 nor check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -358,6 +368,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] wide prompt layers take the last wide layer's whole stream and mix, not their spans' concatenation (MLX_SERVE_DSV41_WHOLE_STREAM=0: the concatenation)\n", .{})
     else
         log.info("[turboexl3_ds41] wide prompt layers concatenate their spans' streams (MLX_SERVE_DSV41_WHOLE_STREAM=0)\n", .{});
+    if (stage.on)
+        log.info("[turboexl3_ds41] wide prompt calls' predicted transient loads staged in their windows while the attention runs (MLX_SERVE_DSV41_STAGE=0: each stream group read by its own route); [prompt-io] staged= adopted= with PROMPT_IO\n", .{})
+    else
+        log.info("[turboexl3_ds41] wide prompt calls' stream groups read by their own routes (MLX_SERVE_DSV41_STAGE=0)\n", .{});
     switch (joinless.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt calls' routed outputs joined, the routed sum and shared expert by the op chain (MLX_SERVE_DSV41_JOINLESS=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt calls' routed sum and shared expert in one combine over the waves' outputs, no joins (MLX_SERVE_DSV41_JOINLESS=0: the joins and the op chain)\n", .{}),

@@ -288,6 +288,22 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
 - On against `=0` (w-pio-20261101-0737; WOA_ROWS and JOINLESS on in every arm): 1132.3 and 1127.8 tok/s cold prefill
   against 1125.7 and 1126.8 (+0.3%); new text 1116.8 and 1137.2 against 1104.9 and 1130.3 (+0.8%). Exact: the seeded
   text is the same in every arm (md5 efeb6f4ecd).
+- `MLX_SERVE_DSV41_STAGE` (src/stage.zig, patches/turboexl3-zzz8f-stage.patch; on, `=0` off): a wide prompt call's
+  predicted transient loads read while its layer's attention runs. `=0`: P1's read-ahead fills the persistent rows the
+  seed leaves free (about 50 records a layer at 16K rows) and the call's stream groups (about 240 transient misses a
+  layer once the seed holds every persistent row) are read by their own routes while the groups before them compute. On,
+  after P1 the copied stream reads the prediction's stream misses into the windows the call's first stream groups take
+  (group g of a call takes window g mod 5); the stream's ticket ring doubles (2048) so their tickets stay unclaimed
+  beside P1's and the call's own. The call's first stream groups become the staged experts it routes, each filled up to
+  48 from the rest in hot order; a transient miss takes the row of its window holding its record and skips the read; a
+  route with a transient load lands its window's staged reads first. `[prompt-io]` adds `staged=` and `adopted=` a
+  layer, `[stream-stats prompt]` `stage_posted=`, `stage_adopted=` and `stage_gb=`.
+- On against `=0` (w-pio-20261101-0821; WOA_ROWS, JOINLESS, WHOLE_STREAM, EMBED_PREAD and VISION_LAZY on in every arm):
+  1171.4 and 1178.4 tok/s cold prefill against 1136.0 and 1120.5 (+4.1%); new text 1204.2 and 1202.6 against 1119.1 and
+  1136.1 (+6.7%). Over the cold request's encoder the moe stage took 4470 and 4484 ms against 5476 and 5590, the host's
+  waits on bytes 666 and 679 ms against 1516 and 1650; 4722 records staged, 4079 adopted (86%), the rest 7.9 GB of reads
+  under the attention, which ran about 25 ms a layer longer with them in flight. Exact: the texts are the same in every
+  arm (the cold one md5 efeb6f4ecd).
 
 ## The pack
 

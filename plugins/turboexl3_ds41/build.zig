@@ -86,6 +86,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(free).step);
+    // MLX_SERVE_DSV41_STAGE's transient rows on the same policy (`PlanOpts.held_rows`): src/stage_test.zig, likewise.
+    const stage_rows = b.addTest(.{ .name = "stage_rows", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/stage_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(stage_rows).step);
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/turboexl3_sdk.zig"),
         .target = target,
