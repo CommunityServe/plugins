@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/affine_layout.zig@61ec76d7bc1abfb7f588db3bf6a94ffc0cd423c7
+//! copied_from: src/plugins/minimax_m3/affine_layout.zig@2d42b6c7e8b4b0b0b1372789c425b966d73a9dbd
 const std = @import("std");
 const sdk_ext = @import("mlx_stream").sdk_ext;
 const mlx = @import("mlx_stream").sdk.mlx;

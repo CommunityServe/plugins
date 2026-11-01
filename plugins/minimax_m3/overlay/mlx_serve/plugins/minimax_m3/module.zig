@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/module.zig@61ec76d7bc1abfb7f588db3bf6a94ffc0cd423c7
+//! copied_from: src/plugins/minimax_m3/module.zig@2d42b6c7e8b4b0b0b1372789c425b966d73a9dbd
 //! MiniMax M3.1 Flash text execution. The first implementation uses serial prompt
 //! tokens, bounded expert slots and exact per-index-head sparse block selection.
 const std = @import("std");
@@ -209,7 +209,10 @@ pub const Module = struct {
         defer g.release(x);
         const last = if (head and ids.len > 1) try ops.row(g, x, @intCast(ids.len - 1)) else x;
         const result = if (head) try ops.linear(g, try ops.norm(g, last, self.norm, &self.c.model), self.head) else x;
-        if (head) try g.evalAll(&.{result});
+        if (head) {
+            try g.evalAll(&.{result});
+            try self.source.settle();
+        }
         self.pos += @intCast(ids.len);
         return g.keep(result);
     }

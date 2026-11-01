@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/experts.zig@61ec76d7bc1abfb7f588db3bf6a94ffc0cd423c7
+//! copied_from: src/plugins/minimax_m3/experts.zig@2d42b6c7e8b4b0b0b1372789c425b966d73a9dbd
 //! Bounded MiniMax demand reads through the SDK stream. Every route is evaluated
 //! before its slots are unpinned; NVFP4 gathers retain the shared global-scale math.
 const std = @import("std");
@@ -82,10 +82,10 @@ pub fn Backend(comptime B: type, comptime F: type) type {
                 _ = self.stream.refsOf(route, &refs);
                 const arrays: SlotBanks = .{ .base = self.stream.bankArrays(rel, .base), .ext = self.stream.bankArrays(rel, .ext), .transient = self.stream.bankArrays(rel, .transient) };
                 const result = try applyOne(g, c, x, ids, weights, refs[0..ids.len], arrays, down_bias);
-                try g.evalAll(&.{result});
+                // Its kernels run with the next layer's routing read (or the head's eval); the released slots stay
+                // pinned until that route's flush (or `settle`).
                 self.stream.release(route);
                 released = true;
-                try self.stream.flush();
                 return result;
             }
             pub fn applyChunk(self: *SourceType, g: *ops.G, c: *const C, layer: u32, x: ops.T, ids: []const u16, weights: []const f32, down_bias: ?ops.T) !ops.T {
@@ -383,6 +383,12 @@ pub const Source = struct {
         return switch (self.backend) {
             inline else => |source| source.applySpan(g, c, layer, x, ids, weights, bias),
         };
+    }
+    /// Unpins the released routes: only after an eval that consumed them.
+    pub fn settle(self: *Source) !void {
+        switch (self.backend) {
+            inline else => |source| try source.stream.flush(),
+        }
     }
     pub fn stats(self: *Source) @import("mlx_stream").sdk_ext.expert.Stats {
         return switch (self.backend) {
