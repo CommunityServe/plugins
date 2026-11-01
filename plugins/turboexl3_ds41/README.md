@@ -278,6 +278,16 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   window's first server, Engram-cold, read 1057.1). The card and greedy texts are the same in every arm. An image
   request (448x448, a red disc) returned HTTP 200 on the resident and the lazy tower alike, the same reasoning head;
   its 64 tokens all went to reasoning, so the answer itself was not read in that window.
+- `MLX_SERVE_DSV41_WHOLE_STREAM` (src/whole_stream.zig, patches/turboexl3-zzz8e-whole-stream.patch; on, `=0` off): a
+  wide prompt layer takes the last wide layer's whole stream and FFN mix as they are. `=0`: each wide layer starts by
+  concatenating its spans' streams (`[L, hc, D]`) and mixes into fresh arrays, though the last wide layer's one MoE
+  group left every span holding a row slice of one array: a copy and a fresh buffer a layer. On, the layer's last step
+  also keeps that array and the mix (two held slots), and the next wide layer takes them when every span still holds its
+  slice: not on an Engram layer (1 and 14 write rows per span), and not after an exchange or a layer of several MoE
+  groups. The words are the concatenation's.
+- On against `=0` (w-pio-20261101-0737; WOA_ROWS and JOINLESS on in every arm): 1132.3 and 1127.8 tok/s cold prefill
+  against 1125.7 and 1126.8 (+0.3%); new text 1116.8 and 1137.2 against 1104.9 and 1130.3 (+0.8%). Exact: the seeded
+  text is the same in every arm (md5 efeb6f4ecd).
 
 ## The pack
 

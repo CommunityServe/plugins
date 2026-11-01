@@ -1,0 +1,98 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -295,6 +295,7 @@
+     pub const MLX_SERVE_DSV41_T3_GROUP: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode hit wave on turboexl3's grouped banked decode (turboexl3_ds41, with MLX_SERVE_DSV41_ROUTED=turboexl3): its GEMVs share one weight decode among up to four row-slots of one expert, and the device route's pairs whose expert no bank holds run no expert in it (their rows come from the miss parts, as before); served bytes unchanged (=0: the banked texts, a miss pair computed from base row 0)" };
+     pub const MLX_SERVE_DSV41_TIMELINE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode verify GPU timeline (turboexl3_ds41's profile builds only, zig build -Dplugin-profile=true): an absolute directory; each request's VERIFY_GPU_TIMELINE line logged and its command buffers, verify stamps and rounds written there at its end" };
+     pub const MLX_SERVE_DSV41_VISION_LAZY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 vision tower read from the pack for each image and freed after, not resident (turboexl3_ds41): its 0.9 GB become streamed slot rows; the bank holds its prompt rows while the tower is loaded; an image's rows unchanged (=0: resident)" };
++    pub const MLX_SERVE_DSV41_WHOLE_STREAM: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' stream (turboexl3_ds41): on, each takes the last wide layer's whole stream and FFN mix where every span still holds its rows of them, not their concatenation, the same words; 0: the concatenation" };
+     pub const MLX_SERVE_DSV41_WOA_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' EXL3 wo_a (turboexl3_ds41): on, over runs of 4096 rows of the attention spans, one grouped linear a run, each slice decoded once a run (a reorder-level rounding: MLX's GEMM at another M); 0: span by span; check: both, compared word for word, the span-by-span result served ([woa-rows] lines)" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -48,6 +48,9 @@
+ /// turboexl3_ds41's src/joinless.zig (`MLX_SERVE_DSV41_JOINLESS`): a wide call's routed sum and the shared expert in one
+ /// combine over the call's unjoined outputs (the source's `source_shared`).
+ const jless = @import("../../../joinless.zig");
++/// turboexl3_ds41's src/whole_stream.zig (`MLX_SERVE_DSV41_WHOLE_STREAM`): a wide layer takes the last wide layer's whole
++/// stream and mix (`Spans.whole`) where its spans still hold their rows, not their concatenation.
++const wstream = @import("../../../whole_stream.zig");
+ /// The CED decoder prefetch (turboexl3_ds41's src/dec_prefetch.zig, `MLX_SERVE_DSV41_DEC_PREFETCH`).
+ const dp = @import("../../../dec_prefetch.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+@@ -3645,7 +3648,8 @@
+     const tail = cedTail(m, st, L, want);
+     const n_tail = if (tail) |t| (t + span - 1) / span else 0;
+     const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
+-    const held = try gpa.alloc(A, (n_spans + n_tail) * (4 + targets));
++    // (+ 4: `Spans.whole`'s two slots for the chunk's spans and two for the tail's)
++    const held = try gpa.alloc(A, (n_spans + n_tail) * (4 + targets) + 4);
+     defer {
+         for (held) |x| if (x.ctx != null) {
+             _ = mlx.mlx_array_free(x);
+@@ -3654,6 +3658,7 @@
+     }
+     @memset(held, none);
+     var sp = spansOf(held, n_spans, targets, span, L, p0);
++    sp.whole = held[held.len - 4 ..][0..2];
+     sp.eng_ids = eng_ids;
+     sp.ncols = ncols;
+     var img_mask: A = none;
+@@ -3747,6 +3752,7 @@
+     try runLayers(m, gpa, st, &sp, held, from, enc_hi);
+     if (tail) |tl| {
+         var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
++        tsp.whole = held[held.len - 2 ..][0..2];
+         tsp.floor = tsp.p0;
+         try cedReplayIn(m, gpa, st, &sp, &tsp, enc_hi);
+         m.ced_stats.chunks += 1;
+@@ -3857,6 +3863,8 @@
+         hold(&sp.topks[k], none);
+         hold(&sp.cands[k], none);
+     }
++    // MLX_SERVE_DSV41_WHOLE_STREAM: the spans are the worker's rows now.
++    for (sp.whole) |*w| hold(w, none);
+ }
+ /// Worker: its layers over one step the host handed over (`x` [L, hc, dim], `pre` [L, hc]),
+ /// returning both as they stand after them (caller frees). The state follows the host's: a step
+@@ -3927,8 +3935,13 @@
+     const parts = try gpa.alloc(A, n_spans);
+     defer gpa.free(parts);
+     for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
+-    const x = try sc.concat(parts, 0);
+-    const pres = try sc.concat(sp.pres, 0);
++    // MLX_SERVE_DSV41_WHOLE_STREAM: the last wide layer's whole stream and mix when every span still holds its rows of
++    // them (this layer writes no Engram rows, and nothing replaced a span since): the same words, no copy.
++    const whole = wstream.on and sp.whole.len == 2 and sp.whole[0].ctx != null and (for (parts, sp.xs) |p, sx| {
++        if (p.ctx != sx.ctx) break false;
++    } else true);
++    const x = if (whole) sp.whole[0] else try sc.concat(parts, 0);
++    const pres = if (whole) sp.whole[1] else try sc.concat(sp.pres, 0);
+     // MLX_SERVE_DSV41_RA_FUSED: the attention-side mix first, and the read-ahead's prediction from one more pass of its
+     // norm kernel under the FFN's norm (the same collapse of the same rows with the same previous mix), not the op chain.
+     // The attention's input is the same kernels' over the same arrays; only the predicted experts may round apart.
+@@ -4023,6 +4036,12 @@
+             hold(&sp.xs[k], try gsc.slice(xg, 0, a - lo, b - lo));
+             hold(&sp.pres[k], try gsc.slice(pf.sp.pre, 0, a, b));
+         }
++        // MLX_SERVE_DSV41_WHOLE_STREAM: one group's output is the whole stream the spans now hold slices of.
++        if (wstream.on and sp.whole.len == 2) {
++            const one = k0 == 0 and k1 == n_spans;
++            hold(&sp.whole[0], if (one) xg else none);
++            hold(&sp.whole[1], if (one) pf.sp.pre else none);
++        }
+     }
+ }
+ /// `MLX_SERVE_DSV41_WOA_ROWS=check` over a layer's runs: the runs compared, those equal bit for bit, the elements that
+@@ -4136,6 +4155,9 @@
+     /// `[L]` bool, the chunk's rows inside an image span (none for text): they route by the VL bias and
+     /// Engram leaves them untouched.
+     img: A = none,
++    /// turboexl3_ds41 (MLX_SERVE_DSV41_WHOLE_STREAM): two held slots, the last wide layer's whole stream `[L, hc, D]` and
++    /// FFN mix, whose row slices `xs` / `pres` hold (none: not one array's slices); empty: no slots.
++    whole: []A = &.{},
+     fn bounds(sp: *const Spans, k: usize) [2]usize {
+         const lo = k * sp.span;
+         return .{ lo, @min(sp.L, lo + sp.span) };
