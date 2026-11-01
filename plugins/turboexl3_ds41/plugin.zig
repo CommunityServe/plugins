@@ -74,6 +74,9 @@ pub const joinless = @import("src/joinless.zig");
 /// src/verify_tl.zig).
 pub const plugin_profile: bool = @import("build_options").plugin_profile;
 const verify_tl = @import("src/verify_tl.zig");
+/// The prompt pass's GPU timeline (`MLX_SERVE_DSV41_PROMPT_TL`, src/prompt_tl.zig): the verify timeline's store over a
+/// prompt, its buffers tagged by layer and host stage at `[prompt-io]`'s hooks.
+const prompt_tl = @import("src/prompt_tl.zig");
 const timeline = @import("mlx_stream").verify_timeline;
 const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
@@ -258,6 +261,18 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // Before the model's load, which compiles its decode stretches only when the stage profiler is off.
     stage_prof.configure(env.span(.MLX_SERVE_DSV41_STAGE_PROF));
     prompt_io.configure(env.span(.MLX_SERVE_DSV41_PROMPT_IO));
+    prompt_tl.setting = prompt_tl.parse(env.span(.MLX_SERVE_DSV41_PROMPT_TL), plugin_profile) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_PROMPT_TL is refused ({s}): an absolute directory, in a profile build (zig build -Dplugin-profile=true)\n", .{@errorName(e)});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    if (prompt_tl.setting.dirPath() != null and (!prompt_io.on or verify_tl.setting.dirPath() != null)) {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_PROMPT_TL needs MLX_SERVE_DSV41_PROMPT_IO on (its stages are its hooks) and MLX_SERVE_DSV41_TIMELINE unset (the two share one store): the load is refused\n", .{});
+        out.* = Verdict.refuse(.unsupported, "turboexl3_ds41: PromptTimelineSettings");
+        return null;
+    }
     // Before the model's load: the stream's read pool reserves the fills' tickets at its construction.
     dec_prefetch.configure(env.span(.MLX_SERVE_DSV41_DEC_PREFETCH)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DEC_PREFETCH is neither S nor S:K (S an encoder layer from 1, K 1..32) nor 0: the load is refused\n", .{});
@@ -270,6 +285,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     own.weights = null;
     const mp = ds.table.load(&own, out) orelse return null;
     open = null;
+    ptl_model = if (prompt_tl.setting.dirPath() != null) model(mp) else null;
+    prompt_tl.hook = if (ptl_model != null) &ptlStage else null;
     const on: rounds.Switches = .{
         .copy = config.switchOn(env.span(.MLX_SERVE_DSV41_DSPARK_COPY)),
         .policy = config.switchOn(env.span(.MLX_SERVE_DSV41_DSPARK_POLICY)),
@@ -316,6 +333,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => "the op chain (MLX_SERVE_DSV41_MARKOV=0)",
     }});
     if (plugin_profile) log.info("[turboexl3_ds41] a profile build (zig build -Dplugin-profile=true, never served): the stream's profile probes compiled in, the decode verify timeline {s}\n", .{if (verify_tl.setting.dirPath() != null) "on (MLX_SERVE_DSV41_TIMELINE): VERIFY_GPU_TIMELINE and ds41-timeline-<pid>-<seq>.json at each request's end" else "off (MLX_SERVE_DSV41_TIMELINE unset)"});
+    if (prompt_tl.setting.dirPath()) |d| log.info("[turboexl3_ds41] prompt GPU timeline on (MLX_SERVE_DSV41_PROMPT_TL): each prompt's command buffers tagged by layer and stage (pre, attn, moe, rest), ds41-prompt-tl-<pid>-<seq>.json in {s} at each request's end\n", .{d});
     const la = stream_lookahead.setting;
     if (!la.isDefault()) log.info("[turboexl3_ds41] decode lookahead (MLX_SERVE_DSV41_LOOKAHEAD): {d} records read ahead a layer call{s}, idle rule {d}, the stream sized for {d}\n", .{ la.budget, if (la.predicts()) "" else " (the predictor off)", la.idle_busy, la.initBudget() });
     round_io.on = model(mp).mdl.ds_prof != null;
@@ -624,6 +642,7 @@ var meter_buf: [131072]u8 = undefined;
 /// round's stream traffic (src/round_io.zig) with the DSpark profile.
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = slot;
+    ptlWrite(model(mp));
     tlWrite(model(mp));
     stage_prof.requestEnd();
     usageEnd(model(mp));
@@ -709,7 +728,8 @@ fn tlCounters(m: *ds.Model) verify_tl.Counters {
 /// timeline disarmed until the next request's first round.
 fn tlWrite(m: *ds.Model) void {
     if (comptime !plugin_profile) return;
-    if (!timeline.active) return;
+    // The store is the prompt timeline's when it is on (`ptlWrite`).
+    if (verify_tl.setting.dirPath() == null or !timeline.active) return;
     const pending = timeline.settle(m.mdl.s, 2000);
     defer timeline.uninstall();
     var lb: [16384]u8 = undefined;
@@ -731,6 +751,60 @@ fn tlJson(w: *std.Io.Writer) !void {
     try timeline.writeJson(w);
     try w.writeAll(", ");
     try verify_tl.writeRounds(w, tl_rounds.slice());
+    try w.writeAll("}\n");
+}
+
+// ── The prompt pass's GPU timeline (`MLX_SERVE_DSV41_PROMPT_TL`, profile builds only) ──
+
+/// The loaded model while the prompt timeline is on (its stream and layers), else null.
+var ptl_model: ?*ds.Model = null;
+var ptl_marks: prompt_tl.Marks = .{};
+var ptl_seq: u32 = 0;
+var ptl_failed = false;
+
+/// `prompt_tl.hook`: layer `layer`'s stage `st` starts now. A prompt's first stage installs the timeline (a failed install
+/// turns it off for the process); `end` stops recording until the request's end writes the file.
+fn ptlStage(layer: u32, st: prompt_tl.Stage) void {
+    if (comptime !plugin_profile) return;
+    const m = ptl_model orelse return;
+    if (ptl_failed) return;
+    if (!timeline.active) {
+        if (st == .end) return;
+        timeline.install(m.mdl.s, 2, @intCast(m.mdl.n_layers)) catch |e| {
+            log.err("[turboexl3_ds41] the prompt timeline is off: {s}\n", .{@errorName(e)});
+            ptl_failed = true;
+            return;
+        };
+        ptl_marks.reset();
+    }
+    ptl_marks.add(timeline.now(), layer, st);
+    timeline.promptStage(layer, @intFromEnum(st));
+}
+
+/// The request's end: the prompt's buffers settled, its file written, the timeline uninstalled until the next prompt.
+fn ptlWrite(m: *ds.Model) void {
+    if (comptime !plugin_profile) return;
+    const dir = prompt_tl.setting.dirPath() orelse return;
+    if (!timeline.active) return;
+    const pending = timeline.settle(m.mdl.s, 2000);
+    defer timeline.uninstall();
+    var pb: [prompt_tl.max_path + 64]u8 = undefined;
+    const path = prompt_tl.filePath(&pb, dir, @intCast(std.c.getpid()), ptl_seq) catch return;
+    ptl_seq += 1;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    ptlJson(&aw.writer) catch |e| return log.err("[turboexl3_ds41] the prompt timeline's file was not made: {s}\n", .{@errorName(e)});
+    std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = aw.written() }) catch |e|
+        return log.err("[turboexl3_ds41] the prompt timeline was not written to {s}: {s}\n", .{ path, @errorName(e) });
+    const k = timeline.counts();
+    log.info("[turboexl3_ds41] prompt timeline written: {s} ({d} buffers, {d} pending, {d} dropped, {d} marks, {d} marks dropped)\n", .{ path, @min(k[0], timeline.max_buffers), pending, k[2], ptl_marks.n, ptl_marks.dropped });
+}
+
+fn ptlJson(w: *std.Io.Writer) !void {
+    try w.writeAll("{\"timeline\": ");
+    try timeline.writeJson(w);
+    try w.writeAll(", ");
+    try prompt_tl.writeMarks(w, ptl_marks.slice(), ptl_marks.dropped, timeline.origin());
     try w.writeAll("}\n");
 }
 

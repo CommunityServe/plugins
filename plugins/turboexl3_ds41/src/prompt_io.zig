@@ -22,6 +22,8 @@
 //!   share among the top `cut` of the earlier prompts' routes of the layer (a static prior; `-` for a server's first).
 
 const std = @import("std");
+/// `MLX_SERVE_DSV41_PROMPT_TL` (profile builds): the prompt's GPU timeline marks its stages at these hooks.
+const ptl = @import("prompt_tl.zig");
 
 /// The switch (`configure`, at load). `2` also splits each wide layer's read-ahead wait (`split_ra`).
 pub var on: bool = false;
@@ -205,9 +207,20 @@ pub fn raEval(layer: usize) void {
     ra_eval_t = now();
 }
 
+/// A wide layer of the prompt begins (its input, before its read-ahead): the prompt timeline's `pre` stage.
+pub fn layerBegin(layer: usize) void {
+    if (!on) return;
+    ptl.stage(layer, .pre);
+}
+
+/// The layer of the last routed call begun (the prompt timeline's stages after it).
+var tl_layer: usize = 0;
+
 /// A routed call of the prompt begins: `c` the stream's counters now.
 pub fn callStart(layer: usize, rows: usize, c: Counters) void {
     if (!on) return;
+    tl_layer = layer;
+    ptl.stage(layer, .attn);
     const t = now();
     const t_first = if (ra_layer != null and ra_layer.? == layer) ra_t[0] else t;
     begin(c, t_first);
@@ -242,13 +255,17 @@ pub fn callStart(layer: usize, rows: usize, c: Counters) void {
 
 /// The call's routes are evaluated (the GPU's attention and router done).
 pub fn callRouted() void {
-    if (!on or n_calls == 0) return;
+    if (!on) return;
+    ptl.stage(tl_layer, .moe);
+    if (n_calls == 0) return;
     calls[n_calls - 1].t_idx = now();
 }
 
 /// The routed call returned (its groups drained): `c` the stream's counters now.
 pub fn callEnd(c: Counters) void {
-    if (!on or n_calls == 0) return;
+    if (!on) return;
+    ptl.stage(tl_layer, .rest);
+    if (n_calls == 0) return;
     const r = &calls[n_calls - 1];
     if (r.t1 != 0) return;
     r.t1 = now();
@@ -386,6 +403,7 @@ fn wideSteps(r: *const Call) [8]u64 {
 }
 
 pub fn report(c: Counters) void {
+    if (on) ptl.stage(tl_layer, .end);
     if (!on or !active) {
         reset();
         return;

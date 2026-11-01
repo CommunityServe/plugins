@@ -145,6 +145,14 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   `ds41-timeline-<pid>-<seq>.json` the raw rows and each round's rows, accepted drafts, misses and host times. The shim
   hooks the class of MLX's command buffers through a buffer of the plugin's own queue (src/tl_buffer.m). A served build
   has no hook and refuses the setting.
+- `MLX_SERVE_DSV41_PROMPT_TL=<absolute directory>` (src/prompt_tl.zig, patches/turboexl3-zzz8c-prompt-timeline.patch;
+  profile builds, with `MLX_SERVE_DSV41_PROMPT_IO`, refused with `MLX_SERVE_DSV41_TIMELINE`) arms the same store over
+  each prompt pass: from its first stage to its end every command buffer MLX commits, tagged with the layer and the
+  host's stage (`pre`: a wide layer's start, its Engram rows and read-ahead, to its routed call; `attn`: the call's
+  barrier, its routes evaluated; `moe`: the call's reads and waves; `rest`: the layer's last eval), the stages' host
+  marks and the read pool's event signals. No fence is added: the marks sit at `[prompt-io]`'s hooks. At the request's
+  end `ds41-prompt-tl-<pid>-<seq>.json` holds the rows (`cycle` the layer, `phase` the stage) and the marks, all on
+  Metal's clock.
 - The decode's slot rows are split across the layers (src/decode_rows.zig, the hook in
   patches/turboexl3-zzz1-decode-rows.patch) at the flat bill's bytes or fewer, each layer between its prompt rows and
   256, by each layer's misses-a-row curve: the decode residency policy replayed over routes recorded on a development

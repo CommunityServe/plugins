@@ -1,0 +1,45 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -282,6 +282,7 @@
+     pub const MLX_SERVE_DSV41_LOOKAHEAD: Var = .{ .kind = .kill, .type = .text, .default = "2 (records read ahead a layer call; idle rule 0)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's expert lookahead (turboexl3_ds41): <budget>[:<idle>], the records read ahead a layer call 0 to 4 (0: the predictor off) and the idle rule 0 or 1; the served bytes are the same at every setting" };
+     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
+     pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end, and a [prompt-io] wide line a wide layer; =2 also splits the read-ahead's wait by a sync at each step" };
++    pub const MLX_SERVE_DSV41_PROMPT_TL: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt GPU timeline (turboexl3_ds41's profile builds only, zig build -Dplugin-profile=true; needs MLX_SERVE_DSV41_PROMPT_IO, refused with MLX_SERVE_DSV41_TIMELINE): an absolute directory; each prompt's command buffers tagged by layer and host stage (pre, attn, moe, rest) and the stages' host marks written there at the request's end" };
+     pub const MLX_SERVE_DSV41_RA_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' read-ahead prediction on the fused hc kernels (turboexl3_ds41): the attention-side mix first, the prediction from one more pass of its norm kernel under the FFN's norm; served bytes unchanged (=0: the op chain)" };
+     pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -3870,6 +3870,8 @@
+ /// once over all of the chunk's rows, attention's state-bound core per span, the MoE over `moe_rows` at a
+ /// time. A span-wide linear fills a few threadgroups per GPU core; the chunk's rows fill the GPU. New streams and mixes land in `sp.xs` / `sp.pres`.
+ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, li: usize) !void {
++    // turboexl3_ds41 (MLX_SERVE_DSV41_PROMPT_TL, with PROMPT_IO): the layer's `pre` stage starts.
++    pio.layerBegin(li);
+     const n_spans = sp.xs.len;
+     const ly = &m.layers[li];
+     var sc = Scope.init(gpa, m.s);
+diff -ruN -x .generated a/sdk/weights/streamed/profile/verify_timeline.zig b/sdk/weights/streamed/profile/verify_timeline.zig
+--- a/sdk/weights/streamed/profile/verify_timeline.zig
++++ b/sdk/weights/streamed/profile/verify_timeline.zig
+@@ -156,6 +156,18 @@
+     layers[cur][layer].gate_gu = gu;
+     layers[cur][layer].gate_down = down_first + n_parts - 1;
+ }
++/// turboexl3_ds41 (`MLX_SERVE_DSV41_PROMPT_TL`): MLX's buffers from now on are recorded as model layer `layer`'s stage
++/// `stage` of a prompt pass (a row's `cycle` and `phase` in `writeJson`), the timeline armed by `install` with no cycle;
++/// stage 0 stops recording.
++pub fn promptStage(layer: u32, stage: u8) void {
++    if (comptime !enabled) return;
++    if (!active) return;
++    if (comptime @hasDecl(c, "dsv41tl_tag")) c.dsv41tl_tag(if (stage == 0) 0 else (@as(u64, layer) + 1) << 8 | stage);
++}
++/// The install's time (`now`'s clock): `writeJson`'s times are from it.
++pub fn origin() u64 {
++    return t0;
++}
+ /// Stops recording (the decode has ended); every buffer committed after is not a row.
+ pub fn disarm() void {
+     if (comptime !enabled) return;
