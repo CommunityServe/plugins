@@ -26,6 +26,9 @@ const vision_common = @import("src/sushi/vision_common.zig");
 const attn_nax = @import("src/attn_nax.zig");
 const index_nax = @import("src/index_nax.zig");
 const vision_key = @import("src/vision_key.zig");
+const copy_lookup = @import("src/copy_lookup.zig");
+const ablation = @import("src/ablation.zig");
+const tap_files = @import("src/tap.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.1.0";
@@ -64,6 +67,8 @@ const Model = struct {
     s: mlx.mlx_stream,
     /// The raw token ids the state holds (the state's own history is compressed ids).
     ids: std.ArrayList(u32) = .empty,
+    /// `ids` by n-gram, for the round's copy arm; follows `ids` lazily and is cleared with it (`clearIds`).
+    lookup: copy_lookup.Index = .{},
     /// The prompt being prefilled: its restore point is taken where the state stands at its last token.
     arm: ?Arm = null,
     /// A completed capture waiting for the engine to take it (`auxSnapshot`).
@@ -72,11 +77,18 @@ const Model = struct {
     policy: rows_policy.Policy = .{},
     /// A round whose verify the engine is accepting (`NativeDrafter.verify` until `finish`).
     open: ?Open = null,
+    /// This request's copy rounds, the drafts they verified and kept; logged when the next request starts (`startCopies`).
+    copy: CopyStats = .{},
+    /// Whether this request still takes copies (`copy_lookup.Backoff`).
+    copy_backoff: copy_lookup.Backoff = .{},
     prev_cache_limit: ?usize = null,
     /// The MLX buffer-pool cap in force (`borrow.poolCap` of the last pass's rows): `pool_bytes` at decode widths.
     pool_now: u64 = pool_bytes,
     /// Positions the expert cache was sized to leave room for (a request's state and one prefill chunk's working set).
     billed_context: u64 = default_context,
+    /// Calibration (`SUSHI_DS41_TAP_DIR`): where each prompt's tap is written, and how many were.
+    tap_dir: ?[]const u8 = null,
+    tap_seq: u64 = 0,
 };
 
 // ── bill ──
@@ -206,6 +218,31 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         pf.* = dsv.Profile.init(verify_profile);
         m.mdl.profile = pf;
     }
+    if (std.c.getenv("SUSHI_DS41_PREFILL_PIPELINE")) |raw| {
+        const text = std.mem.span(raw);
+        if (pipeSetting(text)) |n| m.mdl.pipe_depth = n else log.warn("[sushi_ds41] SUSHI_DS41_PREFILL_PIPELINE=\"{s}\" is not a layer count: kept {d} (0 turns the pipeline off)\n", .{ text, m.mdl.pipe_depth });
+    }
+    // The profiles time each stage when it ends, so they turn the pipeline off (`pipeOn`) whatever the setting.
+    if (m.mdl.profile != null)
+        log.info("[sushi_ds41] prefill pipeline: off (a SUSHI_DSV41_*_PROFILE diagnostic waits on every layer)\n", .{})
+    else if (m.mdl.pipe_depth == 0)
+        log.info("[sushi_ds41] prefill pipeline: off (SUSHI_DS41_PREFILL_PIPELINE=0: every layer waits)\n", .{})
+    else
+        log.info("[sushi_ds41] prefill pipeline: up to {d} prefill-width layers in flight\n", .{m.mdl.pipe_depth});
+    if (std.c.getenv("SUSHI_DS41_TAP_DIR")) |d| {
+        const tap = try gpa.create(dsv.StreamTap);
+        errdefer gpa.destroy(tap);
+        tap.* = try dsv.StreamTap.init(gpa, c.layers, tap_rows);
+        m.mdl.stream_tap = tap;
+        m.tap_dir = std.mem.span(d);
+        m.tap_seq = tap_files.nextTapSeq(gpa, m.tap_dir.?);
+        log.warn("[sushi_ds41] calibration tap ON: every prompt's per-layer activations and last ids are written to {s} (owner-only files); unset SUSHI_DS41_TAP_DIR to stop\n", .{m.tap_dir.?});
+    }
+    errdefer if (m.mdl.stream_tap) |t| {
+        t.deinit();
+        gpa.destroy(t);
+        m.mdl.stream_tap = null;
+    };
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
     errdefer if (m.tower) |*t| t.deinit();
@@ -230,6 +267,9 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     _ = mlx.mlx_clear_cache();
     return m;
 }
+
+/// Rows the calibration tap keeps per pass: positions -5..-2 from a prompt's prefix pass, -1 from its last-token pass.
+const tap_rows = 4;
 
 /// MLX's freed-buffer pool during decode, which the ledger bills.
 const pool_bytes: u64 = 1 << 30;
@@ -277,12 +317,17 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     }
     if (m.snap) |sn| freeSnap(sn);
     if (m.tower) |*t| t.deinit();
+    if (m.mdl.stream_tap) |t| {
+        t.deinit();
+        gpa.destroy(t);
+    }
     m.mdl.deinit();
     m.engine.deinit();
     gpa.destroy(m.engine);
     gpa.destroy(m.experts);
     m.weights.deinit();
     m.ids.deinit(gpa);
+    m.lookup.deinit(gpa);
     gpa.destroy(m);
 }
 
@@ -293,6 +338,8 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     if (f.mode == .verify or f.mode == .batched_rows) return Verdict.refuse(.unsupported, "sushi_ds41: no speculative verify or batched rows");
     if (f.capture_layers.len > 0 or f.want_hidden) return Verdict.refuse(.unsupported, "sushi_ds41: no layer capture or hidden rows (not an embedding model)");
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "sushi_ds41: one slot's rows at a time");
+    if (armAblation(m, f)) |refused| return refused;
+    defer ablation.disarm(m.mdl);
     const host = hostIds(m, f) catch return Verdict.refuse(.failed, "sushi_ds41: the token ids do not read back");
     defer host.deinit();
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
@@ -301,17 +348,35 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     if (st.n != pos) return Verdict.refuse(.failed, "sushi_ds41: the position does not follow the model's state");
     if (pos + host.ids.len > m.billed_context + generation_rows) return Verdict.refuse(.failed, "sushi_ds41: the request is longer than the context the expert cache was sized for (raise ctx_size)");
     for (host.ids) |t| if (t >= m.cfg.vocab) return Verdict.refuse(.failed, "sushi_ds41: token id past the vocabulary");
+    // Every row's logits come from one pass over the whole span (`run` chunks only a prompt that wants the last row's),
+    // so refuse a span wider than the widest prefill pass: a DeepSeek-V4.1 pass past 8,192 rows can hang the machine.
+    if (f.logits == .all_rows and host.ids.len > sc.prefill_width + sc.tail_merge_rows) return Verdict.refuse(.too_large, "sushi_ds41: every row's logits past one prefill pass");
     capture(m) catch return Verdict.refuse(.failed, "sushi_ds41: the restore point could not be taken");
     const want: dsv.Want = if (f.logits == .all_rows) .all else .last;
     const rows: ?dsv.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
     // A host older than `Forward.progress` passes a shorter struct.
     const progress: ?*u64 = if (f.size >= @offsetOf(abi.Forward, "progress") + @sizeOf(?*u64)) f.progress else null;
-    const logits = run(m, host.ids, want, rows, progress) catch |e| {
+    // The tap records prompt passes only, never a one-token decode forward.
+    const logits = run(m, host.ids, want, rows, progress, ablation.tapsMode(f.mode)) catch |e| {
         log.err("[sushi_ds41] forward failed: {s}\n", .{@errorName(e)});
         return Verdict.refuse(.failed, "sushi_ds41: the forward failed");
     };
     if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
     return .ok;
+}
+
+/// Arms the forward's ablation on the model for this call (`ablation.disarm` after); a refusal when the host's table
+/// is not one this plugin runs.
+fn armAblation(m: *Model, f: *const abi.Forward) ?Verdict {
+    const a = (ablation.of(f) catch |e| return switch (e) {
+        error.AblationStrength => Verdict.refuse(.unsupported, "sushi_ds41: ablation strength is not in [0, 1]"),
+        error.AblationSlots => Verdict.refuse(.unsupported, "sushi_ds41: one ablation entry per slot"),
+    }) orelse return null;
+    ablation.arm(m.mdl, a, m.cfg.dim, m.s) catch |e| return switch (e) {
+        error.AblationShape => Verdict.refuse(.unsupported, "sushi_ds41: ablation directions are not [1, dim] f32"),
+        else => Verdict.refuse(.failed, "sushi_ds41: the ablation could not be armed"),
+    };
+    return null;
 }
 
 const HostIds = struct {
@@ -334,17 +399,42 @@ fn hostIds(m: *Model, f: *const abi.Forward) !HostIds {
     return .{ .ids = data[0..mlx.mlx_array_size(flat)], .flat = flat };
 }
 
+/// Empties the token history and its n-gram index together: a history that is replaced, not extended, must not keep
+/// the old one's n-grams.
+fn clearIds(m: *Model) void {
+    m.ids.clearRetainingCapacity();
+    m.lookup.clear();
+}
+
+const CopyStats = struct { rounds: u64 = 0, drafted: u64 = 0, accepted: u64 = 0 };
+
+/// A new request's copy arm: the last one's copy rounds are logged and its backoff forgotten. Runs from both places a
+/// request starts, a fresh state (`reset`) and a restored prefix (`auxRestoreAt`).
+fn startCopies(m: *Model) void {
+    if (m.copy.rounds > 0) log.info("[sushi_ds41] copy rounds={d} drafted={d} accepted={d}\n", .{ m.copy.rounds, m.copy.drafted, m.copy.accepted });
+    m.copy = .{};
+    m.copy_backoff = .{};
+}
+
 fn reset(m: *Model) void {
+    startCopies(m);
     dsv.resetState(m.mdl);
     m.open = null;
-    m.ids.clearRetainingCapacity();
+    clearIds(m);
     m.policy = rows_policy.Policy.init(depth_bounds.active, m.cfg.dspark.block);
 }
 
 /// A prompt as sushi runs it: all but its last token in chunks (`prefill_width`, a short tail merged into the last), each
 /// told what follows it so the next chunk's Engram rows read while it runs, then the last token alone for the logits.
 /// Logits `[rows, vocab]`. `progress` gets the rows forwarded after each chunk (`Forward.progress`).
-fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64) !mlx.mlx_array {
+fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64, prompt: bool) !mlx.mlx_array {
+    const tapping = prompt and m.mdl.stream_tap != null;
+    errdefer dsv.pipeDrain(m.mdl) catch {};
+    // The tap records the prefix's last chunk and the last token's pass: every layer runs both.
+    if (m.mdl.stream_tap) |t| t.clear();
+    defer if (m.mdl.stream_tap) |t| {
+        t.on = false;
+    };
     var rows = media;
     const prefix = if (want == .last and ids.len > 1) ids.len - 1 else 0;
     var at: usize = 0;
@@ -355,19 +445,39 @@ fn run(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, prog
         // Another chunk of the prefix follows and is wider than the window (the merge keeps tails of `tail_merge_rows`
         // rows), so its CED tail overwrites this chunk's decoder rows before anything reads them: run this one without
         // its decoder (`extendState`).
+        if (tapping) m.mdl.stream_tap.?.on = end == prefix;
         if (end < prefix and prefix - end > m.mdl.cfg.window and m.mdl.ced_split != null) try stateRows(m, ids[at..end], ids[end..next], rows) else _ = mlx.mlx_array_free(try forwardRows(m, ids[at..end], .last, ids[end..next], rows));
         if (rows) |*r| r.offset += std.mem.count(u32, ids[at..end], &.{m.cfg.image_token_id});
         at = end;
         if (progress) |p| @atomicStore(u64, p, at, .monotonic);
     }
+    // Pipelined state-only layers finish before the restore point reads the state (no-op when nothing is in flight).
+    // Progress above counts rows submitted; this is where they are done.
+    try dsv.pipeDrain(m.mdl);
     try capture(m);
+    if (tapping) m.mdl.stream_tap.?.on = true;
     const logits = try forwardRows(m, ids[prefix..], want, &.{}, rows);
     defer _ = mlx.mlx_array_free(logits);
+    if (tapping) {
+        tap_files.dumpTap(gpa, m.mdl.stream_tap.?, m.tap_dir.?, m.tap_seq, m.ids.items, m.mdl.ablation != null, m.s) catch |e| log.err("[sushi_ds41] tap dump failed: {s}\n", .{@errorName(e)});
+        m.tap_seq += 1;
+    }
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_reshape(&o, logits, &[_]c_int{ -1, @intCast(m.cfg.vocab) }, 2, m.s));
     return o;
 }
+
+/// The `SUSHI_DS41_PREFILL_PIPELINE` value: prefill layers in flight, capped at `pipe_measured`; only 0 turns the
+/// pipeline off. Null when it is no count (a typo, empty, "on"): the caller warns and keeps the default, so a bad value
+/// never turns a default-on feature off.
+fn pipeSetting(raw: []const u8) ?usize {
+    const n = std.fmt.parseInt(usize, raw, 10) catch return null;
+    return @min(n, pipe_measured);
+}
+
+/// The deepest pipeline measured (M5 Ultra, 2,048-row chunks): a deeper setting is capped here until one is.
+const pipe_measured = 2;
 
 /// One pass over `rows`; the logits are the caller's to free (an intermediate chunk's are dropped).
 fn forwardRows(m: *Model, rows: []const u32, want: dsv.Want, ahead: []const u32, media: ?dsv.VisionRows) !mlx.mlx_array {
@@ -413,6 +523,18 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 test {
     _ = config;
     _ = attn_nax;
+    _ = @import("src/all_resident_test.zig");
+    _ = ablation;
+    _ = tap_files;
+}
+
+test "sushi_ds41 prefill pipeline: SUSHI_DS41_PREFILL_PIPELINE parses to layers in flight, only 0 is off, junk keeps the default, capped" {
+    const t = std.testing;
+    try t.expectEqual(@as(?usize, 0), pipeSetting("0"));
+    try t.expectEqual(@as(?usize, 1), pipeSetting("1"));
+    try t.expectEqual(@as(?usize, 2), pipeSetting("2"));
+    try t.expectEqual(@as(?usize, pipe_measured), pipeSetting("99"));
+    for ([_][]const u8{ "", "on", "off", "two", "-1", " 2", "2x" }) |junk| try t.expectEqual(@as(?usize, null), pipeSetting(junk));
 }
 
 // ── prefix cache ──
@@ -535,10 +657,11 @@ fn auxRestoreAt(mp: *anyopaque, _: u32, h: abi.Handle, pos: u64) callconv(.c) Ve
     const m: *Model = @ptrCast(@alignCast(mp));
     const sn = snapOf(h) orelse return Verdict.refuse(.unsupported, "sushi_ds41: no snapshot to restore");
     if (pos != sn.n) return Verdict.refuse(.unsupported, "sushi_ds41: restore needs the snapshot's exact position");
-    m.ids.clearRetainingCapacity();
+    startCopies(m);
+    clearIds(m);
     m.ids.appendSlice(gpa, sn.ids) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
     dsv.restoreState(m.mdl, sn.slots, sn.n, sn.ids) catch |e| {
-        m.ids.clearRetainingCapacity();
+        clearIds(m);
         return Verdict.named(.failed, @errorName(e));
     };
     return .ok;
@@ -721,6 +844,8 @@ fn roundFailed(e: anyerror) Verdict {
 fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (roundEntry(m, f, out)) |refused| return refused;
+    if (armAblation(m, f)) |refused| return refused;
+    defer ablation.disarm(m.mdl);
     const suppress: ?mlx.mlx_array = if (f.suppress_mask.ctx != null) .{ .ctx = f.suppress_mask.ctx } else null;
     var open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e);
     defer _ = mlx.mlx_array_free(open.logits);
@@ -737,6 +862,8 @@ fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callc
 fn nativeVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (roundEntry(m, f, out)) |refused| return refused;
+    if (armAblation(m, f)) |refused| return refused;
+    defer ablation.disarm(m.mdl);
     const open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e);
     out.logits = .{ .ctx = open.logits.ctx };
     out.round.n = @intCast(open.rows);
@@ -763,6 +890,8 @@ const Open = struct {
     conf: [max_drafts]f32,
     block_len: usize,
     drafted: bool,
+    /// The drafts are the context's own continuation (the copy arm), not a stage block: no confidences to learn from.
+    copied: bool,
     draft_ms: f32,
     verify_start: std.Io.Timestamp,
     logits: mlx.mlx_array,
@@ -771,9 +900,18 @@ const Open = struct {
 fn openRound(m: *Model, t1: u32, cap: u32) !Open {
     if (t1 >= m.cfg.vocab) return error.TokenPastVocabulary;
     const draft_start = now();
-    const plain = m.policy.next() == .plain;
-    var o: Open = .{ .ids = undefined, .rows = 1, .conf = @splat(0), .block_len = 1, .drafted = !plain, .draft_ms = 0, .verify_start = undefined, .logits = .{ .ctx = null } };
+    var o: Open = .{ .ids = undefined, .rows = 1, .conf = @splat(0), .block_len = 1, .drafted = false, .copied = false, .draft_ms = 0, .verify_start = undefined, .logits = .{ .ctx = null } };
     o.ids[0] = t1;
+    if (try copyDrafts(m, t1, cap, o.ids[1..])) |n| {
+        o.rows = 1 + n;
+        o.block_len = 1 + n;
+        o.drafted = true;
+        o.copied = true;
+        o.draft_ms = nanosSince(draft_start);
+        return verifyOpen(m, o);
+    }
+    const plain = m.policy.next() == .plain;
+    o.drafted = !plain;
     if (!plain) {
         var block = try dsv.draftHeads(m.mdl, t1, .conf);
         defer block.deinit();
@@ -783,17 +921,34 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
     }
     o.draft_ms = nanosSince(draft_start);
     const wanted: usize = if (plain) 1 else m.policy.rows(o.conf[0 .. o.block_len - 1]);
-    var rows = std.math.clamp(wanted, 1, @min(@as(usize, cap) + 1, max_verify_rows));
-    rows = @min(rows, o.block_len);
+    const rows = std.math.clamp(wanted, 1, @min(@as(usize, cap) + 1, max_verify_rows));
+    o.rows = @min(rows, o.block_len);
+    return verifyOpen(m, o);
+}
+
+/// The copy arm: writes the context's continuation after `t1` to `drafts` and returns its length, or null for a stage
+/// round.
+fn copyDrafts(m: *Model, t1: u32, cap: u32, drafts: []u32) !?usize {
+    try m.lookup.sync(gpa, m.ids.items);
+    const room = m.copy_backoff.width(@min(@as(usize, cap), max_verify_rows - 1, drafts.len));
+    const found = m.lookup.matchBest(t1, @intCast(room));
+    const n = copy_lookup.copyLen(found, room, m.cfg.dspark.block);
+    if (n == 0 or !m.copy_backoff.take()) return null;
+    @memcpy(drafts[0..n], found.?.draft[0..n]);
+    return n;
+}
+
+/// Verifies `o.rows` of the round's ids as one rewindable chunk.
+fn verifyOpen(m: *Model, open: Open) !Open {
+    var o = open;
     // The model refuses an image id without rows, and the trunk never picks one: a draft holding it ends the chunk.
-    if (m.cfg.image_token_id != 0) if (std.mem.indexOfScalar(u32, o.ids[1..rows], m.cfg.image_token_id)) |at| {
-        rows = 1 + at;
+    if (m.cfg.image_token_id != 0) if (std.mem.indexOfScalar(u32, o.ids[1..o.rows], m.cfg.image_token_id)) |at| {
+        o.rows = 1 + at;
     };
-    o.rows = rows;
     o.verify_start = now();
     m.engine.beginForward();
-    o.logits = try dsv.verify(m.mdl, o.ids[0..rows]);
-    m.engine.finishForward(rows);
+    o.logits = try dsv.verify(m.mdl, o.ids[0..o.rows]);
+    m.engine.finishForward(o.rows);
     return o;
 }
 
@@ -802,7 +957,17 @@ fn closeRound(m: *Model, o: *const Open, accepted: usize, r: *abi.Round) !void {
     try dsv.finishVerify(m.mdl, accepted);
     const verify_ms = nanosSince(o.verify_start);
     try m.ids.appendSlice(gpa, o.ids[0 .. 1 + accepted]);
-    if (!o.drafted) m.policy.observePlain(verify_ms) else m.policy.observeRound(o.conf[0 .. o.block_len - 1], @intCast(o.rows), @intCast(accepted), o.draft_ms, verify_ms);
+    if (o.copied) {
+        // The stage policy learns from stage blocks only: a copy round's wide verify would move its fitted row price,
+        // and so the stage rounds' widths, in requests the copy arm only touches now and then.
+        m.copy.rounds += 1;
+        m.copy.drafted += o.rows - 1;
+        m.copy.accepted += accepted;
+        m.copy_backoff.observeCopy(o.rows - 1, accepted, o.draft_ms + verify_ms);
+    } else {
+        if (!o.drafted) m.policy.observePlain(verify_ms) else m.policy.observeRound(o.conf[0 .. o.block_len - 1], @intCast(o.rows), @intCast(accepted), o.draft_ms, verify_ms);
+        m.copy_backoff.observeStage(1 + accepted, o.draft_ms + verify_ms);
+    }
     r.n = @intCast(1 + accepted);
     r.accepted = @intCast(accepted);
     r.rows = @intCast(o.rows);
