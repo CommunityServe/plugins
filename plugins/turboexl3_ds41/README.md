@@ -23,9 +23,9 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   - The pack's plain f16 linears are cast to the activation dtype at load.
   - The load keeps suh/svh f16 and never reads a trunk layer's routed experts.
   - The stream budget stays within the host's ceiling.
-- The routed experts are the repack's `experts.bin` bank. The streamer's own EXL3 kernels (mul1, K2 and K3) run them;
-  `MLX_SERVE_DSV41_ROUTED=turboexl3` runs their decode on turboexl3 instead (src/routed_t3.zig), on the streamer's
-  schedule: its decode waves, banked and with the device route (patches/turboexl3-t3-banked.patch), on turboexl3's
+- The routed experts are the repack's `experts.bin` bank. Their decode runs on turboexl3 by default (src/routed_t3.zig;
+  `MLX_SERVE_DSV41_ROUTED=streamer` keeps the streamer's own EXL3 kernels, mul1, K2 and K3, throughout), on the
+  streamer's schedule: its decode waves, banked and with the device route (patches/turboexl3-t3-banked.patch), on turboexl3's
   banked decode (`moeClampedBanked`: a wave's pairs over the layer's three slot banks in one call, each pair
   `moeClamped`'s bytes at top-1 on its bank). The prompt calls stay on the streamer's own DIG-X lane, whose working set
   the prompt bill covers. The banked kernels compile at load, one set per pair count (1 to 48) and code width (the
@@ -64,8 +64,8 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
     `MLX_SERVE_DSV41_DSPARK_COPY=0` turns them off.
   - The verify policy: a stage round verifies the prefix of the block whose calibrated confidence buys the most tokens
     per ms of verify, on the verify ladder the plugin measures from its own rounds, and where drafting does not pay the
-    round verifies `t1` alone (the engine's backoff). `MLX_SERVE_DSV41_DSPARK_POLICY=0` verifies the whole block every
-    round.
+    round verifies `t1` alone (the engine's backoff). Off by default: every round verifies the whole block;
+    `MLX_SERVE_DSV41_DSPARK_POLICY=1` turns the policy on.
   - The ladder (src/rounds.zig `Ladder`): the 1-row cell in ms, every other row as a ratio to it, so a level change
     the plain rounds see moves every row; each cell the lower median of its last 8 samples and the engine's prior
     ladder (one stall moves it a rank, a new level takes 4 or 5 samples); a cell unsampled for 64 rounds counts no
@@ -173,7 +173,7 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   warm server's fills evicted residents and its prompt lost 2 to 3%; with the rule a warm server's second prompt posted
   no fill (w-pio-20261101-0338). Over the usage seed it does not help: with SEED_FREE, S=10 took 984.7 tok/s against
   986.4 to 997.3 without it, its decoder misses 1404 against 1320.
-- `MLX_SERVE_DSV41_SEED_FREE=1` (src/seed_free.zig, the policy in patches/turboexl3-zz5-seed-free.patch, tested by
+- `MLX_SERVE_DSV41_SEED_FREE` (src/seed_free.zig, the policy in patches/turboexl3-zz5-seed-free.patch, tested by
   src/seed_free_test.zig): the rows the usage seed fills stay free until a route uses their expert. The prompt's
   read-ahead may take one for an expert its prediction ranks before the seeded one, so a layer's rows hold its call's
   hottest experts as they would have held them empty: a 16K-row prediction names nearly every expert, and without the
@@ -181,7 +181,8 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   The decoder prefetch may take one whose expert its prediction does not name. A seeded row a route has used is a
   resident as any other. Cold code-ctx16384 prompt on the full pack (M5 Max, w-pio-20261101-0338, a usage profile
   recorded on prompts apart from the test case): 997.3 tok/s against 991.9 and 986.4 for the seed alone; the encoder's
-  read-ahead read 11.5 GB against 0.36, its read waits 0.95 s against 1.11 and 1.14. Off by default.
+  read-ahead read 11.5 GB against 0.36, its read waits 0.95 s against 1.11 and 1.14. On by default (the measured
+  policy, with the pack's usage profile), `=0` off.
 - With `MLX_SERVE_DSV41_PROMPT_IO` (patches/turboexl3-zz8-prompt-wide.patch), a `[prompt-io] wide` line a wide layer
   splits the time before its routed call: the read-ahead's wait for its predicted routes (`ra_wait_ms`) and its host
   work after (`ra_host_ms`), then the host's build of each lazy graph step (the attention-side mix, the projections,
@@ -213,8 +214,8 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   verifies, the usage seed with SEED_FREE, ROUTED=turboexl3, A B B A): 40.0 and 40.1 tok/s on the card's decode against
   39.3 and 39.2, 47.0 and 47.0 greedy against 46.1 and 45.6, the misses a round the same (62.4 greedy, 82.3 card; 63.5
   and 83.1 in the last arm), the texts the same in every arm.
-- `MLX_SERVE_DSV41_T3_GROUP` (src/t3_group.zig, patches/turboexl3-zzz8b-t3-group.patch; on with
-  `MLX_SERVE_DSV41_ROUTED=turboexl3`, `=0` off): the t3 route's device hit wave on turboexl3's grouped banked decode
+- `MLX_SERVE_DSV41_T3_GROUP` (src/t3_group.zig, patches/turboexl3-zzz8b-t3-group.patch; on with the t3 route, the
+  default, `=0` off): the t3 route's device hit wave on turboexl3's grouped banked decode
   (`Config.banked_group` 4, turboexl3 65c72d1). A verify's 36 routed pairs a layer name about 23 distinct experts
   (recorded routes: p10 18, p90 29). The banked GEMVs shared a weight decode between at most two row-slots of one
   expert; the grouped ones share it among up to four. DEVROUTE's LUT also sends a pair whose expert no bank holds to

@@ -1,4 +1,5 @@
-//! `MLX_SERVE_DSV41_T3_GROUP` (read at load; on by default with `MLX_SERVE_DSV41_ROUTED=turboexl3`, off without it, which
+//! `MLX_SERVE_DSV41_T3_GROUP` (read at load; on by default with the t3 route, the default; off with
+//! `MLX_SERVE_DSV41_ROUTED=streamer`, which
 //! has no t3 hit wave to group; `0` turns it off, any other value is refused by name): the t3 route's device hit wave on
 //! turboexl3's grouped banked decode. src/routed_t3.zig sets turboexl3's `Config.banked_group` to `bankedGroup()` before
 //! the bank opens, so the banked GEMVs share one weight decode among up to four row-slots of one packed id (two at 2).

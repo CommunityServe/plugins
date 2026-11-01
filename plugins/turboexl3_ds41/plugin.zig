@@ -173,10 +173,16 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     t3kit.bind(ctx.host.?);
     // The streamed bank's slot rows fit within the host's ceiling, not only the device's working set.
     bill.host_ceiling = &shims.memoryCeiling;
-    routed_t3.enabled = config.routedT3(env.span(.MLX_SERVE_DSV41_ROUTED));
+    routed_t3.enabled = config.routedT3(env.span(.MLX_SERVE_DSV41_ROUTED)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ROUTED is neither turboexl3 nor streamer (unset: turboexl3): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     // Before the model's load: the t3 math compiles the banked kernels at turboexl3's banked group when the bank opens.
     t3_group.configure(env.span(.MLX_SERVE_DSV41_T3_GROUP), routed_t3.enabled) catch |e| {
-        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_T3_GROUP is set to something other than 0 (unset: on with MLX_SERVE_DSV41_ROUTED=turboexl3, 0: the banked texts): the load is refused\n", .{});
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_T3_GROUP is set to something other than 0 (unset: on with the t3 route, the default; 0: the banked texts): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -308,7 +314,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
-        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1: the load is refused\n", .{});
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1 (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -380,7 +386,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     prompt_tl.hook = if (ptl_model != null) &ptlStage else null;
     const on: rounds.Switches = .{
         .copy = config.switchOn(env.span(.MLX_SERVE_DSV41_DSPARK_COPY)),
-        .policy = config.switchOn(env.span(.MLX_SERVE_DSV41_DSPARK_POLICY)),
+        .policy = config.switchOff(env.span(.MLX_SERVE_DSV41_DSPARK_POLICY)),
     };
     // The policy reads each draft's confidence, as the engine has its built-in model's stages do.
     model(mp).mdl.ds_want_conf = on.policy;
@@ -397,17 +403,18 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     dropPending();
     if (drafter) |*d| d.deinit();
     drafter = rounds.Drafter.init(gpa, on);
-    log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on" else "off (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
+    log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on (MLX_SERVE_DSV41_DSPARK_POLICY=1)" else "off: every round verifies the whole block (MLX_SERVE_DSV41_DSPARK_POLICY=1: the policy)" });
     log.info("[turboexl3_ds41] read pool parts: {s}\n", .{if (direct_parts.on) "each demand read's parts on the file's block read straight into their rows, the rest staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0: every part staged); [direct-parts] lines at each prompt's and request's end" else "every part staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0)"});
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
     if (dec_prefetch.on) log.info("[turboexl3_ds41] CED decoder prefetch on (MLX_SERVE_DSV41_DEC_PREFETCH): the decoder layers' experts predicted at encoder layer {d}, {d} layers posted per prompt call, into their free rows only\n", .{ dec_prefetch.start, dec_prefetch.per_call });
-    if (seed_free.on) log.info("[turboexl3_ds41] usage seed's rows free until routed (MLX_SERVE_DSV41_SEED_FREE): the prompt's read-ahead and the CED decoder prefetch may take them\n", .{});
+    if (seed_free.on) log.info("[turboexl3_ds41] usage seed's rows free until routed (MLX_SERVE_DSV41_SEED_FREE=0: a seeded row is a resident from the load): the prompt's read-ahead and the CED decoder prefetch may take them\n", .{}) else log.info("[turboexl3_ds41] usage seed's rows residents from the load (MLX_SERVE_DSV41_SEED_FREE=0)\n", .{});
     if (prompt_io.on) log.info("[turboexl3_ds41] prompt timeline on (MLX_SERVE_DSV41_PROMPT_IO): [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end{s}\n", .{if (prompt_io.split_ra) "; the read-ahead's wait split (=2: a sync at each step)" else ""});
     log.info("[turboexl3_ds41] read-ahead prediction: {s}\n", .{if (ra_fused.on) "on the fused hc kernels (MLX_SERVE_DSV41_RA_FUSED=0: the op chain)" else "the op chain (MLX_SERVE_DSV41_RA_FUSED=0)"});
     log.info("[turboexl3_ds41] decode lookahead's next-layer scores: {s}\n", .{if (late_gemv.on) "MLX's wide GEMV in the weights' half type (MLX_SERVE_DSV41_LATE_GEMV=0: the f32 product)" else "the f32 product (MLX_SERVE_DSV41_LATE_GEMV=0)"});
     log.info("[turboexl3_ds41] decode layers' shared expert: {s}\n", .{if (shared_hoist.on) "committed behind the hit wave (MLX_SERVE_DSV41_SHARED_HOIST=0: in the layer's last stretch)" else "in the layer's last stretch (MLX_SERVE_DSV41_SHARED_HOIST=0)"});
     log.info("[turboexl3_ds41] embedding table: {s}\n", .{if (embed_pread.on) "read from the pack at each lookup, not resident (MLX_SERVE_DSV41_EMBED_PREAD=0: resident)" else "resident (MLX_SERVE_DSV41_EMBED_PREAD=0)"});
     log.info("[turboexl3_ds41] vision tower: {s}\n", .{if (vision_lazy.on) "read from the pack for each image, not resident (MLX_SERVE_DSV41_VISION_LAZY=0: resident)" else "resident (MLX_SERVE_DSV41_VISION_LAZY=0)"});
+    if (!routed_t3.enabled) log.info("[turboexl3_ds41] routed experts' decode on the streamer's own EXL3 kernels (MLX_SERVE_DSV41_ROUTED=streamer; unset: turboexl3)\n", .{});
     if (routed_t3.enabled) log.info("[turboexl3_ds41] t3 hit wave: {s}\n", .{if (t3_group.on) "turboexl3's grouped banked decode, up to four row-slots of one expert a weight decode, the device route's miss pairs skipped (MLX_SERVE_DSV41_T3_GROUP=0: the banked texts)" else "the banked texts (MLX_SERVE_DSV41_T3_GROUP=0)"});
     switch (woa_rows.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' wo_a span by span (MLX_SERVE_DSV41_WOA_ROWS=0)\n", .{}),

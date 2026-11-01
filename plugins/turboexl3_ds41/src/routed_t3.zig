@@ -1,5 +1,5 @@
 //! The routed experts' decode on turboexl3, for the copied expert streamer (sdk/weights/streamed/exl3_source.zig) when
-//! `MLX_SERVE_DSV41_ROUTED=turboexl3` asks for it; the default is the streamer's own EXL3 kernels throughout. The
+//! the default (`MLX_SERVE_DSV41_ROUTED=streamer` keeps the streamer's own EXL3 kernels throughout). The
 //! streamer's decode waves run its banked route on turboexl3's banked decode (`moeClampedBanked`): a wave's pairs over the
 //! layer's three slot banks in one call, each pair one row-slot whose id is packed (bank << 24 | slot row), DEVROUTE's
 //! device wave among them (patches/turboexl3-t3-banked.patch binds both). The call runs whole at the wave's down:

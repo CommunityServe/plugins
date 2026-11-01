@@ -63,18 +63,28 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     return v;
 }
 
-/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the server's environment: mlx-serve hands a plugin's load only the settings it
-/// knows): the streamed bank's experts run on turboexl3 (src/routed_t3.zig) instead of the streamer's own EXL3 kernels.
-pub fn routedT3(value: ?[]const u8) bool {
-    const v = value orelse return false;
-    return std.mem.eql(u8, v, "turboexl3");
+/// `MLX_SERVE_DSV41_ROUTED` (the server's environment: mlx-serve hands a plugin's load only the settings it knows): the
+/// streamed bank's experts run their decode on turboexl3 (src/routed_t3.zig) unless it names `streamer`, the streamer's
+/// own EXL3 kernels throughout. Unset, empty or `turboexl3`: turboexl3; anything else is refused by name.
+pub fn routedT3(value: ?[]const u8) error{RoutedSetting}!bool {
+    const v = value orelse return true;
+    if (v.len == 0 or std.mem.eql(u8, v, "turboexl3")) return true;
+    if (std.mem.eql(u8, v, "streamer")) return false;
+    return error.RoutedSetting;
 }
 
-/// `MLX_SERVE_DSV41_DSPARK_COPY` and `MLX_SERVE_DSV41_DSPARK_POLICY` (the server's environment, as `routedT3`): the
-/// drafter's copy rounds and verify policy (src/rounds.zig), on unless the value starts with `0`.
+/// `MLX_SERVE_DSV41_DSPARK_COPY` (the server's environment, as `routedT3`): the drafter's copy rounds (src/rounds.zig),
+/// on unless the value starts with `0`.
 pub fn switchOn(value: ?[]const u8) bool {
     const v = value orelse return true;
     return v.len == 0 or v[0] != '0';
+}
+
+/// `MLX_SERVE_DSV41_DSPARK_POLICY` (as `switchOn`): the drafter's verify policy (src/rounds.zig), off unless the value is
+/// given and does not start with `0` (`1` turns it on); off, every round verifies the whole block.
+pub fn switchOff(value: ?[]const u8) bool {
+    const v = value orelse return false;
+    return v.len > 0 and v[0] != '0';
 }
 
 /// The built-in's facts as this plugin serves them: the bank streams (the copy's parse saw `experts.bin`), the state is
@@ -162,14 +172,20 @@ test "turboexl3_ds41 refuses by name the pack before its repack and a codebook i
     }
 }
 
-test "turboexl3_ds41 runs the routed experts on turboexl3 only when MLX_SERVE_DSV41_ROUTED names it" {
-    try testing.expect(routedT3("turboexl3"));
-    for ([_]?[]const u8{ null, "", "0", "streamer", "turboexl3 " }) |v| try testing.expect(!routedT3(v));
+test "turboexl3_ds41 runs the routed experts' decode on turboexl3 unless MLX_SERVE_DSV41_ROUTED names the streamer" {
+    for ([_]?[]const u8{ null, "", "turboexl3" }) |v| try testing.expect(try routedT3(v));
+    try testing.expect(!try routedT3("streamer"));
+    for ([_][]const u8{ "0", "1", "turboexl3 ", "Streamer", "t3" }) |v| try testing.expectError(error.RoutedSetting, routedT3(v));
 }
 
-test "turboexl3_ds41 keeps its DSpark copy rounds and verify policy on unless the setting starts with 0" {
+test "turboexl3_ds41 keeps its DSpark copy rounds on unless the setting starts with 0" {
     for ([_]?[]const u8{ null, "", "1", "on" }) |v| try testing.expect(switchOn(v));
     for ([_][]const u8{ "0", "00", "0n" }) |v| try testing.expect(!switchOn(v));
+}
+
+test "turboexl3_ds41 keeps its DSpark verify policy off unless the setting is given and does not start with 0" {
+    for ([_]?[]const u8{ null, "", "0", "00" }) |v| try testing.expect(!switchOff(v));
+    for ([_][]const u8{ "1", "on" }) |v| try testing.expect(switchOff(v));
 }
 
 test {
