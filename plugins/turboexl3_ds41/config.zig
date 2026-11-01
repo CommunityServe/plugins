@@ -188,6 +188,7 @@ test {
     _ = @import("src/ra_fused.zig");
     _ = @import("src/woa_rows.zig");
     _ = @import("src/joinless.zig");
+    _ = @import("src/tail_fuse.zig");
     _ = @import("src/prompt_tl.zig");
     _ = @import("src/whole_stream.zig");
     _ = @import("src/stage.zig");

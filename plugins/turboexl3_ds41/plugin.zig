@@ -75,6 +75,9 @@ pub const woa_rows = @import("src/woa_rows.zig");
 /// A wide prompt call's routed sum and the layer's shared expert in one combine over the call's unjoined outputs
 /// (`MLX_SERVE_DSV41_JOINLESS`, src/joinless.zig), read by the copied model and the copied stream's source.
 pub const joinless = @import("src/joinless.zig");
+/// A wide prompt layer's joinless combine and hc expand in one kernel (`MLX_SERVE_DSV41_TAIL_FUSE`, src/tail_fuse.zig),
+/// read by the copied model and launched by the copied stream's source.
+pub const tail_fuse = @import("src/tail_fuse.zig");
 /// A wide prompt layer's input as the last wide layer's whole stream (`MLX_SERVE_DSV41_WHOLE_STREAM`, src/whole_stream.zig),
 /// read by the copied model.
 pub const whole_stream = @import("src/whole_stream.zig");
@@ -265,6 +268,22 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    tail_fuse.configure(env.span(.MLX_SERVE_DSV41_TAIL_FUSE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_TAIL_FUSE is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // The tail kernel is the joinless combine's: unset, the setting follows JOINLESS; set without it, the load is refused.
+    if (tail_fuse.on() and joinless.mode != .on) {
+        if (tail_fuse.explicit) {
+            log.err("[turboexl3_ds41] MLX_SERVE_DSV41_TAIL_FUSE needs MLX_SERVE_DSV41_JOINLESS on (its kernel is the joinless combine's): the load is refused\n", .{});
+            out.* = Verdict.refuse(.unsupported, "turboexl3_ds41: TailFuseJoinless");
+            return null;
+        }
+        tail_fuse.mode = .off;
+    }
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1: the load is refused\n", .{});
         out.* = switch (e) {
@@ -376,6 +395,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] wide prompt calls' routed outputs joined, the routed sum and shared expert by the op chain (MLX_SERVE_DSV41_JOINLESS=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt calls' routed sum and shared expert in one combine over the waves' outputs, no joins (MLX_SERVE_DSV41_JOINLESS=0: the joins and the op chain)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt calls' routed sum and shared expert in one combine and by the op chain, compared word for word, the op chain's served (MLX_SERVE_DSV41_JOINLESS=check): a [joinless] check line a wide call\n", .{}),
+    }
+    switch (tail_fuse.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' tail as the chain: the combine's f32 sum, its rounding and the hc expand ({s})\n", .{if (tail_fuse.explicit) "MLX_SERVE_DSV41_TAIL_FUSE=0" else "MLX_SERVE_DSV41_JOINLESS off: the tail kernel is the combine's"}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' joinless combine and hc expand in one kernel, the new streams written once (MLX_SERVE_DSV41_TAIL_FUSE=0: the chain)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' joinless combine and hc expand as the chain, served, and in one kernel over each call's first and last rows, compared word for word (MLX_SERVE_DSV41_TAIL_FUSE=check): a [tail-fuse] check line a wide call\n", .{}),
     }
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {

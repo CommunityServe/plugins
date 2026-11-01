@@ -304,6 +304,22 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   waits on bytes 666 and 679 ms against 1516 and 1650; 4722 records staged, 4079 adopted (86%), the rest 7.9 GB of reads
   under the attention, which ran about 25 ms a layer longer with them in flight. Exact: the texts are the same in every
   arm (the cold one md5 efeb6f4ecd).
+- `MLX_SERVE_DSV41_TAIL_FUSE` (src/tail_fuse.zig, src/kernels/tail_fuse.metal, patches/turboexl3-zzz8g-tail-fuse.patch;
+  on, `=0` off, `check` the kernel checked): a wide prompt layer's tail in one kernel. `=0`: the routed call ends in the
+  joinless combine (an f32 [rows, D] sum of the routed rows and the shared expert, itself widened to f32 for it), the
+  model rounds the sum to the activation dtype and glm5's hc expand writes the new streams: the widened shared rows, the
+  f32 sum and its rounded copy are GB-sized transients of a 16K-row layer (~840 MB), over four passes. On, the source
+  runs one kernel over the same inputs (the waves' outputs where they wrote them, the weights, the shared expert as it
+  came, the streams, each row's post and comb) and writes the new streams: the combine's fold under `fp contract(off)`,
+  one rounding to the activation dtype, then the expand's fmas in its order, so the same words. `check` serves the
+  chain's streams and runs the kernel over each wide call's first and last 2048 rows, compared word for word:
+  `[tail-fuse] check layer= rows= words= differ= max_abs=` a call (the chain's memory and a few hundred MB). The kernel is
+  the joinless combine's: unset, it follows `MLX_SERVE_DSV41_JOINLESS`; set with JOINLESS off, the load is refused.
+- On against `=0` (w-pio-20261101-0828, on 7af6430: WHOLE_STREAM on; usage seed with SEED_FREE, A B B A): 1150.0 and
+  1161.5 tok/s cold prefill against 1147.1 and 1136.6 (+1.2%); new text 1142.8 and 1157.4 against 1122.9 and 1142.1
+  (+1.5%); the guard's sampled peak 105.3 GiB. Exact: the seeded cold text is the same in every arm (md5 efeb6f4ecd), and
+  `check` (w-pio-20261101-0809) compared every wide call's first and last 2048 rows, 40 calls and 3,355,443,200 words,
+  with none different.
 
 ## The pack
 
