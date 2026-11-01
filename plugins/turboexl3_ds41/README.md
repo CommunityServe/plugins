@@ -11,7 +11,8 @@ runs the EXL3 trunk. The plugin claims a `deepseek_v41` pack only when its confi
 M5-class GPUs (NAX) only; any other GPU is refused by name at load.
 
 - src/mlx_serve (generated, not committed) is mlx-serve's own DeepSeek-V4.1 model (plugins/deepseek_v41), its vision
-  tower, and mlx-serve's expert streamer (sdk/weights/streamed, module `mlx_stream`), at MLX_SERVE_REF.
+  tower, and mlx-serve's expert streamer (sdk/weights/streamed, module `mlx_stream`, which mlx-serve absorbed from
+  David Tai's mlx-stream: see NOTICE), at MLX_SERVE_REF.
   scripts/prepare.sh writes it with scripts/sync-mlx-serve.sh, copies overlay/mlx_serve over it and applies
   patches/turboexl3.patch, then the other patches/*.patch in name order. A build refuses a tree whose hash is not
   scripts/mlx_serve.sha256.

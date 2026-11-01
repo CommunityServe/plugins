@@ -21,5 +21,19 @@ src/host_shims.zig stands in for mlx-serve's sdk/weights/streamed/csrc/mlx_event
 mlx_launch_cache.inc and q3_event_shim.mm (their C symbols, over the server's host table); it is this plugin's code.
 
 --------------------------------------------------------------------------------
+mlx-stream
+https://github.com/davidtai/mlx-stream
+Copyright (c) 2026 David Tai
+Licensed under the MIT License.
+
+mlx-serve absorbed mlx-stream into its server (mlx-serve's NOTICE at MLX_SERVE_REF: "Absorbed from mlx-stream ..., built
+into the macOS server"). Of what src/mlx_serve/ copies from mlx-serve, that is: the SSD expert streamer, its SDK and C
+shims (sdk/weights/streamed/, module `mlx_stream`: scripts/slice-stream.txt) and the DeepSeek-V4.1 EXL3 decoder with
+its pinned Metal kernels (sdk/quant/exl3/stream/). The streaming runtime they were ported from (the packed expert record
+and manifest formats, the streamed-bank layout and the routed-expert EXL3 Metal kernels) is David Tai's earlier work.
+mlx-serve's NOTICE carries mlx-stream's full entry, with what mlx-stream itself incorporates (MLX, ExLlamaV3,
+DeepSeek-V4.1-Flash).
+
+--------------------------------------------------------------------------------
 tests/fixtures/config.json is the config.json of OpensourceWTF/DeepSeek-V4.1-Flash-1017-exl3-2.81bpw (the SC 2.81bpw
 EXL3 pack of DeepSeek-V4.1-Flash; license MIT, as DeepSeek's release), unchanged.
