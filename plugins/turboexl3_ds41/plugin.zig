@@ -406,7 +406,7 @@ var stream_prev: StreamStats = .{};
 
 /// `[stream-stats]`: the streamed bank's routes, resident hits and misses (unique experts a route), evictions, bytes
 /// read and the host's read waits since the last request (the first request's include the load's); then `[routed-one]`
-/// (`routed_one.meters`).
+/// (`routed_one.meters`) and `[routed-t3]` (the turboexl3 route's banked calls and miss parts, `routed_t3`).
 fn streamMeters(m: *ds.Model, buf: []u8) []const u8 {
     const r = m.mdl.streamed orelse return buf[0..0];
     if (r.math != .source) return buf[0..0];
@@ -428,7 +428,8 @@ fn streamMeters(m: *ds.Model, buf: []u8) []const u8 {
         s.claimed -| p.claimed,
     }) catch {};
     const n = w.buffered().len;
-    return buf[0 .. n + routed_one.meters(&src.one, buf[n..]).len];
+    const n1 = n + routed_one.meters(&src.one, buf[n..]).len;
+    return buf[0 .. n1 + src.t3_state.meters(buf[n1..]).len];
 }
 
 fn fillRound(round: *abi.Round, tokens: []const u32, rows: u32, position: usize) void {

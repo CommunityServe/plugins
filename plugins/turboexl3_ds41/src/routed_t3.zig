@@ -27,13 +27,42 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         state: *State,
 
         /// A decode group's gate and up arrays, from its `gateUp` to its `down`: the streamer runs a call's gate/ups before
-        /// their downs, and each group's ids are an array of their own.
+        /// their downs, and each group's ids are an array of their own. `begin` at each layer call (the source's `rows`).
         pub const State = struct {
             limit: c_int,
             pending: [256]Pending = undefined,
             n: usize = 0,
+            tally: Tally = .{},
+            /// the current layer call's banked calls and its last one's pairs
+            call_banked: u32 = 0,
+            call_last: u32 = 0,
+
+            /// A layer call begins: the last one's banked calls counted (`Tally`), the pending list emptied.
+            pub fn begin(st: *State) void {
+                if (st.call_banked > 1) st.tally.last_part_pairs += st.call_last;
+                st.call_banked = 0;
+                st.call_last = 0;
+                st.n = 0;
+            }
+
+            /// `[routed-t3]` since the last request's end: the banked route's layer calls, banked calls and miss parts.
+            pub fn meters(st: *State, buf: []u8) []const u8 {
+                if (!enabled) return buf[0..0];
+                st.begin();
+                const t = st.tally;
+                st.tally = .{};
+                var w = std.Io.Writer.fixed(buf);
+                w.print("[routed-t3] banked_calls={d} layer_calls={d} parts={d} part_pairs={d} last_part_pairs={d}\n", .{ t.banked, t.layer_calls, t.parts, t.part_pairs, t.last_part_pairs }) catch {};
+                return w.buffered();
+            }
         };
         const Pending = struct { ids: ?*anyopaque, gate: Proj, up: Proj };
+
+        /// The banked route's work since the last request's end. A layer call's first banked call is its resident pairs'
+        /// (DEVROUTE's device wave in decode, the hit wave before a prompt's misses), each later one a miss part, which
+        /// runs whole once its down bytes landed (`downBanked`): in the streamer's own route a part's gate|up runs once its
+        /// gate and up bytes land, so a call's last part (`last_part_pairs`) is where that order can lengthen it.
+        pub const Tally = struct { banked: u64 = 0, layer_calls: u64 = 0, parts: u64 = 0, part_pairs: u64 = 0, last_part_pairs: u64 = 0 };
 
         /// Keeps the group's gate and up for its `down`, which runs the pairs: `x` is what `down` receives.
         pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: Proj, up: Proj) !T {
@@ -69,7 +98,67 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         /// miss part, every array waited (gate and up at the gate value, down at the part's).
         pub fn downBanked(self: *const Self, g: *G, x: T, ids: T, banks: *const [3]Bank) !T {
             const tb = t3Banks(banks);
-            return g.adopt(try t3.moeClampedBanked(g.s, x, &tb, ids, .mul1, self.state.limit));
+            const y = try g.adopt(try t3.moeClampedBanked(g.s, x, &tb, ids, .mul1, self.state.limit));
+            const st = self.state;
+            const pairs_n: u32 = @intCast(g.shapeOf(ids).dim(0));
+            st.tally.banked += 1;
+            if (st.call_banked == 0) st.tally.layer_calls += 1 else {
+                st.tally.parts += 1;
+                st.tally.part_pairs += pairs_n;
+            }
+            st.call_banked += 1;
+            st.call_last = pairs_n;
+            return y;
+        }
+
+        /// What `warm` compiled: its calls and their wall time.
+        pub const Warmed = struct { calls: u32 = 0, ms: u64 = 0 };
+
+        /// At load, before any request: every kernel the routed experts can launch, compiled, on the first layer of each
+        /// code width (K3, K2). A banked call's pair count is a template constant of its kernels (RKC), so each count
+        /// 1..max_decode_rows is a kernel set of its own; the prompt lane's top-1 `moeClamped` calls take its decode
+        /// launches up to 16 rows (each count its own as well) and its prefill chain above. Each call reads the layer's
+        /// base bank at slot row 0 with x zero in the trunk's dtype (`act`; bf16 served) and keeps nothing. Unwarmed
+        /// counts compile at their first launch, as before.
+        pub fn warm(self: *const Self, g: *G, banks: []const [3]?Bank, hidden: c_int, act: mlx.mlx_dtype) !Warmed {
+            var out: Warmed = .{};
+            const t0 = nowNs();
+            var seen: [2]bool = .{ false, false };
+            for (banks) |lb| {
+                const b = lb[0] orelse continue;
+                const ki: usize = if (g.shapeOf(b.gate.code).dim(3) == 32) 1 else 0;
+                if (seen[ki]) continue;
+                seen[ki] = true;
+                const three = [3]Bank{ b, b, b };
+                for (1..max_decode_rows + 1) |r| {
+                    const m = g.mark();
+                    defer g.resetTo(m);
+                    const x = try g.zeros(&.{ @intCast(r), hidden }, act);
+                    const ids = try g.zeros(&.{@intCast(r)}, .uint32);
+                    try g.evalAll(&.{try self.downBanked(g, try self.gateUpBanked(g, x, ids, &three), ids, &three)});
+                    out.calls += 1;
+                }
+                for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 64 }) |r| {
+                    const m = g.mark();
+                    defer g.resetTo(m);
+                    const x = try g.zeros(&.{ r, hidden }, .float32);
+                    const ids = try g.zeros(&.{r}, .uint32);
+                    try g.evalAll(&.{try pairs(self.state.limit, g, x, ids, b)});
+                    out.calls += 1;
+                }
+            }
+            // the warm-up's calls are no request's
+            self.state.tally = .{};
+            self.state.call_banked = 0;
+            self.state.call_last = 0;
+            out.ms = (nowNs() - t0) / std.time.ns_per_ms;
+            return out;
+        }
+
+        fn nowNs() u64 {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
         }
 
         /// The gate|up state of the group whose ids are `ids`, taken off the list.
