@@ -2,6 +2,17 @@
   "kit": "26.11.1",
   "plugins": [
     {
+      "name": "minimax_m3",
+      "kind": "model",
+      "version": "0.1.0",
+      "summary": "MiniMax-M3.1-Flash text from prepared packs: residents in memory, the 128 routed experts streamed from experts.bin.",
+      "models": [
+        "minimax_m3_vl with an expert_streaming bank (a pack scripts/prepare_minimax_pack.py writes)"
+      ],
+      "requires_mlx_serve": ">=26.11.1",
+      "fixture": "in memory (conformanceFixture)"
+    },
+    {
       "name": "sushi_ds41",
       "kind": "model",
       "version": "0.1.0",
