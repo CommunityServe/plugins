@@ -40,6 +40,11 @@ pub const stream_lookahead = @import("src/stream_lookahead.zig");
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_DIR`, `_RECORD`, `_LABEL`), read by the copied EXL3 source through this root: the
 /// prompt rows seeded at the load with each layer's most used experts, and each request's routed experts recorded.
 pub const expert_usage_cfg = @import("src/expert_usage_cfg.zig");
+/// The decode route recorder (`MLX_SERVE_DSV41_ROUTES`, src/route_rec.zig: mlx-serve's `expert.routes` in the copied
+/// stream, a file a request and its steps' tokens), compiled into route-recording builds only (`zig build
+/// -Droute-rec=true`); the copied stream reads `route_recording` through this root.
+pub const route_rec = @import("src/route_rec.zig");
+pub const route_recording: bool = @import("build_options").route_rec;
 /// The usage seed's rows free until a route uses them (`MLX_SERVE_DSV41_SEED_FREE`, src/seed_free.zig), read by the
 /// copied EXL3 source through this root: the prompt's read-ahead and the CED decoder prefetch may take them.
 pub const seed_free = @import("src/seed_free.zig");
@@ -140,6 +145,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1: the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    route_rec.setting = route_rec.parse(env.span(.MLX_SERVE_DSV41_ROUTES), route_recording) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ROUTES is refused ({s}): an absolute directory, in a route-recording build (zig build -Droute-rec=true)\n", .{@errorName(e)});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -310,6 +322,7 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
         var d = try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
         errdefer d.deinit(gpa);
         d.len = dr.cut(d.confidence[0..@min(d.len, max)]);
+        routesRound(m, "stage", st.n, d.ids[0 .. d.len + 1]);
         var round: Round = .{ .kind = .stage, .drafts = d.len, .watch = watch };
         @memcpy(round.conf[0..d.len], d.confidence[0..d.len]);
         return .{ .d = d, .round = round };
@@ -318,6 +331,7 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
     const ids = try gpa.alloc(u32, copied.len + 1);
     ids[0] = t1;
     @memcpy(ids[1..], copied);
+    routesRound(m, @tagName(plan), st.n, ids);
     return .{ .d = .{ .ids = ids, .len = copied.len, .logits = &.{}, .confidence = &.{} }, .round = .{ .kind = plan, .drafts = copied.len, .watch = watch } };
 }
 
@@ -326,6 +340,7 @@ fn kept(m: *ds.Model, round: *const Round, r: *dsv41.DsparkRound, st: *const dsv
     r.phases.draft_ns = if (round.kind == .stage) m.mdl.ds_draft_ns else 0;
     dsv41.dsparkObserve(m.mdl, r.phases);
     if (round_io.on) round_io.end(ioSnap(m), round.drafts + 1, r.phases.verify_ns, round.watch.read());
+    routesStep(m, round.drafts + 1, round.drafts, r.accepted, r.tokens, round.watch.read(), false);
     const dr = if (drafter) |*d| d else return;
     const conf: []const f32 = if (round.kind == .stage) round.conf[0..round.drafts] else &.{};
     dr.learn(round.kind, round.drafts, conf, r.accepted, msOf(r.phases.verify_ns), msOf(round.watch.read()));
@@ -450,6 +465,7 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     const in: ?v4plugin.Ids = if (on_gpu) null else v4plugin.Ids.of(f) catch null;
     defer if (in) |x| x.deinit();
     const v = ds.table.forward(mp, f, out);
+    if (v.isOk()) routesStep(model(mp), f.rows, 0, 0, &.{}, 0, true);
     if (!v.isOk() or f.slots.len > 1 or (!on_gpu and in == null)) {
         dr.history.lose();
         return v;
@@ -473,6 +489,7 @@ fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: ab
     const n = ds.table.cache.resume_prompt.?(mp, slot, prompt, media_rows);
     req_prompt = prompt.len;
     req_kept = @min(@as(usize, @intCast(n)), prompt.len);
+    routesBegin(model(mp));
     dropPending();
     if (drafter) |*d| d.begin(prompt.slice()[0..@min(@as(usize, @intCast(n)), prompt.len)]);
     return n;
@@ -488,6 +505,7 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = slot;
     stage_prof.requestEnd();
     usageEnd(model(mp));
+    routesWrite(model(mp));
     const head = if (drafter) |*d| d.meters(&meter_buf) else meter_buf[0..0];
     const mid = streamMeters(model(mp), meter_buf[head.len..]);
     const tail = markov.meters(meter_buf[head.len + mid.len ..]);
@@ -505,6 +523,61 @@ fn usageEnd(m: *ds.Model) void {
     const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
     const at: usize = if (m.mdl.dec_state) |*st| st.n else 0;
     src.usageEnd(std.Io.Threaded.global_single_threaded.io(), req_prompt -| req_kept, at -| req_prompt) catch |e| log.err("[turboexl3_ds41] the expert usage record was not written: {s}\n", .{@errorName(e)});
+}
+
+// ── The decode route recorder (`MLX_SERVE_DSV41_ROUTES`, route-recording builds only) ──
+
+var route_log: route_rec.Log = .{};
+var route_seq: u32 = 0;
+
+/// The armed recorder's source; null in every other build or setting.
+fn routesSource(m: *ds.Model) ?*Exl3Source {
+    if (comptime !route_recording) return null;
+    if (route_rec.setting.dirPath() == null) return null;
+    const r = m.mdl.streamed orelse return null;
+    if (r.math != .source) return null;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    return if (src.routesOn()) src else null;
+}
+
+fn routesBegin(m: *ds.Model) void {
+    const src = routesSource(m) orelse return;
+    src.routesBegin(@intCast(@min(req_prompt -| req_kept, std.math.maxInt(u32))));
+    route_log.begin(gpa, req_prompt, req_kept) catch |e| log.err("[turboexl3_ds41] the route log lost a line: {s}\n", .{@errorName(e)});
+}
+
+fn routesRound(m: *ds.Model, kind: []const u8, pos: usize, rows: []const u32) void {
+    if (routesSource(m) == null) return;
+    route_log.round(kind, pos, rows);
+}
+
+/// A step's end: a round's (`only_routed` false) or a plain forward's that routed in the decode.
+fn routesStep(m: *ds.Model, rows: usize, drafted: usize, accepted: usize, emitted: []const u32, wall_ns: u64, only_routed: bool) void {
+    const src = routesSource(m) orelse return;
+    if (!src.routesStep(@intCast(rows), @intCast(drafted), @intCast(accepted), @intCast(emitted.len), wall_ns, only_routed)) return;
+    const pos: usize = if (m.mdl.dec_state) |*st| st.n else 0;
+    route_log.step(gpa, pos, accepted, emitted) catch |e| log.err("[turboexl3_ds41] the route log lost a line: {s}\n", .{@errorName(e)});
+}
+
+/// The request's end: the recorder's file and the steps' log, `ds41-routes-<pid>-<seq>` in the setting's directory.
+fn routesWrite(m: *ds.Model) void {
+    const src = routesSource(m) orelse return;
+    const dir = route_rec.setting.dirPath().?;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pid: i64 = @intCast(std.c.getpid());
+    var pb: [route_rec.max_path + 64]u8 = undefined;
+    const bin = route_rec.filePath(&pb, dir, pid, route_seq, ".bin") catch return;
+    const wrote = src.routesWrite(io, bin) catch |e| {
+        log.err("[turboexl3_ds41] the decode routes were not written to {s}: {s}\n", .{ bin, @errorName(e) });
+        return;
+    };
+    if (!wrote) return;
+    log.info("[turboexl3_ds41] decode routes written: {s} ({d} steps)\n", .{ bin, route_log.steps });
+    var tb: [route_rec.max_path + 64]u8 = undefined;
+    const txt = route_rec.filePath(&tb, dir, pid, route_seq, ".steps.txt") catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = txt, .data = route_log.buf.items }) catch |e|
+        log.err("[turboexl3_ds41] the route log was not written to {s}: {s}\n", .{ txt, @errorName(e) });
+    route_seq += 1;
 }
 
 const Exl3Source = @import("src/mlx_serve/sdk/weights/streamed.zig").Exl3.Source;

@@ -129,6 +129,12 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   and the decode routes') into that file at the request's end (`MLX_SERVE_DSV41_EXPERT_USAGE_LABEL` names the prompt
   set); the counts are routes, so the seed does not bias them. The prompt residents stay across requests (`keep`), and
   the rate tally stays off (mlx-serve's DeepSeek-V4.1 default, pending a measurement).
+- A diagnostic build (`zig build -Doptimize=ReleaseFast -Droute-rec=true`, never served) records the decode's routes:
+  `MLX_SERVE_DSV41_ROUTES=<absolute directory>` arms mlx-serve's `expert.routes` recorder on the streamed bank
+  (src/route_rec.zig, patches/turboexl3-zz7-route-rec.patch), and each request writes `ds41-routes-<pid>-<seq>.bin`
+  (the decode handover's residents and prompt counts, then each step and each routed call: its ids, what served each,
+  the lookahead's records) and `.steps.txt` (each step's rows' tokens, accepted drafts and emitted tokens), for replaying
+  residency policies offline. A served build has no recorder branch and refuses the setting.
 - `MLX_SERVE_DSV41_DEC_PREFETCH=S[:K]` (src/dec_prefetch.zig, the model's prediction and the stream's fills in
   patches/turboexl3-zz2-dec-prefetch.patch): at encoder layer S of a replaying prompt chunk, each CED decoder layer's
   router runs over the replay tail's rows, and from then on each routed call's end posts the next K decoder layers'

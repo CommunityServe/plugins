@@ -18,6 +18,8 @@ pub fn build(b: *std.Build) void {
     const opts = b.addOptions();
     opts.addOption(bool, "mlx_stream", true);
     opts.addOption(bool, "slow_tests", false);
+    // The decode route recorder (src/route_rec.zig, `MLX_SERVE_DSV41_ROUTES`): a diagnostic build's, off in every served one.
+    opts.addOption(bool, "route_rec", b.option(bool, "route-rec", "Compile the decode route recorder in (MLX_SERVE_DSV41_ROUTES); a diagnostic build, never served") orelse false);
     root.addOptions("build_options", opts);
     // MLX's steel headers as the kit ships them (lane_qmm's tile matmul, turboexl3's prefill GEMMs): the kit module's own
     // import, so the file is in one module.
