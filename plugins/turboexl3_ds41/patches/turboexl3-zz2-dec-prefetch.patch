@@ -1,0 +1,465 @@
+diff -ruN a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -269,6 +269,7 @@
+     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
+     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
+     pub const MLX_SERVE_DSV41_COMPILE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 compiled decode stretches (=0: every op eager)" };
++    pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
+     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -38,6 +38,8 @@
+ const prof = @import("../../../stage_prof.zig");
+ /// The prompt timeline (turboexl3_ds41's src/prompt_io.zig, `MLX_SERVE_DSV41_PROMPT_IO`): off, every hook returns at once.
+ const pio = @import("../../../prompt_io.zig");
++/// The CED decoder prefetch (turboexl3_ds41's src/dec_prefetch.zig, `MLX_SERVE_DSV41_DEC_PREFETCH`).
++const dp = @import("../../../dec_prefetch.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+ const one_plan = @import("../../../one_plan.zig");
+ /// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
+@@ -3660,8 +3662,9 @@
+         from = p.hi;
+     }
+     const enc_hi = if (tail != null) m.ced_split.? else m.n_layers;
+-    // The prompt timeline's probe and its decoder calls: the split and the tail of a replaying chunk.
+-    if (pio.on) {
++    // The prompt timeline's probe and its decoder calls, and the decoder prefetch: the split and the tail of a replaying
++    // chunk.
++    if (pio.on or dp.on) {
+         pio.split = if (tail != null) enc_hi else 0;
+         pio.tail = tail orelse 0;
+     }
+@@ -3850,7 +3853,7 @@
+     const x = try sc.concat(parts, 0);
+     const pres = try sc.concat(sp.pres, 0);
+     if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, x, pres, sp.img, ra, src.ctx);
+-    if (pio.on and pio.tail > 0) try probeDecoder(&sc, m, sp, li, x, pres);
++    if ((pio.on or dp.on) and pio.tail > 0) try predictDecoder(&sc, m, sp, li, x, pres);
+     try prof.mark(.read_ahead, &.{ x, pres });
+     const pa = try hcPreNormWide(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm);
+     try prof.mark(.attn_hc, &.{ pa.sp.pre, pa.sp.post, pa.sp.comb, pa.h });
+@@ -3918,13 +3921,14 @@
+     for (ids, (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n]) |*o, v| o.* = @intCast(v);
+     try ra(ctx, @intCast(li), ids).get();
+ }
+-/// The prompt timeline's probe (`MLX_SERVE_DSV41_PROMPT_IO`) at encoder layer `li`, one of `pio.probe_layers`, of a
+-/// replaying chunk: every CED decoder layer's router over the tail rows' stream as it enters `li` (collapsed with its
+-/// mix and normed for that layer's FFN, as the read-ahead predicts a layer's own routes), each tail row's top-k kept.
+-fn probeDecoder(sc: *Scope, m: *const Dsv41Model, sp: *const Spans, li: usize, x: A, pre: A) !void {
+-    const slot = for (pio.probe_layers, 0..) |pl, s| {
+-        if (pl == li) break s;
+-    } else return;
++/// A replaying chunk's CED decoder layers predicted at encoder layer `li`: every decoder layer's router over the tail
++/// rows' stream as it enters `li` (collapsed with its mix and normed for that layer's FFN, as the read-ahead predicts a
++/// layer's own routes), each tail row's top-k. For the prompt timeline's probe (`MLX_SERVE_DSV41_PROMPT_IO`, at
++/// `pio.probe_layers`) and the decoder prefetch's plan (`MLX_SERVE_DSV41_DEC_PREFETCH`, at `dp.start`).
++fn predictDecoder(sc: *Scope, m: *const Dsv41Model, sp: *const Spans, li: usize, x: A, pre: A) !void {
++    const slot = probeSlot(li);
++    const fill = dp.on and li == dp.start;
++    if (slot == null and !fill) return;
+     const tl = pio.tail;
+     const L = sp.L;
+     if (tl == 0 or tl > L or pio.split == 0 or li >= pio.split or m.n_layers > pio.max_layers) return;
+@@ -3940,9 +3944,17 @@
+     for (pio.split..m.n_layers, 0..) |d, i| {
+         const n = mlx.mlx_array_size(idxs[i]);
+         const data = mlx.mlx_array_data_uint32(idxs[i]) orelse return error.NoData;
+-        pio.predict(slot, d, data[0..n]);
++        if (slot) |s| pio.predict(s, d, data[0..n]);
++        if (fill) dp.rank(d, data[0..n]);
+     }
++    if (fill) dp.plan(pio.split, m.n_layers);
+ }
++/// The prompt timeline's probe slot of encoder layer `li` (null: not a probe layer, or the timeline off).
++fn probeSlot(li: usize) ?usize {
++    if (!pio.on) return null;
++    for (pio.probe_layers, 0..) |pl, s| if (pl == li) return s;
++    return null;
++}
+ /// What crosses layers in `extend`: each span's stream and mix, the picks
+ /// attention layers hand down, the DSpark main rows, and the Engram row ids.
+ pub const Spans = struct {
+diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -33,6 +33,8 @@
+ const routed_one = @import("mlx_host").routed_one;
+ /// `MLX_SERVE_DSV41_PROMPT_IO` (the plugin's src/prompt_io.zig): a prompt's routed calls timed and counted.
+ const prompt_io = @import("mlx_host").prompt_io;
++/// `MLX_SERVE_DSV41_DEC_PREFETCH` (the plugin's src/dec_prefetch.zig): the CED decoder layers' fills.
++const dec_prefetch = @import("mlx_host").dec_prefetch;
+ pub const Gate = Hook.Gate;
+ pub const Phase = enum { prompt, decode };
+ /// The trunk's MoE geometry the bank must match.
+@@ -62,6 +64,14 @@
+ const event_watchdog_ms = 2000;
+ const wide: xp.Wide = .{ .seed = true, .hot_first = true, .depth = wide_depth, .defer_base = true, .read_ahead = true, .base_at_seed = true, .seed_aligned = true };
+ const forms: xq.Forms = .{ .down_pair = true, .gu_one = true };
++/// DEC_PREFETCH's reserved read tickets (the plugin's src/dec_prefetch.zig): a fill of every layer's prompt rows at once,
++/// two tickets a record; 0 with the switch off (the pool's ring as before).
++fn fillReserve(prompt_rows: []const u32) u32 {
++    if (!dec_prefetch.on) return 0;
++    var n: u32 = 0;
++    for (prompt_rows) |r| n += 2 * r;
++    return n;
++}
+ /// The bank geometry the EXL3 lane decodes for `geo`: mul1, K = 3 or 2 per layer.
+ fn implementedOf(geo: Geometry) expert_bank.Implemented {
+     return .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3 }, .hidden = geo.hidden_size, .inter = geo.moe_intermediate_size, .n_experts = geo.n_routed_experts, .n_layers = geo.n_layers };
+@@ -172,6 +182,7 @@
+             .wide_depth = wide_depth,
+             .transient_rows = @as(u32, wide_depth) * sdk_ext.expert.policy.max_route_ids,
+             .transient_release = expert_stream.phase_change_releases_wide_windows and expert_stream.transient_release_default,
++            .fill_reserve = fillReserve(self.prompt_rows),
+         });
+         errdefer self.stream.deinit();
+         self.source = xp.StreamSource.init(self.stream);
+@@ -225,6 +236,8 @@
+         const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
+         self.t3_state.n = 0;
+         const pio = prompt_io.on and self.phase == .prompt;
++        // DEC_PREFETCH: the next decoder layers' fills posted once the call (its reads drained) is done.
++        defer if (dec_prefetch.on and self.phase == .prompt) self.postFills();
+         if (pio) try self.pioStart(layer, x, ids);
+         defer if (pio) prompt_io.callEnd(self.pioCounters());
+         if (routed_one.on() and self.phase == .prompt) switch (self.hook) {
+@@ -264,7 +277,20 @@
+     /// The stream's counters `MLX_SERVE_DSV41_PROMPT_IO` keeps.
+     fn pioCounters(self: *Source) prompt_io.Counters {
+         const s = self.source.stats();
+-        return .{ .routes = s.route_calls, .hits = s.expert_cache_hits, .misses = s.expert_cache_misses, .evictions = s.expert_cache_evictions, .bytes = s.expert_bytes_read, .wait_ns = s.read_wait_ns, .wall_ns = s.read_wall_ns, .ahead_posted = s.ahead_posted, .ahead_hits = s.ahead_hits, .ahead_bytes = s.ahead_bytes, .spec_issued = s.spec_issued, .spec_landed = s.spec_landed, .claimed = s.claimed };
++        return .{ .routes = s.route_calls, .hits = s.expert_cache_hits, .misses = s.expert_cache_misses, .evictions = s.expert_cache_evictions, .bytes = s.expert_bytes_read, .wait_ns = s.read_wait_ns, .wall_ns = s.read_wall_ns, .ahead_posted = s.ahead_posted, .ahead_hits = s.ahead_hits, .ahead_bytes = s.ahead_bytes, .spec_issued = s.spec_issued, .spec_landed = s.spec_landed, .claimed = s.claimed, .fill_posted = s.fill_posted, .fill_bytes = s.fill_bytes };
++    }
++    /// DEC_PREFETCH: the next `dec_prefetch.per_call` decoder layers' fills of the replaying chunk's plan, at a prompt
++    /// call's end. A refusal ends the plan (the layers left read on demand, as without it).
++    fn postFills(self: *Source) void {
++        var k: usize = 0;
++        while (k < dec_prefetch.per_call) : (k += 1) {
++            const p = dec_prefetch.next() orelse return;
++            _ = self.stream.prefetchLayer(p.layer, p.experts) catch |e| {
++                std.log.warn("streamed exl3: the CED decoder prefetch of layer {d} was refused ({s}); the rest of the prompt reads on demand", .{ p.layer, @errorName(e) });
++                dec_prefetch.reset();
++                return;
++            };
++        }
+     }
+     /// A prompt pass's predicted routes of `layer` (every row's ids): its experts, hottest first, read into its rows
+     /// while its attention runs.
+@@ -290,6 +316,9 @@
+                 try h.flush();
+                 switch (p) {
+                     .decode => {
++                        // DEC_PREFETCH: no route of the prompt is left to land a fill.
++                        try self.stream.landFills();
++                        dec_prefetch.reset();
+                         if (prompt_io.on) prompt_io.report(self.pioCounters());
+                         self.released = (try h.releaseTransient()) > 0;
+                         _ = mlx.mlx_synchronize(self.g.s);
+@@ -298,6 +327,7 @@
+                     },
+                     .prompt => {
+                         if (prompt_io.on) prompt_io.reset();
++                        dec_prefetch.reset();
+                         // `shrink` frees the grown rows and checks MLX's active bytes dropped by them, so no command may
+                         // still hold them (the grow's own fills, a decode's last eval): a phase change right after the
+                         // load's grow otherwise fails at random with GrownRowsStillReferenced and leaves the stream failed.
+diff -ruN a/sdk/weights/streamed/sdk_ext/expert.zig b/sdk/weights/streamed/sdk_ext/expert.zig
+--- a/sdk/weights/streamed/sdk_ext/expert.zig
++++ b/sdk/weights/streamed/sdk_ext/expert.zig
+@@ -136,6 +136,10 @@
+     ahead_bytes: u64 = 0,
+     /// P7 overlap: read-ahead records never read because the call's plans evict them before any hit (`p7Tail`).
+     ahead_dropped: u64 = 0,
++    /// DEC_PREFETCH's fills (`Stream.prefetchLayer`): records posted into a later layer's rows and their bytes (in
++    /// `expert_bytes_read` too).
++    fill_posted: u64 = 0,
++    fill_bytes: u64 = 0,
+     /// Prompt records copied from a transient row into a resident's row (`Stream.promote`) and their bytes.
+     promoted: u64 = 0,
+     promoted_bytes: u64 = 0,
+diff -ruN a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weights/streamed/sdk_ext/expert/io.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/io.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/io.zig
+@@ -177,6 +177,10 @@
+     /// wider spans sizes it from the bank (`stream.Options.staging_from_bank`).
+     staging_bytes: u64 = 9 << 20,
+     tickets: u32 = 256,
++    /// Tickets at the ring's end kept out of the demand range, for the owner's fills (`Records.submitReserved`): each
++    /// fill's tickets stay unread until its owner lands it, past any wrap of the demand range. 0: the whole ring is
++    /// demand's.
++    reserve: u32 = 0,
+     /// The demand ranges' read route, fixed at start: true reads every demand range straight into its rows (one preadv
+     /// iovec per part, no staging, no copy); false (the default) takes the staging loop and the copy. The pool tests no
+     /// range: the owner proves the alignment once at construction (`checkDirectBlock` + the stream's
+@@ -287,7 +291,8 @@
+     /// here and stay put until `stop`.
+     pub fn start(allocator: std.mem.Allocator, opt: Options) !*Pool {
+         const page = std.heap.pageSize();
+-        if (opt.workers == 0 or opt.workers > max_workers or opt.staging_bytes == 0 or opt.staging_bytes % page != 0 or opt.tickets < 2 * max_items)
++        if (opt.workers == 0 or opt.workers > max_workers or opt.staging_bytes == 0 or opt.staging_bytes % page != 0 or opt.tickets < 2 * max_items or
++            opt.reserve > opt.tickets - 2 * max_items)
+             return error.InvalidOptions;
+         if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
+             s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
+@@ -306,7 +311,7 @@
+         @memset(res, 0);
+         @memset(log_arr, 0);
+         @memset(published, false);
+-        const demand: u32 = opt.tickets;
++        const demand: u32 = opt.tickets - opt.reserve;
+         self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand };
+         var bufs: [max_spec]u64 = undefined;
+         var threads: i32 = 0;
+@@ -487,6 +492,11 @@
+         pub fn submit(pool: *Pool, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
+             return submitOn(pool, 0, pool.demand_tickets, &pool.next_ticket, fd, gu_offsets, down_offsets, rows, lens);
+         }
++        /// `submit` in the ring's reserved range (`Options.reserve`), from `next.*` on (the owner starts it at
++        /// `demand_tickets` and keeps every claim inside the range).
++        pub fn submitReserved(pool: *Pool, next: *u32, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
++            return submitOn(pool, pool.demand_tickets, @intCast(pool.published.len), next, fd, gu_offsets, down_offsets, rows, lens);
++        }
+         /// A part's place in a pack whose parts live apart (`submitScatter`): its file and offset.
+         pub const Part = struct { fd: UncachedFd, offset: u64 };
+         /// `submit` for records whose parts are not contiguous: part `c` of record `i` read from `parts[i][c]`. The
+diff -ruN a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+@@ -436,6 +436,9 @@
+             /// The read-ahead's admission bound in records; null: the stock rule, from the pool's tickets. A route that
+             /// widens the ticket ring pins it to the narrower ring's bound so the admissions stay the control's.
+             ahead_cap: ?u32 = null,
++            /// DEC_PREFETCH: tickets kept past the pool's demand range for fills a prompt posts into a later layer's own
++            /// persistent rows (`prefetchLayer`), each held until that layer's first route lands it; 0 = no fills.
++            fill_reserve: u32 = 0,
+             /// P7 `overlap` relocation (glm5next/prefill-levers lever 1): at a call's plans, every read-ahead record the plans
+             /// evict before any group hits it and load again later in the call into a transient row no earlier group of the
+             /// call reads is copied from its read-ahead row into that transient row (`p7Relocate`), so that load holds its
+@@ -685,6 +688,14 @@
+             owner: std.Thread.Id,
+             /// P1: the prompt pass's read-ahead in flight (one layer's predicted seed).
+             ahead: Ahead,
++            /// DEC_PREFETCH (`Options.fill_reserve`): per layer its fill (`prefetchLayer`) until its first route lands it
++            /// (`awaitFill`); empty without a reserve. Fills claim the pool's reserved tickets from `fill_next` on, from
++            /// the range's start again once none is live; `fill_*` own every fill's buffers.
++            fills: []Fill = &.{},
++            fill_next: u32 = 0,
++            fill_loads: []LayerPolicy.ReadAhead = &.{},
++            fill_reads: []bool = &.{},
++            fill_parts: []Part = &.{},
+             /// The route recorder, a diagnostic its arch arms (`expert.routes`): every decode route, the handover's
+             /// residents and prompt counts. Null: off.
+             recorder: ?*expert_routes.Recorder = null,
+@@ -724,6 +735,15 @@
+             };
+             /// The second geometry's transient scratch: its rows, their meta and the layer whose geometry it has.
+             const AltTransient = struct { rows: Rows, meta: []SlotMeta, layer: u32 };
++            /// DEC_PREFETCH: one layer's fill, P1's read-ahead record (`Ahead`) for a layer the prompt reaches later.
++            const Fill = struct {
++                live: bool = false,
++                n: u32 = 0,
++                n_parts: u32 = 0,
++                loads: []LayerPolicy.ReadAhead,
++                reads: []bool,
++                parts: []Part,
++            };
+             /// P7 overlap: one prompt call's schedule, from `planCall` to its last group's `releaseP7`.
+             pub const P7 = struct {
+                 live: bool = false,
+@@ -891,6 +911,26 @@
+                 const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts) else &.{};
+                 errdefer if (ahead_job.len > 0) a.free(ahead_job);
+                 @memset(ahead_job, no_job);
++                // DEC_PREFETCH's fills: the reserved tickets past demand's, and per layer a fill's record (P1's sizes).
++                if (opt.fill_reserve > 0) {
++                    if (multi_bank or scatter) return error.InvalidOptions;
++                    pool_opt.tickets += opt.fill_reserve;
++                    pool_opt.reserve = opt.fill_reserve;
++                }
++                const n_fills: usize = if (opt.fill_reserve > 0) n_layers else 0;
++                const fill_parts_n: usize = (std.math.divCeil(u32, bank.n_experts, expert_io.max_items / minis) catch unreachable) + 1;
++                const fill_loads = try a.alloc(LayerPolicy.ReadAhead, n_fills * bank.n_experts);
++                errdefer a.free(fill_loads);
++                const fill_reads = try a.alloc(bool, n_fills * bank.n_experts);
++                errdefer a.free(fill_reads);
++                const fill_parts = try a.alloc(Part, n_fills * fill_parts_n);
++                errdefer a.free(fill_parts);
++                const fills = try a.alloc(Fill, n_fills);
++                errdefer a.free(fills);
++                for (fills, 0..) |*fl, i| {
++                    const ne: usize = bank.n_experts;
++                    fl.* = .{ .loads = fill_loads[i * ne ..][0..ne], .reads = fill_reads[i * ne ..][0..ne], .parts = fill_parts[i * fill_parts_n ..][0..fill_parts_n] };
++                }
+                 const pool = try expert_io.Pool.start(a, pool_opt);
+                 errdefer pool.stop();
+                 if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);
+@@ -933,6 +973,11 @@
+                     .prompt_relocate = opt.prompt_relocate,
+                     .p7_rows = p7_rows,
+                     .ahead_job = ahead_job,
++                    .fills = fills,
++                    .fill_next = pool.demand_tickets,
++                    .fill_loads = fill_loads,
++                    .fill_reads = fill_reads,
++                    .fill_parts = fill_parts,
+                 };
+                 // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
+                 if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
+@@ -970,6 +1015,10 @@
+                 a.free(self.ahead.landed);
+                 if (self.p7_rows.len > 0) a.free(self.p7_rows);
+                 if (self.ahead_job.len > 0) a.free(self.ahead_job);
++                a.free(self.fills);
++                a.free(self.fill_loads);
++                a.free(self.fill_reads);
++                a.free(self.fill_parts);
+                 a.destroy(self);
+             }
+             fn fail(self: *Stream, err: Error) Error {
+@@ -1359,6 +1408,8 @@
+                 std.debug.assert(self.phase != .decode or ids.len <= self.decode_route_ids);
+                 // A layer's read-ahead lands before a route plans over its rows (a hit must never read a loading row).
+                 if (self.ahead.live and self.ahead.layer == layer) try self.awaitReadAhead(layer);
++                // DEC_PREFETCH: a fill of the layer lands before its first route plans over its rows.
++                if (self.fills.len > 0 and self.fills[layer].live) try self.awaitFill(layer);
+                 const lookahead = self.route_lookahead;
+                 const tag = self.clock + 1;
+                 if (self.route_preread) try self.preRead(layer, ids, tag);
+@@ -1740,7 +1791,7 @@
+                 const ah = &self.ahead;
+                 const mn = minisOf(&self.bank.layers[layer]);
+                 // The ticket ring's room in records (each record's minis take a gate/up and a down ticket apiece).
+-                const fit = @min(ah.loads.len, self.ahead_cap orelse (self.pool.published.len - 2 * expert_io.max_items) / (2 * mn));
++                const fit = @min(ah.loads.len, self.ahead_cap orelse (self.pool.demand_tickets - 2 * expert_io.max_items) / (2 * mn));
+                 // The rows live routes of the layer serve from and the deferred base call's are never a read-ahead's victims
+                 // (as a plan beside them holds them): their records are being read by a wave.
+                 const held_set = &self.held_scratch;
+@@ -1878,7 +1929,124 @@
+                 }
+                 for (ah.loads[p.first..][0..p.n]) |l| self.locate(ah.layer, l.slot).meta.pins -= 1;
+                 if (failure) |e| return self.fail(e);
++            }
++            /// DEC_PREFETCH: layer `layer`'s predicted experts (`experts`, the most likely first) read into its own
++            /// persistent rows while earlier layers run, by P1's admission (`admitReadAheadHeld`: an empty row, else the
++            /// coldest resident the prediction left out; never a row a live route of the layer serves from, a pinned or
++            /// a loading one), in jobs of `max_items` records in the pool's reserved tickets, file order; the rows stay
++            /// pinned until the layer's first route lands them (`awaitFill`), or the phase change does (`landFills`).
++            /// Returns the records admitted: 0 when no fill is armed, the stream is not prompting, the layer's fill is
++            /// already posted, or no reserved ticket is left.
++            pub fn prefetchLayer(self: *Stream, layer: u32, experts: []const u16) Error!u32 {
++                if (self.failed) return error.StreamFailed;
++                if (self.fills.len == 0 or self.phase != .prefill or layer >= self.fills.len) return 0;
++                const f = &self.fills[layer];
++                if (f.live) return 0;
++                var any_live = false;
++                for (self.fills) |*o| any_live = any_live or o.live;
++                if (!any_live) self.fill_next = self.pool.demand_tickets;
++                const mn = minisOf(&self.bank.layers[layer]);
++                const total: u32 = @intCast(self.pool.published.len);
++                const room: u32 = (total -| self.fill_next) / (2 * mn);
++                if (room == 0) return 0;
++                self.prompt_started = true;
++                const held_set = &self.held_scratch;
++                held_set.clearRetainingCapacity();
++                for (&self.routes) |*o| {
++                    if (o.state == .free or o.layer != layer) continue;
++                    for (o.hit_slots[0..o.plan.n_hits]) |hs| if (hs < self.layers[layer].policy.capacity) {
++                        held_set.append(self.allocator, hs) catch return self.fail(error.RoutesExhausted);
++                    };
++                    for (o.plan.loadsOf()) |l| if (l.persistent) {
++                        held_set.append(self.allocator, l.slot) catch return self.fail(error.RoutesExhausted);
++                    };
++                }
++                if (self.held_base.items.len > 0 and self.held_layer == layer)
++                    held_set.appendSlice(self.allocator, self.held_base.items) catch return self.fail(error.RoutesExhausted);
++                for (self.layers[layer].meta[0..self.layers[layer].policy.capacity], 0..) |m, s| if (m.pins != 0 or m.state == .loading) {
++                    held_set.append(self.allocator, @intCast(s)) catch return self.fail(error.RoutesExhausted);
++                };
++                const admitted = self.layers[layer].policy.admitReadAheadHeld(experts, held_set.items, f.loads[0..@min(f.loads.len, room)]);
++                const n: u32 = @intCast(admitted.len);
++                f.n = n;
++                f.n_parts = 0;
++                if (n == 0) return 0;
++                std.sort.pdq(LayerPolicy.ReadAhead, admitted, {}, struct {
++                    fn less(_: void, x: LayerPolicy.ReadAhead, y: LayerPolicy.ReadAhead) bool {
++                        return x.expert < y.expert;
++                    }
++                }.less);
++                for (admitted, f.reads[0..n]) |l, *rd| {
++                    const m = self.locate(layer, l.slot).meta;
++                    if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
++                    rd.* = !(m.state == .ready and m.layer == layer and m.expert == l.expert);
++                    if (rd.*) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
++                    m.pins = 1;
++                }
++                f.live = true;
++                const lens = &self.layers[layer].lens;
++                var start: u32 = 0;
++                while (start < n) {
++                    const end = @min(start + expert_io.max_items / mn, n);
++                    var part: Part = .{ .first = start, .n = end - start };
++                    var rows: [expert_io.max_items][n_components]u64 = undefined;
++                    var gu: [expert_io.max_items]u64 = undefined;
++                    var down: [expert_io.max_items]u64 = undefined;
++                    var ids: [expert_io.max_items]u16 = undefined;
++                    var nr: u32 = 0;
++                    var posted: u32 = 0;
++                    for (f.loads[start..end], f.reads[start..end]) |l, rd| {
++                        if (!rd) continue;
++                        nr = self.entries(layer, l.slot, l.expert, &rows, &gu, &down, &ids, nr);
++                        posted += 1;
++                    }
++                    if (nr > 0) {
++                        part.ticket = B.Records.submitReserved(self.pool, &self.fill_next, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |err| return self.fail(err);
++                        part.n_reads = nr;
++                        self.counters.fill_posted += posted;
++                    } else part.settled = true;
++                    f.parts[f.n_parts] = part;
++                    f.n_parts += 1;
++                    start = end;
++                }
++                return n;
+             }
++            /// DEC_PREFETCH: lands layer `layer`'s fill (none live: nothing to do): every job waited and its rows ready, the
++            /// rows' pins dropped; a record that failed is forgotten by the policy and fails the stream, as P1's does.
++            fn awaitFill(self: *Stream, layer: u32) Error!void {
++                const f = &self.fills[layer];
++                if (!f.live) return;
++                f.live = false;
++                const policy = &self.layers[layer].policy;
++                var first_error: ?Error = null;
++                for (f.parts[0..f.n_parts]) |*p| {
++                    if (!p.settled) {
++                        p.settled = true;
++                        const count = 2 * p.n_reads;
++                        const waited = self.waitReads(p.ticket, count);
++                        var ok = if (waited) |_| true else |_| false;
++                        if (ok) for (0..count) |k| {
++                            const res = self.pool.result(p.ticket + @as(u32, @intCast(k)));
++                            if (res.status != .ok) ok = false;
++                            self.counters.expert_bytes_read += @intCast(@max(res.payload, 0));
++                            self.counters.fill_bytes += @intCast(@max(res.payload, 0));
++                            self.counters.preadv_calls += @intCast(@max(res.preadv_calls, 0));
++                            self.noteRead(res);
++                        };
++                        for (f.loads[p.first..][0..p.n], f.reads[p.first..][0..p.n]) |l, rd| if (rd) {
++                            self.locate(layer, l.slot).meta.state = if (ok) .ready else .failed;
++                            if (!ok) policy.invalidate(l.expert);
++                        };
++                        if (!ok and first_error == null) first_error = if (waited) |_| error.ReadFailed else |e| e;
++                    }
++                    for (f.loads[p.first..][0..p.n]) |l| self.locate(layer, l.slot).meta.pins -= 1;
++                }
++                if (first_error) |e| return self.fail(e);
++            }
++            /// DEC_PREFETCH: every live fill landed (the prompt's end, where no route is left to land one).
++            pub fn landFills(self: *Stream) Error!void {
++                for (self.fills, 0..) |f, l| if (f.live) try self.awaitFill(@intCast(l));
++            }
+             /// Whether read-ahead job `j` has landed or its reads have all completed (never blocks).
+             fn aheadJobDone(self: *Stream, j: u32) bool {
+                 const ah = &self.ahead;

@@ -178,4 +178,5 @@ test {
     _ = @import("src/one_plan.zig");
     _ = @import("src/markov_plan.zig");
     _ = @import("src/prompt_io.zig");
+    _ = @import("src/dec_prefetch.zig");
 }

@@ -59,6 +59,9 @@ pub const Counters = struct {
     spec_issued: u64 = 0,
     spec_landed: u64 = 0,
     claimed: u64 = 0,
+    /// the CED decoder prefetch's (`MLX_SERVE_DSV41_DEC_PREFETCH`): records posted, bytes landed
+    fill_posted: u64 = 0,
+    fill_bytes: u64 = 0,
 
     fn since(a: Counters, b: Counters) Counters {
         var d: Counters = .{};
@@ -289,7 +292,7 @@ const Side = struct {
     }
 
     fn print(s: *const Side, name: []const u8) void {
-        std.debug.print("[prompt-io] side={s} calls={d} layer_ms={d:.1} ra_ms={d:.1} attn_ms={d:.1} moe_ms={d:.1} uniq={d} read_gb={d:.2} rwall_ms={d:.1} rwait_ms={d:.1} misses={d} hits={d} ahead_hits={d} ahead_gb={d:.2}\n", .{ name, s.calls, ms(s.layer_ns), ms(s.ra_ns), ms(s.attn_ns), ms(s.moe_ns), s.uniq, gb(s.d.bytes), ms(s.d.wall_ns), ms(s.d.wait_ns), s.d.misses, s.d.hits, s.d.ahead_hits, gb(s.d.ahead_bytes) });
+        std.debug.print("[prompt-io] side={s} calls={d} layer_ms={d:.1} ra_ms={d:.1} attn_ms={d:.1} moe_ms={d:.1} uniq={d} read_gb={d:.2} rwall_ms={d:.1} rwait_ms={d:.1} misses={d} hits={d} ahead_hits={d} ahead_gb={d:.2} fill_posted={d} fill_gb={d:.2}\n", .{ name, s.calls, ms(s.layer_ns), ms(s.ra_ns), ms(s.attn_ns), ms(s.moe_ns), s.uniq, gb(s.d.bytes), ms(s.d.wall_ns), ms(s.d.wait_ns), s.d.misses, s.d.hits, s.d.ahead_hits, gb(s.d.ahead_bytes), s.d.fill_posted, gb(s.d.fill_bytes) });
     }
 };
 
@@ -319,7 +322,7 @@ pub fn report(c: Counters) void {
     dec.print("decoder");
     all.print("total");
     const d = c.since(c_prompt);
-    std.debug.print("[stream-stats prompt] wall_ms={d:.1} routes={d} hits={d} misses={d} evictions={d} read_gb={d:.2} read_wait_ms={d:.1} read_wall_ms={d:.1} ahead_posted={d} ahead_hits={d} ahead_gb={d:.2} spec_issued={d} spec_landed={d} claimed={d} calls={d} dropped={d}\n", .{ ms(t_end -| t_prompt), d.routes, d.hits, d.misses, d.evictions, gb(d.bytes), ms(d.wait_ns), ms(d.wall_ns), d.ahead_posted, d.ahead_hits, gb(d.ahead_bytes), d.spec_issued, d.spec_landed, d.claimed, n_calls, dropped });
+    std.debug.print("[stream-stats prompt] wall_ms={d:.1} routes={d} hits={d} misses={d} evictions={d} read_gb={d:.2} read_wait_ms={d:.1} read_wall_ms={d:.1} ahead_posted={d} ahead_hits={d} ahead_gb={d:.2} spec_issued={d} spec_landed={d} claimed={d} fill_posted={d} fill_gb={d:.2} calls={d} dropped={d}\n", .{ ms(t_end -| t_prompt), d.routes, d.hits, d.misses, d.evictions, gb(d.bytes), ms(d.wait_ns), ms(d.wall_ns), d.ahead_posted, d.ahead_hits, gb(d.ahead_bytes), d.spec_issued, d.spec_landed, d.claimed, d.fill_posted, gb(d.fill_bytes), n_calls, dropped });
     for (probes[0..n_probes]) |p| {
         var buf: [32]u8 = undefined;
         const prev_s = if (p.prev) |h| std.fmt.bufPrint(&buf, "{d:.2}", .{share(h, p.actual)}) catch "?" else "-";

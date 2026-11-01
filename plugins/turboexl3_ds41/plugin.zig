@@ -24,6 +24,9 @@ pub const routed_one = @import("src/routed_one.zig");
 /// A prompt pass's routed calls timed and counted, and the CED decoder's experts probed, when
 /// `MLX_SERVE_DSV41_PROMPT_IO` asks (src/prompt_io.zig, hooked by the copied model and source).
 pub const prompt_io = @import("src/prompt_io.zig");
+/// The CED decoder layers' experts read into their rows while the encoder runs, when `MLX_SERVE_DSV41_DEC_PREFETCH`
+/// asks (src/dec_prefetch.zig, posted by the copied source, planned by the copied model).
+pub const dec_prefetch = @import("src/dec_prefetch.zig");
 /// The DSpark draft's Markov chain in B + 1 launches (src/markov.zig, called by the copied model's draft;
 /// `MLX_SERVE_DSV41_MARKOV`).
 const markov = @import("src/markov.zig");
@@ -117,6 +120,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // Before the model's load, which compiles its decode stretches only when the stage profiler is off.
     stage_prof.configure(env.span(.MLX_SERVE_DSV41_STAGE_PROF));
     prompt_io.configure(env.span(.MLX_SERVE_DSV41_PROMPT_IO));
+    // Before the model's load: the stream's read pool reserves the fills' tickets at its construction.
+    dec_prefetch.configure(env.span(.MLX_SERVE_DSV41_DEC_PREFETCH)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DEC_PREFETCH is neither S nor S:K (S an encoder layer from 1, K 1..32) nor 0: the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     var own = ctx.*;
     own.weights = null;
     const mp = ds.table.load(&own, out) orelse return null;
@@ -142,6 +153,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     drafter = rounds.Drafter.init(gpa, on);
     log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on" else "off (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
+    if (dec_prefetch.on) log.info("[turboexl3_ds41] CED decoder prefetch on (MLX_SERVE_DSV41_DEC_PREFETCH): the decoder layers' experts predicted at encoder layer {d}, {d} layers posted per prompt call\n", .{ dec_prefetch.start, dec_prefetch.per_call });
     if (prompt_io.on) log.info("[turboexl3_ds41] prompt timeline on (MLX_SERVE_DSV41_PROMPT_IO): [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end\n", .{});
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {
