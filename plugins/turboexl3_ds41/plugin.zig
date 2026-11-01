@@ -44,6 +44,9 @@ pub const expert_usage_cfg = @import("src/expert_usage_cfg.zig");
 /// stream, a file a request and its steps' tokens), compiled into route-recording builds only (`zig build
 /// -Droute-rec=true`); the copied stream reads `route_recording` through this root.
 pub const route_rec = @import("src/route_rec.zig");
+/// The decode's slot rows split across the layers (`MLX_SERVE_DSV41_DECODE_ROWS=split`, src/decode_rows.zig: the flat
+/// bill's decode bytes by a development corpus's misses-a-row curves), read by the copied EXL3 source through this root.
+pub const decode_rows = @import("src/decode_rows.zig");
 pub const route_recording: bool = @import("build_options").route_rec;
 /// The usage seed's rows free until a route uses them (`MLX_SERVE_DSV41_SEED_FREE`, src/seed_free.zig), read by the
 /// copied EXL3 source through this root: the prompt's read-ahead and the CED decoder prefetch may take them.
@@ -155,6 +158,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1: the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    decode_rows.mode = decode_rows.parse(env.span(.MLX_SERVE_DSV41_DECODE_ROWS)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_ROWS is refused ({s}): flat or split, or unset (the split where it fits the pack)\n", .{@errorName(e)});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };

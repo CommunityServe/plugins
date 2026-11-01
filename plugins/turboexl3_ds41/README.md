@@ -135,6 +135,16 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   (the decode handover's residents and prompt counts, then each step and each routed call: its ids, what served each,
   the lookahead's records) and `.steps.txt` (each step's rows' tokens, accepted drafts and emitted tokens), for replaying
   residency policies offline. A served build has no recorder branch and refuses the setting.
+- The decode's slot rows are split across the layers (src/decode_rows.zig, the hook in
+  patches/turboexl3-zzz1-decode-rows.patch) at the flat bill's bytes or fewer, each layer between its prompt rows and
+  256, by each layer's misses-a-row curve: the decode residency policy replayed over routes recorded on a development
+  corpus kept apart from the code-ctx prompts (Python and Zig sources with tasks of their own, chat questions; 8
+  requests, 1948 rounds). The curves fit this pack's geometry only (40 layers, 384 experts, its K3 and K2 records): on
+  any other the rows stay flat (one info line). One load line gives the rows and the bytes against flat.
+  `MLX_SERVE_DSV41_DECODE_ROWS=flat` keeps flat rows; `=split` requires the split (refused by name with log.err, rows
+  flat, where it does not fit). On the full pack (code-ctx16384, fixed full-block verifies, the seed, SEED_FREE and
+  ROUTED=turboexl3, window w-20261101-0510) the split decoded 46.1 and 46.0 tok/s greedy against flat's 44.6 and 43.9,
+  39.5 and 39.6 on the cold prompt's decode against 37.9 and 37.2, with 7.7% fewer misses a round and the same texts.
 - `MLX_SERVE_DSV41_DEC_PREFETCH=S[:K]` (src/dec_prefetch.zig, the model's prediction and the stream's fills in
   patches/turboexl3-zz2-dec-prefetch.patch): at encoder layer S of a replaying prompt chunk, each CED decoder layer's
   router runs over the replay tail's rows, and from then on each routed call's end posts the next K decoder layers'

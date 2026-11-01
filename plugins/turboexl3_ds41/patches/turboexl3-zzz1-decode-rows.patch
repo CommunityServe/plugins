@@ -1,0 +1,50 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig	2026-11-01 00:18:02
++++ b/env.zig	2026-11-01 00:18:02
+@@ -269,6 +269,7 @@
+     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
+     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
+     pub const MLX_SERVE_DSV41_COMPILE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 compiled decode stretches (=0: every op eager)" };
++    pub const MLX_SERVE_DSV41_DECODE_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "split where its curves fit the pack, else flat", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode slot rows (turboexl3_ds41): unset, the flat bill's decode bytes split across the layers by its development corpus's misses-a-row curves, each layer between its prompt rows and 256, where the curves fit the pack (flat rows where they do not); flat: flat rows; split: the split required (refused by name, rows flat, where it does not fit)" };
+     pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
+     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig	2026-11-01 00:18:02
++++ b/sdk/weights/streamed/exl3_source.zig	2026-11-01 00:18:02
+@@ -176,6 +176,7 @@
+         self.decode_rows = try a.alloc(u32, geo.n_layers);
+         errdefer a.free(self.decode_rows);
+         @memset(self.decode_rows, self.bill.rows.decode);
++        self.splitDecodeRows();
+         self.g = try G.init(a, s);
+         errdefer self.g.deinit();
+         self.set = try kernel_set.Set.init(a, .{ .device = .{ .stream = s } }, &diag);
+@@ -251,6 +252,27 @@
+         errdefer if (comptime recording) self.freeRecorder();
+         try self.seedUsage(a, io, dir, layers, experts);
+         return self;
++    }
++    /// turboexl3_ds41's `MLX_SERVE_DSV41_DECODE_ROWS` (its src/decode_rows.zig): unset, the flat decode rows split across
++    /// the layers at the flat bill's bytes or fewer, each layer between its prompt rows and 256, where the split's curves
++    /// fit the pack (one info line and flat rows where they do not); `flat`, the rows flat; `split`, the split required
++    /// (a refusal logged by name with log.err, the rows flat).
++    fn splitDecodeRows(self: *Source) void {
++        const dr = @import("mlx_host").decode_rows;
++        if (dr.mode == .flat) return;
++        const s = self.splitWith(dr) catch |e| {
++            if (dr.mode == .split) {
++                std.log.err("streamed exl3: decode rows split refused ({s}, MLX_SERVE_DSV41_DECODE_ROWS=split): the rows stay flat, {d} a layer", .{ @errorName(e), self.bill.rows.decode });
++            } else std.log.info("streamed exl3: decode rows flat, {d} a layer: the split's curves do not fit this pack ({s})", .{ self.bill.rows.decode, @errorName(e) });
++            return;
++        };
++        std.log.info("streamed exl3: decode rows split by layer ({s}): {any}; {d} B against the flat {d} rows' {d} B", .{ if (dr.mode == .split) "MLX_SERVE_DSV41_DECODE_ROWS=split" else "the default on this pack", self.decode_rows, s.bytes, self.bill.rows.decode, s.flat_bytes });
++    }
++    fn splitWith(self: *Source, comptime dr: type) dr.Error!dr.Split {
++        if (self.bank.layers.len != dr.n_layers) return error.DecodeRowsLayers;
++        var bytes: [dr.n_layers]u64 = undefined;
++        for (self.bank.layers, &bytes) |l, *b| b.* = l.logical_bytes;
++        return dr.split(self.decode_rows, self.prompt_rows, &bytes, self.bank.n_experts);
+     }
+     fn freeRecorder(self: *Source) void {
+         if (comptime !recording) return;

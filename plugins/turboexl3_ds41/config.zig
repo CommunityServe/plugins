@@ -183,6 +183,7 @@ test {
     _ = @import("src/stream_lookahead.zig");
     _ = @import("src/expert_usage_cfg.zig");
     _ = @import("src/route_rec.zig");
+    _ = @import("src/decode_rows.zig");
     _ = @import("src/seed_free.zig");
     _ = @import("src/ra_fused.zig");
 }
