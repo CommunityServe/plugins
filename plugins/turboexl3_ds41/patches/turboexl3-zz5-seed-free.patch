@@ -1,0 +1,267 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -282,6 +282,7 @@
+     pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
++    pub const MLX_SERVE_DSV41_SEED_FREE: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 usage seed's rows free until routed (turboexl3_ds41): the prompt's read-ahead may take a row the load's seed filled that no route has used, for an expert its prediction ranks before the seeded one, and the CED decoder prefetch one whose expert its prediction does not name" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -41,6 +41,8 @@
+ const prompt_io = @import("mlx_host").prompt_io;
+ /// `MLX_SERVE_DSV41_DEC_PREFETCH` (the plugin's src/dec_prefetch.zig): the CED decoder layers' fills.
+ const dec_prefetch = @import("mlx_host").dec_prefetch;
++/// `MLX_SERVE_DSV41_SEED_FREE` (the plugin's src/seed_free.zig): the usage seed's rows free until a route uses them.
++const seed_free = @import("mlx_host").seed_free;
+ pub const Gate = Hook.Gate;
+ pub const Phase = enum { prompt, decode };
+ /// The trunk's MoE geometry the bank must match.
+@@ -242,7 +244,8 @@
+     }
+     /// The resident seed (`resident_seed`, as glm5_next: unset, `usage` when the profile's directory has
+     /// expert-usage-v1.json): each layer's empty prompt rows filled with its most used experts, read now; the first
+-    /// request finds them resident. The seed changes no policy: a seeded expert is a resident as a kept one is.
++    /// request finds them resident. The seed changes no policy: a seeded expert is a resident as a kept one is
++    /// (MLX_SERVE_DSV41_SEED_FREE: its row free for the prompt's read-ahead and the decoder prefetch until a route uses it).
+     fn seedUsage(self: *Source, a: std.mem.Allocator, io: std.Io, dir: []const u8, layers: u32, experts: u32) !void {
+         var st: expert_usage.Settings = .{};
+         st.seed = switch (usage_cfg.seed) {
+@@ -259,6 +262,7 @@
+         var buf: [expert_usage.max_label + 400]u8 = undefined;
+         const seeded = expert_usage.Seeded.of(self.stream.layers, self.prompt_rows, records);
+         std.log.info("streamed exl3: {s}", .{expert_usage.seedLine(&buf, usage_arch, &d, seeded, records * (self.bill.row_bytes / layers), ms)});
++        if (seed_free.on) std.log.info("streamed exl3: {d} seeded rows free until a route uses them: the prompt's read-ahead and the CED decoder prefetch may take them (MLX_SERVE_DSV41_SEED_FREE)", .{self.stream.freeSeed()});
+     }
+     /// `expert_usage_record`, at a request's end: its routed experts (the prompt pass's and the decode routes') added to
+     /// the record and the file written; the prompt counts zeroed after, since a next request with its prompt cached runs
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/policy.zig b/sdk/weights/streamed/sdk_ext/expert/policy.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/policy.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/policy.zig
+@@ -13,6 +13,8 @@
+ pub const max_route_ids = 48;
+ pub const no_expert: u16 = std.math.maxInt(u16);
+ pub const no_slot: u32 = std.math.maxInt(u32);
++/// An expert outside the prediction an admission ranks (`LayerPolicy.ahead_rank`).
++const no_rank: u32 = std.math.maxInt(u32);
+ /// Decode admission: routes remembered by the frequency term, and the weights of
+ /// the transition prediction, window frequency and recency terms.
+ const window_limit = 16;
+@@ -98,6 +100,12 @@
+     /// Persistent slots another live route of this layer still serves from
+     /// (`PlanOpts.held`, set for one plan): never a victim.
+     held: std.DynamicBitSetUnmanaged,
++    /// MLX_SERVE_DSV41_SEED_FREE (turboexl3_ds41): the residents the load's usage seed placed that no route has used yet
++    /// (`markSeedFree`), free rows for the prompt's read-ahead and the CED decoder prefetch (`admitReadAheadHeld`,
++    /// `admitFill`). A route that uses one, or an admission of one, makes it a resident as any other.
++    free_seed: std.DynamicBitSetUnmanaged,
++    /// An admission's ranks: each expert's place in the prediction it admits (`no_rank`: not in it).
++    ahead_rank: []u32,
+     // The rate tally (`setTally`, `sdk_ext.expert.tally`): per expert an EMA of "a decode route of this layer requests
+     // it" (`rate`, `alpha` = 1 - 2^(-1/window) a route), folded in at each request's end from the request's counts
+     // (`endRequest`: a decode route only counts its experts). Once seeded (a tally file read, or a request ended) the
+@@ -151,6 +159,8 @@
+             .pinned = undefined,
+             .request_counts = undefined,
+             .pin_scratch = undefined,
++            .free_seed = undefined,
++            .ahead_rank = undefined,
+         };
+         errdefer a.free(p.slot_to_expert);
+         p.expert_to_slot = try a.alloc(u32, n);
+@@ -195,6 +205,10 @@
+         errdefer p.pinned.deinit(a);
+         p.request_counts = try a.alloc(u32, n);
+         errdefer a.free(p.request_counts);
++        p.free_seed = try std.DynamicBitSetUnmanaged.initEmpty(a, n);
++        errdefer p.free_seed.deinit(a);
++        p.ahead_rank = try a.alloc(u32, n);
++        errdefer a.free(p.ahead_rank);
+         p.pin_scratch = try a.alloc(u16, n);
+         @memset(p.rate, 0);
+         @memset(p.request_counts, 0);
+@@ -234,6 +248,8 @@
+         p.pinned.deinit(a);
+         a.free(p.request_counts);
+         a.free(p.pin_scratch);
++        p.free_seed.deinit(a);
++        a.free(p.ahead_rank);
+         p.* = undefined;
+     }
+     pub fn slotOf(p: *const LayerPolicy, expert: u16) ?u32 {
+@@ -356,6 +372,7 @@
+             e.* = no_expert;
+         };
+         p.occupancy = 0;
++        p.free_seed.unsetAll();
+         // No resident left: forgetPrompt clears the prompt state and sets no recency.
+         _ = p.forgetPrompt();
+         return n;
+@@ -406,24 +423,41 @@
+     pub fn admitReadAhead(p: *LayerPolicy, experts: []const u16, out: []ReadAhead) []ReadAhead {
+         return p.admitReadAheadHeld(experts, &.{}, out);
+     }
++    /// MLX_SERVE_DSV41_SEED_FREE: a free seed row (`free_seed`) comes before a resident victim: the one whose expert the
++    /// prediction ranks last (`freeSeedVictim`), and only one it ranks after this expert, so the rows hold the
++    /// prediction's head as they would have held it empty.
+     pub fn admitReadAheadHeld(p: *LayerPolicy, experts: []const u16, held: []const u32, out: []ReadAhead) []ReadAhead {
++        return p.admitAhead(experts, held, out, 0, true);
++    }
++    /// DEC_PREFETCH (turboexl3_ds41): each predicted expert (hottest first) not resident takes an empty row, else a free
++    /// seed row whose expert the prediction does not name at all; never another resident's row, so a fill evicts nothing a
++    /// route has used. `held` as `admitReadAheadHeld`'s. Returns the admissions (at most `out.len`).
++    pub fn admitFill(p: *LayerPolicy, experts: []const u16, held: []const u32, out: []ReadAhead) []ReadAhead {
++        return p.admitAhead(experts, held, out, @intCast(experts.len), false);
++    }
++    /// The read-ahead admissions: an empty row, else a free seed row the prediction ranks after the expert and after its
++    /// first `keep` (`freeSeedVictim`), else where `residents` the coldest resident the prediction left out (`aheadVictim`).
++    fn admitAhead(p: *LayerPolicy, experts: []const u16, held: []const u32, out: []ReadAhead, keep: u32, residents: bool) []ReadAhead {
+         for (held) |s| p.held.set(s);
+         defer for (held) |s| p.held.unset(s);
+         for (experts) |e| if (e < p.n_experts) p.retained.set(e);
+         defer for (experts) |e| if (e < p.n_experts) p.retained.unset(e);
++        p.rankAhead(experts);
+         var n: usize = 0;
+-        for (experts) |e| {
++        for (experts, 0..) |e, i| {
+             if (n == out.len) break;
+             if (e >= p.n_experts or p.expert_to_slot[e] != no_slot) continue;
+-            const slot = p.emptySlot() orelse p.aheadVictim() orelse break;
++            const slot = p.emptySlot() orelse p.freeSeedVictim(@intCast(i), keep) orelse (if (residents) p.aheadVictim() else null) orelse break;
+             const victim = p.slot_to_expert[slot];
+             if (victim != no_expert) {
+                 p.expert_to_slot[victim] = no_slot;
+                 p.protected.unset(victim);
+                 p.recency[victim] = 0;
++                p.free_seed.unset(victim);
+             } else p.occupancy += 1;
+             p.slot_to_expert[slot] = e;
+             p.expert_to_slot[e] = slot;
++            p.free_seed.unset(e);
+             p.clock += 1;
+             p.recency[e] = p.clock;
+             out[n] = .{ .expert = e, .slot = slot };
+@@ -431,6 +465,47 @@
+         }
+         return out[0..n];
+     }
++    /// `ahead_rank` for `experts` (hottest first): each one's place in them, `no_rank` for every other expert.
++    fn rankAhead(p: *LayerPolicy, experts: []const u16) void {
++        @memset(p.ahead_rank, no_rank);
++        for (experts, 0..) |e, i| if (e < p.n_experts and p.ahead_rank[e] == no_rank) {
++            p.ahead_rank[e] = @intCast(i);
++        };
++    }
++    /// The free seed row an expert the prediction ranks `rank` may take: of the free seed residents (none held, pinned,
++    /// protected or routing), the one the prediction ranks last (not in it first; ties by the higher slot, the colder by
++    /// the profile: the seed filled each layer's rows hottest first from slot 0), if it ranks after both `rank` and the
++    /// prediction's first `keep`. Null: none to take.
++    fn freeSeedVictim(p: *const LayerPolicy, rank: u32, keep: u32) ?u32 {
++        var best: ?u32 = null;
++        var best_rank: u32 = 0;
++        for (p.slot_to_expert[0..p.capacity], 0..) |e, s| {
++            if (e == no_expert or !p.free_seed.isSet(e) or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s) or p.pinned.isSet(e)) continue;
++            const r = p.ahead_rank[e];
++            if (best == null or r >= best_rank) {
++                best = @intCast(s);
++                best_rank = r;
++            }
++        }
++        const b = best orelse return null;
++        return if (best_rank > rank and best_rank >= keep) b else null;
++    }
++    /// The rows a fill may take (`admitFill`): the empty ones and the free seed rows.
++    pub fn freeRows(p: *const LayerPolicy) u32 {
++        var n: u32 = p.capacity -| p.occupancy;
++        for (p.slot_to_expert[0..p.capacity]) |e| n += @intFromBool(e != no_expert and p.free_seed.isSet(e));
++        return n;
++    }
++    /// MLX_SERVE_DSV41_SEED_FREE: every resident a free seed row (`free_seed`) until a route uses it; once, at the load,
++    /// right after the usage seed filled the rows (`Stream.freeSeed`). Returns the rows marked.
++    pub fn markSeedFree(p: *LayerPolicy) u32 {
++        var n: u32 = 0;
++        for (p.slot_to_expert[0..p.capacity]) |e| if (e != no_expert) {
++            p.free_seed.set(e);
++            n += 1;
++        };
++        return n;
++    }
+     /// The read-ahead's victim: the coldest probationary resident (`probationVictim`'s rule) the prediction did not
+     /// name (`retained` holds the predicted experts for the admission).
+     fn aheadVictim(p: *const LayerPolicy) ?u32 {
+@@ -447,6 +522,7 @@
+     }
+     /// Forgets a resident expert (its record failed to load).
+     pub fn invalidate(p: *LayerPolicy, expert: u16) void {
++        p.free_seed.unset(expert);
+         const s = p.expert_to_slot[expert];
+         if (s == no_slot) return;
+         p.slot_to_expert[s] = no_expert;
+@@ -478,6 +554,8 @@
+         }
+         const unique = unique_buf[0..n_unique];
+         defer for (unique) |e| p.in_route.unset(e);
++        // A route uses its experts: a free seed row among them is a resident as any other from now on.
++        for (unique) |e| p.free_seed.unset(e);
+         if (phase == .decode) {
+             p.epoch += 1;
+             for (ids) |e| p.last_used[e] = p.epoch;
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+@@ -1931,12 +1931,12 @@
+                 if (failure) |e| return self.fail(e);
+             }
+             /// DEC_PREFETCH: layer `layer`'s predicted experts (`experts`, the most likely first) read into its own
+-            /// empty persistent rows while earlier layers run, by P1's admission (`admitReadAheadHeld`: an empty row
+-            /// first) capped at the layer's empty rows, so a fill evicts no resident (a warm or seeded layer has few or
+-            /// no empty rows, and gets few or no fills); in jobs of `max_items` records in the pool's reserved tickets,
+-            /// file order; the rows stay pinned until the layer's first route lands them (`awaitFill`), or the phase
+-            /// change does (`landFills`). Returns the records admitted: 0 when no fill is armed, the stream is not
+-            /// prompting, its fill is already posted, the layer has no empty row, or no reserved ticket is left.
++            /// free persistent rows while earlier layers run (`admitFill`: an empty row, else a free seed row whose
++            /// expert the prediction does not name; never a row a route has used, so a warm layer gets few or no fills),
++            /// in jobs of `max_items` records in the pool's reserved tickets, file order; the rows stay pinned until the
++            /// layer's first route lands them (`awaitFill`), or the phase change does (`landFills`). Returns the records
++            /// admitted: 0 when no fill is armed, the stream is not prompting, its fill is already posted, the layer has
++            /// no free row, or no reserved ticket is left.
+             pub fn prefetchLayer(self: *Stream, layer: u32, experts: []const u16) Error!u32 {
+                 if (self.failed) return error.StreamFailed;
+                 if (self.fills.len == 0 or self.phase != .prefill or layer >= self.fills.len) return 0;
+@@ -1947,7 +1947,7 @@
+                 if (!any_live) self.fill_next = self.pool.demand_tickets;
+                 const mn = minisOf(&self.bank.layers[layer]);
+                 const total: u32 = @intCast(self.pool.published.len);
+-                const room: u32 = @min((total -| self.fill_next) / (2 * mn), self.layers[layer].policy.capacity -| self.layers[layer].policy.occupancy);
++                const room: u32 = @min((total -| self.fill_next) / (2 * mn), self.layers[layer].policy.freeRows());
+                 if (room == 0) return 0;
+                 self.prompt_started = true;
+                 const held_set = &self.held_scratch;
+@@ -1966,7 +1966,7 @@
+                 for (self.layers[layer].meta[0..self.layers[layer].policy.capacity], 0..) |m, s| if (m.pins != 0 or m.state == .loading) {
+                     held_set.append(self.allocator, @intCast(s)) catch return self.fail(error.RoutesExhausted);
+                 };
+-                const admitted = self.layers[layer].policy.admitReadAheadHeld(experts, held_set.items, f.loads[0..@min(f.loads.len, room)]);
++                const admitted = self.layers[layer].policy.admitFill(experts, held_set.items, f.loads[0..@min(f.loads.len, room)]);
+                 const n: u32 = @intCast(admitted.len);
+                 f.n = n;
+                 f.n_parts = 0;
+@@ -2511,6 +2511,14 @@
+                 // No prompt routed what the seed read.
+                 self.ahead.tallied = true;
+                 for (self.layers) |*ls| _ = ls.policy.forgetPrompt();
++                return n;
++            }
++            /// MLX_SERVE_DSV41_SEED_FREE (turboexl3_ds41), right after `seedResidents`: every seeded row free
++            /// (`LayerPolicy.markSeedFree`) until a route uses its expert, for the prompt's read-ahead and the CED decoder
++            /// prefetch to take. Returns the rows marked.
++            pub fn freeSeed(self: *Stream) u64 {
++                var n: u64 = 0;
++                for (self.layers) |*ls| n += ls.policy.markSeedFree();
+                 return n;
+             }
+             /// The usage profile's route counting on (`LayerPolicy.count_routes`), once at construction: each decode route

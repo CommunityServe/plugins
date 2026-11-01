@@ -125,6 +125,25 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   and the decode routes') into that file at the request's end (`MLX_SERVE_DSV41_EXPERT_USAGE_LABEL` names the prompt
   set); the counts are routes, so the seed does not bias them. The prompt residents stay across requests (`keep`), and
   the rate tally stays off (mlx-serve's DeepSeek-V4.1 default, pending a measurement).
+- `MLX_SERVE_DSV41_DEC_PREFETCH=S[:K]` (src/dec_prefetch.zig, the model's prediction and the stream's fills in
+  patches/turboexl3-zz2-dec-prefetch.patch): at encoder layer S of a replaying prompt chunk, each CED decoder layer's
+  router runs over the replay tail's rows, and from then on each routed call's end posts the next K decoder layers'
+  experts (default 2), ranked by the tail rows' votes, into those layers' free rows: an empty row, else a free seed row
+  (below). A fill never takes a row a route has used, so a warm layer gets few or no fills. Only the pool's reserved
+  tickets are new memory. Cold code-ctx16384 prompt on the full pack (M5 Max, w-pio-20261101-0252), S=10: 963.8 and
+  964.9 tok/s against 914.6 and 913.0, the decoder side 1.67 s against 2.75 s. Before fills were held to free rows, a
+  warm server's fills evicted residents and its prompt lost 2 to 3%; with the rule a warm server's second prompt posted
+  no fill (w-pio-20261101-0338). Over the usage seed it does not help: with SEED_FREE, S=10 took 984.7 tok/s against
+  986.4 to 997.3 without it, its decoder misses 1404 against 1320.
+- `MLX_SERVE_DSV41_SEED_FREE=1` (src/seed_free.zig, the policy in patches/turboexl3-zz5-seed-free.patch, tested by
+  src/seed_free_test.zig): the rows the usage seed fills stay free until a route uses their expert. The prompt's
+  read-ahead may take one for an expert its prediction ranks before the seeded one, so a layer's rows hold its call's
+  hottest experts as they would have held them empty: a 16K-row prediction names nearly every expert, and without the
+  rule a seeded server's read-ahead found no row to take (27 records posted against 2413 unseeded, w-20261101-0307).
+  The decoder prefetch may take one whose expert its prediction does not name. A seeded row a route has used is a
+  resident as any other. Cold code-ctx16384 prompt on the full pack (M5 Max, w-pio-20261101-0338, a usage profile
+  recorded on prompts apart from the test case): 997.3 tok/s against 991.9 and 986.4 for the seed alone; the encoder's
+  read-ahead read 11.5 GB against 0.36, its read waits 0.95 s against 1.11 and 1.14. Off by default.
 
 ## The pack
 

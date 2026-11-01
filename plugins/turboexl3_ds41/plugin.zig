@@ -40,6 +40,9 @@ pub const stream_lookahead = @import("src/stream_lookahead.zig");
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_DIR`, `_RECORD`, `_LABEL`), read by the copied EXL3 source through this root: the
 /// prompt rows seeded at the load with each layer's most used experts, and each request's routed experts recorded.
 pub const expert_usage_cfg = @import("src/expert_usage_cfg.zig");
+/// The usage seed's rows free until a route uses them (`MLX_SERVE_DSV41_SEED_FREE`, src/seed_free.zig), read by the
+/// copied EXL3 source through this root: the prompt's read-ahead and the CED decoder prefetch may take them.
+pub const seed_free = @import("src/seed_free.zig");
 const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
 const v4plugin = @import("src/mlx_serve/plugins/deepseek_v4/plugin.zig");
@@ -135,6 +138,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1: the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     stream_lookahead.setting = stream_lookahead.parse(env.span(.MLX_SERVE_DSV41_LOOKAHEAD)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_LOOKAHEAD is none of 0 to 4, with an optional :0 or :1: the load is refused\n", .{});
         out.* = switch (e) {
@@ -178,7 +188,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     drafter = rounds.Drafter.init(gpa, on);
     log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on" else "off (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
-    if (dec_prefetch.on) log.info("[turboexl3_ds41] CED decoder prefetch on (MLX_SERVE_DSV41_DEC_PREFETCH): the decoder layers' experts predicted at encoder layer {d}, {d} layers posted per prompt call\n", .{ dec_prefetch.start, dec_prefetch.per_call });
+    if (dec_prefetch.on) log.info("[turboexl3_ds41] CED decoder prefetch on (MLX_SERVE_DSV41_DEC_PREFETCH): the decoder layers' experts predicted at encoder layer {d}, {d} layers posted per prompt call, into their free rows only\n", .{ dec_prefetch.start, dec_prefetch.per_call });
+    if (seed_free.on) log.info("[turboexl3_ds41] usage seed's rows free until routed (MLX_SERVE_DSV41_SEED_FREE): the prompt's read-ahead and the CED decoder prefetch may take them\n", .{});
     if (prompt_io.on) log.info("[turboexl3_ds41] prompt timeline on (MLX_SERVE_DSV41_PROMPT_IO): [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end\n", .{});
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {

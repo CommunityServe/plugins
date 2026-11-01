@@ -3,8 +3,9 @@
 //! decoder layer's router runs over the replay tail's rows (the model's `predictDecoder`, the prompt timeline's probe);
 //! each decoder layer's experts are ranked by the tail rows' votes (each row's top-k), ties by the lower id. From then
 //! on, at the end of each routed call of the prompt, the source posts the next K decoder layers' rankings, in layer order,
-//! into those layers' own persistent rows (the stream's `prefetchLayer`: P1's admission, an empty row else the coldest
-//! resident the ranking left out; the pool's reserved tickets), and each decoder layer's first route lands its fill. K
+//! into those layers' own free persistent rows (the stream's `prefetchLayer`: an empty row, else a usage seed row no route
+//! has used whose expert the ranking does not name, `MLX_SERVE_DSV41_SEED_FREE`; never a row a route has used, so a warm
+//! layer gets few or no fills; the pool's reserved tickets), and each decoder layer's first route lands its fill. K
 //! defaults to 2: S = 10 posts all twenty by the encoder's end; S = 19 keeps the posts about two layers ahead of the
 //! decoder.
 //!

@@ -344,12 +344,12 @@ diff -ruN a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streame
                  if (failure) |e| return self.fail(e);
 +            }
 +            /// DEC_PREFETCH: layer `layer`'s predicted experts (`experts`, the most likely first) read into its own
-+            /// persistent rows while earlier layers run, by P1's admission (`admitReadAheadHeld`: an empty row, else the
-+            /// coldest resident the prediction left out; never a row a live route of the layer serves from, a pinned or
-+            /// a loading one), in jobs of `max_items` records in the pool's reserved tickets, file order; the rows stay
-+            /// pinned until the layer's first route lands them (`awaitFill`), or the phase change does (`landFills`).
-+            /// Returns the records admitted: 0 when no fill is armed, the stream is not prompting, the layer's fill is
-+            /// already posted, or no reserved ticket is left.
++            /// empty persistent rows while earlier layers run, by P1's admission (`admitReadAheadHeld`: an empty row
++            /// first) capped at the layer's empty rows, so a fill evicts no resident (a warm or seeded layer has few or
++            /// no empty rows, and gets few or no fills); in jobs of `max_items` records in the pool's reserved tickets,
++            /// file order; the rows stay pinned until the layer's first route lands them (`awaitFill`), or the phase
++            /// change does (`landFills`). Returns the records admitted: 0 when no fill is armed, the stream is not
++            /// prompting, its fill is already posted, the layer has no empty row, or no reserved ticket is left.
 +            pub fn prefetchLayer(self: *Stream, layer: u32, experts: []const u16) Error!u32 {
 +                if (self.failed) return error.StreamFailed;
 +                if (self.fills.len == 0 or self.phase != .prefill or layer >= self.fills.len) return 0;
@@ -360,7 +360,7 @@ diff -ruN a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streame
 +                if (!any_live) self.fill_next = self.pool.demand_tickets;
 +                const mn = minisOf(&self.bank.layers[layer]);
 +                const total: u32 = @intCast(self.pool.published.len);
-+                const room: u32 = (total -| self.fill_next) / (2 * mn);
++                const room: u32 = @min((total -| self.fill_next) / (2 * mn), self.layers[layer].policy.capacity -| self.layers[layer].policy.occupancy);
 +                if (room == 0) return 0;
 +                self.prompt_started = true;
 +                const held_set = &self.held_scratch;

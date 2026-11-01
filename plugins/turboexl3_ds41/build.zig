@@ -55,6 +55,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "turboexl3_format", .module = format }},
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(exact).step);
+    // MLX_SERVE_DSV41_SEED_FREE on the streamer's own policy, MLX-free: src/seed_free_test.zig as a test of its own (the
+    // policy is the `mlx_stream` module's file, never the plugin root's).
+    const free = b.addTest(.{ .name = "seed_free", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/seed_free_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(free).step);
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/turboexl3_sdk.zig"),
         .target = target,

@@ -244,9 +244,9 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
 @@ -3908,6 +3950,8 @@
          hold(&tsp.pres[k], try sc.slice(pre, 0, off + lo, off + hi));
      }
-     for ([_][]A{ sp.xs, sp.pres, sp.topks, sp.cands }) |slots| for (slots) |*s| hold(s, none);
 +    const ls = &st.layers[li];
 +    try prof.mark(.ced_replay, &.{ x, pre, if (ls.comp) |rw| rw.buf else none, if (ls.idx_k) |rw| rw.buf else none, ls.pend_kv, ls.pend_gate });
+     for ([_][]A{ sp.xs, sp.pres, sp.topks, sp.cands }) |slots| for (slots) |*s| hold(s, none);
  }
  /// Span `k`'s stream entering layer `li`: its Engram write, and its DSpark
  /// main row when the layer is a target.
