@@ -39,7 +39,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          _ = mlx.mlx_fast_metal_kernel_free(self.kv_row_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(self.engram_kernel);
          self.dec.deinit();
-@@ -1146,17 +1152,22 @@
+@@ -1172,17 +1178,22 @@
      qk: mlx.mlx_fast_metal_kernel,
      sm: mlx.mlx_fast_metal_kernel,
      pv: mlx.mlx_fast_metal_kernel,
@@ -63,7 +63,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      }
  };
  /// The indexer's scores `[L, nb]`: sum over heads of weight * relu(q_h . k_n),
-@@ -1435,6 +1446,7 @@
+@@ -1461,6 +1472,7 @@
          .hc_stage_x_kernel = try buildKernel("dsv41_hc_stage_x", &HC_STAGE_X_INS, &HC_STAGE_X_OUTS, HC_STAGE_X_SOURCE, ""),
          .hc_split_kernel = try buildKernel("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, HC_SPLIT_SOURCE, ""),
          .rope_kernel = try buildKernel("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, ROPE_TAIL_SOURCE, FP8_HEADER),
@@ -71,7 +71,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          .kv_row_kernel = try buildKernel("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, KV_ROW_SOURCE, FP8_HEADER),
          .engram_kernel = try buildKernel("dsv41_engram", &ENGRAM_INS, &.{"out"}, ENGRAM_SOURCE, ""),
          .moe_gu_kernel = try buildKernel("dsv41_moe_gu", &MOE_GU_INS, &.{"out"}, MOE_GU_SOURCE, MOE_HEADER),
-@@ -1473,6 +1485,7 @@
+@@ -1499,6 +1511,7 @@
          _ = mlx.mlx_fast_metal_kernel_free(m.hc_stage_x_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(m.hc_split_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(m.rope_kernel);
@@ -79,7 +79,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          _ = mlx.mlx_fast_metal_kernel_free(m.kv_row_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(m.engram_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(m.moe_gu_kernel);
-@@ -1958,6 +1971,32 @@
+@@ -1984,6 +1997,32 @@
      var o = mlx.mlx_array_new();
      return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
  }
@@ -112,7 +112,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  pub fn ropeFor(m: *const Dsv41Model, li: usize) *const Rope {
      return if (m.ratio(li) > 0) &m.rope_yarn else &m.rope_plain;
  }
-@@ -2210,7 +2249,7 @@
+@@ -2236,7 +2275,7 @@
          try runRegion(sc, m, li, .q_kv, &.{ x, pos }, &a);
          pj = .{ .q = a[0], .kv = a[1], .qr = a[2] };
      } else pj = try qkvProj(sc, m, ly, ropeFor(m, li).fwd, x, pos);
@@ -121,7 +121,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const qr = pj.qr;
      const kv = pj.kv;
      const window = c.sliding_window;
-@@ -2254,7 +2293,10 @@
+@@ -2280,7 +2319,10 @@
      const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
      const f16_core = m.attn_f16 and (m.act == .bfloat16 or m.act == .float16) and dim(keys_w, 0) + K <= ATTN_SOFTMAX_MAX_COLS and mlx.streamIsGpu(sc.s);
      const want_grouped: ?Grouped = if (pre != null) .{ .periods = ropeFor(m, li).inv, .p0 = p0 } else null;
@@ -133,7 +133,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          sh.grouped = want_grouped != null;
          break :blk g;
      } else if (f16_core)
-@@ -2276,7 +2318,9 @@
+@@ -2302,7 +2344,9 @@
  /// The wide core on the matrix units, null where it does not serve (no NAX, not bf16, another head geometry): each row's
  /// scores against its own window and selected rows, read in place, never gathered.
  /// The heads `[L, H, D]`, or with `grouped` already inverse-roped and grouped.
@@ -144,7 +144,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const g = m.attn_gather orelse return null;
      const L = dim(q, 0);
      const H = dim(q, 1);
-@@ -2311,7 +2355,11 @@
+@@ -2337,7 +2381,11 @@
              return s.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
          }
      }.one;
@@ -157,7 +157,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
      const p = try run(sc, g.sm, &.{ s, picks, sink, meta, scal }, &.{ ci(L), ci(H), ci(NK) }, .float16, .{ ci(H * 32), ci(L) }, &.{.{ .name = "NJ", .v = ci((NK + 31) / 32) }}, &.{.{ "PT", .float16 }});
      const periods = if (grouped) |gr| gr.periods else scal;
-@@ -2547,10 +2595,18 @@
+@@ -2573,10 +2621,18 @@
  pub fn attnSplits(rows: usize) c_int {
      return @intCast(@max(1, @min(8, rows / 160)));
  }
@@ -177,7 +177,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const c = &m.cfg;
      const qa, const kv = if (ly.q_kv) |*f| blk: {
          const y = try f.apply(sc, x);
-@@ -2559,7 +2615,21 @@
+@@ -2585,7 +2641,21 @@
      } else .{ try ly.wq_a.apply(sc, x), try ly.wkv.apply(sc, x) };
      const qr = try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
      const qb = try ly.wq_b.apply(sc, qr);
@@ -200,7 +200,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const row = try kvRow(sc, m, ly, periods, kv, pos);
      try prof.mark(.qkv, &.{ q, row, qr });
      return .{ .q = q, .kv = row, .qr = qr };
-@@ -3982,7 +4052,10 @@
+@@ -4008,7 +4078,10 @@
      try prof.mark(.attn_hc, &.{ pa.sp.pre, pa.sp.post, pa.sp.comb, pa.h });
      pio.wide(li, .hc);
      const pos = try sc.i(ci(sp.p0));
@@ -212,7 +212,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      pio.wide(li, .qkv);
      const heads = try gpa.alloc(A, n_spans);
      defer gpa.free(heads);
-@@ -4006,7 +4079,9 @@
+@@ -4032,7 +4105,9 @@
          var ssc = Scope.init(gpa, m.s);
          defer ssc.deinit();
          var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor };
@@ -223,7 +223,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          var o_k = try attention(&ssc, m, st, li, try ssc.slice(pa.h, 0, lo, hi), sp.p0 + lo, &sh, span_pj);
          // Each span (or each run of spans) takes its own `wo_a`: the rows the chunk's `wo_b` reads, not the heads, are
          // joined. Heads the core handed back plain are roped and grouped here.
-@@ -4033,6 +4108,7 @@
+@@ -4059,6 +4134,7 @@
          hold(&sp.cands[k], sh.cand);
      }
      if (woa.mode == .check and run > 1) woa.report(li, woa_check.runs, woa_check.equal, woa_check.differ, woa_check.max_abs);

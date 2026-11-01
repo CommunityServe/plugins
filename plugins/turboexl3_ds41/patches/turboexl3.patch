@@ -10,9 +10,9 @@ diff -ruN a/env.zig b/env.zig
 +    pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
      pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
 +    pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
-     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
      pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
      pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
+     // ── diagnostics ──
 diff -ruN a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/bill.zig
 --- a/plugins/deepseek_v41/bill.zig
 +++ b/plugins/deepseek_v41/bill.zig
@@ -85,7 +85,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      const wt = try getW(w, base ++ ".weight", args);
      const sc = getOpt(w, base ++ ".scales", args) orelse return .{ .w = wt };
      const bi = getOpt(w, base ++ ".biases", args) orelse none;
-@@ -646,6 +654,76 @@
+@@ -646,6 +654,95 @@
      };
      return .{ .w = wt, .s = sc, .b = bi, .qp = qp };
  }
@@ -115,7 +115,17 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
 +        parts[2][g] = p.svh;
 +    }
 +    var out: [3]A = undefined;
-+    for (&out, 0..) |*o, k| o.* = try m.own(try mlx.stackEvaluated(parts[k][0..groups], m.s));
++    for (&out, 0..) |*o, k| {
++        // The loads first: a GPU stack waiting on hundreds of queued disk reads times out.
++        const xs = parts[k][0..groups];
++        try evalAll(xs);
++        const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
++        defer _ = mlx.mlx_vector_array_free(vec);
++        var st = mlx.mlx_array_new();
++        try mlx.check(mlx.mlx_stack_axis(&st, vec, 0, m.s));
++        o.* = try m.own(st);
++        try mlx.check(mlx.mlx_array_eval(st));
++    }
 +    for (0..groups) |g| inline for (.{ "trellis", "suh", "svh" }) |part| {
 +        var buf: NameBuf = undefined;
 +        w.remove(try std.fmt.bufPrint(&buf, base ++ "." ++ part, .{ li, g }));
@@ -139,7 +149,16 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
 +            try parts[2].append(m.gpa, p.svh);
 +        }
 +        var stacked: [3]A = undefined;
-+        for (&stacked, &parts) |*o, *p| o.* = try m.own(try mlx.stackEvaluated(p.items, m.s));
++        for (&stacked, &parts) |*o, *p| {
++            // The loads first: a GPU stack waiting on hundreds of queued disk reads times out.
++            try evalAll(p.items);
++            const vec = mlx.mlx_vector_array_new_data(p.items.ptr, p.items.len);
++            defer _ = mlx.mlx_vector_array_free(vec);
++            var st = mlx.mlx_array_new();
++            try mlx.check(mlx.mlx_stack_axis(&st, vec, 0, m.s));
++            o.* = try m.own(st);
++            try mlx.check(mlx.mlx_array_eval(st));
++        }
 +        var u = mlx.mlx_array_new();
 +        try mlx.check(mlx.mlx_view(&u, stacked[0], .uint16, m.s));
 +        @field(bank, pf[1]) = .{ .trellis = try m.own(try evalOne(u)), .suh = stacked[1], .svh = stacked[2] };
@@ -162,7 +181,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
  /// A dense weight that an mxfp8 code plus e8m0 scale per 32 columns holds
  /// exactly (fp8 blocks a converter widened to bf16) as that pair, half the
  /// bytes; null when any value would move.
-@@ -753,6 +831,16 @@
+@@ -753,6 +850,16 @@
      }
      return out;
  }
@@ -179,7 +198,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
  /// `kv` and `gate` as `Comp.wkv` holds them above ratio 1: rows fused when the
  /// formats agree (affine scales and biases widened to f32; dense rows as
  /// stored, `denseF32x` reads them), else both dequantized to f32 rows.
-@@ -841,6 +929,8 @@
+@@ -841,6 +948,8 @@
          .up = bankOf(try getLin(w, d, pfx ++ ".{d}.ffn.experts.w3", .{li})),
          .down = bankOf(try getLin(w, inter, pfx ++ ".{d}.ffn.experts.w2", .{li})),
      };
@@ -188,7 +207,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      if (getOpt(w, pfx ++ ".{d}.ffn.experts.0.w1.weight", .{li}) != null) {
          var banks: [3]Bank = undefined;
          inline for (.{ "w1", "w3", "w2" }, 0..) |proj, k| {
-@@ -884,8 +974,11 @@
+@@ -891,8 +1000,11 @@
      const ratio: u8 = if (trunk_li) |t| c.dsv4_compress_ratios[t] else 0;
      const is_kv = if (trunk_li) |t| m.isKvSource(t) else false;
      const is_ix = if (trunk_li) |t| m.isIndexSource(t) else false;
@@ -202,7 +221,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
          // A decode step reads every wo_a: half the bytes, the same values.
          wo_a = .{ .w = try m.own(pair[0]), .s = try m.own(pair[1]), .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
          var buf: NameBuf = undefined;
-@@ -917,14 +1010,11 @@
+@@ -924,14 +1036,11 @@
          .wo_b = try getLin(w, og * ol, pfx ++ ".{d}.attn.wo_b", .{li}),
          .sink = sink,
          .ratio = ratio,
@@ -220,7 +239,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
              .k_norm = if (is_kv) try ownCast(m, try getW(w, pfx ++ ".{d}.attn.indexer.k_norm.weight", .{li}), m.act) else none,
          } else null,
          .gate_w = try getW(w, pfx ++ ".{d}.ffn.gate.weight", .{li}),
-@@ -1229,7 +1319,9 @@
+@@ -1236,7 +1345,9 @@
  /// The pack's tensors as the engine's loader reads a V4.1 pack: the text prefix stripped, a tensor two shards carry
  /// from the shard the index names, the vision tower only on `vision`, the Engram projections kept beside its tables.
  pub fn loadPack(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, vision: bool) !Weights {
@@ -231,7 +250,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      errdefer w.deinit();
      const path = try std.fmt.allocPrintSentinel(gpa, "{s}/engram/engram-residents.safetensors", .{dir}, 0);
      defer gpa.free(path);
-@@ -1239,6 +1331,11 @@
+@@ -1246,6 +1357,11 @@
      try weights_load.loadSafetensorsFile(gpa, &w, path, s, .{});
      return w;
  }
@@ -243,7 +262,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
  pub const InitOpts = struct {
      /// The activation dtype; tests run f32 against the f32 reference.
      act: mlx.mlx_dtype = .bfloat16,
-@@ -1257,7 +1354,7 @@
+@@ -1264,7 +1380,7 @@
      const m = try gpa.create(Dsv41Model);
      errdefer gpa.destroy(m);
      const n_layers = cfg.num_hidden_layers;
@@ -252,7 +271,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
          cfg.dsv4_n_compress_ratios - n_layers
      else
          0;
-@@ -1343,7 +1440,7 @@
+@@ -1350,7 +1466,7 @@
      } else {
          m.embed = try getLin(w, cfg.hidden_size, "embed", .{});
          m.head = try getLin(w, cfg.hidden_size, "head", .{});
@@ -261,7 +280,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
              if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
              log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
          }
-@@ -1365,8 +1462,9 @@
+@@ -1372,8 +1488,9 @@
              .main_proj = try getLin(w, cfg.hidden_size * targets, "mtp.0.main_proj", .{}),
              .main_norm = try ownCast(m, try getW(w, "mtp.0.main_norm.weight", .{}), m.act),
              .norm = try ownCast(m, try getW(w, "mtp.{d}.norm.weight", .{last}), m.act),
@@ -273,7 +292,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
              .conf = try ownCast(m, try getW(w, "mtp.{d}.confidence_head.proj.weight", .{last}), .float32),
          };
          m.n_mtp = n_stages;
-@@ -1519,7 +1617,7 @@
+@@ -1526,7 +1643,7 @@
  }
  /// Engram for the pack in `dir`: the token map, the hash, and each layer's
  /// table and projections. Without Engram layers in the config this is a no-op.
@@ -282,7 +301,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      const c = &m.cfg;
      if (c.dsv41_n_engram_layers == 0) return;
      m.token_map = try engram.loadTokenMap(m.gpa, dir, c.vocab_size, c.dsv41_engram_compressed_vocab);
-@@ -1552,7 +1650,7 @@
+@@ -1559,7 +1676,7 @@
          try mlx.check(mlx.mlx_array_eval(prod));
          m.engrams[k] = .{
              .layer = l,
@@ -291,7 +310,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
              .qk = prod,
              .table = try engram.Table.open(m.gpa, dir, k, l, c.dsv41_engram_rows[k], c.dsv41_engram_head_dim),
          };
-@@ -2427,6 +2525,8 @@
+@@ -2434,6 +2551,8 @@
  /// The grouped `wo_a` of heads already grouped and inverse-roped `[og, L, in]`: `[L, og * o_lora]` in `m.act`.
  pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A) !A {
      const L = dim(ob, 1);
@@ -300,7 +319,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
      const oa = if (wd.ctx != null)
          try sc.matmul(ob, try sc.transpose(wd, &.{ 0, 2, 1 }))
-@@ -2439,6 +2539,7 @@
+@@ -2446,6 +2565,7 @@
  /// `x` [L, K] f32 through the dense linear `l` in f32: decode rows read `l`
  /// as stored (`DENSE_F32X_SOURCE`); wider inputs widen it (MLX promotes).
  pub fn denseF32x(sc: *Scope, m: *const Dsv41Model, l: *const Lin, x: A) !A {
@@ -308,7 +327,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      const L = dim(x, 0);
      const N = dim(l.w, 0);
      const K = dim(x, 1);
-@@ -2463,7 +2564,10 @@
+@@ -2470,7 +2590,10 @@
  /// latent at its group's first position and stores it fp4-simulated.
  pub fn compress(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Comp, x: A, p0: usize) !void {
      // Pooling runs in f32, weights included (the reference promotes them).
@@ -320,7 +339,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      return compressFrom(sc, m, st, li, cw, proj, p0);
  }
  /// `compressFrom` on the fused pool step (`decode/idx_score.zig`); false (nothing moved) where it declines.
-@@ -3136,9 +3240,22 @@
+@@ -3143,9 +3266,22 @@
          if (dim(x, 0) > region_rows) return slotPrefill(sc, m, &sl, x, r.wts, try shared(sc, m, ly, x));
          return withShared(sc, m, ly, x, try rowSum(sc, try slotRows(sc, m, &sl, x, r.wts, null)));
      };
@@ -343,7 +362,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
  // ── Engram ──────────────────────────────────────────────────────────────
  /// The gated write of the n-gram rows into the stream `[L, hc, dim]`: `wkv`
  /// turns the rows into one key per copy plus a shared value, and the gate is
-@@ -3842,6 +3959,8 @@
+@@ -3849,6 +3985,8 @@
      return rows <= region_rows and m.regions.len > 0 and m.trace == null;
  }
  fn compileRegions(m: *Dsv41Model) !void {

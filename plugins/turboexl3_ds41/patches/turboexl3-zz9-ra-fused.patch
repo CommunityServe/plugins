@@ -21,7 +21,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// The CED decoder prefetch (turboexl3_ds41's src/dec_prefetch.zig, `MLX_SERVE_DSV41_DEC_PREFETCH`).
  const dp = @import("../../../dec_prefetch.zig");
  /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
-@@ -1934,13 +1936,17 @@
+@@ -1960,13 +1962,17 @@
  }
  /// `hcPreNorm` for blocks of many rows, where throughput rules: the mix and norm kernels.
  pub fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, norm_w: A) !Normed {
@@ -40,7 +40,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      var zv = mlx.mlx_vector_array_new();
      defer _ = mlx.mlx_vector_array_free(zv);
      {
-@@ -1957,8 +1963,7 @@
+@@ -1983,8 +1989,7 @@
          try mlx.check(mlx.mlx_fast_metal_kernel_apply(&zv, m.hc_mix_kernel, iv, cfg, sc.s));
      }
      var z = mlx.mlx_array_new();
@@ -50,7 +50,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  }
  /// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1/M2): launches every hc kernel once at
  /// `m.hc_tg` threads and halves it until they run.
-@@ -3852,10 +3857,22 @@
+@@ -3878,10 +3883,22 @@
      for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
      const x = try sc.concat(parts, 0);
      const pres = try sc.concat(sp.pres, 0);
@@ -75,7 +75,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      try prof.mark(.attn_hc, &.{ pa.sp.pre, pa.sp.post, pa.sp.comb, pa.h });
      pio.wide(li, .hc);
      const pos = try sc.i(ci(sp.p0));
-@@ -3910,8 +3927,9 @@
+@@ -3936,8 +3953,9 @@
      }
  }
  /// A streamed prompt call's routes of layer `li` predicted before its attention (the FFN's input taken as the stream
@@ -87,7 +87,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const t0: u64 = if (pio.on) pio.now() else 0;
      defer if (pio.on) pio.readAhead(li, t0, pio.now());
      // MLX_SERVE_DSV41_PROMPT_IO=2: the wait split by an eval at each step, the stream's rows, then its collapse.
-@@ -3919,7 +3937,7 @@
+@@ -3945,7 +3963,7 @@
          try evalAll(&.{ x, pre });
          pio.raStep(li, .cat);
      }

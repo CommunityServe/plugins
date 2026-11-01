@@ -12,7 +12,7 @@ diff -ruN -x .generated a/env.zig b/env.zig
 diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
-@@ -3870,6 +3870,8 @@
+@@ -3896,6 +3896,8 @@
  /// once over all of the chunk's rows, attention's state-bound core per span, the MoE over `moe_rows` at a
  /// time. A span-wide linear fills a few threadgroups per GPU core; the chunk's rows fill the GPU. New streams and mixes land in `sp.xs` / `sp.pres`.
  fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, li: usize) !void {

@@ -22,7 +22,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// The CED decoder prefetch (turboexl3_ds41's src/dec_prefetch.zig, `MLX_SERVE_DSV41_DEC_PREFETCH`).
  const dp = @import("../../../dec_prefetch.zig");
  /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
-@@ -3279,6 +3282,14 @@
+@@ -3305,6 +3308,14 @@
      try prof.mark(.router, &.{ r.idx, r.wts });
      // The DSpark stages' experts stay resident.
      if (li < m.n_layers) if (m.streamed) |src| {

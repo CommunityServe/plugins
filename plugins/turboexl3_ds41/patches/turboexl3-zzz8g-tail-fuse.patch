@@ -21,7 +21,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
  const one_plan = @import("../../../one_plan.zig");
  /// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
-@@ -3332,6 +3334,25 @@
+@@ -3358,6 +3360,25 @@
      if (dim(x, 0) > region_rows) return moePrefill(sc, m, ly, x, r.idx, r.wts, try shared(sc, m, ly, x));
      return withShared(sc, m, ly, x, try routed(sc, m, ly, x, r.idx, r.wts));
  }
@@ -47,7 +47,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// A resident EXL3 bank's routed sum `[L, d]` f32: turboexl3's MoE with the pack's SwiGLU clamp.
  fn routedExl3(sc: *Scope, m: *const Dsv41Model, b: *const t3.Bank, x: A, idx: A, wts: A) !A {
      const L = dim(x, 0);
-@@ -4027,9 +4048,12 @@
+@@ -4053,9 +4074,12 @@
          const hi = sp.bounds(k1 - 1)[1];
          var gsc = Scope.init(gpa, m.s);
          defer gsc.deinit();

@@ -22,7 +22,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
  const one_plan = @import("../../../one_plan.zig");
  /// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
-@@ -3328,10 +3331,13 @@
+@@ -3354,10 +3357,13 @@
  }
  /// `img` (`[L]` bool, or none) names the rows inside an image span, which pick their experts by `gate_bias_vl`.
  pub fn route(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, img: A) !Routes {
@@ -38,7 +38,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const bias = if (img.ctx != null and ly.gate_bias_vl != null) try sc.where(try sc.expand(img, -1), ly.gate_bias_vl.?, ly.gate_bias) else ly.gate_bias;
      const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
      const cfg = mlx.mlx_fast_metal_kernel_config_new();
-@@ -3905,7 +3911,7 @@
+@@ -3931,7 +3937,7 @@
      const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
      for (lo..hi) |li| {
          prof.layer();
@@ -47,7 +47,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              // A span's intermediates are dropped as soon as it is built, so the
              // layer's evaluation frees each one when its consumers are done.
              var sc = Scope.init(gpa, m.s);
-@@ -4016,7 +4022,8 @@
+@@ -4042,7 +4048,8 @@
  /// Layer `li` over a wide chunk: the row-wise stages (hc mixes, projections, `attnOut`, the FFN half) run
  /// once over all of the chunk's rows, attention's state-bound core per span, the MoE over `moe_rows` at a
  /// time. A span-wide linear fills a few threadgroups per GPU core; the chunk's rows fill the GPU. New streams and mixes land in `sp.xs` / `sp.pres`.
@@ -57,7 +57,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      // turboexl3_ds41 (MLX_SERVE_DSV41_PROMPT_TL, with PROMPT_IO): the layer's `pre` stage starts.
      pio.layerBegin(li);
      const n_spans = sp.xs.len;
-@@ -4128,6 +4135,10 @@
+@@ -4154,6 +4161,10 @@
          const img = try sp.imgSlice(&gsc, lo, hi);
          const sf: Split = .{ .pre = try gsc.slice(pf.sp.pre, 0, lo, hi), .post = try gsc.slice(pf.sp.post, 0, lo, hi), .comb = try gsc.slice(pf.sp.comb, 0, lo, hi) };
          const x1g = try gsc.slice(pf.x1, 0, lo, hi);
@@ -68,7 +68,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          // MLX_SERVE_DSV41_TAIL_FUSE: the routed call's combine and the hc expand in one kernel (the same words).
          const xg = if (try moeExpand(&gsc, m, li, hg, img, x1g, &sf)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
          try prof.mark(.combine, &.{xg});
-@@ -4201,6 +4212,17 @@
+@@ -4227,6 +4238,17 @@
      defer sc.a.free(ids);
      for (ids, (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n]) |*o, v| o.* = @intCast(v);
      try ra(ctx, @intCast(li), ids).get();

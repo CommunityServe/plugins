@@ -41,7 +41,7 @@
  /// The CED decoder prefetch (turboexl3_ds41's src/dec_prefetch.zig, `MLX_SERVE_DSV41_DEC_PREFETCH`).
  const dp = @import("../../../dec_prefetch.zig");
  /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
-@@ -3385,7 +3386,15 @@
+@@ -3411,7 +3412,15 @@
                  },
              };
              var y: [1]A = undefined;
@@ -58,7 +58,7 @@
              try prof.mark(.combine, &y);
              pre.* = p[1];
              return y[0];
-@@ -4083,7 +4092,7 @@
+@@ -4109,7 +4118,7 @@
  pub const region_rows = 16;
  /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
  /// barrier, cut where `ffn` has no fusable op across the cut.
@@ -67,7 +67,7 @@
  const LayerRegions = struct {
      m: *Dsv41Model,
      li: usize,
-@@ -4200,6 +4209,17 @@
+@@ -4226,6 +4235,17 @@
                      const ro = if (mlx.getShape(a[4]).len == 2) a[4] else try rowSum(&sc, a[4]);
                      res.* = mlx.mlx_vector_array_new_data(&.{try hcExpand(&sc, a[0], try withShared(&sc, m, ly, a[3], ro), &sp)}, 1);
                  },

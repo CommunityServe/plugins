@@ -13,7 +13,7 @@ diff -ruN -x .generated a/env.zig b/env.zig
 diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
-@@ -3911,7 +3911,7 @@
+@@ -3937,7 +3937,7 @@
      const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
      for (lo..hi) |li| {
          prof.layer();
@@ -22,7 +22,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              // A span's intermediates are dropped as soon as it is built, so the
              // layer's evaluation frees each one when its consumers are done.
              var sc = Scope.init(gpa, m.s);
-@@ -4022,8 +4022,9 @@
+@@ -4048,8 +4048,9 @@
  /// Layer `li` over a wide chunk: the row-wise stages (hc mixes, projections, `attnOut`, the FFN half) run
  /// once over all of the chunk's rows, attention's state-bound core per span, the MoE over `moe_rows` at a
  /// time. A span-wide linear fills a few threadgroups per GPU core; the chunk's rows fill the GPU. New streams and mixes land in `sp.xs` / `sp.pres`.
@@ -34,7 +34,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      // turboexl3_ds41 (MLX_SERVE_DSV41_PROMPT_TL, with PROMPT_IO): the layer's `pre` stage starts.
      pio.layerBegin(li);
      const n_spans = sp.xs.len;
-@@ -4043,7 +4044,11 @@
+@@ -4069,7 +4070,11 @@
      // MLX_SERVE_DSV41_RA_FUSED: the attention-side mix first, and the read-ahead's prediction from one more pass of its
      // norm kernel under the FFN's norm (the same collapse of the same rows with the same previous mix), not the op chain.
      // The attention's input is the same kernels' over the same arrays; only the predicted experts may round apart.
@@ -47,7 +47,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      var pa: Normed = undefined;
      var hp = none;
      if (fused) {
-@@ -4052,7 +4057,7 @@
+@@ -4078,7 +4083,7 @@
          pa = try hcNorm(&sc, m, z, x, pres, ly.attn_norm, eps);
          hp = (try hcNorm(&sc, m, z, x, pres, ly.ffn_norm, eps)).h;
      }

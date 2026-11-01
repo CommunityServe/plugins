@@ -21,7 +21,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  const A = mlx.mlx_array;
  const S = mlx.mlx_stream;
  const Config = @import("config.zig").Config;
-@@ -4813,10 +4815,20 @@
+@@ -4839,10 +4841,20 @@
      try prof.mark(.head, &.{logits});
      var cur = try sc.ints(ids[0..1], &.{1});
      const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
@@ -43,7 +43,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          const e = try sc.take(ds.markov_embed, cur, 0); // [1, rank]
          const me = try sc.astype(e, .float32);
          const bias = try sc.astype(try sc.matmul(try sc.astype(e, m.act), try sc.t2(ds.markov_head)), .float32);
-@@ -4825,11 +4837,19 @@
+@@ -4851,11 +4863,19 @@
          if (want_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.slice(hout, 0, k, k + 1), .float32), me }, -1), try sc.t2(ds.conf));
          cur = try sc.astype(try sc.argmax(row, -1), .int32);
          toks[k] = cur;
