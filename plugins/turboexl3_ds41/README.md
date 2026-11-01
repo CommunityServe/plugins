@@ -191,6 +191,20 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   code-ctx16384 prompt on the full pack (M5 Max, w-pio-20261101-0433, the usage seed with SEED_FREE in every arm): 1019.0
   and 1021.9 tok/s against 984.1 and 988.0 with the op chain, the collapse step 14 to 18 ms a layer against 31 to 33, the
   seeded 32-token text the same in every arm.
+- `MLX_SERVE_DSV41_LATE_GEMV` (src/late_gemv.zig, patches/turboexl3-zzz4-late-gemv-shared-hoist.patch; on, `=0` the f32
+  product): the decode lookahead's next-layer scores (a verify's rows against the next layer's router weights, f16 in
+  the pack) as a product in the weights' half type, which MLX runs as its wide GEMV, one weight pass for the rows. The
+  f32 product took its tiled GEMM at a single row tile: 109 µs a layer on the verify's critical path when it did not run
+  beside the hit wave (the verify timeline, w-20261101-0519). The scores only rank what the read-ahead reads: the served
+  bytes are the same, near-ties may rank apart.
+- `MLX_SERVE_DSV41_SHARED_HOIST` (src/shared_hoist.zig, the same patch; on, `=0` in the layer's last stretch): a decode
+  layer's shared expert is committed on its own as soon as the routed call returns, so it queues right behind the device
+  hit wave and runs while a layer with misses waits on their bytes, where it ran after them. The model's `ffn_post`
+  stretch is split at the shared expert's down projection: the same kernels, so the same bytes.
+- Both on against both off on the full pack (M5 Max, w-20261101-0543; code-ctx16384, card then greedy, fixed full-block
+  verifies, the usage seed with SEED_FREE, ROUTED=turboexl3, A B B A): 40.0 and 40.1 tok/s on the card's decode against
+  39.3 and 39.2, 47.0 and 47.0 greedy against 46.1 and 45.6, the misses a round the same (62.4 greedy, 82.3 card; 63.5
+  and 83.1 in the last arm), the texts the same in every arm.
 
 ## The pack
 

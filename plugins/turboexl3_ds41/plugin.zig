@@ -54,6 +54,12 @@ pub const seed_free = @import("src/seed_free.zig");
 /// The read-ahead's prediction on the fused hc kernels (`MLX_SERVE_DSV41_RA_FUSED`, src/ra_fused.zig), read by the
 /// copied model.
 pub const ra_fused = @import("src/ra_fused.zig");
+/// The decode lookahead's next-layer scores as MLX's wide GEMV (`MLX_SERVE_DSV41_LATE_GEMV`, src/late_gemv.zig), read by
+/// the copied stream.
+pub const late_gemv = @import("src/late_gemv.zig");
+/// A decode layer's shared expert committed as soon as its routed call returns (`MLX_SERVE_DSV41_SHARED_HOIST`,
+/// src/shared_hoist.zig), read by the copied model.
+pub const shared_hoist = @import("src/shared_hoist.zig");
 /// A profile build (`zig build -Dplugin-profile=true`, never served): the copied stream's profile probes compiled in (its
 /// `sdk` reads this through this root) and the decode verify's GPU timeline (`MLX_SERVE_DSV41_TIMELINE`,
 /// src/verify_tl.zig).
@@ -162,6 +168,20 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    late_gemv.configure(env.span(.MLX_SERVE_DSV41_LATE_GEMV)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_LATE_GEMV is set to something other than 0 (unset: on, 0: the f32 product): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    shared_hoist.configure(env.span(.MLX_SERVE_DSV41_SHARED_HOIST)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SHARED_HOIST is set to something other than 0 (unset: on, 0: in the layer's last stretch): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1: the load is refused\n", .{});
         out.* = switch (e) {
@@ -237,6 +257,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (seed_free.on) log.info("[turboexl3_ds41] usage seed's rows free until routed (MLX_SERVE_DSV41_SEED_FREE): the prompt's read-ahead and the CED decoder prefetch may take them\n", .{});
     if (prompt_io.on) log.info("[turboexl3_ds41] prompt timeline on (MLX_SERVE_DSV41_PROMPT_IO): [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end{s}\n", .{if (prompt_io.split_ra) "; the read-ahead's wait split (=2: a sync at each step)" else ""});
     log.info("[turboexl3_ds41] read-ahead prediction: {s}\n", .{if (ra_fused.on) "on the fused hc kernels (MLX_SERVE_DSV41_RA_FUSED=0: the op chain)" else "the op chain (MLX_SERVE_DSV41_RA_FUSED=0)"});
+    log.info("[turboexl3_ds41] decode lookahead's next-layer scores: {s}\n", .{if (late_gemv.on) "MLX's wide GEMV in the weights' half type (MLX_SERVE_DSV41_LATE_GEMV=0: the f32 product)" else "the f32 product (MLX_SERVE_DSV41_LATE_GEMV=0)"});
+    log.info("[turboexl3_ds41] decode layers' shared expert: {s}\n", .{if (shared_hoist.on) "committed behind the hit wave (MLX_SERVE_DSV41_SHARED_HOIST=0: in the layer's last stretch)" else "in the layer's last stretch (MLX_SERVE_DSV41_SHARED_HOIST=0)"});
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {
         .on => "fused, B + 1 launches a draft (MLX_SERVE_DSV41_MARKOV=0: the op chain)",

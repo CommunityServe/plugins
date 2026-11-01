@@ -1,0 +1,87 @@
+--- a/env.zig
++++ b/env.zig
+@@ -277,6 +277,7 @@
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_LABEL: Var = .{ .kind = .kill, .type = .text, .default = "unlabeled", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): the recorded prompt set's name, the file's provenance; needs MLX_SERVE_DSV41_EXPERT_USAGE_RECORD" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_RECORD: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): an absolute file path; each request's routed experts per layer counted into it (expert-usage-v1.json's form), written at the request's end" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
++    pub const MLX_SERVE_DSV41_LATE_GEMV: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode lookahead's next-layer scores as a product in the router weights' half type (turboexl3_ds41): MLX's wide GEMV, one weight pass for a verify's rows; the read-ahead's ranking only, served bytes unchanged (=0: the f32 product)" };
+     pub const MLX_SERVE_DSV41_LOOKAHEAD: Var = .{ .kind = .kill, .type = .text, .default = "2 (records read ahead a layer call; idle rule 0)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's expert lookahead (turboexl3_ds41): <budget>[:<idle>], the records read ahead a layer call 0 to 4 (0: the predictor off) and the idle rule 0 or 1; the served bytes are the same at every setting" };
+     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
+     pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end, and a [prompt-io] wide line a wide layer; =2 also splits the read-ahead's wait by a sync at each step" };
+@@ -285,6 +286,7 @@
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+     pub const MLX_SERVE_DSV41_SEED_FREE: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 usage seed's rows free until routed (turboexl3_ds41): the prompt's read-ahead may take a row the load's seed filled that no route has used, for an expert its prediction ranks before the seeded one, and the CED decoder prefetch one whose expert its prediction does not name" };
++    pub const MLX_SERVE_DSV41_SHARED_HOIST: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode layer's shared expert committed on its own when the routed call returns (turboexl3_ds41): it runs behind the device hit wave, while a layer with misses waits on their bytes; the same kernels, served bytes unchanged (=0: in the layer's last stretch)" };
+     pub const MLX_SERVE_DSV41_ROUTES: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode route recorder (turboexl3_ds41's route-recording builds only, zig build -Droute-rec=true): an absolute directory; each request's decode routes (expert.routes' file) and its rounds' tokens written there at its end" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
+     pub const MLX_SERVE_DSV41_TIMELINE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode verify GPU timeline (turboexl3_ds41's profile builds only, zig build -Dplugin-profile=true): an absolute directory; each request's VERIFY_GPU_TIMELINE line logged and its command buffers, verify stamps and rounds written there at its end" };
+--- a/sdk/weights/streamed/experts.zig
++++ b/sdk/weights/streamed/experts.zig
+@@ -1003,7 +1003,11 @@
+         /// The architecture's predictor, or DeepSeek's sqrt(softplus(f32(x @ w^T))) + bias.
+         fn nextScores(g: *G, xf: T, gate: Gate) !T {
+             if (comptime @hasDecl(M, "predictorScores")) return M.predictorScores(g, xf, gate.w, gate.bias);
+-            const z = try g.astype(try g.matmul(xf, try g.transpose(gate.w)), .float32);
++            // turboexl3_ds41 (MLX_SERVE_DSV41_LATE_GEMV): the product in the weights' half type is MLX's wide GEMV, one
++            // weight pass for a verify's rows; the f32 product is its tiled GEMM at a single row tile.
++            const wt = g.dtypeOf(gate.w);
++            const xw = if (@import("mlx_host").late_gemv.on and (wt == .float16 or wt == .bfloat16)) try g.astype(xf, wt) else xf;
++            const z = try g.astype(try g.matmul(xw, try g.transpose(gate.w)), .float32);
+             return g.add(try g.sqrt(try g.logaddexp(z, try g.scalar(0, .float32))), gate.bias);
+         }
+         /// An event wait's aliases of `xs` (the GPU reads them after `value`), into `outs` (any contents). One wait (one
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -40,6 +40,7 @@
+ const pio = @import("../../../prompt_io.zig");
+ /// turboexl3_ds41's src/ra_fused.zig (`MLX_SERVE_DSV41_RA_FUSED`): the read-ahead's prediction on the fused hc kernels.
+ const raf = @import("../../../ra_fused.zig");
++const shoist = @import("../../../shared_hoist.zig");
+ /// The CED decoder prefetch (turboexl3_ds41's src/dec_prefetch.zig, `MLX_SERVE_DSV41_DEC_PREFETCH`).
+ const dp = @import("../../../dec_prefetch.zig");
+ /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+@@ -3385,7 +3386,15 @@
+                 },
+             };
+             var y: [1]A = undefined;
+-            try runRegion(sc, m, li, .ffn_post, &.{ p[0], p[2], p[3], p[4], ro }, &y);
++            // turboexl3_ds41 (MLX_SERVE_DSV41_SHARED_HOIST): the shared expert committed now queues behind the hit wave.
++            if (shoist.on and src.math == .source) {
++                var s: [1]A = undefined;
++                try runRegion(sc, m, li, .ffn_shared, &.{p[4]}, &s);
++                const v = mlx.mlx_vector_array_new_data(&s, 1);
++                defer _ = mlx.mlx_vector_array_free(v);
++                try mlx.check(mlx.mlx_async_eval(v));
++                try runRegion(sc, m, li, .ffn_post_shared, &.{ p[0], p[2], p[3], ro, s[0] }, &y);
++            } else try runRegion(sc, m, li, .ffn_post, &.{ p[0], p[2], p[3], p[4], ro }, &y);
+             try prof.mark(.combine, &y);
+             pre.* = p[1];
+             return y[0];
+@@ -4083,7 +4092,7 @@
+ pub const region_rows = 16;
+ /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
+ /// barrier, cut where `ffn` has no fusable op across the cut.
+-pub const Region = enum { attn_in, q_kv, attn_out, ffn, ffn_pre, ffn_act, ffn_post };
++pub const Region = enum { attn_in, q_kv, attn_out, ffn, ffn_pre, ffn_act, ffn_post, ffn_shared, ffn_post_shared };
+ const LayerRegions = struct {
+     m: *Dsv41Model,
+     li: usize,
+@@ -4200,6 +4209,17 @@
+                     const ro = if (mlx.getShape(a[4]).len == 2) a[4] else try rowSum(&sc, a[4]);
+                     res.* = mlx.mlx_vector_array_new_data(&.{try hcExpand(&sc, a[0], try withShared(&sc, m, ly, a[3], ro), &sp)}, 1);
+                 },
++                // turboexl3_ds41 (MLX_SERVE_DSV41_SHARED_HOIST): `ffn_post` split at the shared expert's down projection.
++                // The FFN's normed input -> the shared expert's output.
++                .ffn_shared => res.* = mlx.mlx_vector_array_new_data(&.{try shared(&sc, m, ly, a[0])}, 1),
++                // the new stream, the FFN's post and comb, a source's routed sum and the shared expert's output -> the new
++                // stream
++                .ffn_post_shared => {
++                    const sp: Split = .{ .pre = none, .post = a[1], .comb = a[2] };
++                    try prof.mark(.routed, &.{a[3]});
++                    try prof.mark(.shared, &.{a[4]});
++                    res.* = mlx.mlx_vector_array_new_data(&.{try hcExpand(&sc, a[0], try addShared(&sc, m, a[3], a[4]), &sp)}, 1);
++                },
+             }
+         }
+     };
