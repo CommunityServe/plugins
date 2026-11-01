@@ -45,7 +45,7 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
 @@ -27,6 +27,9 @@
- const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows);
+ const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows, Math);
  const HookT3 = xp.ExpertsWith(G, xp.StreamSource, MathT3, .{ .prefill = true, .lookahead = true, .gated = true });
  const Hooks = union(enum) { stream: Hook, t3: HookT3 };
 +/// `MLX_SERVE_DSV41_ROUTED_ONE` (the plugin's src/routed_one.zig): a wide prompt call's resident experts as one turboexl3

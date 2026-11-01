@@ -1,33 +1,38 @@
 diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
-@@ -21,8 +21,8 @@
+@@ -21,10 +21,11 @@
  const T = mlx.mlx_array;
  const Math = xp.QuantMath(G, xq.Accepted(G));
  const Hook = xp.ExpertsWith(G, xp.StreamSource, Math, .{ .prefill = true, .lookahead = true, .gated = true });
 -/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the plugin's src/routed_t3.zig): the same schedule, turboexl3's math, neither
 -/// banked waves nor the device route (both are the streamer's own kernels').
-+/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the plugin's src/routed_t3.zig): the same schedule on turboexl3's math, the decode
-+/// waves banked and DEVROUTE's device wave on turboexl3's banked decode, as the streamer's own kernels run them.
++/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the plugin's src/routed_t3.zig): the same schedule, the decode waves banked and
++/// DEVROUTE's device wave on turboexl3's banked decode, as the streamer's own kernels run them; the prompt calls on the
++/// streamer's own math (`Math`, the bounded DIG-X lane the prompt bill covers).
  const routed_t3 = @import("mlx_host").routed_t3;
- const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows);
+-const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows);
++const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows, Math);
  const HookT3 = xp.ExpertsWith(G, xp.StreamSource, MathT3, .{ .prefill = true, .lookahead = true, .gated = true });
-@@ -176,8 +176,12 @@
+ const Hooks = union(enum) { stream: Hook, t3: HookT3 };
+ pub const Gate = Hook.Gate;
+@@ -176,8 +177,13 @@
              self.gates_t3 = try a.alloc(HookT3.Gate, gates.len);
              errdefer a.free(self.gates_t3);
              for (self.gates_t3, gates) |*o, gt| o.* = .{ .w = gt.w, .bias = gt.bias };
 -            self.hook = .{ .t3 = try HookT3.initWith(a, &self.g, &self.source, .{ .state = &self.t3_state }, geo, .{ .gates = self.gates_t3, .event = event, .wide = wide, .hoist_first = true }) };
 -            std.log.info("streamed exl3: the routed experts run on turboexl3 (MLX_SERVE_DSV41_ROUTED)", .{});
-+            self.hook = .{ .t3 = try HookT3.initWith(a, &self.g, &self.source, .{ .state = &self.t3_state }, geo, .{ .gates = self.gates_t3, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true }) };
-+            std.log.info("streamed exl3: the routed experts run on turboexl3, the decode waves banked and the device route on its banked decode (MLX_SERVE_DSV41_ROUTED)", .{});
++            self.hook = .{ .t3 = try HookT3.initWith(a, &self.g, &self.source, .{ .state = &self.t3_state, .stock = Math.init(self.q, geo) }, geo, .{ .gates = self.gates_t3, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true }) };
++            std.log.info("streamed exl3: the routed experts' decode runs on turboexl3, its waves banked and the device route on its banked decode; the prompt calls stay on the streamer's own lane (MLX_SERVE_DSV41_ROUTED)", .{});
 +            errdefer self.hook.t3.deinit();
-+            // Its kernels compiled now, not at a request's first launch of each pair count (src/routed_t3.zig `warm`).
++            // The banked decode's kernels compiled now, not at a request's first launch of each pair count (src/routed_t3.zig
++            // `warm`).
 +            const w = try self.hook.t3.math.warm(&self.g, self.hook.t3.banks, @intCast(geo.hidden_size), .bfloat16);
 +            std.log.info("streamed exl3: turboexl3's routed kernels compiled at load: {d} calls in {d} ms", .{ w.calls, w.ms });
          } else self.hook = .{ .stream = try Hook.initWith(a, &self.g, &self.source, Math.init(self.q, geo), geo, .{ .gates = self.gates, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true }) };
          return self;
      }
-@@ -202,6 +206,8 @@
+@@ -202,6 +208,8 @@
      /// Model layer `layer`'s routed sum `[n, hidden]` f32 for the normed MoE input `x` `[n, hidden]`, the routes `idx`
      /// `[n, k]` and their weights `wts`.
      pub fn rows(self: *Source, layer: u32, x: T, idx: T, wts: T) !T {
