@@ -1,0 +1,80 @@
+diff -ruN -x .generated a/sdk/weights/streamed/expert/stream.zig b/sdk/weights/streamed/expert/stream.zig
+--- a/sdk/weights/streamed/expert/stream.zig	2026-10-31 22:48:16
++++ b/sdk/weights/streamed/expert/stream.zig	2026-10-31 22:48:16
+@@ -173,6 +173,10 @@
+     pub fn waitDown(self: *StreamSource, call: *Call, part: u32) Error!void {
+         return self.stream.waitDown(call.route.?, part);
+     }
++    /// The call's read-ahead step after its waves (turboexl3_ds41: the next layer's scores read off the barrier).
++    pub fn speculateLate(self: *StreamSource, call: *Call, scores: []const f32) Error!void {
++        return self.stream.speculateLate(call.route.?, scores);
++    }
+     pub fn release(self: *StreamSource, call: *Call) void {
+         self.stream.release(call.route.?);
+     }
+diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streamed/experts.zig
+--- a/sdk/weights/streamed/experts.zig	2026-10-31 22:48:16
++++ b/sdk/weights/streamed/experts.zig	2026-10-31 22:48:16
+@@ -1415,10 +1415,14 @@
+             // The installed decode-only predictor follows the source's phase; the last layer predicts nothing.
+             const predict = (if (comptime routes.lookahead and predictor_decode_only) self.source.decoding() else routes.lookahead) and lookaheadPredicts();
+             const sc: ?T = if (if (predict) self.predictorGate(layer) else null) |gate| try self.scoresOf(g, xf, gate) else null;
+-            // The barrier's arrays: the ids, then the scores when there are any.
++            // turboexl3_ds41: a source that takes its read-ahead step after the waves (`speculateLate`) keeps the next
++            // layer's scores out of the barrier: committed right behind the ids, read once the call's waves are built and
++            // the records issued then (the barrier waited on them for nothing; the same records, the same claims).
++            const late: ?T = if (comptime @hasDecl(S, "speculateLate")) sc else null;
++            // The barrier's arrays: the ids, then the scores when there are any (and they are not read late).
+             var bar: [2]T = undefined;
+             var n_bar: usize = 0;
+-            for ([_]?T{ indices, sc }) |x| if (x) |v| {
++            for ([_]?T{ indices, if (late == null) sc else null }) |x| if (x) |v| {
+                 bar[n_bar] = v;
+                 n_bar += 1;
+             };
+@@ -1426,12 +1430,15 @@
+             const dev: ?T = if (comptime @hasDecl(S, "decoding")) (if (self.devroute and self.source.decoding()) try self.devWave(g, layer, xf, indices, n, k) else null) else null;
+             if (dev) |d| {
+                 try g.asyncEval(bar[0..n_bar]);
++                if (late) |s| try g.asyncEval(&.{s});
+                 try g.asyncEval(&.{d});
+-            }
++            } else if (late) |s| try g.asyncEval(&.{s});
+             // HOIST_FIRST commits them and the hoist here (the evals below then only wait); the stock route nothing.
+             try self.pre_barrier(g, bar[0..n_bar], hoist);
+             if (n_bar > 1) try g.evalAll(bar[0..n_bar]);
+-            if (sc) |s| scores = try g.hostF32(s, score_buf[0 .. n * self.n_experts]);
++            if (late == null) if (sc) |s| {
++                scores = try g.hostF32(s, score_buf[0 .. n * self.n_experts]);
++            };
+             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
+             tt = dt.charge(.barrier, tt);
+             const t_barrier = tt;
+@@ -1484,6 +1491,10 @@
+                 _ = dt.charge(.read_wait, tt);
+                 try g.asyncEval(try self.down_wave(self, g, layer, &wave, &acc, null));
+             }
++            // The next layer's scores (done beside the router long since) read now, its records issued.
++            if (comptime @hasDecl(S, "speculateLate")) if (late) |s| {
++                try self.source.speculateLate(call, try g.hostF32(s, score_buf[0 .. n * self.n_experts]));
++            };
+             self.source.release(call);
+             released = true;
+             // DEVROUTE: the layer's next call reads the policy after this route (the other LUT of the pair).
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/stream.zig	2026-10-31 22:48:16
++++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig	2026-10-31 22:48:16
+@@ -1554,6 +1554,13 @@
+                 _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
+                     return self.fail(error.SpecRefused);
+             }
++            /// A route's read-ahead step after its waves, its scores read then (turboexl3_ds41: the scores off the routing
++            /// barrier; the route itself took its step with none, settling only). The same step `speculate` takes at the
++            /// route: the same tag, records and claims, issued later.
++            pub fn speculateLate(self: *Stream, r: *const Route, scores: []const f32) Error!void {
++                if (self.failed or !self.route_lookahead) return;
++                return self.speculate(r, scores);
++            }
+             /// `speculate` for a bank of several bank layers per routed layer (`B.banks_per_layer`): the next routed
+             /// layer's experts over all its bank layers, each checked against its own bank layer's residency, each record
+             /// its bank layer's span (one step of records of different lengths).

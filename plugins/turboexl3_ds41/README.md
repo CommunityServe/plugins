@@ -110,7 +110,11 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   it for 4. The served bytes are the same at every setting. On the full pack (code-ctx16384, greedy with the prefix
   cached, window w-20261101-0226), at full-block verifies the default verified 7.0 +/- 1.7 ms a round faster than 0
   (107.6 against 114.6 ms, faster in 89 of 107 rounds, the same greedy text), and budget 4 issued 57% more records for no
-  more claimed ones.
+  more claimed ones. The next layer's scores stay out of the routing barrier (patches/turboexl3-zz6-lookahead-late.patch):
+  committed right behind the ids, read once the call's waves are built and the records issued then, so a layer call's
+  barrier waits on its ids alone; the same records and claims. At full-block verifies (window w-20261101-0326) that
+  verified 1.25 +/- 0.20 ms a round faster than the scores in the barrier (93 of 106 rounds; 1.42 +/- 0.23 ms, 132 of
+  142, in the cold prompt's decode), the texts, rounds and misses the same.
 - `[round-io]` (src/round_io.zig, on with the DSpark profile, `MLX_SERVE_DIAG=dspark-profile`) logs at each request's
   end the expert stream's traffic of the decode's rounds and of the rest (the prompt pass): unique experts missed and
   hit, the demand's bytes (and those copied out of lookahead records), the lookahead's bytes, its abandoned ones, its
