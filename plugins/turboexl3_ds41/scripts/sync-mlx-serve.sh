@@ -13,7 +13,7 @@
 #   - every named test taken out, with the comment lines right above it: the plugin runs none of the copies' tests;
 #   - the functions and declarations scripts/cut.txt names taken out, with their `///` lines;
 #   - blank lines taken out, but one between two lines of multiline strings, which would join them.
-# The read pool's C (c_sources below) is copied as it is.
+# The read pool's C and the timeline's shim (c_sources below) are copied as they are.
 # Files in EDGES are this plugin's own, at the paths of the mlx-serve files they stand in for, and never overwritten.
 # Every other file a copy imports gets a stand-in: an empty file, so the import resolves while nothing of it is used.
 set -euo pipefail
@@ -52,9 +52,11 @@ kernel_text = re.compile(r'"((?:kernels|plugins/[a-z0-9_]+/kernels)/[^"]+\.(?:me
 # What a copy embeds by a literal path relative to itself, and the folders a copy embeds by computed names.
 embed_text = re.compile(r'@embedFile\("([^"]+)"\)')
 embed_dirs = ["sdk/quant/exl3/stream/kernels"]
-# The read pool the streamer calls (build.zig compiles it as C), copied as it is; mlx-serve's other C and C++ beside it
-# reaches MLX's private headers, which src/host_shims.zig stands in for.
-c_sources = ["sdk/weights/streamed/csrc/q3_lookahead4_exl3.c", "sdk/weights/streamed/csrc/q3_lookahead4.h"]
+# The read pool the streamer calls (build.zig compiles it as C) and the command-buffer timeline's shim a profile build
+# links (dsv41_cb_timeline.mm), copied as they are; mlx-serve's other C and C++ beside them reaches MLX's private
+# headers, which src/host_shims.zig and src/tl_buffer.m stand in for.
+c_sources = ["sdk/weights/streamed/csrc/q3_lookahead4_exl3.c", "sdk/weights/streamed/csrc/q3_lookahead4.h",
+             "sdk/weights/streamed/csrc/dsv41_cb_timeline.mm", "sdk/weights/streamed/csrc/dsv41_cb_timeline.h"]
 wanted, kernels, embeds = set(), set(), set(c_sources)
 test_head = re.compile(r'^test "((?:\\.|[^"\\])*)"\s*\{')
 def code_of(line):

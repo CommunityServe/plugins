@@ -1,0 +1,41 @@
+--- a/env.zig
++++ b/env.zig
+@@ -287,6 +287,7 @@
+     pub const MLX_SERVE_DSV41_SEED_FREE: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 usage seed's rows free until routed (turboexl3_ds41): the prompt's read-ahead may take a row the load's seed filled that no route has used, for an expert its prediction ranks before the seeded one, and the CED decoder prefetch one whose expert its prediction does not name" };
+     pub const MLX_SERVE_DSV41_ROUTES: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode route recorder (turboexl3_ds41's route-recording builds only, zig build -Droute-rec=true): an absolute directory; each request's decode routes (expert.routes' file) and its rounds' tokens written there at its end" };
+     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
++    pub const MLX_SERVE_DSV41_TIMELINE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode verify GPU timeline (turboexl3_ds41's profile builds only, zig build -Dplugin-profile=true): an absolute directory; each request's VERIFY_GPU_TIMELINE line logged and its command buffers, verify stamps and rounds written there at its end" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
+     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
+--- a/sdk/weights/streamed/csrc/dsv41_cb_timeline.mm
++++ b/sdk/weights/streamed/csrc/dsv41_cb_timeline.mm
+@@ -24,6 +24,9 @@
+ static CommitImp g_origs[TL_MAX_CLASSES];
+ static std::atomic<int> g_nclasses{0};
+ static id g_queue = nil;
++/* turboexl3_ds41: the install's buffer is one of the plugin's own queue (src/tl_buffer.m: the kit ships no MLX header
++ * to read MLX's), of the class chain MLX's buffers have; the first tagged commit's queue is taken as MLX's stream's. */
++static int g_adopt = 0;
+ static Dsv41tlRow *g_rows = NULL;
+ static uint32_t g_cap = 0;
+ static std::atomic<uint32_t> g_committed{0};
+@@ -72,6 +75,10 @@
+     uint64_t tag = g_tag.load(std::memory_order_relaxed);
+     if (tag != 0) {
+       g_tagged.fetch_add(1, std::memory_order_relaxed);
++      if (g_adopt) {
++        g_queue = [(id<MTLCommandBuffer>)self commandQueue];
++        g_adopt = 0;
++      }
+       int same = [(id<MTLCommandBuffer>)self commandQueue] == g_queue;
+       if (!same) g_other_queue.fetch_add(1, std::memory_order_relaxed);
+       uint32_t i = g_committed.fetch_add(1);
+@@ -147,6 +154,7 @@
+   if (r < 0) return r;
+   g_tag.store(0);
+   g_queue = [(id<MTLCommandBuffer>)buf commandQueue];
++  g_adopt = 1;
+   g_rows = rows;
+   g_cap = cap;
+   g_committed.store(0);

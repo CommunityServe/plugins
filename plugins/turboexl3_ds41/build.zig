@@ -20,6 +20,10 @@ pub fn build(b: *std.Build) void {
     opts.addOption(bool, "slow_tests", false);
     // The decode route recorder (src/route_rec.zig, `MLX_SERVE_DSV41_ROUTES`): a diagnostic build's, off in every served one.
     opts.addOption(bool, "route_rec", b.option(bool, "route-rec", "Compile the decode route recorder in (MLX_SERVE_DSV41_ROUTES); a diagnostic build, never served") orelse false);
+    // The copied stream's profile probes and the decode verify's GPU timeline (src/verify_tl.zig, `MLX_SERVE_DSV41_TIMELINE`):
+    // a profile build's, off in every served one.
+    const profile = b.option(bool, "plugin-profile", "Compile the streamer's profile probes and the verify timeline in (MLX_SERVE_DSV41_TIMELINE); a diagnostic build, never served") orelse false;
+    opts.addOption(bool, "plugin_profile", profile);
     root.addOptions("build_options", opts);
     // MLX's steel headers as the kit ships them (lane_qmm's tile matmul, turboexl3's prefill GEMMs): the kit module's own
     // import, so the file is in one module.
@@ -42,8 +46,25 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{ .{ .name = "mlx_host", .module = root }, .{ .name = "sdk", .module = ssdk } },
     });
-    stream.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" } });
+    // A profile build also keeps the read pool's event-signal log, links the timeline's shim (non-ARC Objective-C++, as
+    // mlx-serve's profile build compiles it) and the buffer it hooks (src/tl_buffer.m), over mlx-c's headers as the kit
+    // ships them.
+    const pool: []const []const u8 = if (profile)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_EVSIG" }
+    else
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    stream.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = pool });
     stream.addIncludePath(b.path(csrc));
+    if (profile) {
+        const objc: []const []const u8 = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" };
+        stream.addCSourceFile(.{ .file = b.path(csrc ++ "/dsv41_cb_timeline.mm"), .flags = objc });
+        stream.addCSourceFile(.{ .file = b.path("src/tl_buffer.m"), .flags = objc });
+        stream.addIncludePath(b.dependency("mlx_serve_kit", .{}).path("include"));
+        stream.link_libcpp = true;
+        stream.linkSystemLibrary("objc", .{});
+        stream.linkFramework("Foundation", .{});
+        stream.linkFramework("Metal", .{});
+    }
     root.addImport("mlx_stream", stream);
     // turboexl3: its library and its plugin-kit launcher over this plugin's `sdk` for them.
     const dep = b.dependency("turboexl3", .{ .target = target, .optimize = optimize });

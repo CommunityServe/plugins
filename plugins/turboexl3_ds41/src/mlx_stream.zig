@@ -11,3 +11,6 @@ pub const mlx_pack = @import("mlx_serve/sdk/weights/streamed/mlx_pack.zig");
 pub const exl3_source = @import("mlx_serve/sdk/weights/streamed/exl3_source.zig");
 /// The event shim's ABI version the streamer checks at its first event (src/host_shims.zig serves it).
 pub const event_abi = @import("mlx_serve/sdk/weights/streamed/sdk_ext/expert/event.zig").abi_version;
+/// The decode verify's GPU timeline (profile builds: `zig build -Dplugin-profile=true`), whose layer stamps the routed
+/// calls make (`Experts.run`); the plugin arms it and reads it (src/verify_tl.zig).
+pub const verify_timeline = @import("mlx_serve/sdk/weights/streamed/profile/verify_timeline.zig");

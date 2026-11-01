@@ -54,6 +54,12 @@ pub const seed_free = @import("src/seed_free.zig");
 /// The read-ahead's prediction on the fused hc kernels (`MLX_SERVE_DSV41_RA_FUSED`, src/ra_fused.zig), read by the
 /// copied model.
 pub const ra_fused = @import("src/ra_fused.zig");
+/// A profile build (`zig build -Dplugin-profile=true`, never served): the copied stream's profile probes compiled in (its
+/// `sdk` reads this through this root) and the decode verify's GPU timeline (`MLX_SERVE_DSV41_TIMELINE`,
+/// src/verify_tl.zig).
+pub const plugin_profile: bool = @import("build_options").plugin_profile;
+const verify_tl = @import("src/verify_tl.zig");
+const timeline = @import("mlx_stream").verify_timeline;
 const ds = @import("src/mlx_serve/plugins/deepseek_v41/plugin.zig");
 const dsv41 = @import("src/mlx_serve/plugins/deepseek_v41/deepseek_v41.zig");
 const v4plugin = @import("src/mlx_serve/plugins/deepseek_v4/plugin.zig");
@@ -177,6 +183,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    verify_tl.setting = verify_tl.parse(env.span(.MLX_SERVE_DSV41_TIMELINE), plugin_profile) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_TIMELINE is refused ({s}): an absolute directory, in a profile build (zig build -Dplugin-profile=true)\n", .{@errorName(e)});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     stream_lookahead.setting = stream_lookahead.parse(env.span(.MLX_SERVE_DSV41_LOOKAHEAD)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_LOOKAHEAD is none of 0 to 4, with an optional :0 or :1: the load is refused\n", .{});
         out.* = switch (e) {
@@ -231,6 +244,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .check => "fused and the op chain, compared every draft; the op chain's served (MLX_SERVE_DSV41_MARKOV=check); [markov] lines at each request's end",
         .off => "the op chain (MLX_SERVE_DSV41_MARKOV=0)",
     }});
+    if (plugin_profile) log.info("[turboexl3_ds41] a profile build (zig build -Dplugin-profile=true, never served): the stream's profile probes compiled in, the decode verify timeline {s}\n", .{if (verify_tl.setting.dirPath() != null) "on (MLX_SERVE_DSV41_TIMELINE): VERIFY_GPU_TIMELINE and ds41-timeline-<pid>-<seq>.json at each request's end" else "off (MLX_SERVE_DSV41_TIMELINE unset)"});
     const la = stream_lookahead.setting;
     if (!la.isDefault()) log.info("[turboexl3_ds41] decode lookahead (MLX_SERVE_DSV41_LOOKAHEAD): {d} records read ahead a layer call{s}, idle rule {d}, the stream sized for {d}\n", .{ la.budget, if (la.predicts()) "" else " (the predictor off)", la.idle_busy, la.initBudget() });
     round_io.on = model(mp).mdl.ds_prof != null;
@@ -291,6 +305,8 @@ const Round = struct {
     /// A stage round's confidence logits of its verified drafts.
     conf: [16]f32 = undefined,
     watch: io_util.Stopwatch,
+    /// Recorded on the verify timeline (profile builds, `tlBegin`).
+    tl: bool = false,
 };
 
 /// A verify `draftVerify` left open for `draftFinish`: one per process.
@@ -358,6 +374,7 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
 
 /// A round's kept tokens: its phases to `[dspark-prof]`, what it teaches to the drafter, its tokens to the history.
 fn kept(m: *ds.Model, round: *const Round, r: *dsv41.DsparkRound, st: *const dsv41.State) void {
+    if (round.tl) tlEnd(m, round.drafts + 1, r.accepted);
     r.phases.draft_ns = if (round.kind == .stage) m.mdl.ds_draft_ns else 0;
     dsv41.dsparkObserve(m.mdl, r.phases);
     if (round_io.on) round_io.end(ioSnap(m), round.drafts + 1, r.phases.verify_ns, round.watch.read());
@@ -389,8 +406,11 @@ fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callco
         .refused => |v| return v,
     };
     const t1 = f.tokens.slice()[0];
+    const rec = tlBegin(m);
     var p = draft(m, &drafter.?, st, t1, f.accept_cap) catch |e| return roundFailed(e);
     defer p.d.deinit(gpa);
+    p.round.tl = rec;
+    if (rec) tlVerify(.begin);
     var pending = dsv41.dsparkBeginWith(m.mdl, gpa, st, t1, &p.d) catch |e| return roundFailed(e);
     defer pending.deinit();
     const suppress: ?mlx.mlx_array = if (f.suppress_mask.ctx != null) .{ .ctx = f.suppress_mask.ctx } else null;
@@ -399,6 +419,7 @@ fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callco
         closeVerify(m, st, &pending);
         return roundFailed(e);
     };
+    if (rec) tlVerify(.end);
     var accepted: usize = 0;
     while (accepted < p.d.len and best[accepted] == p.d.ids[accepted + 1]) accepted += 1;
     var r = dsv41.dsparkFinish(m.mdl, gpa, st, &pending, accepted, best[accepted]) catch |e| return roundFailed(e);
@@ -418,8 +439,11 @@ fn draftVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
         .refused => |v| return v,
     };
     const t1 = f.tokens.slice()[0];
+    const rec = tlBegin(m);
     var p = draft(m, &drafter.?, st, t1, f.accept_cap) catch |e| return roundFailed(e);
     defer p.d.deinit(gpa);
+    p.round.tl = rec;
+    if (rec) tlVerify(.begin);
     var pending = dsv41.dsparkBeginWith(m.mdl, gpa, st, t1, &p.d) catch |e| return roundFailed(e);
     const rows = p.d.len + 1;
     const logits = rowsF32(m, pending.vl_g, rows) catch |e| {
@@ -427,6 +451,11 @@ fn draftVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
         pending.deinit();
         return roundFailed(e);
     };
+    // A recorded verify's window closes at its last eval, which the engine's sampling makes after this returns.
+    if (rec) {
+        _ = mlx.mlx_array_eval(logits);
+        tlVerify(.end);
+    }
     out.logits = .{ .ctx = logits.ctx };
     fillRound(&out.round, p.d.ids[0..rows], @intCast(rows), st.n);
     out.round.accepted = 0;
@@ -524,6 +553,7 @@ var meter_buf: [131072]u8 = undefined;
 /// round's stream traffic (src/round_io.zig) with the DSpark profile.
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = slot;
+    tlWrite(model(mp));
     stage_prof.requestEnd();
     usageEnd(model(mp));
     routesWrite(model(mp));
@@ -544,6 +574,93 @@ fn usageEnd(m: *ds.Model) void {
     const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
     const at: usize = if (m.mdl.dec_state) |*st| st.n else 0;
     src.usageEnd(std.Io.Threaded.global_single_threaded.io(), req_prompt -| req_kept, at -| req_prompt) catch |e| log.err("[turboexl3_ds41] the expert usage record was not written: {s}\n", .{@errorName(e)});
+}
+
+// ── The decode verify's GPU timeline (`MLX_SERVE_DSV41_TIMELINE`, profile builds only) ──
+
+var tl_rounds: verify_tl.Rounds = .{};
+var tl_seq: u32 = 0;
+var tl_failed = false;
+
+comptime {
+    if (verify_tl.max_rounds != timeline.max_cycles) @compileError("verify_tl.max_rounds is not the timeline's max_cycles");
+}
+
+/// A round's start: the timeline armed at the request's first round, the round recorded while the request has a cycle
+/// left. False (every served build, the setting unset): not recorded.
+fn tlBegin(m: *ds.Model) bool {
+    if (comptime !plugin_profile) return false;
+    if (verify_tl.setting.dirPath() == null or tl_failed) return false;
+    if (!timeline.active) {
+        timeline.install(m.mdl.s, timeline.max_cycles + 1, @intCast(m.mdl.n_layers)) catch |e| {
+            log.err("[turboexl3_ds41] the verify timeline is off: {s}\n", .{@errorName(e)});
+            tl_failed = true;
+            return false;
+        };
+        tl_rounds.reset();
+    }
+    if (timeline.cycles >= timeline.max_cycles) return false;
+    timeline.cycleBegin();
+    tl_rounds.begin(timeline.cycles - 1, timeline.now(), tlCounters(m));
+    return true;
+}
+
+/// A recorded round's verify: its forward's start, and the read of its last eval.
+fn tlVerify(comptime edge: enum { begin, end }) void {
+    if (comptime !plugin_profile) return;
+    switch (edge) {
+        .begin => {
+            timeline.verifyBegin();
+            tl_rounds.verifyBegin(timeline.now());
+        },
+        .end => {
+            timeline.verifyEnd();
+            tl_rounds.verifyEnd(timeline.now());
+        },
+    }
+}
+
+/// A recorded round's commit: its rows, the drafts kept and the stream's counters.
+fn tlEnd(m: *ds.Model, rows: usize, accepted: usize) void {
+    if (comptime !plugin_profile) return;
+    tl_rounds.end(timeline.now(), tlCounters(m), @intCast(rows), @intCast(accepted));
+}
+
+fn tlCounters(m: *ds.Model) verify_tl.Counters {
+    const r = m.mdl.streamed orelse return .{};
+    if (r.math != .source) return .{};
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    const s = src.stats();
+    return .{ .misses = s.expert_cache_misses, .hits = s.expert_cache_hits, .demand = s.expert_bytes_read };
+}
+
+/// The request's end: the recorded buffers settled, `VERIFY_GPU_TIMELINE` logged and the request's file written, the
+/// timeline disarmed until the next request's first round.
+fn tlWrite(m: *ds.Model) void {
+    if (comptime !plugin_profile) return;
+    if (!timeline.active) return;
+    const pending = timeline.settle(m.mdl.s, 2000);
+    defer timeline.uninstall();
+    var lb: [16384]u8 = undefined;
+    log.info("[turboexl3_ds41] {s}\n", .{timeline.line(&lb, pending)});
+    const dir = verify_tl.setting.dirPath() orelse return;
+    var pb: [verify_tl.max_path + 64]u8 = undefined;
+    const path = verify_tl.filePath(&pb, dir, @intCast(std.c.getpid()), tl_seq) catch return;
+    tl_seq += 1;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    tlJson(&aw.writer) catch |e| return log.err("[turboexl3_ds41] the verify timeline's file was not made: {s}\n", .{@errorName(e)});
+    std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = aw.written() }) catch |e|
+        return log.err("[turboexl3_ds41] the verify timeline was not written to {s}: {s}\n", .{ path, @errorName(e) });
+    log.info("[turboexl3_ds41] verify timeline written: {s} ({d} rounds)\n", .{ path, tl_rounds.slice().len });
+}
+
+fn tlJson(w: *std.Io.Writer) !void {
+    try w.writeAll("{\"timeline\": ");
+    try timeline.writeJson(w);
+    try w.writeAll(", ");
+    try verify_tl.writeRounds(w, tl_rounds.slice());
+    try w.writeAll("}\n");
 }
 
 // ── The decode route recorder (`MLX_SERVE_DSV41_ROUTES`, route-recording builds only) ──

@@ -135,6 +135,16 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   (the decode handover's residents and prompt counts, then each step and each routed call: its ids, what served each,
   the lookahead's records) and `.steps.txt` (each step's rows' tokens, accepted drafts and emitted tokens), for replaying
   residency policies offline. A served build has no recorder branch and refuses the setting.
+- A profile build (`zig build -Doptimize=ReleaseFast -Dplugin-profile=true`, never served) compiles the copied stream's
+  profile probes in, and `MLX_SERVE_DSV41_TIMELINE=<absolute directory>` arms mlx-serve's decode verify timeline
+  (src/verify_tl.zig, patches/turboexl3-zzz2-verify-timeline.patch) at each request's first DSpark round: every command
+  buffer MLX commits, with its host commit time and Metal's GPU start and end, each verify's window and each routed
+  layer's host stamps (the routing barrier's eval, the ids read, the route, the hit wave's submit, the call's end). At
+  the request's end the log gets `VERIFY_GPU_TIMELINE` (per verify: the GPU's busy and idle time, the idle split at the
+  routing barriers, before the layers and after the last, the hit waves, the gated waits on miss bytes) and
+  `ds41-timeline-<pid>-<seq>.json` the raw rows and each round's rows, accepted drafts, misses and host times. The shim
+  hooks the class of MLX's command buffers through a buffer of the plugin's own queue (src/tl_buffer.m). A served build
+  has no hook and refuses the setting.
 - The decode's slot rows are split across the layers (src/decode_rows.zig, the hook in
   patches/turboexl3-zzz1-decode-rows.patch) at the flat bill's bytes or fewer, each layer between its prompt rows and
   256, by each layer's misses-a-row curve: the decode residency policy replayed over routes recorded on a development
