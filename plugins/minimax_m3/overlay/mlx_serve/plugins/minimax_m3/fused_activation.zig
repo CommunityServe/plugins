@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/fused_activation.zig@dc508a5da248397f6c952e75839f1de58aab5be2
+//! copied_from: src/plugins/minimax_m3/fused_activation.zig@9df2c52b504cce5bbf22f074dab168fd8584f961
 //! Decode-sized SwiGLU-OAI, with a rounding point after every original operation.
 const std = @import("std");
 const sdk = @import("mlx_stream").sdk;
@@ -56,23 +56,33 @@ test "MiniMax GPU fused activation preserves intermediate rounding and clipping"
         gates[i] = value;
         ups[edges.len + i] = value;
     }
+    for (edges, 0..) |gate, i| for (edges, 0..) |up, j| {
+        const at = 2 * edges.len + i * edges.len + j;
+        gates[at] = gate;
+        ups[at] = up;
+    };
     const actual = try std.testing.allocator.alloc(f32, n);
     defer std.testing.allocator.free(actual);
     const expected = try std.testing.allocator.alloc(f32, n);
     defer std.testing.allocator.free(expected);
     const shapes = [_][3]c_int{ .{ 4, 1, 3072 }, .{ 1, 1, 12288 }, .{ 3, 1, 65 } };
-    for ([_]mlx.mlx_dtype{ .bfloat16, .float16, .float32 }) |dtype| for (shapes) |shape| {
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float16, .float32 }) |dtype| for (shapes) |shape| for ([_]bool{ false, true }) |strided| {
         const mark = g.mark();
         defer g.resetTo(mark);
         const size: usize = @intCast(shape[0] * shape[1] * shape[2]);
-        const gate = try g.astype(try g.hostArray(std.mem.sliceAsBytes(gates[0..size]), &shape, .float32), dtype);
-        const up = try g.astype(try g.hostArray(std.mem.sliceAsBytes(ups[0..size]), &shape, .float32), dtype);
+        var gate = try g.astype(try g.hostArray(std.mem.sliceAsBytes(gates[0..size]), &shape, .float32), dtype);
+        var up = try g.astype(try g.hostArray(std.mem.sliceAsBytes(ups[0..size]), &shape, .float32), dtype);
+        if (strided) {
+            gate = try g.slice(gate, &.{ 0, 0, 0 }, &shape, &.{ 1, 1, 2 });
+            up = try g.slice(up, &.{ 0, 0, 0 }, &shape, &.{ 1, 1, 2 });
+        }
+        const output_size: usize = @intCast(mlx.mlx_array_size(gate));
         const config: C = .{};
         const want = try ops.activateReference(&g, gate, up, &config);
         const got = try run(&g, gate, up, &config);
-        _ = try g.hostF32(try g.astype(want, .float32), expected[0..size]);
-        _ = try g.hostF32(try g.astype(got, .float32), actual[0..size]);
-        for (actual[0..size], expected[0..size], 0..) |a, e, i| {
+        _ = try g.hostF32(try g.astype(want, .float32), expected[0..output_size]);
+        _ = try g.hostF32(try g.astype(got, .float32), actual[0..output_size]);
+        for (actual[0..output_size], expected[0..output_size], 0..) |a, e, i| {
             if (std.math.isNan(e)) {
                 try std.testing.expect(std.math.isNan(a));
             } else if (@as(u32, @bitCast(a)) != @as(u32, @bitCast(e))) {

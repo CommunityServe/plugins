@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/attention.zig@dc508a5da248397f6c952e75839f1de58aab5be2
+//! copied_from: src/plugins/minimax_m3/attention.zig@9df2c52b504cce5bbf22f074dab168fd8584f961
 //! Serial text attention with per-index-head sparse block masks. Index keys are
 //! retained even before sparsity activates, so later queries can select old blocks.
 const std = @import("std");

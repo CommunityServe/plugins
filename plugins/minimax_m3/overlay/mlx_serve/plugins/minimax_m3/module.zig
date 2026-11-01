@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/module.zig@dc508a5da248397f6c952e75839f1de58aab5be2
+//! copied_from: src/plugins/minimax_m3/module.zig@9df2c52b504cce5bbf22f074dab168fd8584f961
 //! MiniMax M3.1 Flash text execution. The first implementation uses serial prompt
 //! tokens, bounded expert slots and exact per-index-head sparse block selection.
 const std = @import("std");

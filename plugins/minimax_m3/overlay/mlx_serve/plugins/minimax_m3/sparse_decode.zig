@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/sparse_decode.zig@dc508a5da248397f6c952e75839f1de58aab5be2
+//! copied_from: src/plugins/minimax_m3/sparse_decode.zig@9df2c52b504cce5bbf22f074dab168fd8584f961
 //! Standalone GPU sparse selection and selected-block attention for B=1,L=1.
 //! Ordinary Metal SIMD kernels cover M2; no NAX, tensor instructions or Steel
 //! headers are required. Callers retain the existing projection/norm/RoPE path.

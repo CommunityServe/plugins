@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/serial_step.zig@dc508a5da248397f6c952e75839f1de58aab5be2
+//! copied_from: src/plugins/minimax_m3/serial_step.zig@9df2c52b504cce5bbf22f074dab168fd8584f961
 const std = @import("std");
 pub fn run(comptime Tensor: type, executor: anytype, ids: []const u32) !Tensor {
     if (ids.len == 0) return error.MiniMaxEmptyStep;
