@@ -103,6 +103,9 @@ pub const engram_direct = @import("src/engram_direct.zig");
 /// src/engram_decode.zig): an LRU a prompt grid's rows, the decode reads' and the rounds' bonus rows go into, a decode
 /// read's misses read on a pool; read by the copied Engram tables and model.
 pub const engram_decode = @import("src/engram_decode.zig");
+/// A greedy round's next draft launched at the end of the round before it (`MLX_SERVE_DSV41_DRAFT_AHEAD`,
+/// src/draft_ahead.zig).
+pub const draft_ahead = @import("src/draft_ahead.zig");
 /// The wide prompt layers' per-prompt regions (src/scratch.zig), read by the copied model and stream.
 pub const scratch = @import("src/scratch.zig");
 /// A wide prompt call's DIG-X waves write into per-prompt regions (`MLX_SERVE_DSV41_SCRATCH_WAVES`,
@@ -347,6 +350,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     // Before the model's load: the bank's bill takes the LRU's bytes beside the host's (the load line says the rows).
     bill.engram_store_bytes = engram_decode.billBytes();
+    draft_ahead.configure(env.span(.MLX_SERVE_DSV41_DRAFT_AHEAD)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DRAFT_AHEAD is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     scratch_x1.configure(env.span(.MLX_SERVE_DSV41_SCRATCH)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -524,6 +534,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (stage_next.on) log.info("[turboexl3_ds41] {s}\n", .{if (stage_next.skip_own) "a wide prompt layer the call before it read ahead for skips its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own: its own too)" else "every wide prompt layer also runs its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own)"});
     if (engram_direct.on) log.info("[turboexl3_ds41] a prompt's Engram rows read once a table, past the page cache through their file system blocks, on up to 64 threads (MLX_SERVE_DSV41_ENGRAM_DIRECT=0: span by span through the page cache)\n", .{}) else log.info("[turboexl3_ds41] Engram rows read span by span through the page cache (MLX_SERVE_DSV41_ENGRAM_DIRECT=0)\n", .{});
     engram_decode.start();
+    switch (draft_ahead.mode) {
+        .off => log.info("[turboexl3_ds41] a greedy round's draft launched at its own start (MLX_SERVE_DSV41_DRAFT_AHEAD=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] a greedy round's next draft launched at the end of the round before it (MLX_SERVE_DSV41_DRAFT_AHEAD; =0 off): from its next token once its state is committed, when the next plan is the stages' block; the next round takes it when it fits; [draft-ahead] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] a greedy round's next draft launched ahead, checked (MLX_SERVE_DSV41_DRAFT_AHEAD=check): the next round makes its own too, compares ids and confidences word for word and serves its own; [draft-ahead] checks= words= differ= at each request's end\n", .{}),
+    }
     switch (engram_decode.mode) {
         .off => log.info("[turboexl3_ds41] a decode read's Engram rows read from the tables every time (MLX_SERVE_DSV41_ENGRAM_DECODE=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] Engram rows kept across a conversation's turns (MLX_SERVE_DSV41_ENGRAM_DECODE; =0 off): an LRU of {d} MiB (MLX_SERVE_DSV41_ENGRAM_LRU_MB) billed at load, {s}every row a decode read reads put in; a decode read takes the rows it holds and reads the others on a {d}-thread pool; a round's bonus token's rows read while its draft runs; [engram-decode] lines at each request's end\n", .{ engram_decode.lru_mb, if (engram_direct.on) "a prompt grid's distinct rows and " else "(no prompt rows: MLX_SERVE_DSV41_ENGRAM_DIRECT=0) ", engram_decode.pool_threads }),
@@ -622,6 +637,7 @@ fn ioSnap(m: *ds.Model) round_io.Snap {
 fn unload(mp: *anyopaque) callconv(.c) void {
     dropOpen(model(mp));
     dropPending();
+    dropAhead();
     if (drafter) |*d| d.deinit();
     drafter = null;
     ds.table.unload(mp);
@@ -697,9 +713,12 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
     const max = @min(dsv41.maxVerifyDrafts(m.mdl), @as(usize, accept_cap), abi.max_round_tokens - 1);
     const plan = dr.plan(st.n, t1, max, accept_cap, m.mdl.ds_block);
     if (plan == .stage) {
-        // MLX_SERVE_DSV41_ENGRAM_DECODE: the bonus token's Engram rows read while the draft runs.
-        dsv41.engramEarly(m.mdl, st, t1);
-        var d = try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
+        // MLX_SERVE_DSV41_DRAFT_AHEAD: the draft the round before launched, when it fits.
+        var d = if (try aheadTake(m, st, t1)) |a| a else blk: {
+            // MLX_SERVE_DSV41_ENGRAM_DECODE: the bonus token's Engram rows read while the draft runs.
+            dsv41.engramEarly(m.mdl, st, t1);
+            break :blk try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
+        };
         errdefer d.deinit(gpa);
         d.len = dr.cut(d.confidence[0..@min(d.len, max)]);
         routesRound(m, "stage", st.n, d.ids[0 .. d.len + 1]);
@@ -707,6 +726,8 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
         @memcpy(round.conf[0..d.len], d.confidence[0..d.len]);
         return .{ .d = d, .round = round };
     }
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: a launched draft no stage round takes.
+    dropAhead();
     const copied: []const u32 = if (plan == .copy) plan.copy else &.{};
     const ids = try gpa.alloc(u32, copied.len + 1);
     ids[0] = t1;
@@ -734,6 +755,7 @@ fn msOf(ns: u64) f32 {
 
 fn roundFailed(e: anyerror) Verdict {
     round_io.abandon();
+    dropAhead();
     log.err("[turboexl3_ds41] draft round failed: {s}\n", .{@errorName(e)});
     if (drafter) |*d| d.history.lose();
     return Verdict.named(.failed, @errorName(e));
@@ -772,7 +794,60 @@ fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callco
     fillRound(&out.round, r.tokens, @intCast(p.d.len + 1), st.n);
     out.round.accepted = r.accepted;
     out.round.next_token = r.next_token;
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: the next round's draft from this round's next token, launched before the engine's
+    // turn (the cap the next round would get: this one's less the tokens it kept).
+    if (draft_ahead.on()) aheadLaunch(m, st, r.next_token, f.accept_cap -| @as(u32, @intCast(r.tokens.len)));
     return .ok;
+}
+
+/// MLX_SERVE_DSV41_DRAFT_AHEAD: the launched draft the next greedy round may take (one at most).
+var ahead: ?dsv41.DraftAhead = null;
+
+/// MLX_SERVE_DSV41_DRAFT_AHEAD: the launched draft let go (its GPU work runs out), counted dropped.
+fn dropAhead() void {
+    if (ahead) |*a| {
+        a.deinit();
+        ahead = null;
+        draft_ahead.dropped += 1;
+    }
+}
+
+/// MLX_SERVE_DSV41_DRAFT_AHEAD: the next greedy round's draft from `t1` launched now, when that round's plan would be the
+/// stages' block (`rounds.Drafter.wouldStage` at the cap `cap`); its bonus token's Engram rows read early with it.
+fn aheadLaunch(m: *ds.Model, st: *dsv41.State, t1: u32, cap: u32) void {
+    dropAhead();
+    const dr = if (drafter) |*d| d else return;
+    if (!dsv41.draftAheadOk(m.mdl)) return;
+    const max = @min(dsv41.maxVerifyDrafts(m.mdl), @as(usize, cap), abi.max_round_tokens - 1);
+    if (!dr.wouldStage(st.n, t1, max, cap, m.mdl.ds_block)) return;
+    // MLX_SERVE_DSV41_ENGRAM_DECODE: the bonus token's Engram rows read while the draft runs.
+    dsv41.engramEarly(m.mdl, st, t1);
+    ahead = dsv41.dsparkDraftLaunch(m.mdl, gpa, st, t1) catch {
+        draft_ahead.failed += 1;
+        return;
+    };
+    draft_ahead.launched += 1;
+}
+
+/// MLX_SERVE_DSV41_DRAFT_AHEAD: the launched draft read, when it is the one `dsparkDraft` would make now (a greedy round,
+/// the same token, position and state), else dropped; with `check` the round's own draft is made too, compared with it
+/// and served. Null: no draft fits.
+fn aheadTake(m: *ds.Model, st: *dsv41.State, t1: u32) !?dsv41.DsparkDraft {
+    if (ahead == null) return null;
+    if (!drafter.?.greedy or !dsv41.draftAheadFits(m.mdl, st, &ahead.?, t1)) {
+        dropAhead();
+        return null;
+    }
+    var a = ahead.?;
+    ahead = null;
+    defer a.deinit();
+    var d = try dsv41.dsparkDraftCollect(m.mdl, gpa, &a);
+    draft_ahead.taken += 1;
+    if (draft_ahead.mode != .check) return d;
+    defer d.deinit(gpa);
+    const own = try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
+    draft_ahead.compare(d.ids, own.ids, d.confidence, own.confidence, d.len, own.len);
+    return own;
 }
 
 /// The first half of a round the engine accepts under its own sampling: the verified rows' ids and logits.
@@ -785,6 +860,8 @@ fn draftVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const t1 = f.tokens.slice()[0];
     const rec = tlBegin(m);
     drafter.?.greedy = false;
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: a sampled round takes no launched draft.
+    dropAhead();
     var p = draft(m, &drafter.?, st, t1, f.accept_cap) catch |e| return roundFailed(e);
     defer p.d.deinit(gpa);
     p.round.tl = rec;
@@ -853,6 +930,8 @@ fn dropPending() void {
 /// a decode token the forward keeps on the GPU read once the forward has read it (at the next round or forward).
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     round_io.abandon();
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: a forward moves the state past any launched draft.
+    dropAhead();
     const dr = if (drafter) |*d| d else return ds.table.forward(mp, f, out);
     settlePending(dr);
     const at: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
@@ -881,6 +960,8 @@ var req_kept: usize = 0;
 
 /// The built-in's resume: the drafter's request begins on the prompt prefix the state kept.
 fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: a new prompt's state takes no launched draft.
+    dropAhead();
     const n = ds.table.cache.resume_prompt.?(mp, slot, prompt, media_rows);
     req_prompt = prompt.len;
     req_kept = @min(@as(usize, @intCast(n)), prompt.len);
@@ -911,7 +992,10 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const dp = if (partsSnap(model(mp))) |ps| direct_parts.meters(ps, meter_buf[n0..]) else meter_buf[n0..n0];
     const swl = scratch_waves.meters(meter_buf[n0 + dp.len ..]);
     const edl = engram_decode.meters(meter_buf[n0 + dp.len + swl.len ..]);
-    const n = n0 + dp.len + swl.len + edl.len;
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: the request's last round's launched draft has no round after it.
+    dropAhead();
+    const dal = draft_ahead.meters(meter_buf[n0 + dp.len + swl.len + edl.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }

@@ -418,6 +418,15 @@ pub const Drafter = struct {
         return .stage;
     }
 
+    /// MLX_SERVE_DSV41_DRAFT_AHEAD (src/draft_ahead.zig): whether `plan` would return `.stage` for these arguments now,
+    /// without its effects: the copy check as `plan` makes it, and the stages' block only where `plan` gives it without
+    /// the ladder or the backoff (the policy off, or the fixed policy standing aside on a greedy round).
+    pub fn wouldStage(self: *const Drafter, n: usize, t1: u32, max: usize, remaining: u32, block: usize) bool {
+        if (max == 0) return false;
+        if (self.on.copy and copyDrafts(&self.history, n, t1, max, remaining, block).len > 0) return false;
+        return !self.on.policy or self.fixedGreedy();
+    }
+
     /// The drafts of a stage block a round verifies, `conf` the block's confidence logits: the policy's cut, or all.
     /// All as well when the whole block's cell is due a refresh (`Ladder.due`), on any stage round, the backoff's probes
     /// (the rounds that draft within a skip stretch) included, so it never drafts a round the backoff would not. The

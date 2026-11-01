@@ -472,6 +472,22 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   identical in every arm and mode, the check arm's differ 0): greedy 56.15 -> 56.53 tok/s (+0.67%, round 89.43 ->
   88.85 ms), card +0.23%, a second turn +0.65%; the first Engram layer's wait 0.016 ms a greedy round in the b arms
   (0.734 in the check arm, which reads every row); the bank's decode rows 178 -> 177 (the LRU's 256 MiB).
+- `MLX_SERVE_DSV41_DRAFT_AHEAD` (src/draft_ahead.zig, patches/turboexl3-zzz8v-draft-ahead.patch; on, `=0` off,
+  `=check` on and checked): a greedy round's next DSpark draft launched at the end of the round before it. A greedy
+  round ends with its state committed and its next token known; with `=0`, the next round's draft goes to the GPU only
+  after the host's bookkeeping, the engine's turn and the round's start (its checks and plan), the GPU idle meanwhile
+  (tp1: 0.63 ms median from the verify's last kernel to the draft's first). On, `draftStep` launches the next round's
+  draft from its next token right after its bookkeeping, when the next plan would be the stages' block
+  (`rounds.Drafter.wouldStage`): the draft's graph built from the committed state and handed to the GPU, not read
+  (`dsparkDraftLaunch`); the next round takes it when it fits (a greedy round, its plan the stages' block, the same
+  token, position and state; `dsparkDraftCollect`), any other entry drops it. `=check` makes the round's own draft too,
+  compares the ids and confidences word for word and serves its own. `[draft-ahead] mode= launched= taken= dropped=
+  failed=` (and `checks= words= differ=`) at each request's end. Exact: the same ops on the same state, launched
+  earlier. pd1 (w-20261101-2249, two binaries, ABBA + BAAB, margin 2, EVICT, COOL; a: ctl23, b: ctl23 + this code;
+  texts identical in every arm and mode, the check arm's 106 compares 0 differing): greedy 56.03 -> 56.33 tok/s
+  (+0.54%), card 44.33 -> 44.53 (+0.45%); 107 drafts launched ahead a greedy request, 106 taken. `[round-io]`
+  `round_ms` (a round's draft start to its commit) drops more, 89.60 -> 86.79 ms greedy, as the launch now comes after
+  the commit, outside that span: tok/s is the measure.
 - `MLX_SERVE_DSV41_SCRATCH_ATTN` (src/scratch_attn.zig, src/attn_twins.zig, patches/turboexl3-zzz8p-scratch-attn.patch;
   on, `=0` off, `=check`): a wide prompt layer's attention spans write their scores (f32 [L, H, NK]) and probabilities
   (f16) into a ring of two per-prompt slots (S and P, 256 x 64 x 640 words a slot, 126 MB) instead of fresh MLX buffers:
