@@ -8,6 +8,7 @@ const model = @import("../model.zig");
 const expert_io = @import("../expert_io.zig");
 const log = @import("../log.zig");
 const vision = @import("dsv41_vision.zig");
+const exl3 = @import("sushi_exl3");
 
 pub const Parts = struct {
     /// Routed experts as stacked-at-load banks (a checkpoint small enough to hold them); streamed ones are not read here.
@@ -25,8 +26,13 @@ pub fn isVisionKey(key: []const u8) bool {
     return std.mem.endsWith(u8, key, ".bias_vl");
 }
 
+/// Key prefix of the zero pad tensors a repacked shard carries.
+pub const pad_prefix = "__pad__.";
+
 /// Does the resident load keep `key`?
 pub fn keeps(key: []const u8, parts: Parts) bool {
+    // A repacked shard's zero fill that puts the next trellis on a page; it is no weight.
+    if (std.mem.startsWith(u8, key, pad_prefix)) return false;
     // A DSpark draft is text: its stages' image routing biases are never read.
     if (std.mem.startsWith(u8, key, "mtp.")) return parts.dspark and !std.mem.endsWith(u8, key, ".bias_vl");
     if (isVisionKey(key)) return parts.vision;
@@ -139,6 +145,42 @@ pub fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8,
     return weights;
 }
 
+/// The pack's routed trellis tensors against the `order` its config names, before any weight loads: each is stored
+/// under that order's name, has that order's grid for a `hidden` x `inter` expert, and lies in a shard that stamps it.
+pub fn validateTileOrder(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, order: exl3.format.TileOrder, hidden: u32, inter: u32) !void {
+    const marker = ".mlp.switch_mlp.";
+    var shards = try shardNames(io, allocator, dir_path);
+    defer freeShardNames(allocator, &shards);
+    var seen_pack = false;
+    var seen_major = false;
+    for (shards.items) |name| {
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
+        defer allocator.free(path);
+        const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
+        defer _ = std.c.close(fd);
+        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
+        defer header.deinit();
+        var holds = false;
+        var tensors = header.parsed.value.object.iterator();
+        while (tensors.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const at = std.mem.indexOf(u8, key, marker) orelse continue;
+            const parsed = exl3.group_layout.Name.parse(key[at + marker.len ..]) catch continue;
+            if (parsed.part != 0) continue;
+            holds = true;
+            if (parsed.pair_major) seen_major = true else seen_pack = true;
+            if (seen_major and seen_pack) return error.Exl3TileOrderMixed;
+            if (parsed.tileOrder() != order) return error.Exl3TileOrderMismatch;
+            const dims = (entry.value_ptr.object.get("shape") orelse return error.InvalidSafetensorsHeader).array.items;
+            var shape: [5]u64 = undefined;
+            if (dims.len > shape.len) return error.Exl3GroupGeometry;
+            for (dims, 0..) |d, i| shape[i] = std.math.cast(u64, d.integer) orelse return error.InvalidSafetensorsHeader;
+            _ = try exl3.group_layout.trellisRate(order, shape[0..dims.len], if (parsed.projection == 2) inter else hidden, if (parsed.projection == 2) hidden else inter);
+        }
+        if (holds) try exl3.shardTileOrderAgrees(order, expert_io.metadataString(header.parsed.value.object, "tile_order"));
+    }
+}
+
 /// Bytes the resident load holds once built: the stored tensors, the head widened to f32, and each
 /// fp8 weight's 32x32 scale grid spread over its rows.
 pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !u64 {
@@ -235,7 +277,7 @@ fn raggedSlot(key: []const u8) ?usize {
     if (stage >= 16 or !std.mem.startsWith(u8, rest, mid)) return null;
     const tail = rest[mid.len..];
     const proj: usize = if (std.mem.startsWith(u8, tail, "gate_proj")) 0 else if (std.mem.startsWith(u8, tail, "up_proj")) 1 else if (std.mem.startsWith(u8, tail, "down_proj")) 2 else return null;
-    const part: usize = if (std.mem.endsWith(u8, tail, ".trellis")) 0 else if (std.mem.endsWith(u8, tail, ".suh")) 1 else if (std.mem.endsWith(u8, tail, ".svh")) 2 else return null;
+    const part: usize = if (std.mem.endsWith(u8, tail, ".trellis") or std.mem.endsWith(u8, tail, ".trellis_pm")) 0 else if (std.mem.endsWith(u8, tail, ".suh")) 1 else if (std.mem.endsWith(u8, tail, ".svh")) 2 else return null;
     return stage * 9 + part * 3 + proj;
 }
 

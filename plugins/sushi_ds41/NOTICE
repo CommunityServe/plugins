@@ -3,3 +3,5 @@ sushi-ds41 vendors a slice of sushi (MIT, Theinruj Toranavikrai and David Dalcu)
 model.zig, transformer.zig, status.zig, scheduler.zig, test_models.zig, tokenizer.zig, dflash.zig and dsv41/transient_peak.zig
 there are this repo's own cut edges. It is built against the mlx-serve plugin kit.
 The sync then applies this repo's edits to the copy: patches/*.patch.
+The pair-major pack layout (patches/pair-major.patch) is sushi commits 84b25bc9 and 987daf4b, and tileMajorInverse of efc09f2b,
+ported onto that copy.

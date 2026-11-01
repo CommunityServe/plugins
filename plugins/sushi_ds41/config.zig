@@ -15,7 +15,7 @@ const formats = [_][]const u8{"stq"};
 const gpa = std.heap.c_allocator;
 
 /// What `bill` and `load` read.
-pub const Private = struct { cfg: sc.Config, exl3_n: u32, exl3_rates: ?u128, dspark: bool };
+pub const Private = struct { cfg: sc.Config, exl3_n: u32, exl3_rates: ?u128, tile_order: exl3.format.TileOrder, dspark: bool };
 
 pub fn private(p: *const abi.Parsed) *const Private {
     return @ptrCast(@alignCast(p.private.?));
@@ -100,9 +100,13 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     errdefer gpa.destroy(priv);
     priv.cfg = sc.parse(text, o) catch return refuse("config.json is not a DeepSeek-V4.1 geometry sushi serves");
     if (priv.cfg.expert_dec == null or priv.cfg.trunk_dec == null) return refuse("an STQ pack names both expert_quant and trunk_quant");
-    const experts = exl3.parseQuantBlock(o.get("expert_quant").?) catch return refuse("expert_quant does not parse");
+    const experts = exl3.parseExpertQuant(o) catch |e| return switch (e) {
+        error.Exl3TileOrderUnsupported => abi.Verdict.refuse(.unsupported, "sushi_ds41: expert_quant.tile_order is not one this plugin loads (absent, or pair_major)"),
+        else => refuse("expert_quant does not parse"),
+    };
     priv.exl3_n = experts.rate.n;
     priv.exl3_rates = experts.rates;
+    priv.tile_order = experts.tile_order;
     priv.dspark = priv.cfg.dspark.block > 0 and priv.cfg.n_mtp > 0 and mtpAllowed(settings_json.slice()) and shipsStages(dir);
     const c = &priv.cfg;
     var p: abi.Parsed = .{
@@ -193,4 +197,38 @@ test "sushi_ds41 arms its native drafter only for a pack that ships the stages a
     try testing.expect(parse(&dir, abi.Str.of(stq), abi.Str.of("{\"mtp\":false}"), null, true, &off).isOk());
     defer freeParsed(&off);
     try testing.expectEqual(@as(u32, 0), off.spec.native_stages);
+}
+
+/// `stq` with `"tile_order": <value>` added to its expert_quant block (the first `"format": "stq"`).
+fn stqWithOrder(a: std.mem.Allocator, value: []const u8) ![]u8 {
+    const at = std.mem.indexOf(u8, stq, "\"format\": \"stq\",") orelse return error.FixtureConfig;
+    const open = at + "\"format\": \"stq\",".len;
+    return std.fmt.allocPrint(a, "{s} \"tile_order\": {s},{s}", .{ stq[0..open], value, stq[open..] });
+}
+
+fn parseOrder(json: []const u8) !exl3.format.TileOrder {
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    const verdict = parse(&dir, abi.Str.of(json), .{}, null, true, &p);
+    if (!verdict.isOk()) {
+        try testing.expect(std.mem.indexOf(u8, verdict.why.slice(), "tile_order") != null);
+        return error.Refused;
+    }
+    defer freeParsed(&p);
+    return private(&p).tile_order;
+}
+
+test "sushi_ds41 tile order: absent is the pack order, pair_major is read, any other value is refused by name" {
+    try testing.expectEqual(exl3.format.TileOrder.pack, try parseOrder(stq));
+    const major = try stqWithOrder(testing.allocator, "\"pair_major\"");
+    defer testing.allocator.free(major);
+    try testing.expectEqual(exl3.format.TileOrder.pair_major, try parseOrder(major));
+    // A pair-major pack is still an STQ pack: the claim does not change.
+    try testing.expectEqual(kit.abi.common.Claim.by_marker, claimOf(major));
+    for ([_][]const u8{ "\"pack\"", "\"Pair_Major\"", "\"\"", "1", "null", "true" }) |bad| {
+        const json = try stqWithOrder(testing.allocator, bad);
+        defer testing.allocator.free(json);
+        try testing.expectError(error.Refused, parseOrder(json));
+    }
 }

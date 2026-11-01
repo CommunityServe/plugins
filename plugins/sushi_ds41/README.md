@@ -48,6 +48,14 @@ simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2
   bf16 tower is requantized to affine 8-bit (group 128) at load, as sushi does.
 - Token embedding: an affine-quantized embedding stays in its shard and a forward reads its rows from SSD, as sushi does;
   the bytes it frees go to the expert cache.
+- Pack layouts: both of sushi's STQ layouts load. The legacy one stores each routed trellis as `trellis`; the pair-major one
+  (`expert_quant.tile_order: "pair_major"`, as `sushi repack` writes it) stores it as `trellis_pm`, already in the
+  order the kernels read, so a fill copies it without the CPU tile shuffle the legacy layout needs. The zero
+  `__pad__.<shard>.<i>` tensors that page-align each `trellis_pm` are never loaded or billed, and where every trellis
+  sits on a 16 KiB page the experts read straight into page-aligned pools. A pack that mixes `trellis` and `trellis_pm`,
+  names a `tile_order` other than `pair_major`, or whose config, tensor names, shapes and shard stamps disagree on the
+  order is refused by name before a weight loads. Greedy text is the same on both layouts. The edit to the slice is
+  `patches/pair-major.patch` (sushi 84b25bc9 and 987daf4b, with `tileMajorInverse` of efc09f2b).
 - Memory: sushi runs each forward under an MLX transient cap that needs its patched MLX; mlx-serve's MLX has none, so
   the plugin keeps its own buffer-pool caps and bills the prefill pool in the expert room.
 - Attention: on an M5 GPU (`applegpu_g17` or later, macOS 26.2 or later) a prompt's wide spans run on the matrix

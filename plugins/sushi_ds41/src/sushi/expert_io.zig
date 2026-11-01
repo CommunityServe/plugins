@@ -212,6 +212,11 @@ fn spanLess(_: void, a: FillSpan, b: FillSpan) bool {
     return a.offset < b.offset;
 }
 
+fn onPages(s: FillSpan) bool {
+    const page: u64 = @intCast(pageSize());
+    return s.offset % page == 0 and s.len % page == 0 and @intFromPtr(s.dst) % page == 0;
+}
+
 pub fn coalesceSpans(allocator: std.mem.Allocator, spans: []const FillSpan, max_bytes: u64) ![]ReadJob {
     if (max_bytes == 0) return error.InvalidCoalesceBound;
     var jobs: std.ArrayList(ReadJob) = .empty;
@@ -229,6 +234,10 @@ pub fn coalesceSpans(allocator: std.mem.Allocator, spans: []const FillSpan, max_
             if (next.len == 0) return error.InvalidFillSpan;
             if (next.file != file or next.offset != offset + len) break;
             if (next.tile != null or spans[first].tile != null) break;
+            // A page-aligned span whose neighbour in the file lands elsewhere reads alone, straight into its slot,
+            // instead of inside a bounced run.
+            const prev = spans[i - 1];
+            if (next.dst != prev.dst + @as(usize, @intCast(prev.len)) and (onPages(prev) or onPages(next))) break;
             if (len + next.len > max_bytes) break;
             len += next.len;
         }
@@ -252,12 +261,16 @@ fn jobIsDirect(spans: []const FillSpan, job: ReadJob, page: u64) bool {
     return true;
 }
 
+/// A read's latency in bytes the SSD could move meanwhile; without it a byte split piles a run of small reads onto
+/// one worker.
+pub const READ_COST_BYTES: u64 = 1 << 20;
+
 pub fn partitionByMidpoint(allocator: std.mem.Allocator, jobs: []const ReadJob, workers: usize) ![]usize {
     if (workers == 0) return error.InvalidFillPool;
     const bounds = try allocator.alloc(usize, workers + 1);
     errdefer allocator.free(bounds);
     var total: u64 = 0;
-    for (jobs) |j| total += j.len;
+    for (jobs) |j| total += j.len + READ_COST_BYTES;
     for (bounds) |*b| b.* = jobs.len;
     bounds[0] = 0;
     if (total == 0 or jobs.len == 0) {
@@ -268,11 +281,11 @@ pub fn partitionByMidpoint(allocator: std.mem.Allocator, jobs: []const ReadJob, 
     var owner = try allocator.alloc(usize, jobs.len);
     defer allocator.free(owner);
     for (jobs, 0..) |j, i| {
-        const mid = cursor + j.len / 2;
+        const mid = cursor + (j.len + READ_COST_BYTES) / 2;
         var w = @as(usize, @intCast(mid * @as(u64, workers) / total));
         if (w >= workers) w = workers - 1;
         owner[i] = w;
-        cursor += j.len;
+        cursor += j.len + READ_COST_BYTES;
     }
     var w: usize = 0;
     var i: usize = 0;
@@ -320,6 +333,9 @@ pub const FillStats = struct {
     bytes_read: u64 = 0,
     bytes_issued: u64 = 0,
     bytes_bounced: u64 = 0,
+    /// Tile bytes `layout.tileMajor` moved on the CPU while landing them.
+    bytes_reshuffled: u64 = 0,
+    reads_direct: u64 = 0,
     reads_issued: u64 = 0,
     pread_ns: u64 = 0,
     max_worker_bytes: u64 = 0,
@@ -574,6 +590,7 @@ pub const FillPool = struct {
         const job = plan.jobs[index];
         const len: usize = @intCast(job.len);
         var head: usize = 0;
+        var reshuffled: u64 = 0;
         var read_offset: u64 = job.offset;
         var target: []u8 = undefined;
         if (job.direct) {
@@ -617,6 +634,7 @@ pub const FillPool = struct {
                 if (s1.tile) |tile| if (take == sl) {
                     const bytes = 2 * @as(usize, tile.n);
                     layout.tileMajor(u8, s1.dst[0..sl], target[head + written ..][0..sl], tile.it, tile.ot, bytes);
+                    reshuffled += sl;
                     written += sl;
                     continue;
                 };
@@ -628,6 +646,8 @@ pub const FillPool = struct {
         self.stats_acc.bytes_read += delivered;
         self.stats_acc.bytes_issued += result.done;
         self.stats_acc.bytes_bounced += if (job.direct) 0 else delivered;
+        self.stats_acc.bytes_reshuffled += reshuffled;
+        self.stats_acc.reads_direct += @intFromBool(job.direct);
         self.stats_acc.reads_issued += 1;
         self.stats_acc.pread_ns += elapsed;
         self.workers[worker].bytes += delivered;
@@ -1320,7 +1340,7 @@ pub const TensorRegion = struct {
     data_offset: u64,
     tensor_offset: u64,
     tensor_bytes: u64,
-    shape: [4]u64,
+    shape: [5]u64,
     rank: u8,
     dtype: Dtype,
 };
@@ -1361,6 +1381,14 @@ pub const SafetensorsHeader = struct {
         self.parsed.deinit();
     }
 };
+
+/// The string a shard's `__metadata__` holds under `key` (the empty string for a value that is not one), or null.
+pub fn metadataString(header: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const meta = header.get("__metadata__") orelse return null;
+    if (meta != .object) return null;
+    const v = meta.object.get(key) orelse return null;
+    return if (v == .string) v.string else "";
+}
 
 /// Fills `window` (page-aligned, starting at the page-aligned file offset `start`) until file
 /// offset `end` is covered; the read may stop short of the last page at end of file.
@@ -1496,8 +1524,8 @@ pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u
     else
         .other;
     const shape = object.get("shape") orelse return error.InvalidSafetensorsTensor;
-    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 4) return error.InvalidSafetensorsTensor;
-    var dimensions: [4]u64 = .{ 0, 0, 0, 0 };
+    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 5) return error.InvalidSafetensorsTensor;
+    var dimensions: [5]u64 = .{ 0, 0, 0, 0, 0 };
     var elements: u64 = 1;
     for (shape.array.items, 0..) |dim, i| {
         if (dim != .integer or dim.integer <= 0) return error.InvalidSafetensorsTensor;

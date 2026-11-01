@@ -160,6 +160,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             error.OutOfMemory => Verdict.refuse(.failed, "sushi_ds41: out of memory"),
             error.SsdBudgetBelowResident => Verdict.refuse(.too_large, "sushi_ds41: the streamed experts do not fit the free memory"),
             error.MetalOnly => Verdict.refuse(.unsupported, "sushi_ds41: its kernels run on Metal only"),
+            error.Exl3TileOrderMixed => Verdict.refuse(.unsupported, "sushi_ds41: the pack mixes trellis and trellis_pm tensors"),
+            error.Exl3TileOrderMismatch, error.Exl3ShardStampMismatch, error.Exl3GroupGeometry => Verdict.refuse(.unsupported, "sushi_ds41: the pack's tile order disagrees between config.json, tensor names, shapes and shard stamps"),
             else => Verdict.refuse(.failed, "sushi_ds41: the pack does not load"),
         };
         return null;
@@ -184,7 +186,10 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         .intermediate = c.moe_inter,
         .exl3_n = priv.exl3_n,
         .exl3_rates = priv.exl3_rates,
+        .tile_order = priv.tile_order,
     };
+    // The index, the tensor shapes and the shard stamps must all name the order the config does, before any weight loads.
+    try source.validateTileOrder(io, gpa, dir, priv.tile_order, c.dim, c.moe_inter);
     const per = try stream.expertBillFor(gpa, dir, geo, .exl3_k4);
     geo.shape = per.shape;
     geo.shape.pool_bytes = pool_bytes;
@@ -524,6 +529,7 @@ test {
     _ = config;
     _ = attn_nax;
     _ = @import("src/all_resident_test.zig");
+    _ = @import("src/pair_major_test.zig");
     _ = ablation;
     _ = tap_files;
 }

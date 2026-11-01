@@ -8,6 +8,8 @@ pub const Name = struct {
     projection: u32,
     part: u32,
     grouped: bool,
+    /// The trellis is stored `trellis_pm`, in `format.TileOrder.pair_major`.
+    pair_major: bool = false,
 
     pub fn parse(name: []const u8) !Name {
         var it = std.mem.splitScalar(u8, name, '.');
@@ -23,17 +25,41 @@ pub const Name = struct {
             if (group >= max_groups) return error.Exl3GroupNameInvalid;
             leaf = it.next() orelse return error.Exl3GroupNameInvalid;
         }
-        const part: u32 = if (std.mem.eql(u8, leaf, "trellis")) 0 else if (std.mem.eql(u8, leaf, "suh")) 1 else if (std.mem.eql(u8, leaf, "svh")) 2 else return error.Exl3GroupNameInvalid;
+        const pair_major = std.mem.eql(u8, leaf, "trellis_pm");
+        const part: u32 = if (pair_major or std.mem.eql(u8, leaf, "trellis")) 0 else if (std.mem.eql(u8, leaf, "suh")) 1 else if (std.mem.eql(u8, leaf, "svh")) 2 else return error.Exl3GroupNameInvalid;
         if (it.next() != null) return error.Exl3GroupNameInvalid;
-        return .{ .group = group, .projection = p, .part = part, .grouped = grouped };
+        return .{ .group = group, .projection = p, .part = part, .grouped = grouped, .pair_major = pair_major };
+    }
+
+    pub fn tileOrder(self: Name) format.TileOrder {
+        return if (self.pair_major) .pair_major else .pack;
     }
 };
+
+pub const TileDims = struct { it: u64, ot: u64, n: u64 };
+
+/// The tile grid of a trellis tensor: `[E, IT, OT, n]`, or `[E, OT/2, IT, 2, n]` for `pair_major`; null when the
+/// shape is not that order's.
+pub fn tileDims(order: format.TileOrder, shape: []const u64) ?TileDims {
+    return switch (order) {
+        .pack => if (shape.len == 4) .{ .it = shape[1], .ot = shape[2], .n = shape[3] } else null,
+        .pair_major => if (shape.len == 5 and shape[3] == 2) .{ .it = shape[2], .ot = shape[1] * 2, .n = shape[4] } else null,
+    };
+}
 
 pub const Group = struct {
     experts: u32 = 0,
     rates: [3]format.Rate = @splat(.{ .n = 0 }),
     mask: u16 = 0,
 };
+
+/// The rate of a trellis tensor of `order` over an `input` x `output` projection: its grid must be that projection's.
+pub fn trellisRate(order: format.TileOrder, shape: []const u64, input: u32, output: u32) !format.Rate {
+    const dims = tileDims(order, shape) orelse return error.Exl3GroupGeometry;
+    if (dims.it != input / 16 or dims.ot != output / 16) return error.Exl3GroupGeometry;
+    const halfwords = std.math.cast(usize, dims.n) orelse return error.Exl3TrellisGeometry;
+    return format.kFromPackedDim(halfwords) orelse error.Exl3TrellisGeometry;
+}
 
 pub const Layout = struct {
     hidden: u32,
@@ -44,6 +70,8 @@ pub const Layout = struct {
     groups: [max_groups]Group = @splat(.{}),
     count: usize = 0,
     grouped: ?bool = null,
+    /// The order of the layer's trellis tensors; null before the first.
+    tile_order: ?format.TileOrder = null,
     /// The streaming engine serves rate groups (pruned layers still refuse it).
     streams_groups: bool = false,
     bytes: u64 = 0,
@@ -59,14 +87,15 @@ pub const Layout = struct {
         const input = if (name.projection == 2) self.intermediate else self.hidden;
         const output = if (name.projection == 2) self.hidden else self.intermediate;
         if (input == 0 or output == 0 or input % 128 != 0 or output % 128 != 0) return error.Exl3GroupGeometry;
-        if (shape.len != (if (name.part == 0) @as(usize, 4) else 2)) return error.Exl3GroupGeometry;
-        if (shape[0] == 0 or shape[0] > std.math.maxInt(c_int)) return error.Exl3GroupGeometry;
+        if (name.part != 0 and shape.len != 2) return error.Exl3GroupGeometry;
+        if (shape.len == 0 or shape[0] == 0 or shape[0] > std.math.maxInt(c_int)) return error.Exl3GroupGeometry;
         const group = &self.groups[name.group];
         if (group.experts != 0 and group.experts != shape[0]) return error.Exl3GroupGeometry;
         var rate: format.Rate = .{ .n = 0 };
         if (name.part == 0) {
-            if (shape[1] != input / 16 or shape[2] != output / 16) return error.Exl3GroupGeometry;
-            rate = format.kFromPackedDim(shape[3]) orelse return error.Exl3TrellisGeometry;
+            const order = name.tileOrder();
+            if (self.tile_order) |o| if (o != order) return error.Exl3TileOrderMixed;
+            rate = try trellisRate(order, shape, input, output);
             if (rate.n > self.ceiling.n) return error.Exl3TrellisGeometry;
             if (!rate.in(self.rates)) return error.Exl3CodebookTableRateMissing;
         } else if (shape[1] != (if (name.part == 1) input else output)) return error.Exl3GroupGeometry;
@@ -76,6 +105,7 @@ pub const Layout = struct {
         for (shape) |d| bytes = std.math.mul(u64, bytes, d) catch return error.ResidentBytesOverflow;
         self.bytes = std.math.add(u64, self.bytes, bytes) catch return error.ResidentBytesOverflow;
         self.grouped = name.grouped;
+        if (name.part == 0) self.tile_order = name.tileOrder();
         self.count = @max(self.count, name.group + 1);
         group.experts = @intCast(shape[0]);
         group.mask |= bit;
@@ -113,6 +143,16 @@ pub fn tileMajor(comptime T: type, dst: []T, src: []const T, it: usize, ot: usiz
     for (0..ot / 2) |pair| for (0..it) |tk| for (0..2) |o| {
         const from = (tk * ot + pair * 2 + o) * n;
         const to = ((pair * it + tk) * 2 + o) * n;
+        @memcpy(dst[to..][0..n], src[from..][0..n]);
+    };
+}
+
+/// `tileMajor` undone: an expert's `[OT/2][IT][2][n]` tiles back into the pack order `[IT][OT][n]`.
+pub fn tileMajorInverse(comptime T: type, dst: []T, src: []const T, it: usize, ot: usize, n: usize) void {
+    std.debug.assert(ot % 2 == 0 and dst.len == it * ot * n and src.len == dst.len);
+    for (0..ot / 2) |pair| for (0..it) |tk| for (0..2) |o| {
+        const to = (tk * ot + pair * 2 + o) * n;
+        const from = ((pair * it + tk) * 2 + o) * n;
         @memcpy(dst[to..][0..n], src[from..][0..n]);
     };
 }
