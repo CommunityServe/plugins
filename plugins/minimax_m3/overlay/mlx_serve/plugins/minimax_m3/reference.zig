@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/reference.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
+//! copied_from: src/plugins/minimax_m3/reference.zig@61ec76d7bc1abfb7f588db3bf6a94ffc0cd423c7
 //! Scalar reference operations for the released MiniMax M3.1 Flash text path.
 //! Sparse selection follows vLLM 7651825993d001759107c66cdf6983535900c874,
 //! common/ops/index_topk.py: one independently selected block set per index head.

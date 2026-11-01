@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/attention.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
+//! copied_from: src/plugins/minimax_m3/attention.zig@61ec76d7bc1abfb7f588db3bf6a94ffc0cd423c7
 //! Serial text attention with per-index-head sparse block masks. Index keys are
 //! retained even before sparsity activates, so later queries can select old blocks.
 const std = @import("std");
@@ -47,7 +47,6 @@ pub fn forwardChunk(g: *ops.G, a: std.mem.Allocator, c: *const C, w: Weights, ca
         const pos = position + @as(u32, @intCast(i));
         const view = try cache.view(g, pos + 1);
         const attended = try attend(g, a, c, q[i], iq[i], view, pos);
-        try g.evalAll(&.{attended});
         outputs[i] = try ops.linear(g, try g.reshape(attended, &.{ 1, @intCast(c.n_heads * c.head_dim) }), w.o);
     }
     return if (n == 1) outputs[0] else g.concat(outputs[0..n], 0);
@@ -84,8 +83,9 @@ pub fn forwardRows(g: *ops.G, a: std.mem.Allocator, c: *const C, w: Weights, cac
         else
             null;
         const attended = try attend(g, a, c, qi, iqi, try cache.view(g, pos + 1), pos);
-        try g.evalAll(&.{attended});
         outputs[i] = try g.reshape(attended, &.{ 1, @intCast(c.n_heads * c.head_dim) });
+        // Bounds the graph a long span builds before its layer's eval.
+        if (i % 64 == 63) try g.evalAll(outputs[i - 63 .. i + 1]);
     }
     return ops.linear(g, if (n == 1) outputs[0] else try g.concat(outputs, 0), w.o);
 }

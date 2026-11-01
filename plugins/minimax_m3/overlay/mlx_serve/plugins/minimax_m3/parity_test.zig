@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/parity_test.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
+//! copied_from: src/plugins/minimax_m3/parity_test.zig@61ec76d7bc1abfb7f588db3bf6a94ffc0cd423c7
 //! The plugin against `tests/dump_minimax_m3_fixtures.py` (float64, Hugging Face's MiniMax-M3 text math) on the
 //! conformance fixture over a prompt past 16 index blocks, so the sparse block selection decides. Env-gated:
 //! `MINIMAX_M3_FIXTURE_DUMP=<dir>` writes the fixture and the prompt; `MINIMAX_M3_REFERENCE=<dir>` compares every

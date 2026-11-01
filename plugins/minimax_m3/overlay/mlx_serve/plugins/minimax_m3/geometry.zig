@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/geometry.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
+//! copied_from: src/plugins/minimax_m3/geometry.zig@61ec76d7bc1abfb7f588db3bf6a94ffc0cd423c7
 //! MiniMax M3.1 Flash text geometry, checked against MiniMaxAI/MiniMax-M3.1-Flash
 //! config.json at 54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e.
 const std = @import("std");

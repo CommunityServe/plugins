@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/experts.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
+//! copied_from: src/plugins/minimax_m3/experts.zig@61ec76d7bc1abfb7f588db3bf6a94ffc0cd423c7
 //! Bounded MiniMax demand reads through the SDK stream. Every route is evaluated
 //! before its slots are unpinned; NVFP4 gathers retain the shared global-scale math.
 const std = @import("std");

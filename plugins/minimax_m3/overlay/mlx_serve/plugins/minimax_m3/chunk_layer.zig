@@ -1,4 +1,4 @@
-//! copied_from: src/plugins/minimax_m3/chunk_layer.zig@1614df2919f0d76ed61f90b7b8c8bc3e75905144
+//! copied_from: src/plugins/minimax_m3/chunk_layer.zig@61ec76d7bc1abfb7f588db3bf6a94ffc0cd423c7
 //! Prompt tiles; every resident projection retains its serial M=1 kernel.
 const std = @import("std");
 const ops = @import("ops.zig");
@@ -36,8 +36,11 @@ pub fn routeRows(g: *ops.G, c: *const C, x: ops.T, router: ops.T, correction: op
         mixtures[i] = weights;
     }
     var routes: Routes = .{ .n = 4 * count };
-    _ = try g.hostIds(try g.astype(try g.concat(selections[0..count], 0), .int32), routes.ids[0..routes.n]);
-    _ = try g.hostF32(try g.astype(try g.concat(mixtures[0..count], 0), .float32), routes.weights[0..routes.n]);
+    const ids = try g.astype(try g.concat(selections[0..count], 0), .int32);
+    const weights = try g.astype(try g.concat(mixtures[0..count], 0), .float32);
+    try g.evalAll(&.{ ids, weights });
+    _ = try g.hostIds(ids, routes.ids[0..routes.n]);
+    _ = try g.hostF32(weights, routes.weights[0..routes.n]);
     return routes;
 }
 pub fn forwardLayers(g: *ops.G, a: std.mem.Allocator, c: *const C, layers: []const Layer, caches: []attention.Cache, input: ops.T, position: u32, source: anytype, comptime chunked: bool) !ops.T {
@@ -60,7 +63,8 @@ pub fn forwardLayers(g: *ops.G, a: std.mem.Allocator, c: *const C, layers: []con
             if (comptime @hasDecl(@TypeOf(source.*), "observeRoutes")) try source.observeRoutes(index, position, routes);
         }
         const output = try g.add(next, y);
-        try g.evalAll(&.{output});
+        // A decode row's layer output is evaluated by the next layer's routing read (or the caller's head).
+        if (chunked) try g.evalAll(&.{output});
         if (comptime @hasDecl(@TypeOf(source.*), "observeLayer")) try source.observeLayer(g, index, position, output);
         const held = g.keep(output);
         g.resetTo(mark);
@@ -78,8 +82,11 @@ pub fn routeSpan(g: *ops.G, c: *const C, x: ops.T, router: ops.T, correction: op
     var mix = try g.takeAlongAxis(scores, selected, -1);
     mix = try g.div(mix, try g.add(try g.sum(mix, -1, true), try g.scalar(1e-20, .float32)));
     mix = try g.astype(try g.mul(mix, try g.scalar(c.routed_scaling_factor, .float32)), g.dtypeOf(x));
-    _ = try g.hostIds(try g.astype(selected, .int32), ids);
-    _ = try g.hostF32(try g.astype(mix, .float32), weights);
+    const selected_ids = try g.astype(selected, .int32);
+    const mix_f32 = try g.astype(mix, .float32);
+    try g.evalAll(&.{ selected_ids, mix_f32 });
+    _ = try g.hostIds(selected_ids, ids);
+    _ = try g.hostF32(mix_f32, weights);
 }
 /// A prompt span layer-major: all its rows through one layer before the next, every resident projection batched over
 /// the rows and the layer's experts routed once for the span (`source.applySpan`).
