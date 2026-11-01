@@ -468,6 +468,23 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   b2 a2: +3.23%), new text 1363.7 / 1428.0 / 1407.8 / 1346.6 (+4.63%); its check arm compared 402,653,184 words a wide
   layer (its three full runs' heads), 0 differing, over 41 check lines (120 runs on the regions, 40 joined); the bank's
   rows 156 / 178 in every arm.
+- `MLX_SERVE_DSV41_SCRATCH` (src/scratch.zig: the regions; src/scratch_x1.zig, src/kernels/hc_expand_into.metal,
+  patches/turboexl3-zzz8r-scratch-x1.patch; on, `=0` off, `check` checked): a wide prompt layer's streams after its
+  attention (`x1`, [rows, 4, 5120] f32, 1.34 GB at 16K rows) written into one per-prompt buffer, not a fresh MLX
+  allocation each layer. Off, `hcExpand`'s output is a new array each wide layer, and MLX's buffer cache (2 GiB) cannot
+  hold it: each is a fresh `newBufferWithLength`. On, a prompt's first wide layer allocates the region (the host's
+  `alloc_uninit`; kept while the chunk's rows hold, let go at the decode phase change). glm5's expand writes its words
+  into it through an input binding (src/kernels/hc_expand_into.metal: the same loads, fmas and stores) behind the
+  region's last reader (the layer before's MoE output, bound and unread), and declares a one-word carrier output. The
+  norms and the MoE tail read the region through the host's event wait over an event already at 1, with the region and
+  the carrier as tracked inputs (`Region.publish`): MLX fences the compute pass after it on the writer's pass, and its
+  outputs alias the region. The regions' bytes stay within 4 GiB (a region past it takes the fresh path). `check` serves
+  the fresh array and compares the region's with it word for word: a `[scratch] check region=x1 rows= words= differ=`
+  line a wide layer. x1a2 (w-pio-20261101-1841, ABBA, margin 2, EVICT, on f073b85: zzz8p, before phase B; texts
+  identical in every arm): cold 1270.5 / 1308.8 / 1305.4 / 1297.7 tok/s (a1 b1 b2 a2: +1.79%; a1 the slow arm, so the
+  b2 / a2 pair's +0.59% is likelier x1's own), new text 1294.4 / 1351.4 / 1350.2 / 1345.7 (+2.33%; that pair +0.33%);
+  the bank's rows 156 / 178 in every arm, the file cache's growth ~0. On zzz8q the regions together (the waves' 917.5
+  MB, the ring's 125.8 MB, phase B's 536.9 MB, x1's 1342.1 MB at 16,383 rows: 2.72 GiB) stay within the cap.
 
 ## The pack
 
