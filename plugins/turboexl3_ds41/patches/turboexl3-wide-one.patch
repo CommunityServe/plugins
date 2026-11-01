@@ -44,7 +44,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
 diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
-@@ -27,6 +27,9 @@
+@@ -28,6 +28,9 @@
  const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows, Math);
  const HookT3 = xp.ExpertsWith(G, xp.StreamSource, MathT3, .{ .prefill = true, .lookahead = true, .gated = true });
  const Hooks = union(enum) { stream: Hook, t3: HookT3 };
@@ -54,7 +54,7 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
  pub const Gate = Hook.Gate;
  pub const Phase = enum { prompt, decode };
  /// The trunk's MoE geometry the bank must match.
-@@ -109,6 +112,7 @@
+@@ -110,6 +113,7 @@
      hook: Hooks,
      gates_t3: []HookT3.Gate = &.{},
      t3_state: MathT3.State = .{ .limit = 0 },
@@ -62,7 +62,7 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
      bill: Bill,
      phase: Phase = .prompt,
      released: bool = false,
-@@ -170,6 +174,9 @@
+@@ -171,6 +175,9 @@
          self.source = xp.StreamSource.init(self.stream);
          self.gates_t3 = &.{};
          self.t3_state = .{ .limit = 0 };
@@ -72,7 +72,7 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
          if (routed_t3.enabled) {
              if (geo.swiglu_limit < 1 or geo.swiglu_limit > 128 or geo.swiglu_limit != @floor(geo.swiglu_limit)) return error.RoutedT3Clamp;
              self.t3_state.limit = @intFromFloat(geo.swiglu_limit);
-@@ -187,6 +194,7 @@
+@@ -193,6 +200,7 @@
              inline else => |*h| h.deinit(),
          }
          self.a.free(self.gates_t3);
@@ -80,7 +80,7 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
          self.stream.deinit();
          self.q.deinit(&self.g);
          kernel_set.Set.uninstall(G, &self.g);
-@@ -206,6 +214,9 @@
+@@ -214,6 +222,9 @@
          defer g.reset();
          const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
          self.t3_state.n = 0;
