@@ -13,7 +13,8 @@ pool) and what it reaches. overlay/mlx_serve/ is copied over it: the files in th
 plugin's own code at mlx-serve paths (mlx/ffi.zig and its neighbours, env.zig, sdk/util/log.zig, shared.zig,
 sdk/ane/offload.zig follow plugins/turboexl3_qwen38's; mlx/ffi.zig's lower half is scripts/gen-mlx.py's output from the
 kit's mlx-c headers; mlx_stream.zig is the streamer's module root), and plugins/minimax_m3/, the MiniMax port written for
-mlx-serve (ddalcu/mlx-serve#1048 at b9c38f47, with the fixes from its review), as the script writes it from that tree.
+mlx-serve (ddalcu/mlx-serve#1048 at b9c38f47, with the fixes from its review and this plugin's performance changes),
+as the script writes it from that tree.
 A `stand_in` file is an empty one for an import nothing compiled uses.
 
 --------------------------------------------------------------------------------

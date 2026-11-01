@@ -37,18 +37,29 @@ The model settings' `stream_experts` fixes the row count, `ctx_size` the context
 
 ## Measured
 
-Mac Studio M2 Ultra, 192 GB, macOS 26; the NVFP4 pack with BF16 residents, context 4096, greedy, one request at a time,
-served by mlx-serve main 20cb4cc4 with #1047 and the load seam.
+Mac Studio M2 Ultra, 192 GB, macOS 26; served by mlx-serve main 20cb4cc4 with #1047 and the load seam; context 4096,
+BF16 KV cache, greedy (seed 0), one request at a time, prefix caches off, no residents seeded. Q3 pack
+(`mlx-community/MiniMax-M3.1-Flash-oQ3e-mtp` as a stream pack, 116 expert rows a layer). Before is this plugin as
+first published, after is this tree; two runs each on one server binary (the two runs of each agree within 0.1 tok/s).
 
-| Request | Prompt | Prefill tok/s | Decode tok/s |
-|---|---|---|---|
-| a code review, 638 tokens to EOS | 337 | 6.3 | 4.8 |
+| Request | Prompt | Prefill tok/s before | after | Decode tok/s before | after |
+|---|---|---|---|---|---|
+| a Zig file review, 384 tokens (reasoning only) | 3662 | 11.1 | 75.7 | 5.8 | 8.2 |
+| a code review, to EOS | 337 | 7.2 | 12.3 | 7.2 | 11.9 |
+| a Fibonacci function, to EOS | 218 | 18.0 | 60.0 | 6.9 | 10.4 |
 
-- The output is byte for byte the in-tree port's (#1048's head with its review fixes) on the same pack: an answer, a
-  parsed `get_weather` call, a reasoning split, a cancelled stream and the request after it, the review.
-- The in-tree port's float64 parity against transformers' `MiniMaxM3VLForCausalLM` (tests/dump_minimax_m3_fixtures.py
-  `--hf`): 2200 rows past 16 blocks, min cosine 0.99955, no decided argmax miss. The block selection and the expert
-  routing match the reference here too (`gpu-test`'s parity tests: 0 mismatches, 48 of 48 routes).
+- The prompt runs layer by layer in spans of up to 4096 rows: each span reads the experts it misses once, its
+  projections are batched, and its attention is one causal call inside the 16-block budget and tiles of rows past it.
+  Decode syncs the GPU less a token, and its SwiGLU-OAI is one kernel (bit-identical to the op chain on finite values
+  and signed zeros; NaN stays NaN).
+- The Fibonacci answer and the one-line answer are byte for byte the same before and after. The 337-token review
+  takes another greedy path; both answers cover the three points it asks for. The float64 parity against
+  transformers' `MiniMaxM3VLForCausalLM` (tests/dump_minimax_m3_fixtures.py `--hf`) is unchanged: 2200 rows past 16
+  blocks, min cosine 0.99955, no decided argmax miss; the whole-prompt prefill's last row 0.99998. Block selection and
+  expert routing match the reference (0 mismatches, 48 of 48 routes).
+- The prefill bill prices a span from the geometry; a sparse tile, an expert batch and a row-by-row group free their
+  scratch once evaluated.
 - tests/serve_check.sh is the HTTP check (`MINIMAX_PACK=<pack>`).
 
-Not measured: other Macs, the Q3 and BF16 banks through this plugin, long prompts, concurrent requests.
+Not measured: other Macs (an M5 is expected to differ; nothing here is M5-specific), the NVFP4 and BF16 banks as an
+A/B after these changes, an accuracy benchmark, the long review's final answer, concurrent requests.
