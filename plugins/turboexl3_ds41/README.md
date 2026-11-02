@@ -613,6 +613,26 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   16K cells' 150 prompt rows and zzz8x's 179 decode rows. Exact: the texts the same bytes in every arm (cold d081845201,
   new-text slice 3 4d5b401f3c), and the check arm compared 41 wide calls' shared experts, 3,205,017,600 words, none
   different (max_ulps 0).
+- `MLX_SERVE_DSV41_REST_ASYNC` (src/rest_async.zig, patches/turboexl3-zzz9s-rest-async.patch; on, `=0` off): a wide
+  prompt layer followed by another wide one has its last eval committed, not waited for. `=0`: `runLayers` evaluates
+  each wide layer's held arrays and attention state and waits: since REST_EARLY and HC_FUSE the tail is ~17.5 ms of GPU
+  work a 16K-row encoder layer and the host waits out most of it, then the next layer's start keeps the GPU idle 5.9 ms
+  a regular wide layer (pt5 w-pio-20261102-1502; ~0.11 s a cold 16K card). On, the same arrays are committed
+  (`mlx_async_eval`) when the next layer in the pass is wide too, so the next layer's graph and its read-ahead's first
+  buffers are built under the tail; the pass's last wide layer is waited for as before. The same kernels in the same
+  order on the one stream, so the same words (a text gate). The layer's teardown has already run, so the next layer's
+  first arrays overlap only the tail's own inputs and outputs (no bill term; the window's peak gate checks it). With
+  TRANSIENT_KEEP the next layer's start hands the kept projection buffers to MLX's cache while the tail runs: their
+  readers (the attention) finished before the routing barrier, and MLX recycles a buffer only after its last command
+  completes. Prompt only: decode's layers are never wide.
+  - Read as ra2 (ra1's lines on zzz9r; M5 Max, w-pio-20261102-1943; a = ctl46 949ce432e7ff, b = ra2 at 1
+    (830e9e1d94fe), both on G_KITSP1 with keyed sampling; a warm server, then a1 b1 b2 a2, each a cold code-ctx16384
+    card request then the new-text 16K slice 3): cold 1604.0 1612.1 against 1617.2 1623.2 tok/s (+0.76%; pairs +0.82,
+    +0.69), new text 1738.5 1700.7 against 1748.8 1721.2 (+0.90%; pairs +0.59, +1.21); the texts the same bytes in
+    every arm (cold 65d438d647, new-text slice 3 83a88208e3), the bank rows 147 / 177 in every arm, the guard's
+    accounted peak 103.8 / 100.6 GiB in the b arms against 104.7 / 106.6 in the a arms (step footprint 91.2 / 88.1
+    against 91.4 / 93.9); the encoder's other stage past layer 0 4208 / 4189 ms against 4319 / 4294. Measured on
+    zzz9r; merged on (zzz9s).
 - `MLX_SERVE_DSV41_REST_EARLY` (src/rest_early.zig, patches/turboexl3-zzz9e-rest-early.patch; on, `=0` off): a wide
   prompt layer's new streams (its routed call's tail kernel, the TAIL_FUSE combine and hc expand, with its inputs' small
   ops) committed at the call's end, before the layer's teardown. `=0`: `wideLayer` returns after its last group's holds,

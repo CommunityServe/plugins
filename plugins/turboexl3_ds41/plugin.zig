@@ -102,6 +102,9 @@ pub const rest_early = @import("src/rest_early.zig");
 /// A wide prompt layer's attention projections' large outputs kept past its teardown, their buffers to MLX's cache at the
 /// next wide layer's start (`MLX_SERVE_DSV41_TRANSIENT_KEEP`, src/transient_keep.zig), read by the copied model.
 pub const transient_keep = @import("src/transient_keep.zig");
+/// A wide prompt layer followed by another wide one committed at its end, not waited for (`MLX_SERVE_DSV41_REST_ASYNC`,
+/// src/rest_async.zig), read by the copied model.
+pub const rest_async = @import("src/rest_async.zig");
 /// A wide prompt layer's query heads kept unroped, their roped last channels apart (`MLX_SERVE_DSV41_Q_TAIL`,
 /// src/q_tail.zig), read by the copied model.
 pub const q_tail = @import("src/q_tail.zig");
@@ -600,6 +603,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    rest_async.configure(env.span(.MLX_SERVE_DSV41_REST_ASYNC)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_REST_ASYNC is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     rest_early.configure(env.span(.MLX_SERVE_DSV41_REST_EARLY)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_REST_EARLY is neither 0 nor 1 (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -881,6 +891,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] wide prompt layers keep their attention projections' large outputs past the teardown, their buffers to MLX's cache at the next wide layer's start (MLX_SERVE_DSV41_TRANSIENT_KEEP=0: freed at the teardown): [transient-keep] at each request's end\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers keep their attention projections' large outputs past the teardown, their buffers to MLX's cache at the next wide layer's start, and count the buffers taken back (MLX_SERVE_DSV41_TRANSIENT_KEEP=check): [transient-keep] reused= at each request's end\n", .{}),
     }
+    if (rest_async.on)
+        log.info("[turboexl3_ds41] a wide prompt layer followed by another wide one is committed at its end, not waited for: the next layer's start runs under its tail (MLX_SERVE_DSV41_REST_ASYNC=0: waited for)\n", .{})
+    else
+        log.info("[turboexl3_ds41] each wide prompt layer's last eval waited for (MLX_SERVE_DSV41_REST_ASYNC=0)\n", .{});
     if (rest_early.on)
         log.info("[turboexl3_ds41] wide prompt layers commit their new streams at the routed call's end, before the layer's teardown: the GPU runs the tail kernel while the host frees the layer (MLX_SERVE_DSV41_REST_EARLY=0: after the teardown)\n", .{})
     else
