@@ -1,0 +1,78 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -292,6 +292,7 @@
+     pub const MLX_SERVE_DSV41_ENGRAM_FIRST: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt Engram reads (turboexl3_ds41, with MLX_SERVE_DSV41_ENGRAM_DIRECT on, the default): on (unset, empty or 1), a prompt chunk's Engram row ids hashed and their read thread started first, before the phase change and the embedding, and a prompt grid's tables read on up to 128 threads (the stock: after them, 64 threads), so the first Engram layer waits less for table 0; check, as 1 and table 0's rows read again at 64 threads, the bytes compared ([engram-first] check lines); the same rows read and served (0: the stock start and threads)" };
+     pub const MLX_SERVE_DSV41_GU_SPLIT: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's demand reads (turboexl3_ds41, dq1b): 1 reads each missed record's gate/up range as two range jobs side by side (split at the part boundary nearest its middle), check also reads each split range again whole and compares it with the rows ([gu-split] mismatch); unset or 1 on (zzz9h), 0 off; the served bytes are the same at every setting" };
+     pub const MLX_SERVE_DSV41_HC_FUSE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' hyper-connection stages (turboexl3_ds41): on (unset, empty or 1), the attention side's mixes and norm (and the read-ahead's norm) in one launch and the FFN side's expand and norm in one launch into the x1 region, the splits from the mixes after: each stream read once less; check, the stock kernels served and the fused compared word for word ([hc-fuse] check lines); refused by name on a GPU that runs a fused kernel at fewer threads than the stock hc kernels; the same words (0: the stock kernels)" };
++    pub const MLX_SERVE_DSV41_ENGRAM_TWIN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram layers' wkv at 2..16 rows (turboexl3_ds41, eg2): on the batched twin of MLX's one-row gemv, every row its one-row words at any decode width; unset or 1 on, 0 off, check also compares every row with MLX's one-row matmul ([gemv-twin] check, [engram-twin] a request)" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+     pub const MLX_SERVE_DSV41_HW2: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 t3 route's banked calls (turboexl3_ds41, with the grouped banked decode): the hit wave's and each miss part's grouped GEMVs at hw2u's picked variants (gate|up t4, down t4: turboexl3 group_variants, another schedule of the same reads, decodes and sums) on the grouped texts the call runs (hw4b's M = 3 texts with MLX_SERVE_DSV41_HW4B on); served bytes unchanged (unset, empty or 1: the picked variants, on with the grouped banked decode (zzz9m), off without it; 0: variant 0; check: both, every call's words compared, variant 0's rows served, [hw2] lines, not beside MLX_SERVE_DSV41_HW4B=check)" };
+     pub const MLX_SERVE_DSV41_HW4B: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 t3 route's banked calls (turboexl3_ds41, with the grouped banked decode): the hit wave's and each miss part's grouped GEMVs with an M = 3 member path (turboexl3 banked_m3: a lead with three members of an expert runs it, where the grouped GEMVs ran the M = 4 path with a fourth member's FMAs padding; every member fed in the one-member order); served bytes unchanged (unset, empty or 1: the M = 3 path, on with the grouped banked decode (zzz9j), off without it; 0: the M = 4 path; check: both, every call's words compared, the M = 4 path's rows served, [hw4b] lines)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -110,6 +110,9 @@
+ /// turboexl3_ds41 (MLX_SERVE_DSV41_ATTN_CORE, the plugin's src/attn_core.zig): the wide gather's pv at 64 output columns
+ /// a threadgroup (its text derived at load) and its tensor-op launches three-dimensional, the same words.
+ const acore = @import("../../../attn_core.zig");
++/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_TWIN, the plugin's src/engram_twin.zig): the Engram layers' plain wkv on the
++/// batched gemv twin (`gtwin`, src/gemv_twin.zig: every row MLX's M=1 words at any decode width).
++const etwin = @import("../../../engram_twin.zig");
+ const A = mlx.mlx_array;
+ const S = mlx.mlx_stream;
+ const Config = @import("config.zig").Config;
+@@ -1690,6 +1693,9 @@
+             break;
+         };
+     }
++    // MLX_SERVE_DSV41_ENGRAM_TWIN: the gemv twin's launches for each Engram layer's plain wkv compiled now, not in a
++    // request's first verify.
++    if (etwin.on() and mlx.streamIsGpu(s)) try warmEngramTwin(m);
+     // MLX_SERVE_DSV41_SCRATCH_ATTN: the ring twins compiled now, not in a prompt's first wide layer.
+     if (m.attn_gather) |g| if (g.ring != null) try warmRing(m);
+     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages\n", .{ n_layers, m.engrams.len, n_stages });
+@@ -1703,6 +1709,11 @@
+         if (iw.wk) |*wk| if (wk.x3 == null and wk.s.ctx == null) try gtwin.warm(m.s, wk.w);
+     };
+ }
++/// MLX_SERVE_DSV41_ENGRAM_TWIN: the gemv twin's served launches for each Engram layer's plain wkv (`engramWkv`'s), each
++/// launch shape compiled once (the layers share one shape).
++fn warmEngramTwin(m: *Dsv41Model) !void {
++    for (m.engrams) |*e| if (e.wkv.x3 == null and e.wkv.s.ctx == null) try gtwin.warm(m.s, e.wkv.w);
++}
+ /// Every array the model reads, evaluated one layer at a time. A compiled region captures its layer's weights,
+ /// and a lazy load in its trace would read the weight from disk into a fresh buffer on every call.
+ fn evalWeights(m: *Dsv41Model) !void {
+@@ -4114,9 +4125,30 @@
+ /// turns the rows into one key per copy plus a shared value, and the gate is
+ /// sigmoid of the signed sqrt of a per-copy normalized stream-key dot.
+ pub fn engramApply(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, rows: A) !A {
+-    const kv = try e.wkv.apply(sc, try sc.astype(rows, m.act));
++    const kv = try engramWkv(sc, e, try sc.astype(rows, m.act));
+     if (mlx.streamIsGpu(sc.s)) return engramGate(sc, m, e.qk, x, kv);
+     return engramGateOps(sc, m, e.qk, x, kv);
++}
++/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_TWIN): an Engram layer's `wkv`, a plain half-type linear, over 2 to
++/// `etwin.twin_rows` rows on the batched gemv twin, each row MLX's M=1 words (MLX itself: gemv for one row, gemv_wide for
++/// 2..15, its GEMM past them); `check` serves the twin too and compares every row with MLX's own M=1 matmul of it
++/// (`[gemv-twin] check` lines; `[engram-twin]` a request). One row (MLX's gemv: the same words), a wider call and a call
++/// the twin declines keep `wkv.apply`.
++fn engramWkv(sc: *Scope, e: *const EngramLayer, x: A) !A {
++    const l = &e.wkv;
++    const rows = dim(x, 0);
++    if (etwin.on() and l.x3 == null and l.s.ctx == null and rows >= 2 and rows <= etwin.twin_rows) {
++        const n = dim(l.w, 0);
++        const k = dim(l.w, 1);
++        if (try gtwin.linear(sc.s, x, l.w)) |y| {
++            const yk = try sc.keep(y);
++            etwin.note(n, k, true);
++            if (etwin.mode == .check) try gtwin.checkRows(sc.s, x, l.w, yk, try l.apply(sc, x));
++            return yk;
++        }
++        etwin.note(n, k, false);
++    }
++    return l.apply(sc, x);
+ }
+ /// `engramApply` after `wkv` as the op chain.
+ pub fn engramGateOps(sc: *Scope, m: *const Dsv41Model, qk: A, x: A, kv: A) !A {

@@ -458,6 +458,43 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   guard's accounted samples 98.9 and 99.9 GiB in the b arms against 108.9 and 105.3 in the a arms. Exact: the texts the
   same bytes in every arm (cold 65d438d647, new-text slice 3 83a88208e3), and the check arm's 480 calls compared
   31,172,213,760 words, none different.
+- `MLX_SERVE_DSV41_DEC_INVARIANT` (src/dec_invariant.zig, src/gemv_twin.zig, src/kernels/gemv_twin.metal,
+  patches/turboexl3-zzz9r-1-idx-twins.patch; on, `=0` off, `=check` checked): the indexer's plain bf16 linears (each
+  index layer's head weights `weights_proj`, 32 x 5120, and each KV source's index key `wk`, 128 x 512) give a decode
+  row the same words at any verify width. MLX runs them as its M=1 gemv for one row, gemv_wide for 2..15 rows and its
+  GEMM past them, so a verify's rows round apart from the same rows decoded one at a time. On, a call of 2..6 rows runs
+  on a batched twin of MLX's M=1 gemv (`GEMVKernel::run`'s body at MLX 64ea011): a thread's K elements, its products,
+  its simdgroup shuffles and its threadgroup partials are MLX's one-row call's (fixed by MLX's sn, tn and bn), so each
+  row is that call's words, and the weight is read once a launch. The free axes (the rows a threadgroup, a thread's
+  rows, the simdgroup rows, the chunks' place in the grid) move no word; `served` picks them per weight shape and rows
+  from this machine's timings. One row keeps MLX's gemv (the same words) and wider calls MLX's matmul. `check`
+  compares every twin call with MLX's own M=1 matmul of each of its rows and logs `[gemv-twin] check N= K= calls= rows=
+  words= differ= max_ulps=` a weight shape every 128 calls, at its first differing word and at the model's end, and
+  the call's own matmul against the same words (`[gemv-twin] wide-vs-m1`, reported only).
+  - Read as iv1, with `MLX_SERVE_DSV41_ENGRAM_TWIN` (both twins in one build; M5 Max, w-20261102-1818; a = ctl45
+    d572b1c44375, b = iv1 69cc90910e93, both on G_KITSP1 with keyed sampling and the standard decode config, every round
+    the whole block; chk (b, both twins at `check`) first, g_a / g_b at MTP:0, then a1 b1 b2 a2 b3 a3 a4 b4, each a
+    code-ctx16384 card then greedy, 1024 tokens): exact. chk's check lines differ 0 / max_ulps 0 on every twin shape
+    (weights_proj 1816 calls, 10896 rows; wk 911 calls, 3417 rows; the Engram wkv 456 calls, 2740 rows); every b greedy
+    the 1-row text (4d36d6e8aa2a87ac, g_a's and g_b's), the control's DSpark greedy (5ab2578db940c51c) not; the card the
+    keyed 1-row card (d63fabe7ba2cbb39) in all eleven arms; 6 rows every round in every arm. The card, the same text in
+    both arms: 48.4 49.1 48.8 48.9 against 48.8 48.8 48.8 48.6 tok/s (-0.10%; pairs +0.83, -0.61, 0.00, -0.61), 122
+    rounds in each arm, a round's wall ms 102.13 -> 102.23, misses a round 56.19 -> 56.56. The greedy, a different text
+    by design (the control's DSpark greedy is not its 1-row text; b's is), is
+    information only: 57.4 58.0 57.9 57.9 against 58.5 58.0 58.5 58.4 tok/s (+0.95%), 107 rounds against 105. A
+    correctness fix (a verify row's words its own at any width), merged on its exactness gates. Measured on zzz9q;
+    merged on (zzz9r).
+- `MLX_SERVE_DSV41_ENGRAM_TWIN` (src/engram_twin.zig, on src/gemv_twin.zig;
+  patches/turboexl3-zzz9r-2-engram-twin.patch, eg2; on, `=0` off, `=check` on and checked): an Engram layer's `wkv` (a
+  plain half-type linear: bf16 [L, 6144] x [25600, 6144]^T) at 2 to 16 rows runs on the batched twin of MLX's one-row
+  gemv, so a verify row's keys and value are the words that row gets decoded alone (MLX runs gemv_wide at 2 to 15 rows:
+  ip1, w-20261102-0143, the only break at widths to 6); one row keeps MLX's gemv (the same words), a wider call its
+  matmul. The twin's served launches for the shape (dvi4u): r2 t1, r3 t1h, r4 t1, r5 and r6 c3t2i, compiled at load.
+  `check` serves the twin and compares every row with MLX's one-row matmul (`[gemv-twin] check N=25600 K=6144` lines);
+  `[engram-twin] mode= served= declined=` (and in check the request's calls, rows, words, differ, max_ulps) at each
+  request's end. No second weight is held in check.
+  - Read as iv1 with `MLX_SERVE_DSV41_DEC_INVARIANT` (above: w-20261102-1818): exact, the Engram wkv's check lines
+    differ 0 over 456 calls and 70,144,000 words, every b greedy the 1-row text. Measured on zzz9q; merged on (zzz9r).
 - `MLX_SERVE_DSV41_JOINLESS` (src/joinless.zig, patches/turboexl3-zzz8-joinless.patch; on, `=0` off, `check` both): a
   wide prompt call's routed sum and the layer's shared expert in one combine. `=0`: the streamer joins each bank call's
   wave outputs (a concatenate and a take, each evaluated inside the routed call), then the call's outputs again into
