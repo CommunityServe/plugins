@@ -242,6 +242,27 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   peaks 109.0 / 105.9 GiB on against 102.2 / 108.7 off; check (c1, margin 12): 88,177,669,376 words over 760 waves,
   every launch's output (x0, x1, zg, zu, hd, z, y) 0 words differing, max ulps 0. Exact: the texts identical in every
   arm.
+- `MLX_SERVE_DSV41_M1` (src/m1.zig, patches/turboexl3-zzz9k-m1.patch: the four texts, their manifest entries and the
+  manifest's pin, the registry tags, the self-check's twins, the quant's route; on by default, `=0` off, `=check`): a
+  wide prompt call's DIG-X waves run their 128-row routed GEMMs (K3 and K2, gate|up and down) on texts with the B stage
+  double-buffered (`dsv41_prefill_dig_gemm_*_m128d`): stage 0 decoded before the K loop, then per stage the MMA on its
+  buffer and the next stage decoded into the other, one barrier a stage. Every output's A fragments, decoded B values
+  and tile_matmad_nax sequence are the 128-row text's, so the same z words: the quant's `routeM1` self-checks the four
+  texts at load (compile, composition, and a twin check against the 128-row text, bitwise), and a failure refuses the
+  load by name. SCRATCH_WAVES' write-into twins derive from the double-buffered texts (the same anchors). `check`
+  serves the 128-row texts, launches the double-buffered ones beside them on every wave's inputs (the waves off the
+  scratch regions, so every GEMM is compared) and gives `[m1]` at each request's end (per gate|up and down: GEMMs,
+  words, differing words, the largest ulp distance).
+  - m1u's microbench (w-m1u-20261102-0007; 8 experts a wave, median µs a launch): every word of 28 wave records the
+    128-row text's (204,365,824 words); the 16K shape's wave (8 x 256 rows) 1789.5 -> 1707.3 (-4.6%) on K3's
+    gate|up, 886.6 -> 878.1 (-1.0%) on its down, 1755.6 -> 1702.4 (-3.0%) and 872.9 -> 861.8 (-1.3%) on K2's;
+    every other wave -0.9% to -6.5%.
+  - Read as m1 (M5 Max, w-pio-20261102-0941; a cold code-ctx16384 card then the new-text 16K slice 3, 32 tokens,
+    a = ctl25 5ccb44791b50, b = m1 3466f8330cbd at 1, both on G_KIT1271; a1 b1 b2 a2): cold 1397.4 1399.6 against
+    1397.1 1405.7 tok/s (+0.21%; pairs -0.02, +0.44); new text 1489.8 1474.6 against 1487.4 1501.7 tok/s (+0.83%;
+    pairs -0.16, +1.84); the cold card's encoder MoE stage 4102 4097 against 4087 4057 ms; the texts the same bytes
+    in every arm, check's `[m1]` differ 0 and max_ulps 0 over 1428 and 1334 GEMMs of each kind, the bank rows 149 /
+    174 in every measured arm, the guard's accounted peak not up (b 106.7 against a 107.8 GiB). Merged on (zzz9k).
 - `MLX_SERVE_DSV41_SEED_FREE` (src/seed_free.zig, the policy in patches/turboexl3-zz5-seed-free.patch, tested by
   src/seed_free_test.zig): the rows the usage seed fills stay free until a route uses their expert. The prompt's
   read-ahead may take one for an expert its prediction ranks before the seeded one, so a layer's rows hold its call's

@@ -152,6 +152,9 @@ pub const scratch = @import("src/scratch.zig");
 /// src/scratch_waves.zig on src/scratch.zig's `Region`, its twins' texts by src/wave_twins.zig), read by the copied
 /// quant and source.
 pub const scratch_waves = @import("src/scratch_waves.zig");
+/// A wide prompt call's DIG-X waves' 128-row GEMMs with the B stage double-buffered (`MLX_SERVE_DSV41_M1`, src/m1.zig),
+/// read by the copied quant and source.
+pub const m1 = @import("src/m1.zig");
 /// A wide prompt layer's new streams written in place over its x1 region by TAIL_FUSE's write-into twin
 /// (`MLX_SERVE_DSV41_SCRATCH_TAIL`, src/scratch_tail.zig), read by the copied model and source.
 pub const scratch_tail = @import("src/scratch_tail.zig");
@@ -372,6 +375,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     scratch_waves.configure(env.span(.MLX_SERVE_DSV41_SCRATCH_WAVES)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_WAVES is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the bank opens (the copied quant's routeM1 reads it at construction, before SCRATCH_WAVES' twins derive).
+    m1.configure(env.span(.MLX_SERVE_DSV41_M1)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_M1 is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -828,6 +839,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] prefill waves' intermediates in fresh buffers (MLX_SERVE_DSV41_SCRATCH_WAVES=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] prefill waves into per-prompt regions (MLX_SERVE_DSV41_SCRATCH_WAVES; =0: fresh buffers): their launches as write-into twins of the stock texts (compiled at load) on two sets of a wave's intermediates at {d} rows, an uncarried call's waves on them; [scratch-waves] at each request's end\n", .{scratch_waves.set_rows}),
         .check => log.info("[turboexl3_ds41] prefill waves into per-prompt regions, checked (MLX_SERVE_DSV41_SCRATCH_WAVES=check): the fresh waves served, every launch's region output compared with the fresh one; [scratch-waves] per launch (words, differ, max_abs, max_ulps, over1) at each request's end\n", .{}),
+    }
+    switch (m1.mode) {
+        .off => log.info("[turboexl3_ds41] m1: the prefill waves' 128-row GEMMs on the 128-row texts (MLX_SERVE_DSV41_M1=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] m1: the prefill waves' 128-row GEMMs double-buffered (MLX_SERVE_DSV41_M1; =0: the 128-row texts), self-checked at load against the 128-row texts, the scratch twins derived from them; [m1] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] m1: the prefill waves' 128-row GEMMs served, the double-buffered ones beside them on every wave's inputs, every z word compared, the waves off the scratch regions (MLX_SERVE_DSV41_M1=check); [m1] at each request's end\n", .{}),
     }
     return mp;
 }
@@ -1288,7 +1304,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const pgl = pg2.meters(pgc[0], pgc[1], meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len ..]);
     // MLX_SERVE_DSV41_HW4B: the [hw4b] line (on or check; check's compares since the last request's end).
     const hwl = hw4b.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len ..]);
-    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len;
+    // MLX_SERVE_DSV41_M1: the [m1] line (on or check; check's compares since the last request's end).
+    const m1l = m1.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     // dq1b: the decode's demand ranges by class, the gate/up split's counts, the cold start's first calls.
     const dmd = demand_split.meters(meter_buf[n + io.len ..]);
