@@ -149,6 +149,9 @@ pub const scratch = @import("src/scratch.zig");
 /// src/scratch_waves.zig on src/scratch.zig's `Region`, its twins' texts by src/wave_twins.zig), read by the copied
 /// quant and source.
 pub const scratch_waves = @import("src/scratch_waves.zig");
+/// A wide prompt layer's new streams written in place over its x1 region by TAIL_FUSE's write-into twin
+/// (`MLX_SERVE_DSV41_SCRATCH_TAIL`, src/scratch_tail.zig), read by the copied model and source.
+pub const scratch_tail = @import("src/scratch_tail.zig");
 /// Both phases' slot rows over one buffer (`MLX_SERVE_DSV41_BANK_POOL`, src/bank_pool.zig: the switch and the plan),
 /// read by the copied stream and source.
 pub const bank_pool = @import("src/bank_pool.zig");
@@ -348,6 +351,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] [bank-pool] off: the server's host table has no HostGpu.alias entry (its HostGpu {d} bytes, the entry at bytes 96-104: mlx-serve without host-alias.patch); the streamed bank's rows freed and freshly allocated at each phase change, as before the pool\n", .{shims.gpuBytes()});
         bank_pool.mode = .off;
     }
+    scratch_tail.configure(env.span(.MLX_SERVE_DSV41_SCRATCH_TAIL)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_TAIL is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     scratch_waves.configure(env.span(.MLX_SERVE_DSV41_SCRATCH_WAVES)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_WAVES is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -778,6 +788,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] the streamed bank's rows freed and freshly allocated at each phase change (MLX_SERVE_DSV41_BANK_POOL=0, or a host without HostGpu.alias)\n", .{}),
         .on => log.info("[turboexl3_ds41] the streamed bank's rows over one pool (MLX_SERVE_DSV41_BANK_POOL; =0: off): the prompt's windows and the wave sets' regions, then decode's window 0 and whole ext arrays over the same bytes, each pooled array its own buffer (HostGpu.alias); a [bank-pool] plan line at load\n", .{}),
         .check => log.info("[turboexl3_ds41] the streamed bank's rows over one pool, checked (MLX_SERVE_DSV41_BANK_POOL=check): every range that changes hands filled with 0xFF at its install, a [bank-pool] check line each\n", .{}),
+    }
+    switch (scratch_tail.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' new streams in a fresh buffer a layer (MLX_SERVE_DSV41_SCRATCH_TAIL=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' new streams written in place over their x1 region (MLX_SERVE_DSV41_SCRATCH_TAIL; =0: a fresh buffer a layer; with MLX_SERVE_DSV41_SCRATCH and TAIL_FUSE on): TAIL_FUSE's write-into twin, the region published as the layer's streams, no fresh buffer a layer (a call's last wide layer keeps it)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' new streams over their x1 region, checked (MLX_SERVE_DSV41_SCRATCH_TAIL=check): the stock kernel's fresh streams served, the twin's compared word for word in the same routed call; a [scratch-tail] check line a wide layer\n", .{}),
     }
     switch (scratch_attn.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' attention spans' scores and probabilities in fresh buffers (MLX_SERVE_DSV41_SCRATCH_ATTN=0)\n", .{}),

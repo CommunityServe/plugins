@@ -809,6 +809,30 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   the cold 16K card 1405.2/1389.7 -> 1420.1/1416.6 tok/s (+1.50%; pairs +1.06/+1.94), the new-text slice
   1486.2/1495.7 -> 1508.6/1510.0 (+1.23%; pairs +1.51/+0.96); texts identical in every arm (check's 0xFF fills
   included), bank rows 147/176 in every arm, the guard's peak 104.2/106.3 against 107.5/110.1.
+- `MLX_SERVE_DSV41_SCRATCH_TAIL` (src/scratch_tail.zig, TAIL_FUSE's twin in src/tail_fuse.zig,
+  patches/turboexl3-zzz9i-scratch-tail.patch; on by default, `=0` off, `=check`): a wide prompt layer's new streams written in place
+  over its x1 region (`MLX_SERVE_DSV41_SCRATCH`) instead of a fresh buffer. Off, TAIL_FUSE's kernel writes each layer's
+  streams (671 MB of bf16 at 16K rows) into a fresh MLX buffer: MLX holds a buffer until its command buffer completes and reuses
+  a cached one only within two pages of the size asked, under the kit's 8 GB pool, and a layer's transients pass
+  through that pool between one stream buffer's release and the next one's allocation (pt2: 2.34 GB of fresh buffers a
+  layer in the rest stage; pt4's read: the tail's output allocation, ~11.5 ms a wide layer of the rest stage's ~20 ms of
+  exposed GPU idle). On, with the x1 region serving the layer, one MoE group over every span, and the next layer a wide
+  one of the same call whose launches before its hc expand are the streams' only readers (no read-ahead of its own, no
+  DSpark row), the kernel's write-into twin (its text derived from the stock one at its first use: the store over `res`,
+  a one-word carrier; the stock kernel's 29 inputs and one output, 30 buffers of Metal's 31) writes the new streams over
+  the region: each thread reads its row's copies of x1 and every other input before it stores the row's outputs, and
+  nothing reads the region's x1 after the tail; the region is published as the layer's streams, and the next layer's hc
+  expand reads and writes it in place the same way. A call's last wide layer keeps the fresh buffer (its streams are read
+  after the call's last eval: the CED replay, the head, the next chunk). `check`, in the one routed call: the stock
+  kernel's fresh streams first, then the twin, compared word for word (`[scratch-tail] check layer= words= differ=`), the
+  stock's served. `zig build gpu-check -Dgpu-check-mlx=<host tree>/lib/mlx` builds src/gpu_check.zig, which compiles
+  both in-place kernels on the GPU at the served template arguments and checks their words against the stock kernels'
+  (run in a GPU window). Exact: the stock statements. Measured (sx4, w-pio-20261102-0840: ctl33 0262e23069e7 against sx4
+  59fe2654e8b8, both on G_KITSP1, two runs an arm; its GPU check first: 30 buffers of 31, differ 0 on every tail,
+  tail-check and hc line at 16,383 and 4,097 rows): the cold 16K card 1491.3/1487.6 -> 1518.9/1514.9 tok/s (+1.84%;
+  pairs +1.85/+1.84), the new-text slice 1588.5/1587.6 -> 1596.1/1616.7 (+1.16%; pairs +0.48/+1.83); texts identical
+  in every arm; chk's 38 `[scratch-tail]` check lines differ=0; bank rows 147/176, 146/175 in one arm of each binary
+  (b1, a2: the load's); the guard's peak not up (b's largest 106.2 against a's 108.1).
 
 ## The pack
 
