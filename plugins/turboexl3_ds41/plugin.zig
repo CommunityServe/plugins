@@ -87,6 +87,9 @@ pub const joinless = @import("src/joinless.zig");
 /// A wide prompt layer's joinless combine and hc expand in one kernel (`MLX_SERVE_DSV41_TAIL_FUSE`, src/tail_fuse.zig),
 /// read by the copied model and launched by the copied stream's source.
 pub const tail_fuse = @import("src/tail_fuse.zig");
+/// A decode-lane call's routed sum, shared expert and hc expand in TAIL_FUSE's kernel (`MLX_SERVE_DSV41_DECODE_FUSE`,
+/// src/decode_fuse.zig), read by the copied model and source.
+pub const decode_fuse = @import("src/decode_fuse.zig");
 /// What a wide prompt call's MoE does not read, committed behind its routes before the routing barrier waits on them
 /// (`MLX_SERVE_DSV41_WIDE_EARLY`, src/wide_early.zig), read by the copied model.
 pub const wide_early = @import("src/wide_early.zig");
@@ -505,6 +508,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    // Before the model's load: its decode instance of TAIL_FUSE's kernel is compiled at load.
+    decode_fuse.configure(env.span(.MLX_SERVE_DSV41_DECODE_FUSE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_FUSE is none of 0, 1, check (unset: 1): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     tail_fuse.configure(env.span(.MLX_SERVE_DSV41_TAIL_FUSE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_TAIL_FUSE is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -687,6 +698,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (prompt_io.on) log.info("[turboexl3_ds41] prompt timeline on (MLX_SERVE_DSV41_PROMPT_IO): [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end{s}\n", .{if (prompt_io.split_ra) "; the read-ahead's wait split (=2: a sync at each step)" else ""});
     log.info("[turboexl3_ds41] read-ahead prediction: {s}\n", .{if (ra_fused.on) "on the fused hc kernels (MLX_SERVE_DSV41_RA_FUSED=0: the op chain)" else "the op chain (MLX_SERVE_DSV41_RA_FUSED=0)"});
     log.info("[turboexl3_ds41] decode lookahead's next-layer scores: {s}\n", .{if (late_gemv.on) "MLX's wide GEMV in the weights' half type (MLX_SERVE_DSV41_LATE_GEMV=0: the f32 product)" else "the f32 product (MLX_SERVE_DSV41_LATE_GEMV=0)"});
+    switch (decode_fuse.mode) {
+        .off => {},
+        .on => log.info("[turboexl3_ds41] decode calls' routed sum, shared expert and hc expand in TAIL_FUSE's kernel (MLX_SERVE_DSV41_DECODE_FUSE){s}; [decode-fuse] at each request's end\n", .{if (shared_hoist.on) "" else ": no effect without MLX_SERVE_DSV41_SHARED_HOIST"}),
+        .check => log.info("[turboexl3_ds41] decode calls' tail fused, checked (MLX_SERVE_DSV41_DECODE_FUSE=check): the chain served, the kernel compared with it on every decode call word for word{s}; [decode-fuse] checks= words= differ= at each request's end\n", .{if (shared_hoist.on) "" else ": no effect without MLX_SERVE_DSV41_SHARED_HOIST"}),
+    }
     log.info("[turboexl3_ds41] decode layers' shared expert: {s}\n", .{if (shared_hoist.on) "committed behind the hit wave (MLX_SERVE_DSV41_SHARED_HOIST=0: in the layer's last stretch)" else "in the layer's last stretch (MLX_SERVE_DSV41_SHARED_HOIST=0)"});
     log.info("[turboexl3_ds41] embedding table: {s}\n", .{if (embed_pread.on) "read from the pack at each lookup, not resident (MLX_SERVE_DSV41_EMBED_PREAD=0: resident)" else "resident (MLX_SERVE_DSV41_EMBED_PREAD=0)"});
     log.info("[turboexl3_ds41] vision tower: {s}\n", .{if (vision_lazy.on) "read from the pack for each image, not resident (MLX_SERVE_DSV41_VISION_LAZY=0: resident)" else "resident (MLX_SERVE_DSV41_VISION_LAZY=0)"});
@@ -1306,7 +1322,8 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const hwl = hw4b.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len ..]);
     // MLX_SERVE_DSV41_M1: the [m1] line (on or check; check's compares since the last request's end).
     const m1l = m1.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len ..]);
-    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len;
+    const dfl = decode_fuse.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     // dq1b: the decode's demand ranges by class, the gate/up split's counts, the cold start's first calls.
     const dmd = demand_split.meters(meter_buf[n + io.len ..]);

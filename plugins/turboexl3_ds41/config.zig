@@ -207,6 +207,7 @@ test {
     _ = @import("src/woa_rows.zig");
     _ = @import("src/joinless.zig");
     _ = @import("src/tail_fuse.zig");
+    _ = @import("src/decode_fuse.zig");
     _ = @import("src/wide_early.zig");
     _ = @import("src/rest_early.zig");
     _ = @import("src/q_tail.zig");

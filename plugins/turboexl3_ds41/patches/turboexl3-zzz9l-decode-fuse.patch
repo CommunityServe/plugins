@@ -1,0 +1,256 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -276,6 +276,7 @@
+     pub const MLX_SERVE_DSV41_DRAFT_AHEAD: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 greedy round's next DSpark draft (turboexl3_ds41): launched at the end of the round before it, from its next token once its state is committed, when the next plan is the stages' block, and taken by the next round when it fits (the same token, position and state); the same ops, served bytes unchanged (unset or 1: on; 0: off; check: on, the next round makes its own draft too, compares the ids and confidences word for word and serves its own, [draft-ahead] lines)" };
+     pub const MLX_SERVE_DSV41_DECODE_STOP: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode stop (turboexl3_ds41): the decode phase's budget takes 1.0e9 B of the 2.0e9 B stop under the ceiling back for its slot rows (two more on the M5 Max at 16K), MLX's cache capped at 1 GiB from the phase change to decode and the prompt's cap restored at the change back; the prompt's budget and rows unchanged; the same bytes (unset or 1: on; 0: off; check: as 1, [decode-stop] lines)" };
+     pub const MLX_SERVE_DSV41_STAGE_TRIM: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt call's staging trimmed at its routes (turboexl3_ds41, with MLX_SERVE_DSV41_STAGE): the staged windows' parts posted hottest first, and once the call's routes are known each staged part holding none of its experts that no read has started taken back out of the read pool unread, its rows let go; reads only, the same bytes (unset or 1: on; 0: off; check: as 1, each withdrawn ticket's status read back, [stage-trim] lines)" };
++    pub const MLX_SERVE_DSV41_DECODE_FUSE: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode call's tail in one kernel (turboexl3_ds41, with MLX_SERVE_DSV41_SHARED_HOIST): a decode-lane routed call's joined rows read in place through their (source, row) table by TAIL_FUSE's kernel, weighted and folded in the column reduce's order, the shared expert (committed behind the call's waves) added, rounded and hc-expanded into the layer's new streams, not the take, weight, sum and ffn_post_shared stretch; the same words (unset or 1: on, zzz9l; 0: off; check: the chain served, the kernel compared word for word, [decode-fuse] lines)" };
+     pub const MLX_SERVE_DSV41_DECODE_WINDOW: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode window 0 (turboexl3_ds41): 4 rows, not the widest decode route's 48, a decode plan admitting its declined misses past them over the lowest-ranked residents it does not use, the freed bytes billed to the decode slot rows (taken where every layer keeps 96 decode rows or more); the same bytes served (unset or 1: on; 0: off; check: on, the plans left past the window counted), [bank-bill] at load and [mem-decode] at each request's end" };
+     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
+     pub const MLX_SERVE_DSV41_DSPARK_COSTS: Var = .{ .kind = .kill, .type = .text, .default = "unset", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark fixed verify policy's tables (turboexl3_ds41; with MLX_SERVE_DSV41_DSPARK_POLICY unset or =fixed only, refused beside =0 or =1; sampled requests only, a greedy request's rounds verify the whole block; unset: the built-in tables fitted on an M5 Max, src/rounds.zig DEFAULT_COSTS): v1,v2,...,vN/d, the verify ms by rows from one to N (2..16) then the ms a stage draft takes, or such tables by context U1:t1+U2:t2+...+tK (the bounds ascending positions, the last table unbounded, at most 8; a round reads the first table whose bound exceeds its position), fitted once per box and pack; the cut and the drafting backoff read it instead of the measured ladder and the round's wall time, so a request's text is the same run to run; refused by name when malformed" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -55,6 +55,9 @@
+ const dp = @import("../../../dec_prefetch.zig");
+ /// A wide layer's tail in one kernel (turboexl3_ds41's src/tail_fuse.zig, `MLX_SERVE_DSV41_TAIL_FUSE`).
+ const tfuse = @import("../../../tail_fuse.zig");
++/// A decode-lane call's routed sum, shared expert and hc expand in TAIL_FUSE's kernel (turboexl3_ds41's
++/// src/decode_fuse.zig, `MLX_SERVE_DSV41_DECODE_FUSE`).
++const dfuse = @import("../../../decode_fuse.zig");
+ /// What a wide call's MoE does not read, committed behind its routes before the routing barrier waits on them
+ /// (turboexl3_ds41's src/wide_early.zig, `MLX_SERVE_DSV41_WIDE_EARLY`).
+ const wearly = @import("../../../wide_early.zig");
+@@ -1625,6 +1628,9 @@
+     try probeTopkThreads(gpa, m);
+     if (mlx.streamIsGpu(s)) m.dec = try Dec.init(gpa, cfg);
+     try compileRegions(m);
++    // turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE): TAIL_FUSE's decode instance compiled now, not at a request's first
++    // decode call.
++    if (dfuse.on() and mlx.streamIsGpu(s)) try warmDecodeFuse(m);
+     if (n_stages > 0) {
+         for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
+         const last = n_stages - 1;
+@@ -3794,6 +3800,26 @@
+     const n: u64 = mlx.mlx_array_size(early);
+     wearly.report(li, n, n - @as(u64, @intCast(same)), @intFromFloat(far), biggest);
+ }
++/// turboexl3_ds41 (`MLX_SERVE_DSV41_DECODE_FUSE`): TAIL_FUSE's decode instance (`tfuse.expandDecode`) launched once on
++/// zeros of a decode call's shapes and dtypes (f32 routed rows, the activation dtype's streams, the shared rows in the
++/// activation dtype and in f32), so its pipelines are compiled at load.
++fn warmDecodeFuse(m: *const Dsv41Model) !void {
++    var sc = Scope.init(m.gpa, m.s);
++    defer sc.deinit();
++    const c = &m.cfg;
++    const k = c.num_experts_per_tok;
++    const d = c.hidden_size;
++    const hc = c.dsv4_hc_mult;
++    const rows = try sc.zeros(&.{ ci(k), ci(d) }, .float32);
++    const loc = try sc.zeros(&.{ 1, ci(k), 2 }, .int32);
++    const w = try sc.zeros(&.{ 1, ci(k) }, .float32);
++    const res = try sc.zeros(&.{ 1, ci(hc), ci(d) }, m.act);
++    const pc = try sc.zeros(&.{ 1, ci(hc + hc * hc) }, .float32);
++    var outs: [2]A = undefined;
++    for ([_]mlx.mlx_dtype{ m.act, .float32 }, &outs) |sdt, *o| o.* = try sc.keep(try tfuse.expandDecode(m.s, &.{rows}, loc, w, try sc.zeros(&.{ 1, ci(d) }, sdt), res, pc));
++    try evalAll(&outs);
++    dfuse.warmed = true;
++}
+ /// A resident EXL3 bank's routed sum `[L, d]` f32: turboexl3's MoE with the pack's SwiGLU clamp.
+ fn routedExl3(sc: *Scope, m: *const Dsv41Model, b: *const t3.Bank, x: A, idx: A, wts: A) !A {
+     const L = dim(x, 0);
+@@ -3885,6 +3911,18 @@
+         if (m.streamed) |src| {
+             var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
+             try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, a[0], a[1], a[2] }, &p);
++            // turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE, with SHARED_HOIST): the shared expert built first (the source
++            // commits it behind the routed call's waves, as SHARED_HOIST does), the call's joined rows, the shared rows and
++            // the hc expand in TAIL_FUSE's kernel: the new stream, the words of the source's sum and `ffn_post_shared`.
++            if (dfuse.on() and shoist.on and src.math == .source and mlx.mlx_array_dtype(p[2]) == .float32 and mlx.mlx_array_dtype(p[3]) == .float32) if (src.source_decode_expand) |fx| {
++                var s: [1]A = undefined;
++                try runRegion(sc, m, li, .ffn_shared, &.{p[4]}, &s);
++                const pc = try sc.concat(&.{ p[2], try sc.reshape(p[3], &.{ ci(dim(p[3], 0)), -1 }) }, 1);
++                const yf = try sc.keep(try fx(src.ctx, @intCast(li), p[4], p[5], p[6], s[0], p[0], pc).get());
++                try prof.mark(.combine, &.{yf});
++                pre.* = p[1];
++                return yf;
++            };
+             const ro = switch (src.math) {
+                 .source => |f| try sc.keep(try f(src.ctx, @intCast(li), p[4], p[5], p[6]).get()),
+                 .trunk => blk: {
+diff -ruN -x .generated a/sdk/weights/routed.zig b/sdk/weights/routed.zig
+--- a/sdk/weights/routed.zig
++++ b/sdk/weights/routed.zig
+@@ -41,6 +41,10 @@
+     /// model's hc expand of the streams `res` [n, hc, d] by `pc` (f32 [n, hc + hc * hc], each row's post then comb) in
+     /// the combine's kernel: the layer's new streams. Null: not offered.
+     source_expand: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
++    /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE): `source_expand`'s fused tail for a decode-lane call (at most
++    /// `decode_ids` ids; the same arguments, the shared expert's rows committed behind the call's waves): the layer's new
++    /// streams, the words of `source`'s sum and the model's `ffn_post_shared`. Null: not offered.
++    source_decode_expand: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
+     /// turboexl3_ds41 (MLX_SERVE_DSV41_SCRATCH_TAIL): `source_expand` with the new streams written over `res` in place (the
+     /// model's x1 region); returns the write's one-word carrier (`check`: the stock kernel's streams, the twin's compared
+     /// with them in the call). Null: not offered.
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -52,6 +52,9 @@
+ const dec_prefetch = @import("mlx_host").dec_prefetch;
+ /// `MLX_SERVE_DSV41_TAIL_FUSE` (the plugin's src/tail_fuse.zig): the combine and the model's hc expand in one kernel.
+ const tail_fuse = @import("mlx_host").tail_fuse;
++/// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE, the plugin's src/decode_fuse.zig): a decode-lane call ending in
++/// TAIL_FUSE's kernel.
++const decode_fuse = @import("mlx_host").decode_fuse;
+ /// `MLX_SERVE_DSV41_SCRATCH_TAIL` (the plugin's src/scratch_tail.zig): the new streams written over the model's x1 region.
+ const scratch_tail = @import("mlx_host").scratch_tail;
+ /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_STOP, the plugin's src/decode_stop.zig): MLX's cache capped at decode, the
+@@ -481,6 +484,46 @@
+         };
+         const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
+         return g.keep(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false));
++    }
++    /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE): the decode lane's fused tail is offered (`Routed.source_decode_expand`).
++    pub fn decodeFuseOn(self: *const Source) bool {
++        _ = self;
++        return decode_fuse.on();
++    }
++    /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE): a decode-lane call (at most `decode_route_ids` routed ids) ending in
++    /// TAIL_FUSE's kernel: the call's joined rows read in place through their (source 0, row) table, each weighted, the
++    /// six folded in the column reduce's order, the shared rows (`shared`, as the model made them, committed behind the
++    /// call's waves as SHARED_HOIST commits them) added, rounded to the streams' dtype, then the hc expand of `res` by
++    /// `pc` (f32 [n, hc + hc * hc], each row's post then comb): the layer's new streams, the words of `rows`'s take,
++    /// weight and sum and the model's `ffn_post_shared`. `check`: that chain from the same rows served, the kernel's
++    /// compared with it word for word on the device (`decode_fuse.note`).
++    pub fn rowsDecodeExpand(self: *Source, layer: u32, x: T, idx: T, wts: T, shared: T, res: T, pc: T) !T {
++        self.t3_state.begin();
++        const g = &self.g;
++        defer g.reset();
++        const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
++        self.t3_state.n = 0;
++        const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
++        switch (self.hook) {
++            inline else => |*h| {
++                const lo = try h.at(layer).routedHoistLocated(g, x, ids, &.{});
++                // The shared expert committed behind the call's waves, where SHARED_HOIST commits it.
++                try g.asyncEval(&.{shared});
++                decode_fuse.firstCall(g.dtypeOf(lo.rows) == .float32, g.dtypeOf(res) == .bfloat16, g.dtypeOf(shared) == .bfloat16, g.dtypeOf(shared) == .float32);
++                if (decode_fuse.mode != .check) return tail_fuse.expandDecode(g.s, &.{lo.rows}, lo.loc, w, shared, res, pc);
++                const n = g.shapeOf(w).dim(0);
++                const k = g.shapeOf(w).dim(1);
++                const hidden = g.shapeOf(lo.rows).dim(1);
++                const routed = try g.reshape(try g.take(lo.rows, lo.order, 0), &.{ n, k, hidden });
++                const y32 = try g.sum(try g.mul(try g.astype(routed, .float32), try g.expandDims(w, -1)), -2, false);
++                const sh32 = if (g.dtypeOf(shared) == .float32) shared else try g.astype(shared, .float32);
++                const ref = try tail_fuse.chain(g.s, try g.add(y32, sh32), res, pc);
++                errdefer _ = mlx.mlx_array_free(ref);
++                const c = try tail_fuse.compareDecode(g.s, &.{lo.rows}, lo.loc, w, shared, res, pc, ref);
++                decode_fuse.note(c.words, c.differ, c.max_abs);
++                return ref;
++            },
++        }
+     }
+     /// MLX_SERVE_DSV41_SCRATCH_WAVES: a wide prompt call (more routed rows than `decode_route_ids`) begins: the regions
+     /// made or kept (`scratch_waves.callBegin`); false (the fresh path) off, in decode, for a narrow call, or where the
+diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streamed/experts.zig
+--- a/sdk/weights/streamed/experts.zig
++++ b/sdk/weights/streamed/experts.zig
+@@ -1118,6 +1118,11 @@
+             pub fn routedHoistIndexed(h: Hook, g: *G, xf: T, indices: T, hoist: []const T) !Indexed {
+                 return h.ex.runEnd(g, h.layer, xf, indices, hoist, .indexed);
+             }
++            /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE, a decode-lane call): `routedHoistIndexed` with the same rows as
++            /// a (source, row) table, for TAIL_FUSE's kernel to read them in place.
++            pub fn routedHoistLocated(h: Hook, g: *G, xf: T, indices: T, hoist: []const T) !Located {
++                return h.ex.runEnd(g, h.layer, xf, indices, hoist, .located);
++            }
+             /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs as the
+             /// combine's sources and each assignment's (source, row); `releaseParts` after the combines are evaluated.
+             pub fn routedParts(h: Hook, g: *G, xf: T, indices: T) !Parts {
+@@ -1401,9 +1406,20 @@
+         /// combine reads the rows in place): the concatenated outputs [rows, hidden] and each routed position's row in
+         /// them, u32 [n * k] (`joinOrder`; the stock join takes exactly these rows).
+         pub const Indexed = struct { rows: T, order: T };
+-        /// How a call ends: the join's take (`run`, every caller's route) or the indexed rows (JOIN_INDEXED).
+-        const Ending = enum { take, indexed };
+-        fn runEnd(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T, comptime ending: Ending) !(if (ending == .take) T else Indexed) {
++        /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE): `Indexed` plus each routed position's (source, row) in the
++        /// concatenated outputs, int32 [n, k, 2] (source 0: the one concatenated source), for TAIL_FUSE's kernel.
++        pub const Located = struct { rows: T, order: T, loc: T };
++        /// How a call ends: the join's take (`run`, every caller's route), the indexed rows (JOIN_INDEXED) or the located
++        /// rows (MLX_SERVE_DSV41_DECODE_FUSE).
++        const Ending = enum { take, indexed, located };
++        fn EndOf(comptime ending: Ending) type {
++            return switch (ending) {
++                .take => T,
++                .indexed => Indexed,
++                .located => Located,
++            };
++        }
++        fn runEnd(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T, comptime ending: Ending) !EndOf(ending) {
+             const n: u32 = @intCast(g.shapeOf(xf).dim(0));
+             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
+             const n_ids = n * k;
+@@ -1412,7 +1428,7 @@
+             if (if (comptime @hasDecl(M, "prefill_min_tokens")) n >= M.prefill_min_tokens else n_ids > max_route_ids) {
+                 // Only a decode-width layer hoists (the trunk's small-rows segments).
+                 std.debug.assert(hoist.len == 0);
+-                if (comptime ending == .indexed) {
++                if (comptime ending != .take) {
+                     // The indexed join serves the decode lane only (a wide call joins in its combine already).
+                     return error.IndexedJoinWideCall;
+                 } else if (comptime !routes.prefill) {
+@@ -1522,7 +1538,7 @@
+             if (dev != null) try self.devLutAfterRoute(g, layer);
+             if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), sv.n_parts > 0);
+             if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, ids, sv.waves, wall_b, tail_reads);
+-            return if (comptime ending == .take) self.join(g, &acc, n, k) else joinIndexed(g, &acc, n, k);
++            return if (comptime ending == .take) self.join(g, &acc, n, k) else if (comptime ending == .indexed) joinIndexed(g, &acc, n, k) else joinLocated(g, &acc, n, k);
+         }
+         /// Each routed position's row in the concatenated outputs: the LAST row carrying it (DEVROUTE's miss parts follow
+         /// the device wave and replace its rows for their pairs; the stock route carries each position once).
+@@ -1546,6 +1562,21 @@
+             const n_ids = joinOrder(acc.pos[0..acc.n_pos], n * k, &order);
+             const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
+             return .{ .rows = joined, .order = ord };
++        }
++        /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE): `joinIndexed` plus the take's rows as (source 0, row) pairs, made on
++        /// the host from the same order.
++        fn joinLocated(g: *G, acc: *const Acc, n: u32, k: u32) !Located {
++            const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
++            var order: [max_route_ids]u32 = undefined;
++            const n_ids = joinOrder(acc.pos[0..acc.n_pos], n * k, &order);
++            var pairs: [2 * max_route_ids]i32 = undefined;
++            for (order[0..n_ids], 0..) |o, j| {
++                pairs[2 * j] = 0;
++                pairs[2 * j + 1] = @intCast(o);
++            }
++            const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
++            const loc = try g.hostArray(std.mem.sliceAsBytes(pairs[0 .. 2 * n_ids]), &.{ @intCast(n), @intCast(k), 2 }, .int32);
++            return .{ .rows = joined, .order = ord, .loc = loc };
+         }
+         /// The self-check's joined row as the host reads it: a math with its own projection (bf16 joins) casts to
+         /// f32; DeepSeek's EXL3 joins are f32 already and are read as they are.
+diff -ruN -x .generated a/sdk/weights/streamed.zig b/sdk/weights/streamed.zig
+--- a/sdk/weights/streamed.zig
++++ b/sdk/weights/streamed.zig
+@@ -78,6 +78,10 @@
+             const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
+             return .of(s.rowsSharedExpandInto(layer, x, idx, wts, shared, res, pc));
+         }
++        fn rowsDecodeExpand(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array, shared: mlx.mlx_array, res: mlx.mlx_array, pc: mlx.mlx_array) routed.Ret(mlx.mlx_array) {
++            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.rowsDecodeExpand(layer, x, idx, wts, shared, res, pc));
++        }
+         fn nextAhead(ctx: *anyopaque, na: routed.NextAhead, ids: mlx.mlx_array) routed.Ret(void) {
+             const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
+             return .of(s.nextAhead(na.layer, ids, na.cap, na.fill, na.windows));
+@@ -85,7 +89,7 @@
+     };
+     // turboexl3_ds41 (MLX_SERVE_DSV41_JOINLESS): the joinless combine, when the source built it; MLX_SERVE_DSV41_STAGE_NEXT:
+     // the next routed layer's prediction (the source drops it when the switch is off).
+-    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead, .decode_ids = Exl3.decode_route_ids, .source_shared = if (src.joinlessOn()) &C.rowsShared else null, .source_expand = if (src.joinlessOn()) &C.rowsSharedExpand else null, .source_expand_into = if (src.joinlessOn()) &C.rowsSharedExpandInto else null, .next_fn = &C.nextAhead };
++    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead, .decode_ids = Exl3.decode_route_ids, .source_shared = if (src.joinlessOn()) &C.rowsShared else null, .source_expand = if (src.joinlessOn()) &C.rowsSharedExpand else null, .source_expand_into = if (src.joinlessOn()) &C.rowsSharedExpandInto else null, .next_fn = &C.nextAhead, .source_decode_expand = if (src.decodeFuseOn()) &C.rowsDecodeExpand else null };
+ }
+ /// GLM-5.3-Flash's EXL3 bank (`streamed/glm5n_source.zig`): the source returns routed sums.
+ pub const Glm5n = if (build_options.mlx_stream) plugin.glm5n_source else struct {};

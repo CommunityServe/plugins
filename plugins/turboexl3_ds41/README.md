@@ -470,6 +470,25 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   waits on bytes 666 and 679 ms against 1516 and 1650; 4722 records staged, 4079 adopted (86%), the rest 7.9 GB of reads
   under the attention, which ran about 25 ms a layer longer with them in flight. Exact: the texts are the same in every
   arm (the cold one md5 efeb6f4ecd).
+- `MLX_SERVE_DSV41_DECODE_FUSE` (src/decode_fuse.zig, src/tail_fuse.zig's decode instance, patches/turboexl3-zzz9l-decode-
+  fuse.patch; on by default, `=0` off, `=check` the chain served and the kernel compared; needs
+  `MLX_SERVE_DSV41_SHARED_HOIST`, on by default): a
+  decode-lane routed call's tail in TAIL_FUSE's kernel. A decode call (at most 48 routed ids) ends in the streamer's
+  join (its outputs concatenated, then taken in routed order), the source's weight and sum (a multiply, then MLX's
+  column reduce over the six) and the model's `ffn_post_shared` stretch (the shared expert added in f32, rounded,
+  glm5's hc expand). TAIL_FUSE's kernel computes that chain's words for a wide call; on, the model builds the shared
+  expert first and hands it to the source, which commits it behind the call's waves (where SHARED_HOIST does); the
+  call ends at the join's rows and their (source 0, row) table (`Hook.routedHoistLocated`, JOIN_INDEXED's order) and
+  the kernel writes the layer's new streams. Its decode instance (`tail_fuse.expandDecode`: NROWS fixed at 16, the
+  grid's own bound never reached) is
+  one pipeline for every decode call, compiled at load. `=check` serves the chain from the same rows and compares the
+  kernel's streams with it on every decode call, word for word. `[decode-fuse] mode= calls= checks= words= differ=
+  max_abs=` at each request's end. Exact: the chain's operations in its order, one launch.
+- Read as jc1 (M5 Max, w-20261102-1043; code-ctx16384 card then greedy, a = ctl25 5ccb44791b50, b = jc1 3ba9ae0d352e
+  at 1, chk at check; a1 b1 b2 a2 b3 a3 a4 b4): card 44.1 44.0 43.9 43.7 against 44.3 44.3 43.8 44.4 tok/s (+0.63%;
+  pairs +0.45, +0.68, -0.23, +1.60), greedy 55.7 56.1 55.6 55.7 against 56.0 55.9 56.1 56.1 (+0.45%; pairs +0.54, -0.36,
+  +0.90, +0.72); the texts the same bytes in every arm, chk's [decode-fuse] differ 0 over 4640 + 8960 checks, the
+  kernel's calls in every b arm. Merged on (zzz9l).
 - `MLX_SERVE_DSV41_TAIL_FUSE` (src/tail_fuse.zig, src/kernels/tail_fuse.metal, patches/turboexl3-zzz8g-tail-fuse.patch;
   on, `=0` off, `check` the kernel checked): a wide prompt layer's tail in one kernel. `=0`: the routed call ends in the
   joinless combine (an f32 [rows, D] sum of the routed rows and the shared expert, itself widened to f32 for it), the
