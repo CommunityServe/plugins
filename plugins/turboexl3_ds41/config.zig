@@ -242,6 +242,7 @@ test {
     _ = @import("src/hw2.zig");
     _ = @import("src/embed_pread.zig");
     _ = @import("src/vision_lazy.zig");
+    _ = @import("src/hc_fuse.zig");
     _ = @import("src/scratch_tail.zig");
     _ = @import("src/bank_pool.zig");
 }

@@ -161,6 +161,9 @@ pub const scratch = @import("src/scratch.zig");
 /// src/scratch_waves.zig on src/scratch.zig's `Region`, its twins' texts by src/wave_twins.zig), read by the copied
 /// quant and source.
 pub const scratch_waves = @import("src/scratch_waves.zig");
+/// A wide prompt layer's hyper-connection stages with fewer passes over the stream (`MLX_SERVE_DSV41_HC_FUSE`,
+/// src/hc_fuse.zig, kernels/hc_mix_norm.metal and kernels/hc_expand_norm.metal), read by the copied model.
+pub const hc_fuse = @import("src/hc_fuse.zig");
 /// A wide prompt call's DIG-X waves' 128-row GEMMs with the B stage double-buffered (`MLX_SERVE_DSV41_M1`, src/m1.zig),
 /// read by the copied quant and source.
 pub const m1 = @import("src/m1.zig");
@@ -386,6 +389,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     }
     scratch_tail.configure(env.span(.MLX_SERVE_DSV41_SCRATCH_TAIL)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_TAIL is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    hc_fuse.configure(env.span(.MLX_SERVE_DSV41_HC_FUSE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_HC_FUSE is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -869,6 +879,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] wide prompt layers' new streams in a fresh buffer a layer (MLX_SERVE_DSV41_SCRATCH_TAIL=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' new streams written in place over their x1 region (MLX_SERVE_DSV41_SCRATCH_TAIL; =0: a fresh buffer a layer; with MLX_SERVE_DSV41_SCRATCH and TAIL_FUSE on): TAIL_FUSE's write-into twin, the region published as the layer's streams, no fresh buffer a layer (a call's last wide layer keeps it)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' new streams over their x1 region, checked (MLX_SERVE_DSV41_SCRATCH_TAIL=check): the stock kernel's fresh streams served, the twin's compared word for word in the same routed call; a [scratch-tail] check line a wide layer\n", .{}),
+    }
+    switch (hc_fuse.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' hc stages as the stock kernels (MLX_SERVE_DSV41_HC_FUSE=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' hc stages fused (MLX_SERVE_DSV41_HC_FUSE; =0: the stock kernels): the attention side's mixes and norm in one launch, the FFN side's expand and norm in one launch into the x1 region, the splits from the mixes after\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' hc stages fused, checked (MLX_SERVE_DSV41_HC_FUSE=check): the stock kernels served, the fused launches compared word for word; an [hc-fuse] check line a side a wide layer\n", .{}),
     }
     switch (scratch_attn.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' attention spans' scores and probabilities in fresh buffers (MLX_SERVE_DSV41_SCRATCH_ATTN=0)\n", .{}),

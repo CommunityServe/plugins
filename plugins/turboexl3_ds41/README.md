@@ -936,6 +936,30 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   buffers, allocated earlier: about 48 MB over the phase change and the embedding (the row ids, the thread's copy, table
   0's read buffers, 64 more threads' stacks), at most about 45 MB more at L1's activation peak; nothing in GPU/MLX memory
   or the page cache (direct reads).
+- `MLX_SERVE_DSV41_HC_FUSE` (src/hc_fuse.zig, src/kernels/hc_mix_norm.metal, src/kernels/hc_expand_norm.metal,
+  patches/turboexl3-zzz9o-hc-fuse.patch; on by default, `=0` off, `=check`): a wide prompt layer's hyper-connection
+  stages with fewer passes over the stream ([L, 4, 5120] bf16, 671 MB at 16K rows). Off, the attention side's hc_mix
+  reads the stream and hc_norm reads it again (RA_FUSED's read-ahead norm a third time); the FFN side's expand writes
+  the new stream into the x1 region and hc_mix and hc_norm each read it back. On, the attention side is one launch
+  (hc_mix's threadgroups, statement for statement, and beside each row group's a threadgroup of hc_norm's collapse and
+  norm, the read-ahead's norm too under RA_FUSED) and the FFN side's expand and norm are one launch into the region
+  (each thread expands its columns of every copy with the expand's fmas and collapses them from its registers), hc_mix
+  then reading the region; both sides take the split from the mixes after with hc_split (hc_norm's split statements).
+  Exact: every sum over the same `hc_tg` threads, the same simd sums and partials in the same order; a GPU that runs a
+  fused kernel at fewer threads refuses it by name at load. `check` serves the stock kernels and compares every output
+  word for word (`[hc-fuse] check layer= side=attn|ffn words= differ=`; the FFN side's fused launch evaluated before the
+  served expand, which may overwrite the stream in place). src/gpu_check.zig's hc-fuse arm compiles the three fused
+  kernels on the GPU at the served template arguments and checks every output against the stock chain's at 1, 2, 4,097
+  and 16,383 rows. GPU check (o1g, gpu_check 0238e2fbbf45): every output word-equal to the stock chain's at all four
+  sizes (hc_mix_norm with and without the read-ahead's norm, hc_expand_norm, hc_expand_norm_into out of place and in
+  place, the in-place stream changed), DONE rc=0, peak 4,322 MB; the first build (o1a1) did not load: a row pointer of
+  hc_expand_norm's was `const device float*` from `post`, which MLX binds in the constant space at the load probe's one
+  row (`auto` since). Measured (o1a2, w-pio-20261102-1343: ctl42 05cb5ae13fd0 against o1a2 4f2d245ff5e9, both on
+  G_KITSP1, two runs an arm): the cold 16K card 1586.7/1587.9 -> 1598.5/1599.7 tok/s (+0.74%; pairs +0.74/+0.74), the
+  new-text slice 1705.3/1684.2 -> 1703.3/1704.6 (+0.54%; pairs -0.12/+1.21); texts identical in every arm, chk's
+  included; chk's 80 `[hc-fuse]` check lines differ=0; bank rows 147/176 in every measured arm; the guard's peak
+  103.7/99.7 GiB against 107.9/104.2 (not up: the fused launches make the same large arrays at the same points as the
+  stock kernels, and no fresh stream).
 
 ## The pack
 
