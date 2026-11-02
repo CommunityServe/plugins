@@ -748,10 +748,19 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     open = null;
     ptl_model = if (prompt_tl.setting.dirPath() != null) model(mp) else null;
     prompt_tl.hook = if (ptl_model != null) &ptlStage else null;
+    // MLX_SERVE_DSV41_DSPARK_WIDTH (diagnostic): a greedy round's verify width forced (src/rounds.zig `Width`).
+    const width = rounds.Width.parse(env.span(.MLX_SERVE_DSV41_DSPARK_WIDTH)) catch {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DSPARK_WIDTH is none of 0, 1..8, random:S[:M], sweep[:M] (M 1..8): the load is refused\n", .{});
+        out.* = Verdict.refuse(.unsupported, "turboexl3_ds41: DsparkWidthSetting");
+        return null;
+    };
     const on: rounds.Switches = .{
         .copy = config.switchOn(env.span(.MLX_SERVE_DSV41_DSPARK_COPY)),
         .policy = fixed_on or config.switchOff(policy_raw),
         .fixed = fixed,
+        // aw1 (MLX_SERVE_DSV41_DSPARK_FIXED_GREEDY): the fixed policy on greedy requests too, when set (=1; aw1s: off by default).
+        .fixed_greedy = config.switchOff(env.span(.MLX_SERVE_DSV41_DSPARK_FIXED_GREEDY)),
+        .width = width,
     };
     // The policy reads each draft's confidence, as the engine has its built-in model's stages do.
     model(mp).mdl.ds_want_conf = on.policy;
@@ -775,7 +784,12 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     dropPending();
     if (drafter) |*d| d.deinit();
     drafter = rounds.Drafter.init(gpa, on);
-    log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.fixed != null) (if (costs_raw != null) "fixed on sampled requests, on MLX_SERVE_DSV41_DSPARK_COSTS's tables (the cut and the backoff by context, never the clock; a greedy request's rounds verify the whole block; MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)" else "fixed on sampled requests, on the built-in tables fitted on an M5 Max (the cut and the backoff by context, never the clock; a greedy request's rounds verify the whole block; MLX_SERVE_DSV41_DSPARK_COSTS other tables, MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)") else if (on.policy) "the live policy (MLX_SERVE_DSV41_DSPARK_POLICY=1: the measured ladder and the round's wall time)" else "off: every round verifies the whole block (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
+    if (on.width != .off) {
+        var wb: [32]u8 = undefined;
+        log.info("[turboexl3_ds41] DSpark greedy rounds' verify width forced (MLX_SERVE_DSV41_DSPARK_WIDTH={s}; past the block the drafts again as filler); [dspark-width] lines at each request's end; a diagnostic setting, never served\n", .{on.width.describe(&wb)});
+    }
+    if (on.fixed != null) log.info("[turboexl3_ds41] DSpark fixed policy on greedy requests: {s}\n", .{if (on.fixed_greedy) "on (MLX_SERVE_DSV41_DSPARK_FIXED_GREEDY=1: aw1's cut and backoff on greedy rounds too, on lad2's tables)" else "off, the default: a greedy request's rounds verify the whole block (MLX_SERVE_DSV41_DSPARK_FIXED_GREEDY=1 cuts them)"});
+    log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.fixed != null) (if (costs_raw != null) "fixed on sampled requests, on MLX_SERVE_DSV41_DSPARK_COSTS's tables (the cut and the backoff by context, never the clock; greedy requests: the next line; MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)" else "fixed on sampled requests, on the built-in tables fitted on an M5 Max (the cut and the backoff by context, never the clock; greedy requests: the next line; MLX_SERVE_DSV41_DSPARK_COSTS other tables, MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)") else if (on.policy) "the live policy (MLX_SERVE_DSV41_DSPARK_POLICY=1: the measured ladder and the round's wall time)" else "off: every round verifies the whole block (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
     log.info("[turboexl3_ds41] read pool parts: {s}\n", .{if (direct_parts.on) "each demand read's parts on the file's block read straight into their rows, the rest staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0: every part staged); [direct-parts] lines at each prompt's and request's end" else "every part staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0)"});
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
     if (dec_prefetch.on) log.info("[turboexl3_ds41] CED decoder prefetch on (MLX_SERVE_DSV41_DEC_PREFETCH): the decoder layers' experts predicted at encoder layer {d}, {d} layers posted per prompt call, into their free rows only\n", .{ dec_prefetch.start, dec_prefetch.per_call });
@@ -1158,9 +1172,14 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
         };
         errdefer d.deinit(gpa);
         d.len = dr.cut(d.confidence[0..@min(d.len, max)]);
+        // MLX_SERVE_DSV41_DSPARK_WIDTH (diagnostic): a greedy round's verify width forced.
+        if (dr.greedy) if (dr.on.width.rows(st.n, dr.req.stage_rounds)) |w| try forceWidth(&d, w, max);
         routesRound(m, "stage", st.n, d.ids[0 .. d.len + 1]);
         var round: Round = .{ .kind = .stage, .drafts = d.len, .watch = watch };
-        @memcpy(round.conf[0..d.len], d.confidence[0..d.len]);
+        const nc = @min(d.len, d.confidence.len);
+        @memcpy(round.conf[0..nc], d.confidence[0..nc]);
+        // filler past the block: no confidence (`forceWidth`)
+        for (round.conf[nc..d.len]) |*c| c.* = -std.math.inf(f32);
         return .{ .d = d, .round = round };
     }
     // MLX_SERVE_DSV41_DRAFT_AHEAD: a launched draft no stage round takes.
@@ -1171,6 +1190,26 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
     @memcpy(ids[1..], copied);
     routesRound(m, @tagName(plan), st.n, ids);
     return .{ .d = .{ .ids = ids, .len = copied.len, .logits = &.{}, .confidence = &.{} }, .round = .{ .kind = plan, .drafts = copied.len, .watch = watch } };
+}
+
+/// MLX_SERVE_DSV41_DSPARK_WIDTH: `d` cut or filled to `w` rows (`w - 1` drafts, at most `max`): cut to its first drafts,
+/// or past them the drafts again from the first (`t1` where it drafted none), filler the trunk's argmax rejects (or keeps
+/// where it equals it, as any draft) while its rows still run.
+fn forceWidth(d: *dsv41.DsparkDraft, w: usize, max: usize) !void {
+    const t = @min(w - 1, max);
+    if (t <= d.len) {
+        d.len = t;
+        return;
+    }
+    if (t + 1 > d.ids.len) {
+        const ids = try gpa.alloc(u32, t + 1);
+        @memcpy(ids[0 .. d.len + 1], d.ids[0 .. d.len + 1]);
+        gpa.free(d.ids);
+        d.ids = ids;
+    }
+    const real = d.len;
+    for (real + 1..t + 1) |i| d.ids[i] = if (real > 0) d.ids[1 + (i - 1 - real) % real] else d.ids[0];
+    d.len = t;
 }
 
 /// A round's kept tokens: its phases to `[dspark-prof]`, what it teaches to the drafter, its tokens to the history.

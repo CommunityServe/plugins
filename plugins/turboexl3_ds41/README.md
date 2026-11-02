@@ -67,8 +67,9 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
     the fixed policy, on sampled requests only: the cut and the backoff read a cost table by context (src/rounds.zig
     `Fixed`; the built-in `DEFAULT_COSTS`, fitted on the M5 Max, or `MLX_SERVE_DSV41_DSPARK_COSTS`'s), never the
     measured ladder or a round's wall time, so a request's text is the same run to run; a greedy request's rounds verify
-    the whole block. `MLX_SERVE_DSV41_DSPARK_POLICY=1` is the live policy on the ladder the plugin measures from its own
-    rounds; `=0` turns it off: every round verifies the whole block.
+    the whole block (`MLX_SERVE_DSV41_DSPARK_FIXED_GREEDY=1` cuts them too; off by default, aw1s).
+    `MLX_SERVE_DSV41_DSPARK_POLICY=1` is the live policy on the ladder the plugin measures from its own rounds; `=0`
+    turns it off: every round verifies the whole block.
   - The ladder (src/rounds.zig `Ladder`): the 1-row cell in ms, every other row as a ratio to it, so a level change
     the plain rounds see moves every row; each cell the lower median of its last 8 samples and the engine's prior
     ladder (one stall moves it a rank, a new level takes 4 or 5 samples); a cell unsampled for 64 rounds counts no
@@ -953,14 +954,23 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   b2 / a2 pair's +0.59% is likelier x1's own), new text 1294.4 / 1351.4 / 1350.2 / 1345.7 (+2.33%; that pair +0.33%);
   the bank's rows 156 / 178 in every arm, the file cache's growth ~0. On zzz8q the regions together (the waves' 917.5
   MB, the ring's 125.8 MB, phase B's 536.9 MB, x1's 1342.1 MB at 16,383 rows: 2.72 GiB) stay within the cap.
-- `MLX_SERVE_DSV41_DSPARK_POLICY` (src/rounds.zig `Fixed`, `DEFAULT_COSTS`; plugin.zig; patches/turboexl3-zzz8s-dspark-
-  fixed.patch for env.zig's `MLX_SERVE_DSV41_DSPARK_COSTS`; unset or `fixed` the fixed policy on sampled requests, `=1`
-  the live policy, `=0` off): the cut and the drafting backoff on a fixed cost table, never the clock. The tables by
-  context (`U1:t1+U2:t2+t3`, a round at position n on the first table whose bound exceeds it; each `t` the verify ms by
-  rows from one to N, then the draft's ms), built in as fp3's calibration on the a4k canonical pack: a server on the
-  live policy and one on the whole block at about 1K, 4K and 16K prompt tokens of Python's asyncio sources (a prompt set
-  of its own, apart from every benchmark prompt), each ladder fitted monotone and strictly increasing (fp3_costs.py):
-  `2048:17.7,25.5,26.2,33.6,36.8,42.7/5.0+8192:42.8,60.6,74.5,84.4,88.2,96.3/5.0+37.1,70.2,70.3,104.5,104.6,104.7/4.9`.
+- `MLX_SERVE_DSV41_DSPARK_POLICY` (src/rounds.zig `Fixed`, `DEFAULT_COSTS`; plugin.zig;
+  patches/turboexl3-zzz8s-dspark-fixed.patch for env.zig's `MLX_SERVE_DSV41_DSPARK_COSTS`; unset or `fixed` the fixed
+  policy on sampled requests, `=1` the live policy, `=0` off): the cut and the drafting backoff on a fixed cost table,
+  never the clock. The tables by context (`U1:t1+U2:t2+t3`, a round at position n on the first table whose bound
+  exceeds it; each `t` the verify ms by rows from one to N, then the draft's ms), built in as lad2's calibration on
+  the a4k canonical pack (w-lad2-20261102-1707, zzz9t): on aw1k's build, whose trunk is batch-invariant (a forced
+  width leaves the text alone), `MLX_SERVE_DSV41_DSPARK_WIDTH=sweep:6` forcing a greedy round's verify width 1..6 in
+  turn on the warm request (a card first on the same prompt) at about 1K, 4K and 16K prompt tokens of two prompts of
+  their own (Python's asyncio and email sources, apart from every benchmark prompt); row w the two prompts' median
+  verify ms at w rows plus the bucket's per-round overhead (the median round less its verify), to 0.1 ms and strictly
+  increasing, the draft's ms the greedy rounds':
+  `2048:41.4,47.9,57.2,66.4,77.2,84.4/4.8+8192:40.1,47.1,55.0,64.9,73.2,85.1/4.8+41.0,47.9,57.9,65.8,76.7,85.9/4.9`.
+  Until zzz9t the built-in tables were fp3's (a server on the live policy and one on the whole block at about 1K, 4K
+  and 16K prompt tokens of Python's asyncio sources, each ladder fitted monotone and strictly increasing by
+  fp3_costs.py:
+  `2048:17.7,25.5,26.2,33.6,36.8,42.7/5.0+8192:42.8,60.6,74.5,84.4,88.2,96.3/5.0+37.1,70.2,70.3,104.5,104.6,104.7/4.9`);
+  fp3's and kt2's runs below are on those.
   fp3 (w-fp3-20261101-1906, f073b85 + this code with the policy off by default; ABBA, margin 2, EVICT=1, copy rounds
   on; each arm qbench's ten reference rows sampled as the card, then the code-ctx16384 card sampled and greedy):
   sampled requests 28.45 / 30.97 / 31.24 / 28.98 tok/s (a1 the whole block, b1 b2 fixed, a2: +8.33%; pairs +8.88%,
@@ -972,6 +982,38 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   prose of low acceptance (row 0 skipped drafting in 3,413 of its 4,919 rounds); the code card keeps the whole block
   in most rounds (rows_hist 6:106 of 169). kt2 (w-kt2-20261101-1549, the 16K table alone): +14.4% against the whole
   block over the same rows, the row-by-row geometric mean +4.3%.
+- `MLX_SERVE_DSV41_DSPARK_FIXED_GREEDY` (src/rounds.zig `Switches.fixed_greedy`, `fixedGreedy`, `wouldStage`;
+  plugin.zig; patches/turboexl3-zzz9t-1-fixed-greedy.patch for env.zig; off by default, `=1` on): the fixed policy's
+  cut and backoff on a greedy request's rounds too. On the batch-invariant trunk (zzz9r) a greedy round's width leaves
+  its text the 1-row decode's, so the cut is text-safe; off, the policy stands aside on a greedy round (the whole
+  block), as before. The same patch launches the next draft ahead (`MLX_SERVE_DSV41_DRAFT_AHEAD`) on a sampled round
+  too, where the fixed policy owes no plain round (before, only where the plan was the whole block). Policy-on serving
+  only: the served default (`MLX_SERVE_DSV41_DSPARK_POLICY` unset, the fixed policy) changes with zzz9t's tables and
+  this patch; the standard decode cells run `MLX_SERVE_DSV41_DSPARK_POLICY=0` (every round the whole block) and do not
+  move.
+  - Read as aw1s (M5 Max, w-20261102-1840; the greedy cut alone on one text: one build in every arm, aw1kt
+    9767770a470a, a = `=0`, b = the cut, both on G_KITSP1 with keyed sampling and the policy on; chk first, then a1 b1
+    b2 a2 b3 a3 a4 b4, each a code-ctx16384 card then greedy): every arm's greedy the 1-row text (4d36d6e8aa2a87ac),
+    the card the same in every arm; greedy 57.6 57.5 57.7 57.7 against 56.6 56.5 56.2 56.6 tok/s (-2.00%; pairs -1.74,
+    -1.74, -2.60, -1.91): the cut's rounds 13.5 ms cheaper (73.06 against 86.60 wall ms a round) but 127 of them
+    against 105 (rows_hist 2:29,3:12,4:24,5:7,6:55; accepts a round 3.13 against 4.00). So off by default.
+  - Read as aw2 (M5 Max, w-20261102-2028; a = ctl46 949ce432e7ff, b = aw2 cc7e8b14c0f9, zzz9t's code on zzz9r with
+    this switch off, both on G_KITSP1 with keyed sampling and the policy on, no `MLX_SERVE_DSV41_DSPARK_POLICY=0`; chk
+    (b, the twins at `check`) first, g_a / g_b at MTP:0, then a1 b1 b2 a2 b3 a3 a4 b4, each a code-ctx16384 card then
+    greedy): every arm's greedy the 1-row text (4d36d6e8aa2a87ac), every arm's card the keyed 1-row card
+    (d63fabe7ba2cbb39), chk's twin checks differ 0. The card, the ruled cell (pre-registered; the same text in both
+    arms): 47.5 47.3 47.1 47.2 against 48.1 48.1 48.2 48.3 tok/s (+1.90%; pairs +1.26, +1.69, +2.34, +2.33), 144
+    rounds against 141 (rows_hist 1:15,3:40,6:89 on fp3's tables against 2:18,3:18,4:31,5:13,6:61 on lad2's; accepts a
+    round 3.23 -> 3.32), a round's wall ms 89.31 -> 89.51: the gain is the tables' cut, not the draft launched ahead.
+    The greedy, the same code in both arms with this switch off, reported and not ruled: 57.9 57.5 57.1 57.8 against
+    57.7 57.5 57.5 57.7 tok/s (+0.04%), 105 rounds in each. Measured on zzz9r; merged on (zzz9t).
+- `MLX_SERVE_DSV41_DSPARK_WIDTH` (src/rounds.zig `Width`, `WidthStats`; plugin.zig `forceWidth`;
+  patches/turboexl3-zzz9t-2-dspark-width.patch for env.zig; a diagnostic setting, never served; off): a greedy stage
+  round's verify width forced: `w` (rows 1..8), `random:S[:M]` (a width 1..M a round, keyed by S and the position, so
+  the same each run), `sweep[:M]` (1..M in turn); past the block the drafts again from the first, as filler the
+  trunk's argmax rejects. `[dspark-width]` at each request's end: per width its rounds, verify mean and median ms and
+  drafts kept a round. rw1k (w-20261102-1654) checked the invariant trunk's greedy text at every width 1..6 with it,
+  lad2 timed the built-in tables' ladder with it. Merged on (zzz9t).
 - `MLX_SERVE_DSV41_BANK_POOL` (src/bank_pool.zig, the copied stream's `BankPool` in
   patches/turboexl3-zzz9g-bank-pool.patch; on by default, `=0` off, `=check`; needs the host's `HostGpu.alias`,
   mlx-serve's additive ABI entry: G_KITSP1 carries it, host-alias.patch 3bdf623e15f3; the plugin builds against the
