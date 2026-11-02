@@ -139,6 +139,32 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   move: the speculative class's two threads were busy with the budget's records (640 / 617 MB a round read, 369 / 409
   of it abandoned unrouted), so the extras waited queued behind them and were dropped unstarted at their call's settle,
   or, routed, cancelled by the demand read that needed them.
+- `MLX_SERVE_DSV41_GU_SPLIT` (src/gu_split.zig; the copied read pool's `q3ld_gu_split`, ABI 2026110202,
+  patches/turboexl3-zzz9h-gu-split.patch; on by default, `=0` off, `=check`): decode's demand reads with each missed
+  record's gate/up range read as two range jobs of one ticket, side by side, split at the part boundary nearest the
+  range's middle (a classic bank's gate/up boundary; an a4k bank's up code alone in the second). One range reads as
+  one preadv at about 3.6 GB/s (dq1a's `[demand-split]`, w-20261102-0303: a K = 3 record's 8.88 MB gate/up span in
+  2.44 / 1.88 ms on the card / greedy, its 4.44 MB down span in 1.35 / 1.20 ms beside it) against about 13 GB/s for
+  the drive at four streams: a missed record's latency was its gate/up span's, and with the halves side by side it is
+  about its down span's. Each half is a range of its own (the stock loop, an adoption out of a lookahead record, or a
+  pre-range of its own: the pre-read queues the halves while the split is on); the ticket's status words are the
+  halves' (the counts summed, the earlier start, the later end) and are published once, when both are in. The source
+  sets the pool's mode at each phase change (decode's on, the prompt's off). `check` reads each split range again
+  whole and compares it with the rows its halves wrote before the publish. `[gu-split]` at each request's end: split
+  tickets, their halves read / adopted / pre-read, half pre-ranges queued, the mean span and both halves' mean overlap
+  a ticket, and in check mode the tickets compared and those that differed. Exact: the same bytes into the same rows;
+  only the preadv calls covering a range change. With it, dq1a's `[demand-split]` (src/demand_split.zig, ten status
+  words a ticket: each range's lookahead flags and wait; dq1a's lane rule left out) and `[cold-start]`
+  (src/cold_start.zig): both on with `[round-io]`; `[cold-start]` gives, per request, each layer's first three decode
+  calls' distinct and missed experts and of the missed those the layer's last prompt call routed, those its last 8
+  rows routed, those among its 6 / 12 / 24 / 48 most voted, and per layer the first call's misses / in the tail / in
+  the top 12 (`r0_by_layer`): the size of a phase-change seed of the decode rows from the prompt's last routes.
+- Read as dq1b (M5 Max, w-20261102-0820; code-ctx16384 card then greedy, a = ctl29 6e9c8b0a279a, b = dq1b
+  301b9c8d08fe at 1, both on G_KIT1271; a1 b1 b2 a2 b3 a3 a4 b4): card 43.8 44.1 43.5 44.2 against 45.5 45.8 45.8 46.0
+  tok/s (+4.27%; pairs +3.88, +3.85, +5.29, +4.07), a round 111.56 -> 107.08 ms; greedy 56.1 56.3 55.7 56.4 against
+  57.0 57.0 56.5 57.0 (+1.34%; pairs +1.60, +1.24, +1.44, +1.06), a round 87.12 -> 85.88 ms; the texts the same
+  bytes in every arm, check's split tickets all compared with no mismatch, the rows the same, the claims not
+  collapsing. Merged on (zzz9h).
 - `[round-io]` (src/round_io.zig, on with the DSpark profile, `MLX_SERVE_DIAG=dspark-profile`) logs at each request's
   end the expert stream's traffic of the decode's rounds and of the rest (the prompt pass): unique experts missed and
   hit, the demand's bytes (and those copied out of lookahead records), the lookahead's bytes, its abandoned ones, its

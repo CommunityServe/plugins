@@ -109,6 +109,15 @@ pub const stage = @import("src/stage.zig");
 /// A wide prompt call's staged records its routes do not take let go before the drive reaches them
 /// (`MLX_SERVE_DSV41_STAGE_TRIM`, src/stage_trim.zig), read by the copied stream.
 pub const stage_trim = @import("src/stage_trim.zig");
+/// dq1b: decode's demand reads with each missed record's gate/up range as two range jobs read side by side
+/// (`MLX_SERVE_DSV41_GU_SPLIT`, src/gu_split.zig), set on the read pool by the copied source at each phase change.
+pub const gu_split = @import("src/gu_split.zig");
+/// The decode's demand reads by record size, part and how they were served (src/demand_split.zig, dq1a's, with
+/// [round-io]); read by the copied stream at each route's settle.
+pub const demand_split = @import("src/demand_split.zig");
+/// dq1b's `[cold-start]` (src/cold_start.zig, with [round-io]): the decode's first calls of each layer against the
+/// layer's last prompt call; read by the copied routed call.
+pub const cold_start = @import("src/cold_start.zig");
 /// A wide prompt layer's predicted transient loads read during the call before it, into the windows that call's groups
 /// let go (`MLX_SERVE_DSV41_STAGE_NEXT`, src/stage_next.zig), read by the copied model, stream and source.
 pub const stage_next = @import("src/stage_next.zig");
@@ -369,6 +378,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     stage.configure(env.span(.MLX_SERVE_DSV41_STAGE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE is not 0 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    gu_split.configure(env.span(.MLX_SERVE_DSV41_GU_SPLIT)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_GU_SPLIT is none of 0, 1, check (unset: 1): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -656,6 +672,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] wide prompt calls' predicted transient loads staged in their windows while the attention runs (MLX_SERVE_DSV41_STAGE=0: each stream group read by its own route); [prompt-io] staged= adopted= with PROMPT_IO\n", .{})
     else
         log.info("[turboexl3_ds41] wide prompt calls' stream groups read by their own routes (MLX_SERVE_DSV41_STAGE=0)\n", .{});
+    switch (gu_split.mode) {
+        .off => {},
+        .on => log.info("[turboexl3_ds41] decode's demand reads: each missed record's gate/up range as two range jobs read side by side, split at the part boundary nearest its middle (MLX_SERVE_DSV41_GU_SPLIT, on by default; =0: whole); [gu-split] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] decode's demand reads: each missed record's gate/up range as two range jobs, checked (MLX_SERVE_DSV41_GU_SPLIT=check): each split range read again whole and compared with its rows before its publish; [gu-split] checked= mismatch= at each request's end\n", .{}),
+    }
     switch (stage_trim.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted in file order, none withdrawn (MLX_SERVE_DSV41_STAGE_TRIM=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted hottest first, each one its routes take none of let go unread where no read has started (MLX_SERVE_DSV41_STAGE_TRIM=0: file order, none withdrawn){s}; [stage-trim] at each request's end\n", .{if (stage.on) "" else ": no effect without MLX_SERVE_DSV41_STAGE"}),
@@ -743,11 +764,16 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (!la.isDefault()) log.info("[turboexl3_ds41] decode lookahead (MLX_SERVE_DSV41_LOOKAHEAD): {d} records read ahead a layer call{s}, idle rule {d}, the stream sized for {d}\n", .{ la.budget, if (la.predicts()) "" else " (the predictor off)", la.idle_busy, la.initBudget() });
     if (la_wide.on()) log.info("[turboexl3_ds41] decode lookahead widened (MLX_SERVE_DSV41_LOOKAHEAD_WIDE): about {d} records a round read ahead past each layer call's {d}, at most {d} more a call, the stream sized for the lookahead's widest budget{s}; a [lookahead] line at each request's end with the DSpark profile\n", .{ la_wide.per_round, la.budget, la_wide.max_extra, if (la.predicts()) "" else " (no effect: the predictor off)" });
     round_io.on = model(mp).mdl.ds_prof != null;
+    demand_split.on = round_io.on;
+    cold_start.on = round_io.on;
+    if (demand_split.on) log.info("[turboexl3_ds41] [demand-split] on (with [round-io]): the decode's demand ranges by record size, part and how they were served (clean, beside the lookahead, adopted), at each request's end\n", .{});
+    if (cold_start.on) log.info("[turboexl3_ds41] [cold-start] on (with [round-io]): each layer's first three decode calls' misses against its last prompt call's routes (all, the last 8 rows, the top 6 / 12 / 24 / 48 by votes), at each request's end\n", .{});
     if (round_io.on) {
         round_io.start(ioSnap(model(mp)));
         log.info("[turboexl3_ds41] [round-io] on (the DSpark profile): each round's expert stream traffic and the process's disk reads beside its verify time, the decode's and the rest's at each request's end\n", .{});
     }
     if (direct_parts.on) if (partsSnap(model(mp))) |ps| direct_parts.start(ps);
+    if (gu_split.mode != .off) if (splitSnap(model(mp))) |ss| gu_split.start(ss);
     switch (bank_pool.mode) {
         .off => log.info("[turboexl3_ds41] the streamed bank's rows freed and freshly allocated at each phase change (MLX_SERVE_DSV41_BANK_POOL=0, or a host without HostGpu.alias)\n", .{}),
         .on => log.info("[turboexl3_ds41] the streamed bank's rows over one pool (MLX_SERVE_DSV41_BANK_POOL; =0: off): the prompt's windows and the wave sets' regions, then decode's window 0 and whole ext arrays over the same bytes, each pooled array its own buffer (HostGpu.alias); a [bank-pool] plan line at load\n", .{}),
@@ -789,6 +815,14 @@ fn partsSnap(m: *ds.Model) ?direct_parts.Snap {
     if (r.math != .source) return null;
     const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
     return direct_parts.Snap.of(src.stats());
+}
+
+/// The stream's gate/up split counters now (`gu_split`); null without the EXL3 source.
+fn splitSnap(m: *ds.Model) ?gu_split.Snap {
+    const r = m.mdl.streamed orelse return null;
+    if (r.math != .source) return null;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    return gu_split.Snap.of(src.stats());
 }
 
 /// The stream's counters and the process's disk reads now (`round_io`).
@@ -1222,7 +1256,11 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const pgl = pg2.meters(pgc[0], pgc[1], meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len ..]);
     const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
+    // dq1b: the decode's demand ranges by class, the gate/up split's counts, the cold start's first calls.
+    const dmd = demand_split.meters(meter_buf[n + io.len ..]);
+    const gsl = if (gu_split.mode != .off) (if (splitSnap(model(mp))) |ss| gu_split.meters(ss, meter_buf[n + io.len + dmd.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
+    const csl = cold_start.meters(meter_buf[n + io.len + dmd.len + gsl.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is
