@@ -99,12 +99,25 @@ pub const wide_early = @import("src/wide_early.zig");
 /// A wide prompt layer's new streams committed at its call's end, before the layer's teardown
 /// (`MLX_SERVE_DSV41_REST_EARLY`, src/rest_early.zig), read by the copied model.
 pub const rest_early = @import("src/rest_early.zig");
+/// A wide prompt layer's attention projections' large outputs kept past its teardown, their buffers to MLX's cache at the
+/// next wide layer's start (`MLX_SERVE_DSV41_TRANSIENT_KEEP`, src/transient_keep.zig), read by the copied model.
+pub const transient_keep = @import("src/transient_keep.zig");
+/// A wide prompt layer followed by another wide one committed at its end, not waited for (`MLX_SERVE_DSV41_REST_ASYNC`,
+/// src/rest_async.zig), read by the copied model.
+pub const rest_async = @import("src/rest_async.zig");
 /// A wide prompt layer's query heads kept unroped, their roped last channels apart (`MLX_SERVE_DSV41_Q_TAIL`,
 /// src/q_tail.zig), read by the copied model.
 pub const q_tail = @import("src/q_tail.zig");
 /// A wide prompt layer's EXL3 `wo_a` run on one prepare and one finish launch for its groups, each group's W_hat decoded
 /// once a layer (`MLX_SERVE_DSV41_WOA_JOIN`, src/woa_join.zig), read by the copied model.
 pub const woa_join = @import("src/woa_join.zig");
+/// eg2 (zzz9r): the Engram layers' wkv at decode widths on the batched twin of MLX's one-row gemv, every row its
+/// one-row words (`MLX_SERVE_DSV41_ENGRAM_TWIN`, src/engram_twin.zig, on src/gemv_twin.zig); read by the
+/// copied model.
+pub const engram_twin = @import("src/engram_twin.zig");
+/// The indexer's plain linears' decode rows the same words at any verify width (`MLX_SERVE_DSV41_DEC_INVARIANT`,
+/// src/dec_invariant.zig): on the batched twin of MLX's one-row gemv (src/gemv_twin.zig); read by the copied model.
+pub const dec_invariant = @import("src/dec_invariant.zig");
 /// A wide prompt layer's dense EXL3 linears' matmul and finish as one launch at this machine's tiles
 /// (`MLX_SERVE_DSV41_PG2`, src/pg2.zig; turboexl3's `pgemm` switch, its warm and `check`'s compare in src/pg2_t3.zig).
 pub const pg2 = @import("src/pg2.zig");
@@ -583,6 +596,20 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    transient_keep.configure(env.span(.MLX_SERVE_DSV41_TRANSIENT_KEEP)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_TRANSIENT_KEEP is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    rest_async.configure(env.span(.MLX_SERVE_DSV41_REST_ASYNC)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_REST_ASYNC is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     rest_early.configure(env.span(.MLX_SERVE_DSV41_REST_EARLY)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_REST_EARLY is neither 0 nor 1 (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -613,6 +640,20 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     pg2_t3.configure();
+    dec_invariant.configure(env.span(.MLX_SERVE_DSV41_DEC_INVARIANT)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DEC_INVARIANT is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    engram_twin.configure(env.span(.MLX_SERVE_DSV41_ENGRAM_TWIN)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_TWIN is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1 (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -845,6 +886,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, before the routing barrier waits: the routes, the next layer's predicted routes, then the shared expert and the attention state (MLX_SERVE_DSV41_WIDE_EARLY=0: after the call)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, and the shared expert is also built the old way and served, the two compared word for word (MLX_SERVE_DSV41_WIDE_EARLY=check): a [wide-early] check line a wide call\n", .{}),
     }
+    switch (transient_keep.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' attention projections' outputs freed at the layer's teardown (MLX_SERVE_DSV41_TRANSIENT_KEEP=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers keep their attention projections' large outputs past the teardown, their buffers to MLX's cache at the next wide layer's start (MLX_SERVE_DSV41_TRANSIENT_KEEP=0: freed at the teardown): [transient-keep] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers keep their attention projections' large outputs past the teardown, their buffers to MLX's cache at the next wide layer's start, and count the buffers taken back (MLX_SERVE_DSV41_TRANSIENT_KEEP=check): [transient-keep] reused= at each request's end\n", .{}),
+    }
+    if (rest_async.on)
+        log.info("[turboexl3_ds41] a wide prompt layer followed by another wide one is committed at its end, not waited for: the next layer's start runs under its tail (MLX_SERVE_DSV41_REST_ASYNC=0: waited for)\n", .{})
+    else
+        log.info("[turboexl3_ds41] each wide prompt layer's last eval waited for (MLX_SERVE_DSV41_REST_ASYNC=0)\n", .{});
     if (rest_early.on)
         log.info("[turboexl3_ds41] wide prompt layers commit their new streams at the routed call's end, before the layer's teardown: the GPU runs the tail kernel while the host frees the layer (MLX_SERVE_DSV41_REST_EARLY=0: after the teardown)\n", .{})
     else
@@ -863,6 +913,16 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] wide prompt layers' dense EXL3 linears as MLX's matmul then the finish (MLX_SERVE_DSV41_PG2=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' dense EXL3 linears' matmul and finish as one launch at this machine's tiles ({d} shapes, MLX_SERVE_DSV41_PG2; =0 off): MLX's fused NAX kernel body and loop with the finish as its epilogue where MLX runs that kernel unsplit, the chain's words; [pg2] at each request's end\n", .{pg2_t3.shapes()}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' dense EXL3 linears checked (MLX_SERVE_DSV41_PG2=check): the chain served, pg2's launch run beside every call it takes ({d} shapes) and compared word for word; [pg2] checks= words= differ= at each request's end\n", .{pg2_t3.shapes()}),
+    }
+    switch (dec_invariant.mode) {
+        .off => log.info("[turboexl3_ds41] the indexer's head weights and index keys on MLX's matmul at every width (MLX_SERVE_DSV41_DEC_INVARIANT=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] the indexer's head weights and index keys at 2..6 rows on the batched twin of MLX's one-row gemv, every row that gemv's words, the weight read once a launch (MLX_SERVE_DSV41_DEC_INVARIANT=0: MLX's matmul)\n", .{}),
+        .check => log.info("[turboexl3_ds41] the indexer's head weights and index keys on the batched gemv twin, every twin call compared with MLX's one-row matmul of each of its rows, word for word, and the call's own matmul against the same words (MLX_SERVE_DSV41_DEC_INVARIANT=check): [gemv-twin] check and wide-vs-m1 lines a weight shape every 128 calls, at its first differing word and at the model's end\n", .{}),
+    }
+    switch (engram_twin.mode) {
+        .off => log.info("[turboexl3_ds41] Engram layers' wkv on MLX's matmul at every width (MLX_SERVE_DSV41_ENGRAM_TWIN=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] Engram layers' wkv at 2..{d} rows on the batched twin of MLX's one-row gemv, every row its one-row words (MLX_SERVE_DSV41_ENGRAM_TWIN; =0 MLX's matmul); [engram-twin] at each request's end\n", .{engram_twin.twin_rows}),
+        .check => log.info("[turboexl3_ds41] Engram layers' wkv at 2..{d} rows on the batched twin, checked (MLX_SERVE_DSV41_ENGRAM_TWIN=check): the twin served, every row compared with MLX's one-row matmul; [gemv-twin] check N=25600 K=6144 lines, [engram-twin] at each request's end\n", .{engram_twin.twin_rows}),
     }
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {
@@ -1397,7 +1457,11 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const dmd = demand_split.meters(meter_buf[n + io.len ..]);
     const gsl = if (gu_split.mode != .off) (if (splitSnap(model(mp))) |ss| gu_split.meters(ss, meter_buf[n + io.len + dmd.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
     const csl = cold_start.meters(meter_buf[n + io.len + dmd.len + gsl.len ..]);
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len]);
+    // MLX_SERVE_DSV41_TRANSIENT_KEEP: the [transient-keep] line (on or check; since the last request's end).
+    const tkl = transient_keep.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len ..]);
+    // eg2: the Engram twin's request (MLX_SERVE_DSV41_ENGRAM_TWIN).
+    const etl = engram_twin.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is

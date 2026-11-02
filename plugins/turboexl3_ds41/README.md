@@ -458,6 +458,43 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   guard's accounted samples 98.9 and 99.9 GiB in the b arms against 108.9 and 105.3 in the a arms. Exact: the texts the
   same bytes in every arm (cold 65d438d647, new-text slice 3 83a88208e3), and the check arm's 480 calls compared
   31,172,213,760 words, none different.
+- `MLX_SERVE_DSV41_DEC_INVARIANT` (src/dec_invariant.zig, src/gemv_twin.zig, src/kernels/gemv_twin.metal,
+  patches/turboexl3-zzz9r-1-idx-twins.patch; on, `=0` off, `=check` checked): the indexer's plain bf16 linears (each
+  index layer's head weights `weights_proj`, 32 x 5120, and each KV source's index key `wk`, 128 x 512) give a decode
+  row the same words at any verify width. MLX runs them as its M=1 gemv for one row, gemv_wide for 2..15 rows and its
+  GEMM past them, so a verify's rows round apart from the same rows decoded one at a time. On, a call of 2..6 rows runs
+  on a batched twin of MLX's M=1 gemv (`GEMVKernel::run`'s body at MLX 64ea011): a thread's K elements, its products,
+  its simdgroup shuffles and its threadgroup partials are MLX's one-row call's (fixed by MLX's sn, tn and bn), so each
+  row is that call's words, and the weight is read once a launch. The free axes (the rows a threadgroup, a thread's
+  rows, the simdgroup rows, the chunks' place in the grid) move no word; `served` picks them per weight shape and rows
+  from this machine's timings. One row keeps MLX's gemv (the same words) and wider calls MLX's matmul. `check`
+  compares every twin call with MLX's own M=1 matmul of each of its rows and logs `[gemv-twin] check N= K= calls= rows=
+  words= differ= max_ulps=` a weight shape every 128 calls, at its first differing word and at the model's end, and
+  the call's own matmul against the same words (`[gemv-twin] wide-vs-m1`, reported only).
+  - Read as iv1, with `MLX_SERVE_DSV41_ENGRAM_TWIN` (both twins in one build; M5 Max, w-20261102-1818; a = ctl45
+    d572b1c44375, b = iv1 69cc90910e93, both on G_KITSP1 with keyed sampling and the standard decode config, every round
+    the whole block; chk (b, both twins at `check`) first, g_a / g_b at MTP:0, then a1 b1 b2 a2 b3 a3 a4 b4, each a
+    code-ctx16384 card then greedy, 1024 tokens): exact. chk's check lines differ 0 / max_ulps 0 on every twin shape
+    (weights_proj 1816 calls, 10896 rows; wk 911 calls, 3417 rows; the Engram wkv 456 calls, 2740 rows); every b greedy
+    the 1-row text (4d36d6e8aa2a87ac, g_a's and g_b's), the control's DSpark greedy (5ab2578db940c51c) not; the card the
+    keyed 1-row card (d63fabe7ba2cbb39) in all eleven arms; 6 rows every round in every arm. The card, the same text in
+    both arms: 48.4 49.1 48.8 48.9 against 48.8 48.8 48.8 48.6 tok/s (-0.10%; pairs +0.83, -0.61, 0.00, -0.61), 122
+    rounds in each arm, a round's wall ms 102.13 -> 102.23, misses a round 56.19 -> 56.56. The greedy, a different text
+    by design (the control's DSpark greedy is not its 1-row text; b's is), is
+    information only: 57.4 58.0 57.9 57.9 against 58.5 58.0 58.5 58.4 tok/s (+0.95%), 107 rounds against 105. A
+    correctness fix (a verify row's words its own at any width), merged on its exactness gates. Measured on zzz9q;
+    merged on (zzz9r).
+- `MLX_SERVE_DSV41_ENGRAM_TWIN` (src/engram_twin.zig, on src/gemv_twin.zig;
+  patches/turboexl3-zzz9r-2-engram-twin.patch, eg2; on, `=0` off, `=check` on and checked): an Engram layer's `wkv` (a
+  plain half-type linear: bf16 [L, 6144] x [25600, 6144]^T) at 2 to 16 rows runs on the batched twin of MLX's one-row
+  gemv, so a verify row's keys and value are the words that row gets decoded alone (MLX runs gemv_wide at 2 to 15 rows:
+  ip1, w-20261102-0143, the only break at widths to 6); one row keeps MLX's gemv (the same words), a wider call its
+  matmul. The twin's served launches for the shape (dvi4u): r2 t1, r3 t1h, r4 t1, r5 and r6 c3t2i, compiled at load.
+  `check` serves the twin and compares every row with MLX's one-row matmul (`[gemv-twin] check N=25600 K=6144` lines);
+  `[engram-twin] mode= served= declined=` (and in check the request's calls, rows, words, differ, max_ulps) at each
+  request's end. No second weight is held in check.
+  - Read as iv1 with `MLX_SERVE_DSV41_DEC_INVARIANT` (above: w-20261102-1818): exact, the Engram wkv's check lines
+    differ 0 over 456 calls and 70,144,000 words, every b greedy the 1-row text. Measured on zzz9q; merged on (zzz9r).
 - `MLX_SERVE_DSV41_JOINLESS` (src/joinless.zig, patches/turboexl3-zzz8-joinless.patch; on, `=0` off, `check` both): a
   wide prompt call's routed sum and the layer's shared expert in one combine. `=0`: the streamer joins each bank call's
   wave outputs (a concatenate and a take, each evaluated inside the routed call), then the call's outputs again into
@@ -576,6 +613,26 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   16K cells' 150 prompt rows and zzz8x's 179 decode rows. Exact: the texts the same bytes in every arm (cold d081845201,
   new-text slice 3 4d5b401f3c), and the check arm compared 41 wide calls' shared experts, 3,205,017,600 words, none
   different (max_ulps 0).
+- `MLX_SERVE_DSV41_REST_ASYNC` (src/rest_async.zig, patches/turboexl3-zzz9s-rest-async.patch; on, `=0` off): a wide
+  prompt layer followed by another wide one has its last eval committed, not waited for. `=0`: `runLayers` evaluates
+  each wide layer's held arrays and attention state and waits: since REST_EARLY and HC_FUSE the tail is ~17.5 ms of GPU
+  work a 16K-row encoder layer and the host waits out most of it, then the next layer's start keeps the GPU idle 5.9 ms
+  a regular wide layer (pt5 w-pio-20261102-1502; ~0.11 s a cold 16K card). On, the same arrays are committed
+  (`mlx_async_eval`) when the next layer in the pass is wide too, so the next layer's graph and its read-ahead's first
+  buffers are built under the tail; the pass's last wide layer is waited for as before. The same kernels in the same
+  order on the one stream, so the same words (a text gate). The layer's teardown has already run, so the next layer's
+  first arrays overlap only the tail's own inputs and outputs (no bill term; the window's peak gate checks it). With
+  TRANSIENT_KEEP the next layer's start hands the kept projection buffers to MLX's cache while the tail runs: their
+  readers (the attention) finished before the routing barrier, and MLX recycles a buffer only after its last command
+  completes. Prompt only: decode's layers are never wide.
+  - Read as ra2 (ra1's lines on zzz9r; M5 Max, w-pio-20261102-1943; a = ctl46 949ce432e7ff, b = ra2 at 1
+    (830e9e1d94fe), both on G_KITSP1 with keyed sampling; a warm server, then a1 b1 b2 a2, each a cold code-ctx16384
+    card request then the new-text 16K slice 3): cold 1604.0 1612.1 against 1617.2 1623.2 tok/s (+0.76%; pairs +0.82,
+    +0.69), new text 1738.5 1700.7 against 1748.8 1721.2 (+0.90%; pairs +0.59, +1.21); the texts the same bytes in
+    every arm (cold 65d438d647, new-text slice 3 83a88208e3), the bank rows 147 / 177 in every arm, the guard's
+    accounted peak 103.8 / 100.6 GiB in the b arms against 104.7 / 106.6 in the a arms (step footprint 91.2 / 88.1
+    against 91.4 / 93.9); the encoder's other stage past layer 0 4208 / 4189 ms against 4319 / 4294. Measured on
+    zzz9r; merged on (zzz9s).
 - `MLX_SERVE_DSV41_REST_EARLY` (src/rest_early.zig, patches/turboexl3-zzz9e-rest-early.patch; on, `=0` off): a wide
   prompt layer's new streams (its routed call's tail kernel, the TAIL_FUSE combine and hc expand, with its inputs' small
   ops) committed at the call's end, before the layer's teardown. `=0`: `wideLayer` returns after its last group's holds,
@@ -594,6 +651,27 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   pairs -0.03% and +4.34%); 147 prompt and 176 decode rows in every arm; the guard's accounted peak 106.4/100.2 GiB in
   the b arms against 107.8/107.8 in the a arms. Exact: the texts the same bytes in every arm (cold 65d438d647, new-text
   slice 3 83a88208e3).
+- `MLX_SERVE_DSV41_TRANSIENT_KEEP` (src/transient_keep.zig, patches/turboexl3-zzz9q-transient-keep.patch; on, `=0`
+  off, `=check` on and counting): a wide prompt layer with another wide one after it keeps its attention projections'
+  large outputs (the attention norm's rows, `wq_b`'s heads, their roped tail: 1.4 GB at 16K rows, each at least 64 MiB)
+  past its teardown by an extra reference, and the next wide layer's start hands their buffers to MLX's cache. `=0`: the
+  layer's scope frees them at its end, past MLX's cache limit (the routed call's freed transients already fill it), so
+  they go back to Metal and the next layer allocates them anew as it encodes them, ~15 ms of host a GB in a host-bound
+  stage (pt5 w-pio-20261102-1502's one-op-a-buffer arm: `wq_b`'s 1.07 GB output's encode 19.2 ms of host a regular wide
+  layer, the GPU idle 5.1 ms of it). On, `release` lifts the cache limit, frees the references (each buffer to the cache,
+  the newest there) and puts the limit back at once; the layer's first allocation trims the cache from its oldest
+  buffers, and its same-shaped arrays take these. The same kernels over the same inputs, only the buffers move, so the
+  same words (a text gate). The kept arrays were alive through the routed call either way, so after the teardown they
+  sit beside only the tail's in-flight buffers; the cache is over its limit by their bytes only from the next layer's
+  start (its graph build) to its first allocation. `[transient-keep] mode= layers= arrays= mb=` (`reused=` with check:
+  the kept buffers the next layer's own projections took) at each request's end.
+  - Read as tk1 (M5 Max, w-pio-20261102-1746; a = ctl44 ae169b3ed1b3, b = tk1 at 1 (2d9981be3fd8), both on G_KITSP1
+    with keyed sampling; a warm server, then a1 b1 b2 a2, each a cold code-ctx16384 card request then the new-text 16K
+    slice 3): cold 1597.9 1602.2 against 1612.1 1608.2 tok/s (+0.63%; pairs +0.89, +0.37), new text 1710.4 1712.0
+    against 1732.7 1728.0 (+1.12%; pairs +1.30, +0.93); the texts the same bytes in every arm (cold 65d438d647,
+    new-text slice 3 83a88208e3), the bank rows 148 / 178 in every arm, the guard's accounted peak 108.7 / 104.2 GiB in
+    the b arms against 103.8 / 108.8 in the a arms (step footprint 96.6 / 92.1 against 91.7 / 96.7); `[transient-keep]
+    layers=19 arrays=57` a request (mb=24909 the card, 22686 the slice). Measured on zzz9p; merged on (zzz9q).
 - `MLX_SERVE_DSV41_DIRECT_PARTS` (src/direct_parts.zig, src/direct_parts_test.zig, patches/turboexl3-zzz8i-direct-parts.patch:
   the copied read pool's PARTS route; on, `=0` off): a record is
   read as its gate/up span and its down span, each in one F_NOCACHE preadv into a worker's 9 MiB staging buffer and a

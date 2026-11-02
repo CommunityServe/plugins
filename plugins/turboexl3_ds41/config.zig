@@ -210,7 +210,12 @@ test {
     _ = @import("src/decode_fuse.zig");
     _ = @import("src/wide_early.zig");
     _ = @import("src/rest_early.zig");
+    _ = @import("src/transient_keep.zig");
+    _ = @import("src/rest_async.zig");
     _ = @import("src/q_tail.zig");
+    _ = @import("src/engram_twin.zig");
+    _ = @import("src/dec_invariant.zig");
+    _ = @import("src/gemv_twin.zig");
     _ = @import("src/prompt_tl.zig");
     _ = @import("src/whole_stream.zig");
     _ = @import("src/stage.zig");
