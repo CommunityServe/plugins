@@ -234,4 +234,5 @@ test {
     _ = @import("src/t3_group.zig");
     _ = @import("src/embed_pread.zig");
     _ = @import("src/vision_lazy.zig");
+    _ = @import("src/bank_pool.zig");
 }

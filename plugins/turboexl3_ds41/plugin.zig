@@ -140,6 +140,9 @@ pub const scratch = @import("src/scratch.zig");
 /// src/scratch_waves.zig on src/scratch.zig's `Region`, its twins' texts by src/wave_twins.zig), read by the copied
 /// quant and source.
 pub const scratch_waves = @import("src/scratch_waves.zig");
+/// Both phases' slot rows over one buffer (`MLX_SERVE_DSV41_BANK_POOL`, src/bank_pool.zig: the switch and the plan),
+/// read by the copied stream and source.
+pub const bank_pool = @import("src/bank_pool.zig");
 /// A wide prompt layer's attention spans' scores and probabilities in a ring of two per-prompt slots
 /// (`MLX_SERVE_DSV41_SCRATCH_ATTN`, src/scratch_attn.zig on src/scratch.zig's `Region`, its twins' texts by
 /// src/attn_twins.zig), read by the copied model.
@@ -323,6 +326,19 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    bank_pool.configure(env.span(.MLX_SERVE_DSV41_BANK_POOL)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_BANK_POOL is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // The pool's arrays are the host's aliases (HostGpu.alias, mlx-serve's additive ABI entry): a host without it serves
+    // with the pool off, as before the pool.
+    if (bank_pool.on() and !shims.hasAlias()) {
+        log.info("[turboexl3_ds41] [bank-pool] off: the server's host table has no HostGpu.alias entry (its HostGpu {d} bytes, the entry at bytes 96-104: mlx-serve without host-alias.patch); the streamed bank's rows freed and freshly allocated at each phase change, as before the pool\n", .{shims.gpuBytes()});
+        bank_pool.mode = .off;
+    }
     scratch_waves.configure(env.span(.MLX_SERVE_DSV41_SCRATCH_WAVES)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_WAVES is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -732,6 +748,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] [round-io] on (the DSpark profile): each round's expert stream traffic and the process's disk reads beside its verify time, the decode's and the rest's at each request's end\n", .{});
     }
     if (direct_parts.on) if (partsSnap(model(mp))) |ps| direct_parts.start(ps);
+    switch (bank_pool.mode) {
+        .off => log.info("[turboexl3_ds41] the streamed bank's rows freed and freshly allocated at each phase change (MLX_SERVE_DSV41_BANK_POOL=0, or a host without HostGpu.alias)\n", .{}),
+        .on => log.info("[turboexl3_ds41] the streamed bank's rows over one pool (MLX_SERVE_DSV41_BANK_POOL; =0: off): the prompt's windows and the wave sets' regions, then decode's window 0 and whole ext arrays over the same bytes, each pooled array its own buffer (HostGpu.alias); a [bank-pool] plan line at load\n", .{}),
+        .check => log.info("[turboexl3_ds41] the streamed bank's rows over one pool, checked (MLX_SERVE_DSV41_BANK_POOL=check): every range that changes hands filled with 0xFF at its install, a [bank-pool] check line each\n", .{}),
+    }
     switch (scratch_attn.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' attention spans' scores and probabilities in fresh buffers (MLX_SERVE_DSV41_SCRATCH_ATTN=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' attention spans on a ring of two per-prompt slots (MLX_SERVE_DSV41_SCRATCH_ATTN; =0: fresh buffers): each span's scores and probabilities in its slot, the gather's launches as write-into twins of their stock texts (compiled at load)\n", .{}),

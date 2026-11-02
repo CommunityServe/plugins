@@ -762,6 +762,27 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   prose of low acceptance (row 0 skipped drafting in 3,413 of its 4,919 rounds); the code card keeps the whole block
   in most rounds (rows_hist 6:106 of 169). kt2 (w-kt2-20261101-1549, the 16K table alone): +14.4% against the whole
   block over the same rows, the row-by-row geometric mean +4.3%.
+- `MLX_SERVE_DSV41_BANK_POOL` (src/bank_pool.zig, the copied stream's `BankPool` in
+  patches/turboexl3-zzz9g-bank-pool.patch; on by default, `=0` off, `=check`; needs the host's `HostGpu.alias`,
+  mlx-serve's additive ABI entry: G_KITSP1 carries it, host-alias.patch 3bdf623e15f3; the plugin builds against the
+  standard kit and reads the entry at its offset, bytes 96-104 of the host's HostGpu, so a host without it loads and
+  serves with the pool off, a `[bank-pool] off` line at load naming the missing entry): the streamed bank's slot rows of
+  both phases over one MLX buffer. Off, a phase change frees one phase's rows and freshly allocates the other's: prompt
+  to decode frees the 5 prompt windows (5,082 MiB on the 2.81 bpw pack) and allocates window 0 and the ext rows
+  (11,356 MiB), decode to prompt the reverse, about 13-15 ms a GiB
+  (o2a1: 176-191 ms and 94-101 ms a change). On, the pool's prompt layout is the windows of each geometry and the two
+  wave sets' regions (875 MiB, src/scratch_waves.zig), and its decode layout over the same bytes is window 0 of each
+  geometry and then whole ext component arrays, largest first, while they fit; the other ext arrays are allocated at
+  the grow as before. Each pooled array is its own MTLBuffer (MLX orders it apart, as a separate allocation), made at
+  load and held; a phase installs references to its layout's. Neither phase holds more than without the pool (the
+  prompt layout is what a prompt holds from its first wide call on; the decode layout is part of decode's own rows).
+  `check` fills every range that changes hands with 0xFF at its install (`[bank-pool] check` lines). A `[bank-pool]
+  plan` line at load. Exact: the same plans, rows, kernels and words; a pooled row is read only after its record
+  landed, and a range changes hands only at a phase change, after the stream's drains and the source's synchronize.
+  Measured (bp1, w-pio-20261102-0808: ctl28 3a0002cf7f13 against bp1 abe4a4b85246, both on G_KITBP1, two runs an arm):
+  the cold 16K card 1405.2/1389.7 -> 1420.1/1416.6 tok/s (+1.50%; pairs +1.06/+1.94), the new-text slice
+  1486.2/1495.7 -> 1508.6/1510.0 (+1.23%; pairs +1.51/+0.96); texts identical in every arm (check's 0xFF fills
+  included), bank rows 147/176 in every arm, the guard's peak 104.2/106.3 against 107.5/110.1.
 
 ## The pack
 

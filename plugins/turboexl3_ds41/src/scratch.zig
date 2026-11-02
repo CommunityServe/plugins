@@ -71,6 +71,9 @@ fn readyEvent() !i32 {
 }
 
 pub const max_ndim = 4;
+/// MLX_SERVE_DSV41_BANK_POOL (src/bank_pool.zig): an array the copied stream's pool holds for a region, by shape and
+/// dtype (src/scratch_waves.zig's wave sets').
+pub const Shape = struct { shape: [max_ndim]c_int = @splat(0), ndim: usize = 0, dtype: mlx.mlx_dtype = .float32 };
 /// The most bytes the regions hold together (a machine bound for the M5 Max's 128 GB beside the pack, never a prompt's).
 pub const cap_bytes: u64 = 4 << 30;
 var held_bytes: u64 = 0;
@@ -86,6 +89,10 @@ pub const Region = struct {
     carrier: A = none,
     /// An output of the last reader of the region's words (a reference): the next writer binds it (`after`).
     release: A = none,
+    /// MLX_SERVE_DSV41_BANK_POOL: the pool's array for the region (a reference) and its shape: `ensure` takes it, not a
+    /// fresh buffer, whenever its shape is the one asked.
+    pooled: A = none,
+    pooled_shape: Shape = .{},
 
     /// The region's buffer at `shape` of `dtype`: the one it holds while they match, else a new one (the old freed);
     /// null when the regions together would pass `cap_bytes` (the caller takes the fresh path).
@@ -97,7 +104,9 @@ pub const Region = struct {
         for (shape) |d| n *= @intCast(d);
         if (held_bytes + n > cap_bytes) return null;
         var out = mlx.mlx_array_new();
-        if (dsv41_alloc_uninit(&out, shape.ptr, shape.len, dtype) != 0) {
+        // MLX_SERVE_DSV41_BANK_POOL: the pool's array when its shape is the one asked (a reference, nothing allocated).
+        const pooled = r.pooled.ctx != null and r.pooled_shape.ndim == shape.len and std.mem.eql(c_int, r.pooled_shape.shape[0..shape.len], shape) and r.pooled_shape.dtype == dtype;
+        if (if (pooled) mlx.mlx_array_set(&out, r.pooled) != 0 else dsv41_alloc_uninit(&out, shape.ptr, shape.len, dtype) != 0) {
             _ = mlx.mlx_array_free(out);
             return error.ScratchAlloc;
         }
@@ -151,6 +160,16 @@ pub const Region = struct {
         errdefer _ = mlx.mlx_array_free(outs[0]);
         if (dsv41ev_wait(&gated, 2, try readyEvent(), 1, null, 0, true, s, &outs) != 0) return error.ScratchPublish;
         return outs[0];
+    }
+    /// MLX_SERVE_DSV41_BANK_POOL: the pool's array for the region (`ensure` takes it), a reference kept until
+    /// `dropPooled`.
+    pub fn adoptPooled(r: *Region, arr: A, sh: Shape) !void {
+        try hold(&r.pooled, arr);
+        r.pooled_shape = sh;
+    }
+    pub fn dropPooled(r: *Region) void {
+        drop(&r.pooled);
+        r.pooled_shape = .{};
     }
     pub fn free(r: *Region) void {
         drop(&r.carrier);
