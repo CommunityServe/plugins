@@ -144,6 +144,9 @@ pub const scratch_waves = @import("src/scratch_waves.zig");
 /// (`MLX_SERVE_DSV41_SCRATCH_ATTN`, src/scratch_attn.zig on src/scratch.zig's `Region`, its twins' texts by
 /// src/attn_twins.zig), read by the copied model.
 pub const scratch_attn = @import("src/scratch_attn.zig");
+/// The wide gather's pv at 64 output columns a threadgroup and its tensor-op launches three-dimensional, the same words
+/// (`MLX_SERVE_DSV41_ATTN_CORE`, src/attn_core.zig), read by the copied model.
+pub const attn_core = @import("src/attn_core.zig");
 /// A profile build (`zig build -Dplugin-profile=true`, never served): the copied stream's profile probes compiled in (its
 /// `sdk` reads this through this root) and the decode verify's GPU timeline (`MLX_SERVE_DSV41_TIMELINE`,
 /// src/verify_tl.zig).
@@ -336,6 +339,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     scratch_attn.configureHeads(env.span(.MLX_SERVE_DSV41_SCRATCH_HEADS)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_HEADS is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    attn_core.configure(env.span(.MLX_SERVE_DSV41_ATTN_CORE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ATTN_CORE is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -730,6 +740,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (scratch_attn.heads_mode != .off) {
         if (scratch_attn.mode != .on) log.info("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_HEADS needs the ring (MLX_SERVE_DSV41_SCRATCH_ATTN on, the default): every run joined\n", .{}) else log.info("[turboexl3_ds41] wide prompt layers' full WOA_ROWS runs' grouped heads written straight into run regions as [rows, og, in], each run's wo_a reading its region (MLX_SERVE_DSV41_SCRATCH_HEADS{s}){s}\n", .{ if (scratch_attn.heads_mode == .on) "; =0: the join" else "=check", if (scratch_attn.heads_mode == .check) ": the join served, each full run's region compared word for word (an h: field on the [scratch-attn] check line)" else "" });
     } else log.info("[turboexl3_ds41] wide prompt layers' WOA_ROWS runs' grouped heads joined (MLX_SERVE_DSV41_SCRATCH_HEADS=0)\n", .{});
+    switch (attn_core.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' attention gather on the stock pv text and launches (MLX_SERVE_DSV41_ATTN_CORE=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' attention gather with pv at 64 output columns a threadgroup and its tensor-op launches three-dimensional, (32, 1, 4) threadgroups, the same words (MLX_SERVE_DSV41_ATTN_CORE; =0: the stock text and launches)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' attention gather checked (MLX_SERVE_DSV41_ATTN_CORE=check): the stock pv text and launches served, every call's scores and pv also run at 64 columns and three-dimensional, compared word for word; [attn-core] check lines a kind every 128 calls, at its first differing word and at the model's end\n", .{}),
+    }
     switch (scratch_waves.mode) {
         .off => log.info("[turboexl3_ds41] prefill waves' intermediates in fresh buffers (MLX_SERVE_DSV41_SCRATCH_WAVES=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] prefill waves into per-prompt regions (MLX_SERVE_DSV41_SCRATCH_WAVES; =0: fresh buffers): their launches as write-into twins of the stock texts (compiled at load) on two sets of a wave's intermediates at {d} rows, an uncarried call's waves on them; [scratch-waves] at each request's end\n", .{scratch_waves.set_rows}),

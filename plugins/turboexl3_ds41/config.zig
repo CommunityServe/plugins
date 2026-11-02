@@ -227,6 +227,7 @@ test {
     _ = @import("src/wave_twins.zig");
     _ = @import("src/scratch_attn.zig");
     _ = @import("src/attn_twins.zig");
+    _ = @import("src/attn_core.zig");
     _ = @import("src/verify_tl.zig");
     _ = @import("src/late_gemv.zig");
     _ = @import("src/shared_hoist.zig");

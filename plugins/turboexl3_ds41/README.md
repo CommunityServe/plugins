@@ -708,6 +708,24 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   b2 a2: +3.23%), new text 1363.7 / 1428.0 / 1407.8 / 1346.6 (+4.63%); its check arm compared 402,653,184 words a wide
   layer (its three full runs' heads), 0 differing, over 41 check lines (120 runs on the regions, 40 joined); the bank's
   rows 156 / 178 in every arm.
+- `MLX_SERVE_DSV41_ATTN_CORE` (src/attn_core.zig, patches/turboexl3-zzz9f-attn-core.patch; on, `=0` off, `=check`
+  checked): a wide prompt layer's attention gather on two exact changes, each moving only which threads compute a
+  word. pv's text at 64 output columns a threadgroup instead of 128 (derived at load from the stock attn_pv.metal: the
+  tile constant, the staging registers, the fetch and the store at 32 bytes a thread): the 16 x 64 x 32 tensor op,
+  twice the threadgroups, half the accumulator a lane; every output word is the same contraction (32 keys a step in
+  the stock order, accumulated in f32), then the same epilogue. The SCRATCH_ATTN ring twin and SCRATCH_HEADS' pv twin
+  derive from that text. And the gather's tensor-op launches (qk, Q_TAIL's qk_t and pv, fresh and as their twins) go
+  as MLX's NAX GEMMs do, threadgroup (32, 1, 4) over (x / 4, rows, 4) threads: the same threadgroups, each thread's
+  index and simdgroup the 1D launch's. pv1u (w-pv1u-20261102-0644, L5's late span, GROUPED as served): 0 differing
+  words, 425.6 -> 332.1 us a call (1.285x); ls1u (w-ls1u-20261102-0630): the 3D launch alone 0 differing, qk 1.066x,
+  qk_t 1.064x. `check` serves the stock text and launches and runs every gather call's scores and pv the new way
+  beside them, compared word for word (`[attn-core] check kind=qk|qk_t|pv calls= words= differ= max_ulps=`, a kind
+  every 128 calls, at its first differing word and at the model's end).
+  ac1 (w-pio-20261102-0757, ABBA, margin 2, EVICT, on zzz9d 9dcd5f1, texts identical in every arm): cold 1479.7 /
+  1451.1 / 1497.5 / 1463.0 tok/s (a1 b1 b2 a2: +0.20%, pairs -1.93% / +2.36%), new text 1571.4 / 1595.8 / 1587.7 /
+  1570.7 (+1.32%, pairs +1.55% / +1.08%); its check arm 0 differing words and max_ulps 0 on every line (qk_t 2461
+  calls, pv 2504, qk 43); the guard's peak not up (a 108.4 / 104.3, b 99.8 / 108.5); the bank's rows 147 / 176 in
+  both a arms and b2 (b1 opened at 146, the bill's load-time noise).
 - `MLX_SERVE_DSV41_SCRATCH` (src/scratch.zig: the regions; src/scratch_x1.zig, src/kernels/hc_expand_into.metal,
   patches/turboexl3-zzz8r-scratch-x1.patch; on, `=0` off, `check` checked): a wide prompt layer's streams after its
   attention (`x1`, [rows, 4, 5120] f32, 1.34 GB at 16K rows) written into one per-prompt buffer, not a fresh MLX

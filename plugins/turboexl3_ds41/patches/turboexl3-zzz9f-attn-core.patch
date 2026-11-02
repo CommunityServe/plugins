@@ -1,0 +1,241 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -303,6 +303,7 @@
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+     pub const MLX_SERVE_DSV41_SCRATCH_ATTN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' attention spans (turboexl3_ds41): 1, each span's scores and probabilities in a ring of two per-prompt slots, the gather's launches as write-into twins of their stock texts (compiled at load); check, the fresh launches served and the ring's scores, probabilities and heads compared word for word ([scratch-attn] check lines); the same words (0: fresh buffers)" };
+     pub const MLX_SERVE_DSV41_SCRATCH_HEADS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' WOA_ROWS runs (turboexl3_ds41, with MLX_SERVE_DSV41_SCRATCH_ATTN on, the default): on (also 1), a full run's grouped heads written by pv's twin straight into a run region as [rows, og, in] and the run's wo_a reading it (no join, no transpose); check, the join served and each full run's region compared word for word; the same words (0: the join)" };
++    pub const MLX_SERVE_DSV41_ATTN_CORE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' attention gather core (turboexl3_ds41): unset or 1, pv's text at 64 output columns a threadgroup (the 16 x 64 x 32 tensor op, half the accumulator a lane; derived at load from the stock text, the SCRATCH_ATTN ring and SCRATCH_HEADS twins from it) and the gather's tensor-op launches (qk, qk_t, pv and their twins) three-dimensional, (32, 1, 4) threadgroups over the same grid, each word the stock one; check, the stock text and launches served and every gather call's scores and pv also run the new way, compared word for word ([attn-core] check lines); 0: the stock text and launches" };
+     pub const MLX_SERVE_DSV41_SCRATCH_WAVES: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prefill waves' per-prompt regions (turboexl3_ds41): on (the default; unset, empty or 1), a wide prompt call's DIG-X waves launch write-into twins of their stock texts (derived and compiled at load) on two sets of regions (by the wave's parity), not fresh buffers for their intermediates, the same words; check, the fresh waves served and every launch's region output compared with the fresh one (words, max abs, max ulps); 0: fresh buffers" };
+     pub const MLX_SERVE_DSV41_SCRATCH: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' streams after the attention (turboexl3_ds41): written into one per-prompt buffer, not a fresh MLX allocation each layer; the same words (=0: a fresh array each layer; =check: the fresh array served and the region's compared with it word for word)" };
+     pub const MLX_SERVE_DSV41_SEED_FREE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 usage seed's rows free until routed (turboexl3_ds41): the prompt's read-ahead may take a row the load's seed filled that no route has used, for an expert its prediction ranks before the seeded one, and the CED decoder prefetch one whose expert its prediction does not name" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -84,6 +84,9 @@
+ /// turboexl3_ds41 (MLX_SERVE_DSV41_WOA_JOIN, the plugin's src/woa_join.zig): a wide layer's EXL3 `wo_a` run on one
+ /// prepare and one finish launch for its groups, its rows read in place, each group's W_hat decoded once a layer.
+ const woaj = @import("../../../woa_join.zig");
++/// turboexl3_ds41 (MLX_SERVE_DSV41_ATTN_CORE, the plugin's src/attn_core.zig): the wide gather's pv at 64 output columns
++/// a threadgroup (its text derived at load) and its tensor-op launches three-dimensional, the same words.
++const acore = @import("../../../attn_core.zig");
+ const A = mlx.mlx_array;
+ const S = mlx.mlx_stream;
+ const Config = @import("config.zig").Config;
+@@ -540,6 +543,7 @@
+         _ = mlx.mlx_fast_metal_kernel_free(self.kv_row_kernel);
+         _ = mlx.mlx_fast_metal_kernel_free(self.engram_kernel);
+         self.dec.deinit();
++        if (acore.mode == .check) acore.report();
+         woaj.deinit();
+         freeRegions(self);
+         self.gpa.destroy(self);
+@@ -1182,6 +1186,9 @@
+     qk_t: mlx.mlx_fast_metal_kernel,
+     /// MLX_SERVE_DSV41_SCRATCH_ATTN: the launches' ring twins (src/attn_twins.zig), derived and built at load; null off.
+     ring: ?RingTwins = null,
++    /// MLX_SERVE_DSV41_ATTN_CORE=check (src/attn_core.zig): pv on its DT-64 text, launched in 3D beside the stock one
++    /// and compared with it; null on (`pv` is then the DT-64 text) and off.
++    pv64: ?mlx.mlx_fast_metal_kernel = null,
+     pub const RingTwins = struct {
+         qk: mlx.mlx_fast_metal_kernel,
+         qk_t: mlx.mlx_fast_metal_kernel,
+@@ -1189,8 +1196,9 @@
+         pv: mlx.mlx_fast_metal_kernel,
+         /// MLX_SERVE_DSV41_SCRATCH_HEADS: pv's twin writing a span's grouped heads into its run's region; null off.
+         pv_heads: ?mlx.mlx_fast_metal_kernel = null,
+-        /// Each twin's text from the stock one (a missed anchor refuses the load by name), then built.
+-        fn init() !RingTwins {
++        /// Each twin's text from the stock one (a missed anchor refuses the load by name), then built. `pv_src`: pv's
++        /// text as served (MLX_SERVE_DSV41_ATTN_CORE on: the DT-64 one, its twins named apart).
++        fn init(pv_src: []const u8) !RingTwins {
+             const a = std.heap.page_allocator;
+             const s_io = [_]sat.twins.Io{.{ .name = "s", .mtype = "float" }};
+             const p_io = [_]sat.twins.Io{.{ .name = "p", .mtype = "float16_t" }};
+@@ -1200,7 +1208,7 @@
+             defer a.free(t_qkt);
+             const t_sm = try sat.twins.derive(a, ATTN_SM_SOURCE, "", &p_io, &s_io);
+             defer a.free(t_sm);
+-            const t_pv = try sat.twins.derive(a, ATTN_PV_SOURCE, MPP_HEADER, &.{}, &p_io);
++            const t_pv = try sat.twins.derive(a, pv_src, MPP_HEADER, &.{}, &p_io);
+             defer a.free(t_pv);
+             const qk = try buildKernel("dsv41_attn_qk_ring", &.{ "q", "kw", "comp", "picks", "meta", "s_dst", "dep", "soff" }, &.{"carrier"}, t_qk.ptr, MPP_HEADER);
+             errdefer _ = mlx.mlx_fast_metal_kernel_free(qk);
+@@ -1208,23 +1216,23 @@
+             errdefer _ = mlx.mlx_fast_metal_kernel_free(qk_t);
+             const sm = try buildKernel("dsv41_attn_sm_ring", &.{ "s_rg", "picks", "sink", "meta", "scal", "p_dst", "dep", "soff" }, &.{"carrier"}, t_sm.ptr, "");
+             errdefer _ = mlx.mlx_fast_metal_kernel_free(sm);
+-            const pv = try buildKernel("dsv41_attn_pv_ring", &.{ "p_rg", "kw", "comp", "picks", "meta", "periods", "dep", "soff" }, &.{ "o", "carrier" }, t_pv.ptr, MPP_HEADER);
++            const pv = try buildKernel(if (acore.mode == .on) "dsv41_attn_pv64_ring" else "dsv41_attn_pv_ring", &.{ "p_rg", "kw", "comp", "picks", "meta", "periods", "dep", "soff" }, &.{ "o", "carrier" }, t_pv.ptr, MPP_HEADER);
+             errdefer _ = mlx.mlx_fast_metal_kernel_free(pv);
+-            return .{ .qk = qk, .qk_t = qk_t, .sm = sm, .pv = pv, .pv_heads = if (sat.heads_mode != .off) try headsTwin() else null };
++            return .{ .qk = qk, .qk_t = qk_t, .sm = sm, .pv = pv, .pv_heads = if (sat.heads_mode != .off) try headsTwin(pv_src) else null };
+         }
+         /// MLX_SERVE_DSV41_SCRATCH_HEADS: pv's twin with its p from the ring's slot (`soff[0]`) and its grouped heads
+         /// stored into its run's region (`o_dst`, `[rows, og, in]`, the span's first row `soff[1]`): the stock grouped
+         /// store moved to that layout (the same values; a missed statement refuses the load by name), `dep2` the
+         /// region's last reader.
+-        fn headsTwin() !mlx.mlx_fast_metal_kernel {
++        fn headsTwin(pv_src: []const u8) !mlx.mlx_fast_metal_kernel {
+             const a = std.heap.page_allocator;
+             const subs = [_]sat.twins.Sub{.{
+                 .old = "    device OT* dst = o + (size_t(h / hg) * L + l) * size_t(hg * D) + size_t(h % hg) * D + d;\n",
+                 .new = "    device OT* dst = o + (size_t(soff[1] + l) * G + size_t(h / hg)) * size_t(hg * D) + size_t(h % hg) * D + d;\n",
+             }};
+-            const t = try sat.twins.deriveWith(a, ATTN_PV_SOURCE, MPP_HEADER, &.{.{ .name = "o", .mtype = "OT", .off = null }}, &.{.{ .name = "p", .mtype = "float16_t" }}, &subs, &.{"dep2"});
++            const t = try sat.twins.deriveWith(a, pv_src, MPP_HEADER, &.{.{ .name = "o", .mtype = "OT", .off = null }}, &.{.{ .name = "p", .mtype = "float16_t" }}, &subs, &.{"dep2"});
+             defer a.free(t);
+-            return buildKernel("dsv41_attn_pv_heads", &.{ "p_rg", "kw", "comp", "picks", "meta", "periods", "dep", "soff", "o_dst", "dep2" }, &.{"carrier"}, t.ptr, MPP_HEADER);
++            return buildKernel(if (acore.mode == .on) "dsv41_attn_pv64_heads" else "dsv41_attn_pv_heads", &.{ "p_rg", "kw", "comp", "picks", "meta", "periods", "dep", "soff", "o_dst", "dep2" }, &.{"carrier"}, t.ptr, MPP_HEADER);
+         }
+         fn deinit(self: *RingTwins) void {
+             _ = mlx.mlx_fast_metal_kernel_free(self.qk);
+@@ -1241,9 +1249,20 @@
+         errdefer _ = mlx.mlx_fast_metal_kernel_free(sm);
+         const qk_t = try buildKernel("dsv41_attn_qk_t", &.{ "q", "kw", "comp", "picks", "meta", "qt" }, &.{"s"}, qtail.attn_qk_t_source, MPP_HEADER);
+         errdefer _ = mlx.mlx_fast_metal_kernel_free(qk_t);
+-        const pv = try buildKernel("dsv41_attn_pv", &.{ "p", "kw", "comp", "picks", "meta", "periods" }, &.{"o"}, ATTN_PV_SOURCE, MPP_HEADER);
++        // MLX_SERVE_DSV41_ATTN_CORE (src/attn_core.zig): on, pv's text at 64 output columns a threadgroup, derived from
++        // the stock one here (a missed statement refuses the load by name), for its fresh launch and the ring's twins;
++        // check, the stock text served and the DT-64 one built beside it.
++        const t64: ?[:0]u8 = if (acore.mode != .off) try acore.derivePv64(std.heap.page_allocator, ATTN_PV_SOURCE) else null;
++        defer if (t64) |t| std.heap.page_allocator.free(t);
++        const pv_src: [:0]const u8 = if (acore.mode == .on) t64.? else ATTN_PV_SOURCE;
++        const pv_ins = [_][*:0]const u8{ "p", "kw", "comp", "picks", "meta", "periods" };
++        const pv = try buildKernel(if (acore.mode == .on) "dsv41_attn_pv64" else "dsv41_attn_pv", &pv_ins, &.{"o"}, pv_src.ptr, MPP_HEADER);
+         errdefer _ = mlx.mlx_fast_metal_kernel_free(pv);
+-        return .{ .qk = qk, .sm = sm, .qk_t = qk_t, .pv = pv, .ring = if (sat.mode != .off) try RingTwins.init() else null };
++        const pv64: ?mlx.mlx_fast_metal_kernel = if (acore.mode == .check) try buildKernel("dsv41_attn_pv64", &pv_ins, &.{"o"}, t64.?.ptr, MPP_HEADER) else null;
++        errdefer if (pv64) |k| {
++            _ = mlx.mlx_fast_metal_kernel_free(k);
++        };
++        return .{ .qk = qk, .sm = sm, .qk_t = qk_t, .pv = pv, .pv64 = pv64, .ring = if (sat.mode != .off) try RingTwins.init(pv_src) else null };
+     }
+     pub fn deinit(self: *GatherAttn) void {
+         _ = mlx.mlx_fast_metal_kernel_free(self.qk);
+@@ -1251,6 +1270,7 @@
+         _ = mlx.mlx_fast_metal_kernel_free(self.pv);
+         _ = mlx.mlx_fast_metal_kernel_free(self.qk_t);
+         if (self.ring) |*r| r.deinit();
++        if (self.pv64) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+     }
+ };
+ /// The indexer's scores `[L, nb]`: sum over heads of weight * relu(q_h . k_n),
+@@ -2483,12 +2503,14 @@
+     const comp = if (K > 0) comp_rows else keys_w;
+     const hs: c_int = @intCast(H / 4);
+     const run = struct {
+-        fn one(s: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, shape: []const c_int, dt: mlx.mlx_dtype, grid: [2]c_int, ints: []const Tmpl, types: []const struct { [*:0]const u8, mlx.mlx_dtype }) !A {
++        fn one(s: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, shape: []const c_int, dt: mlx.mlx_dtype, grid: [2]c_int, ints: []const Tmpl, types: []const struct { [*:0]const u8, mlx.mlx_dtype }, three: bool) !A {
+             const cfg = mlx.mlx_fast_metal_kernel_config_new();
+             defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape.ptr, shape.len, dt));
+-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, grid[0], grid[1], 1));
+-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
++            // MLX_SERVE_DSV41_ATTN_CORE: `three`, (32, 1, 4) over (x / 4, rows, 4) threads, the same threadgroups.
++            const ln = acore.launch(grid, three);
++            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ln.grid[0], ln.grid[1], ln.grid[2]));
++            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ln.tg[0], ln.tg[1], ln.tg[2]));
+             for (ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t.name, t.v));
+             for (types) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, t[0], t[1]));
+             const iv = mlx.mlx_vector_array_new_data(ins.ptr, ins.len);
+@@ -2500,6 +2522,28 @@
+             return s.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+         }
+     }.one;
++    // MLX_SERVE_DSV41_ATTN_CORE=check (src/attn_core.zig): the stock launches served below; beside every call, its scores
++    // launch (qk, or Q_TAIL's qk_t, as served) at the stock launch and in 3D, its sm, and its pv (GROUPED as served) on
++    // the stock text at the stock launch and on the DT-64 text in 3D, in a scope of their own, each pair compared word
++    // for word.
++    if (g.pv64) |k64| {
++        var ck = Scope.init(sc.a, sc.s);
++        defer ck.deinit();
++        const c_t = qt.ctx != null and qh.ctx == null;
++        const c_k = if (c_t) g.qk_t else g.qk;
++        const c_qkt = [_]A{ q, keys_w, comp, picks, meta, qt };
++        const c_ins: []const A = if (c_t) &c_qkt else c_qkt[0..5];
++        const c_sh = [_]c_int{ ci(L), ci(H), ci(NK) };
++        const c_s = try run(&ck, c_k, c_ins, &c_sh, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}, false);
++        try acore.compare(sc.s, if (c_t) .qk_t else .qk, try run(&ck, c_k, c_ins, &c_sh, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}, true), c_s);
++        const c_scal = try ck.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
++        const c_p = try run(&ck, g.sm, &.{ c_s, picks, sink, meta, c_scal }, &c_sh, .float16, .{ ci(H * 32), ci(L) }, &.{.{ .name = "NJ", .v = ci((NK + 31) / 32) }}, &.{.{ "PT", .float16 }}, false);
++        const c_pv = [_]A{ c_p, keys_w, comp, picks, meta, if (grouped) |gr| gr.periods else c_scal };
++        const c_osh: []const c_int = if (grouped != null) &.{ ci(og), ci(L), ci(H / og * D) } else &.{ ci(L), ci(H), ci(D) };
++        const c_rd: c_int = @intCast(m.cfg.dsv4_rope_head_dim);
++        const c_o = try run(&ck, g.pv, &c_pv, c_osh, m.act, .{ ci(D / 128 * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = @intFromBool(grouped != null) }, .{ .name = "RD", .v = c_rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, false);
++        try acore.compare(sc.s, .pv, try run(&ck, k64, &c_pv, c_osh, m.act, .{ ci(D / 64 * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = @intFromBool(grouped != null) }, .{ .name = "RD", .v = c_rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, true), c_o);
++    }
+     // MLX_SERVE_DSV41_SCRATCH_ATTN (src/scratch_attn.zig): a wide span's scores and probabilities in the ring's slot j,
+     // each launch its stock text's twin (qk writes s into S's slot, sm reads it and writes p into P's, pv reads p; each
+     // binds the one before's carrier, and qk the carrier of the slot's last pv); `check` serves the fresh launches below
+@@ -2516,8 +2560,8 @@
+         const r_qk_t = [_]A{ q, keys_w, comp, picks, meta, qt, sat.s_region.arr, sat.depFor(j), r_off };
+         const r_qk = [_]A{ q, keys_w, comp, picks, meta, sat.s_region.arr, sat.depFor(j), r_off };
+         const r_ins: []const A = if (qt.ctx != null) &r_qk_t else &r_qk;
+-        try runKernel(sc, if (qt.ctx != null) r_k.qk_t else r_k.qk, r_ins, &.{.{ .shape = r_one, .dt = .uint32 }}, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}, r_carrier[0..1]);
+-        try runKernel(sc, r_k.sm, &.{ sat.s_region.arr, picks, sink, meta, r_scal, sat.p_region.arr, r_carrier[0], r_off }, &.{.{ .shape = r_one, .dt = .uint32 }}, .{ ci(H * 32), ci(L) }, &.{.{ .name = "NJ", .v = ci((NK + 31) / 32) }}, &.{.{ "PT", .float16 }}, r_carrier[1..2]);
++        try runKernel(sc, if (qt.ctx != null) r_k.qk_t else r_k.qk, r_ins, &.{.{ .shape = r_one, .dt = .uint32 }}, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}, r_carrier[0..1], acore.three());
++        try runKernel(sc, r_k.sm, &.{ sat.s_region.arr, picks, sink, meta, r_scal, sat.p_region.arr, r_carrier[0], r_off }, &.{.{ .shape = r_one, .dt = .uint32 }}, .{ ci(H * 32), ci(L) }, &.{.{ .name = "NJ", .v = ci((NK + 31) / 32) }}, &.{.{ "PT", .float16 }}, r_carrier[1..2], false);
+         // MLX_SERVE_DSV41_SCRATCH_HEADS (phase B): the span's grouped heads straight into its run's region at its rows
+         // (`[rows, og, in]`, its `wo_a` reading the region); on, its carrier stands for the heads (the run is joined
+         // from the region, never from them); `check` also runs the stock pv below, after this one, for the join served.
+@@ -2526,7 +2570,7 @@
+             if (sat.headsTarget()) |r_hb| {
+                 const r_hoff = try sc.keep(mlx.mlx_array_new_data(&[_]u32{ sat.slotWord(j), r_hb.row }, &[_]c_int{2}, 1, .uint32));
+                 var r_hc: [1]A = .{none};
+-                try runKernel(sc, r_kh, &.{ sat.p_region.arr, keys_w, comp, picks, meta, grouped.?.periods, r_carrier[1], r_hoff, r_hb.region, r_hb.dep2 }, &.{.{ .shape = r_one, .dt = .uint32 }}, .{ ci(D / 128 * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = 1 }, .{ .name = "RD", .v = r_rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, &r_hc);
++                try runKernel(sc, r_kh, &.{ sat.p_region.arr, keys_w, comp, picks, meta, grouped.?.periods, r_carrier[1], r_hoff, r_hb.region, r_hb.dep2 }, &.{.{ .shape = r_one, .dt = .uint32 }}, .{ ci(D / acore.pvCols() * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = 1 }, .{ .name = "RD", .v = r_rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, &r_hc, acore.three());
+                 try sat.headsWrote(j, r_hc[0]);
+                 if (sat.heads_mode == .on) {
+                     try sat.readBy(j, r_hc[0]);
+@@ -2536,22 +2580,22 @@
+             }
+         }
+         var r_pv: [2]A = .{ none, none };
+-        try runKernel(sc, r_k.pv, &.{ sat.p_region.arr, keys_w, comp, picks, meta, grouped.?.periods, r_pv_dep, r_off }, &.{ .{ .shape = &.{ ci(og), ci(L), ci(H / og * D) }, .dt = m.act }, .{ .shape = r_one, .dt = .uint32 } }, .{ ci(D / 128 * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = 1 }, .{ .name = "RD", .v = r_rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, &r_pv);
++        try runKernel(sc, r_k.pv, &.{ sat.p_region.arr, keys_w, comp, picks, meta, grouped.?.periods, r_pv_dep, r_off }, &.{ .{ .shape = &.{ ci(og), ci(L), ci(H / og * D) }, .dt = m.act }, .{ .shape = r_one, .dt = .uint32 } }, .{ ci(D / acore.pvCols() * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = 1 }, .{ .name = "RD", .v = r_rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, &r_pv, acore.three());
+         try sat.readBy(j, r_pv[1]);
+         r_heads = r_pv[0];
+         if (sat.mode == .on) return r_heads;
+     }
+     const s = if (qt.ctx != null and qh.ctx == null)
+-        try run(sc, g.qk_t, &.{ q, keys_w, comp, picks, meta, qt }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }})
++        try run(sc, g.qk_t, &.{ q, keys_w, comp, picks, meta, qt }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}, acore.three())
+     else
+-        try run(sc, g.qk, &.{ q, keys_w, comp, picks, meta }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }});
+-    if (qh.ctx != null) try qtail.compare(sc.s, try run(sc, g.qk_t, &.{ qh, keys_w, comp, picks, meta, qt }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}), s, &qtail.scores);
++        try run(sc, g.qk, &.{ q, keys_w, comp, picks, meta }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}, acore.three());
++    if (qh.ctx != null) try qtail.compare(sc.s, try run(sc, g.qk_t, &.{ qh, keys_w, comp, picks, meta, qt }, &.{ ci(L), ci(H), ci(NK) }, .float32, .{ ci(NK / 64 * 128), ci(L) }, &.{.{ .name = "HS", .v = hs }}, &.{.{ "T", .bfloat16 }}, acore.three()), s, &qtail.scores);
+     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
+-    const p = try run(sc, g.sm, &.{ s, picks, sink, meta, scal }, &.{ ci(L), ci(H), ci(NK) }, .float16, .{ ci(H * 32), ci(L) }, &.{.{ .name = "NJ", .v = ci((NK + 31) / 32) }}, &.{.{ "PT", .float16 }});
++    const p = try run(sc, g.sm, &.{ s, picks, sink, meta, scal }, &.{ ci(L), ci(H), ci(NK) }, .float16, .{ ci(H * 32), ci(L) }, &.{.{ .name = "NJ", .v = ci((NK + 31) / 32) }}, &.{.{ "PT", .float16 }}, false);
+     const periods = if (grouped) |gr| gr.periods else scal;
+     const shape: []const c_int = if (grouped != null) &.{ ci(og), ci(L), ci(H / og * D) } else &.{ ci(L), ci(H), ci(D) };
+     const rd: c_int = @intCast(m.cfg.dsv4_rope_head_dim);
+-    const o = try run(sc, g.pv, &.{ p, keys_w, comp, picks, meta, periods }, shape, m.act, .{ ci(D / 128 * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = @intFromBool(grouped != null) }, .{ .name = "RD", .v = rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } });
++    const o = try run(sc, g.pv, &.{ p, keys_w, comp, picks, meta, periods }, shape, m.act, .{ ci(D / acore.pvCols() * 128), ci(L) }, &.{ .{ .name = "HS", .v = hs }, .{ .name = "GROUPED", .v = @intFromBool(grouped != null) }, .{ .name = "RD", .v = rd } }, &.{ .{ "T", .bfloat16 }, .{ "PT", .float16 }, .{ "OT", m.act } }, acore.three());
+     // MLX_SERVE_DSV41_SCRATCH_ATTN=check: the ring's scores, probabilities and heads against the fresh ones (served).
+     if (ring_slot) |j| {
+         try sat.compareSlot(sc.s, .s, &sat.s_region, j, r_carrier[0], s);
+@@ -2561,15 +2605,17 @@
+     return o;
+ }
+ /// MLX_SERVE_DSV41_SCRATCH_ATTN: one launch of `k` with outputs `outs` (shape, dtype), each kept in the scope and
+-/// written to `got` (as many as `outs`).
++/// written to `got` (as many as `outs`); `three`, MLX_SERVE_DSV41_ATTN_CORE's (32, 1, 4) launch over the same
++/// threadgroups.
+ const KOut = struct { shape: []const c_int, dt: mlx.mlx_dtype };
+ const KType = struct { [*:0]const u8, mlx.mlx_dtype };
+-fn runKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, outs: []const KOut, grid: [2]c_int, ints: []const Tmpl, types: []const KType, got: []A) !void {
++fn runKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, outs: []const KOut, grid: [2]c_int, ints: []const Tmpl, types: []const KType, got: []A, three: bool) !void {
+     const cfg = mlx.mlx_fast_metal_kernel_config_new();
+     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+     for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, o.shape.ptr, o.shape.len, o.dt));
+-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, grid[0], grid[1], 1));
+-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
++    const ln = acore.launch(grid, three);
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ln.grid[0], ln.grid[1], ln.grid[2]));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ln.tg[0], ln.tg[1], ln.tg[2]));
+     for (ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t.name, t.v));
+     for (types) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, t[0], t[1]));
+     const iv = mlx.mlx_vector_array_new_data(ins.ptr, ins.len);
