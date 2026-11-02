@@ -39,6 +39,9 @@ const round_io = @import("src/round_io.zig");
 /// The decode's expert lookahead (`MLX_SERVE_DSV41_LOOKAHEAD`, src/stream_lookahead.zig), read by the copied stream
 /// (exl3_source.zig, experts.zig) through this root.
 pub const stream_lookahead = @import("src/stream_lookahead.zig");
+/// The decode lookahead widened by a credit of records a round past each layer call's budget, and its `[lookahead]`
+/// line (`MLX_SERVE_DSV41_LOOKAHEAD_WIDE`, src/la_wide.zig), read by the copied source and stream.
+pub const la_wide = @import("src/la_wide.zig");
 /// mlx-serve's expert usage profile on the streamed bank (src/expert_usage_cfg.zig: `MLX_SERVE_DSV41_RESIDENT_SEED`,
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_DIR`, `_RECORD`, `_LABEL`), read by the copied EXL3 source through this root: the
 /// prompt rows seeded at the load with each layer's most used experts, and each request's routed experts recorded.
@@ -492,6 +495,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    la_wide.configure(env.span(.MLX_SERVE_DSV41_LOOKAHEAD_WIDE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_LOOKAHEAD_WIDE is not a number from 0 to 64 (unset: 10): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     // Before the model's load, which compiles its decode stretches only when the stage profiler is off.
     stage_prof.configure(env.span(.MLX_SERVE_DSV41_STAGE_PROF));
     prompt_io.configure(env.span(.MLX_SERVE_DSV41_PROMPT_IO));
@@ -666,6 +676,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (prompt_tl.setting.dirPath()) |d| log.info("[turboexl3_ds41] prompt GPU timeline on (MLX_SERVE_DSV41_PROMPT_TL): each prompt's command buffers tagged by layer and stage (pre, attn, moe, rest), ds41-prompt-tl-<pid>-<seq>.json in {s} at each request's end\n", .{d});
     const la = stream_lookahead.setting;
     if (!la.isDefault()) log.info("[turboexl3_ds41] decode lookahead (MLX_SERVE_DSV41_LOOKAHEAD): {d} records read ahead a layer call{s}, idle rule {d}, the stream sized for {d}\n", .{ la.budget, if (la.predicts()) "" else " (the predictor off)", la.idle_busy, la.initBudget() });
+    if (la_wide.on()) log.info("[turboexl3_ds41] decode lookahead widened (MLX_SERVE_DSV41_LOOKAHEAD_WIDE): about {d} records a round read ahead past each layer call's {d}, at most {d} more a call, the stream sized for the lookahead's widest budget{s}; a [lookahead] line at each request's end with the DSpark profile\n", .{ la_wide.per_round, la.budget, la_wide.max_extra, if (la.predicts()) "" else " (no effect: the predictor off)" });
     round_io.on = model(mp).mdl.ds_prof != null;
     if (round_io.on) {
         round_io.start(ioSnap(model(mp)));
@@ -686,6 +697,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .check => log.info("[turboexl3_ds41] prefill waves into per-prompt regions, checked (MLX_SERVE_DSV41_SCRATCH_WAVES=check): the fresh waves served, every launch's region output compared with the fresh one; [scratch-waves] per launch (words, differ, max_abs, max_ulps, over1) at each request's end\n", .{}),
     }
     return mp;
+}
+
+/// MLX_SERVE_DSV41_LOOKAHEAD_WIDE: the lookahead's records by base / extra and top-k position since load; null without the
+/// EXL3 source.
+fn laHist(m: *ds.Model) ?la_wide.Hist {
+    const r = m.mdl.streamed orelse return null;
+    if (r.math != .source) return null;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    return src.lookaheadHist();
 }
 
 /// The stream's PARTS counters now (`direct_parts`); null without the EXL3 source.
@@ -1120,7 +1140,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const mdl_line = if (decode_window.on()) decode_window.meters(memDecodeSnap(model(mp)), meter_buf[n0 + dp.len + swl.len + edl.len + dal.len ..]) else meter_buf[0..0];
     const dsl = decode_stop.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len ..]);
     const stl = stage_trim.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len ..]);
-    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len;
+    // MLX_SERVE_DSV41_LOOKAHEAD_WIDE: the request's records read ahead by base / extra and top-k position (the DSpark profile's).
+    const lal = if (round_io.on) (if (laHist(model(mp))) |h| la_wide.meters(h, meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }

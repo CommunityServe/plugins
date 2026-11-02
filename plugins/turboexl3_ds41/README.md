@@ -118,6 +118,27 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   barrier waits on its ids alone; the same records and claims. At full-block verifies (window w-20261101-0326) that
   verified 1.25 +/- 0.20 ms a round faster than the scores in the barrier (93 of 106 rounds; 1.42 +/- 0.23 ms, 132 of
   142, in the cold prompt's decode), the texts, rounds and misses the same.
+- `MLX_SERVE_DSV41_LOOKAHEAD_WIDE` (src/la_wide.zig, patches/turboexl3-zzz9c-lookahead-wide.patch; on at 10, `=0` off,
+  `=N` about N records a round, 1 to 64; with the predictor on): the decode lookahead's recall widened past each layer call's
+  budget. On ctl26 a greedy round has 36.2 misses, 13.9 claimed from the lookahead and 22.3 read on demand (12.4 MB and
+  about 1.0 ms of verify each); the lookahead reads 617 MB a round, 412 of it unclaimed, at no verify cost the round
+  fit can see (-15 ms/GB beside the demand reads), and the drive moves 10.4 GB/s in decode against the ~13 GB/s it
+  streams a prompt at: about 240 MB a round to spare. On, the stream is sized for the lookahead's widest budget (4:
+  eight staging slots, 51 MiB more in the bill) and a call reads its budget, then while a credit lasts up to 2 more of
+  the same ranking: the credit grows N / (layers - 1) at each predicting call and spends one a record read past the
+  budget, at most 2 held. N = 10 is half the spare (the speculative class's queue rule still yields to demand reads).
+  On or off, a `[lookahead] wide= p= r= xp= xr= p0= r0= ... xp7= xr7=` line at each request's end with the DSpark
+  profile: the records read ahead, the budget's (p) and the extra ones (xp), by the top-k position each was chosen at,
+  with those the target call routed (r, xr). Exact: the lookahead only reads ahead.
+- Read as la2 (M5 Max, w-20261102-0435; code-ctx16384 card then greedy, a = ctl29, b = la2 at 10; a1 b1 b2 a2 b3 a3 a4
+  b4): card 44.50 44.70 44.70 44.40 against 44.50 44.70 44.70 44.70 tok/s (+0.17%), greedy 57.10 56.10 57.20 57.10
+  against 57.00 56.90 56.80 56.90 (+0.04%); the texts the same bytes and 150 / 179 rows in every arm. Merged as measured
+  (both point estimates >= 0), not as a lever: the extra records were chosen (10.1 / 9.8 a round; 17% / 10% routed)
+  but hardly read. The b arms' records issued rose by exactly them while records landed (2643 -> 2650 a card request),
+  claims a round (20.14 -> 20.25 card, 14.16 -> 14.30 greedy) and the speculative bytes a round (+3 / +4 MB) did not
+  move: the speculative class's two threads were busy with the budget's records (640 / 617 MB a round read, 369 / 409
+  of it abandoned unrouted), so the extras waited queued behind them and were dropped unstarted at their call's settle,
+  or, routed, cancelled by the demand read that needed them.
 - `[round-io]` (src/round_io.zig, on with the DSpark profile, `MLX_SERVE_DIAG=dspark-profile`) logs at each request's
   end the expert stream's traffic of the decode's rounds and of the rest (the prompt pass): unique experts missed and
   hit, the demand's bytes (and those copied out of lookahead records), the lookahead's bytes, its abandoned ones, its
