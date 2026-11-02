@@ -444,6 +444,24 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   16K cells' 150 prompt rows and zzz8x's 179 decode rows. Exact: the texts the same bytes in every arm (cold d081845201,
   new-text slice 3 4d5b401f3c), and the check arm compared 41 wide calls' shared experts, 3,205,017,600 words, none
   different (max_ulps 0).
+- `MLX_SERVE_DSV41_REST_EARLY` (src/rest_early.zig, patches/turboexl3-zzz9e-rest-early.patch; on, `=0` off): a wide
+  prompt layer's new streams (its routed call's tail kernel, the TAIL_FUSE combine and hc expand, with its inputs' small
+  ops) committed at the call's end, before the layer's teardown. `=0`: `wideLayer` returns after its last group's holds,
+  its scopes free every intermediate the layer made (the attention's GB-size transients among them, mostly back to Metal
+  past MLX's 2 GiB cache), and only then does `runLayers` evaluate the held arrays, the new streams first: the GPU idles
+  about 20.7 ms a 16K-row encoder layer (pt4 w-pio-20261102-0613's pk arm: 5.8 ms from the call's end to the eval's
+  first commit, 3.5 ms between its first two small kernels, 11.5 ms for the new streams' fresh allocation), then runs
+  the tail kernel (4.8 ms). On, the last group commits the new streams (`mlx_async_eval`) right after its holds, so the
+  GPU runs the tail kernel while the host tears the layer down. The same kernels over the same inputs, only committed
+  earlier, so the same words (a text gate). The holds have just freed the previous streams, so the new ones take their
+  place in the live set and the peak is the old flow's just before its holds (the bill's `held` term counts two stream
+  sets a row).
+- On against `=0` (re1, w-pio-20261102-0740, two binaries: a = ctl31 (a407f1f, zzz9c), b = this code on zzz9c, =1 in the
+  b arms, both on G_KITSP1 with keyed sampling; a warm server, then a1 b1 b2 a2): cold 16K a 1451.8/1441.3 -> b
+  1459.4/1446.4 tok/s (+0.44%, pairs +0.52% and +0.35%), new text (slice 3) 1543.8/1518.1 -> 1543.3/1584.0 (+2.14%,
+  pairs -0.03% and +4.34%); 147 prompt and 176 decode rows in every arm; the guard's accounted peak 106.4/100.2 GiB in
+  the b arms against 107.8/107.8 in the a arms. Exact: the texts the same bytes in every arm (cold 65d438d647, new-text
+  slice 3 83a88208e3).
 - `MLX_SERVE_DSV41_DIRECT_PARTS` (src/direct_parts.zig, src/direct_parts_test.zig, patches/turboexl3-zzz8i-direct-parts.patch:
   the copied read pool's PARTS route; on, `=0` off): a record is
   read as its gate/up span and its down span, each in one F_NOCACHE preadv into a worker's 9 MiB staging buffer and a

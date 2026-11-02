@@ -87,6 +87,9 @@ pub const tail_fuse = @import("src/tail_fuse.zig");
 /// What a wide prompt call's MoE does not read, committed behind its routes before the routing barrier waits on them
 /// (`MLX_SERVE_DSV41_WIDE_EARLY`, src/wide_early.zig), read by the copied model.
 pub const wide_early = @import("src/wide_early.zig");
+/// A wide prompt layer's new streams committed at its call's end, before the layer's teardown
+/// (`MLX_SERVE_DSV41_REST_EARLY`, src/rest_early.zig), read by the copied model.
+pub const rest_early = @import("src/rest_early.zig");
 /// A wide prompt layer's query heads kept unroped, their roped last channels apart (`MLX_SERVE_DSV41_Q_TAIL`,
 /// src/q_tail.zig), read by the copied model.
 pub const q_tail = @import("src/q_tail.zig");
@@ -450,6 +453,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    rest_early.configure(env.span(.MLX_SERVE_DSV41_REST_EARLY)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_REST_EARLY is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     q_tail.configure(env.span(.MLX_SERVE_DSV41_Q_TAIL)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_Q_TAIL is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -675,6 +685,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, before the routing barrier waits: the routes, the next layer's predicted routes, then the shared expert and the attention state (MLX_SERVE_DSV41_WIDE_EARLY=0: after the call)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, and the shared expert is also built the old way and served, the two compared word for word (MLX_SERVE_DSV41_WIDE_EARLY=check): a [wide-early] check line a wide call\n", .{}),
     }
+    if (rest_early.on)
+        log.info("[turboexl3_ds41] wide prompt layers commit their new streams at the routed call's end, before the layer's teardown: the GPU runs the tail kernel while the host frees the layer (MLX_SERVE_DSV41_REST_EARLY=0: after the teardown)\n", .{})
+    else
+        log.info("[turboexl3_ds41] wide prompt layers' new streams evaluated by the layer's last eval, after its teardown (MLX_SERVE_DSV41_REST_EARLY=0)\n", .{});
     switch (q_tail.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers rope the whole query heads into a copy (MLX_SERVE_DSV41_Q_TAIL=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers keep the query heads unroped and rope their last channels apart, read together by the gather's scores (MLX_SERVE_DSV41_Q_TAIL=0: the whole roped copy)\n", .{}),
