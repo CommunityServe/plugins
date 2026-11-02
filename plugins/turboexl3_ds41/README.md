@@ -403,6 +403,24 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   the encoder: 205.3 GB on against 229.3 (w-pio-20261101-0953, a profile build). Exact: `check` (w-pio-20261101-0953)
   compared 2,564,014,080 tail words and 23,135,944,704 score words over both requests, none different, and every arm's
   texts are the policy-off references (cold d081845201, new-text slice 3 4d5b401f3c).
+- `MLX_SERVE_DSV41_STAGE_TRIM` (src/stage_trim.zig, patches/turboexl3-zzz8z-stage-trim.patch; on, `=0` off, `=check`
+  on and checked): a wide prompt call's staged records its routes do not take let go before the drive reaches them. On
+  the cold code-ctx16384 card (pt3, w-pio-20261101-2207) the encoder staged 4,168 records and its routes took 3,373, 795
+  read for nothing, 207 of them at layer 0 (of 323) and 115 at layer 1, whose staging is posted at the prompt's start
+  with part of it still queued when layer 0's routes are known. On, a staged window's jobs go out in rank order
+  (hottest first) rather than file order, and once the call has its routes and has taken its staged groups, each
+  staged job holding none of the call's experts that no read worker has started is withdrawn from the read pool
+  (`Pool.withdraw`: its tickets published unread, no row written), its rows let go; a started job reads as posted.
+  `=check` reads each withdrawn ticket's status back. `[stage-trim] mode= parts= records= started= verified= bad=` at
+  each request's end. Exact: only reads no route of the call takes are dropped.
+- On against `=0` (tr1, w-pio-20261102-0152, two binaries: a = ctl25 (2ff23cb, zzz8w), dylib 5ccb44791b50; b = this
+  code on zzz8w with the switch off by default, dylib 14e9e72ec2c9, `=1` in the b arms; a warm server, then a1 b1 b2
+  a2): cold 16K a 1407.6/1407.4 -> b 1409.9/1408.2 tok/s (+0.11%, pairs +0.16% and +0.06%), new text (slice 3)
+  1496.3/1492.5 -> 1498.7/1493.5 (+0.11%, pairs +0.16% and +0.07%); 152 prompt / 177 decode rows in every arm. No job
+  was withdrawn: every b request's line reads parts=0 records=0 (started=0 on the cards, 1 on the slices), every staged
+  job holding one of its call's experts, so the waste sits record by record inside them; the b arms posted in rank
+  order, their stream stats the a arms' (read 101.75 / 70.41 GB, 6049 misses, 4228 staged, 3441 adopted). Exact: the
+  texts the same in every arm.
 - `MLX_SERVE_DSV41_STAGE_NEXT` (src/stage_next.zig, patches/turboexl3-zzz8j-stage-next.patch; on, `=0` off, `=own` as
   this patch left it; with `MLX_SERVE_DSV41_STAGE`): a wide prompt layer's read-ahead and predicted transient loads read during the call before
   it. `=0`: staging posts a layer's stream misses at the layer's start, so they read under its attention (~4.5 GB a

@@ -93,6 +93,9 @@ pub const whole_stream = @import("src/whole_stream.zig");
 /// A wide prompt call's predicted transient loads read while its attention runs, into the windows its routes take
 /// (`MLX_SERVE_DSV41_STAGE`, src/stage.zig), read by the copied stream, its source and the streamer's wide call.
 pub const stage = @import("src/stage.zig");
+/// A wide prompt call's staged records its routes do not take let go before the drive reaches them
+/// (`MLX_SERVE_DSV41_STAGE_TRIM`, src/stage_trim.zig), read by the copied stream.
+pub const stage_trim = @import("src/stage_trim.zig");
 /// A wide prompt layer's predicted transient loads read during the call before it, into the windows that call's groups
 /// let go (`MLX_SERVE_DSV41_STAGE_NEXT`, src/stage_next.zig), read by the copied model, stream and source.
 pub const stage_next = @import("src/stage_next.zig");
@@ -329,6 +332,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    stage_trim.configure(env.span(.MLX_SERVE_DSV41_STAGE_TRIM)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE_TRIM is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     stage_next.configure(env.span(.MLX_SERVE_DSV41_STAGE_NEXT)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE_NEXT is none of 0, 1, only, own (unset: only): the load is refused\n", .{});
         out.* = switch (e) {
@@ -560,6 +570,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] wide prompt calls' predicted transient loads staged in their windows while the attention runs (MLX_SERVE_DSV41_STAGE=0: each stream group read by its own route); [prompt-io] staged= adopted= with PROMPT_IO\n", .{})
     else
         log.info("[turboexl3_ds41] wide prompt calls' stream groups read by their own routes (MLX_SERVE_DSV41_STAGE=0)\n", .{});
+    switch (stage_trim.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted in file order, none withdrawn (MLX_SERVE_DSV41_STAGE_TRIM=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted hottest first, each one its routes take none of let go unread where no read has started (MLX_SERVE_DSV41_STAGE_TRIM=0: file order, none withdrawn){s}; [stage-trim] at each request's end\n", .{if (stage.on) "" else ": no effect without MLX_SERVE_DSV41_STAGE"}),
+        .check => log.info("[turboexl3_ds41] wide prompt calls' staging trimmed at their routes, checked (MLX_SERVE_DSV41_STAGE_TRIM=check): as =1, each withdrawn ticket's status read back; [stage-trim] verified= bad= at each request's end\n", .{}),
+    }
     if (stage_next.on)
         log.info("[turboexl3_ds41] wide prompt layers' read-ahead and predicted transient loads posted during the call before them, into its persistent rows and the windows its groups let go ({s}); [prompt-io] early= with PROMPT_IO\n", .{if (stage.on) "MLX_SERVE_DSV41_STAGE_NEXT=0: at the layer's start" else "no effect: MLX_SERVE_DSV41_STAGE=0"})
     else
@@ -1075,7 +1090,8 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const dal = draft_ahead.meters(meter_buf[n0 + dp.len + swl.len + edl.len ..]);
     const mdl_line = if (decode_window.on()) decode_window.meters(memDecodeSnap(model(mp)), meter_buf[n0 + dp.len + swl.len + edl.len + dal.len ..]) else meter_buf[0..0];
     const dsl = decode_stop.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len ..]);
-    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len;
+    const stl = stage_trim.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }

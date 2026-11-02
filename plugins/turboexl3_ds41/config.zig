@@ -211,6 +211,7 @@ test {
     _ = @import("src/prompt_tl.zig");
     _ = @import("src/whole_stream.zig");
     _ = @import("src/stage.zig");
+    _ = @import("src/stage_trim.zig");
     _ = @import("src/stage_next.zig");
     _ = @import("src/scratch_x1.zig");
     _ = @import("src/engram_direct.zig");
