@@ -506,6 +506,19 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   greedy 56.20 -> 56.93 tok/s (+1.29%), card 44.23 -> 44.68 (+1.02%); decode rows 176 -> 178 (a2 175), misses a
   greedy round 39.2 -> 37.7 (card 58.3 -> 57.3). At decode MLX holds 97,056 MiB active and ~0.1 GiB cached, its peak
   51 MiB over active; the process footprint 98,127 MiB (MLX's and ~0.95 GiB of the host's).
+- `MLX_SERVE_DSV41_DECODE_STOP` (src/decode_stop.zig, patches/turboexl3-zzz8x-decode-stop.patch; on, `=0` off, `=check`
+  as on): the decode phase's budget takes 1.0e9 B of the 2.0e9 B stop under the ceiling back for its slot rows, MLX's
+  cache capped at 1 GiB from the phase change to decode (after the grow) and the prompt's cap restored at the change
+  back (before decode's rows go). At decode MLX holds little beyond the bill: wz1's b arms (16K) cached 97 to 109 MiB
+  with a peak 51 MiB over active; md1 (w-20261102-0003, 32K on ctl25) cached 0 with the peak 51 MiB over active, the
+  footprint 3.51 GiB under the 102,400 MiB ceiling. The cut is two decode rows (470 MiB a row) at 16K and at 32K; the
+  prompt's budget and rows and the 2 GiB wired margin are unchanged. `[decode-stop] mode= cut_mb= cache_mb=
+  prompt_cache_mb= enters= exits=` at each request's end, `decode_cut_mb=` in `[bank-bill]`. Exact: a route's bytes are
+  the records' in any row.
+- On against `=0` (ns1, w-20261102-0057, two binaries: a = ctl25 (2ff23cb, zzz8w), b = this code, =1 in the b arms;
+  chk then A B B A, B A A B): greedy 56.60 -> 57.08 tok/s (+0.84%, round 86.36 -> 85.53 ms, misses 38.5 -> 36.9 a
+  round), card 44.40 -> 44.78 (+0.84%); the decode rows 177 -> 179 in every pair (a2 opened 152 prompt rows at its
+  in_use of 102,183 MiB, the others 153); the texts the same in every arm (card f7dfb7a5d4, greedy fd06ee302a).
 - `MLX_SERVE_DSV41_SCRATCH_ATTN` (src/scratch_attn.zig, src/attn_twins.zig, patches/turboexl3-zzz8p-scratch-attn.patch;
   on, `=0` off, `=check`): a wide prompt layer's attention spans write their scores (f32 [L, H, NK]) and probabilities
   (f16) into a ring of two per-prompt slots (S and P, 256 x 64 x 640 words a slot, 126 MB) instead of fresh MLX buffers:

@@ -109,6 +109,9 @@ pub const draft_ahead = @import("src/draft_ahead.zig");
 /// Decode's window 0 at a few rows, its memory the bank's decode slot rows (`MLX_SERVE_DSV41_DECODE_WINDOW`,
 /// src/decode_window.zig), read by the copied streamer's bill and grow.
 pub const decode_window = @import("src/decode_window.zig");
+/// The decode phase's budget takes part of the stop under the ceiling back, MLX's cache capped at decode instead
+/// (`MLX_SERVE_DSV41_DECODE_STOP`, src/decode_stop.zig), read by the copied bill and source.
+pub const decode_stop = @import("src/decode_stop.zig");
 /// The wide prompt layers' per-prompt regions (src/scratch.zig), read by the copied model and stream.
 pub const scratch = @import("src/scratch.zig");
 /// A wide prompt call's DIG-X waves write into per-prompt regions (`MLX_SERVE_DSV41_SCRATCH_WAVES`,
@@ -353,6 +356,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     // Before the model's load: the bank's bill takes the LRU's bytes beside the host's (the load line says the rows).
     bill.engram_store_bytes = engram_decode.billBytes();
+    // Before the model's load: the decode budget's part of the stop (MLX_SERVE_DSV41_DECODE_STOP).
+    decode_stop.configure(env.span(.MLX_SERVE_DSV41_DECODE_STOP)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_STOP is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    bill.decode_stop_cut = decode_stop.cutBytes();
     draft_ahead.configure(env.span(.MLX_SERVE_DSV41_DRAFT_AHEAD)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DRAFT_AHEAD is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -549,6 +561,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] a greedy round's draft launched at its own start (MLX_SERVE_DSV41_DRAFT_AHEAD=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] a greedy round's next draft launched at the end of the round before it (MLX_SERVE_DSV41_DRAFT_AHEAD; =0 off): from its next token once its state is committed, when the next plan is the stages' block; the next round takes it when it fits; [draft-ahead] at each request's end\n", .{}),
         .check => log.info("[turboexl3_ds41] a greedy round's next draft launched ahead, checked (MLX_SERVE_DSV41_DRAFT_AHEAD=check): the next round makes its own too, compares ids and confidences word for word and serves its own; [draft-ahead] checks= words= differ= at each request's end\n", .{}),
+    }
+    switch (decode_stop.mode) {
+        .off => log.info("[turboexl3_ds41] decode phase's stop under the ceiling at 2000 MB, the prompt's (MLX_SERVE_DSV41_DECODE_STOP=0): MLX's cache cap unchanged at decode; [decode-stop] off\n", .{}),
+        .on, .check => log.info("[turboexl3_ds41] decode phase's stop under the ceiling at {d} MB, not 2000 (MLX_SERVE_DSV41_DECODE_STOP{s}): its budget takes the {d} MB back for slot rows, MLX's cache capped at {d} MiB from the phase change to decode, the prompt's cap restored at the change back; [decode-stop] at each request's end\n", .{ (2_000_000_000 - decode_stop.cut_bytes) / 1_000_000, if (decode_stop.mode == .check) "=check, as =1" else "; =0 off", decode_stop.cut_bytes / 1_000_000, decode_stop.cache_bytes >> 20 }),
     }
     switch (decode_window.mode) {
         .off => log.info("[turboexl3_ds41] decode's window 0 at the widest decode route's rows (MLX_SERVE_DSV41_DECODE_WINDOW=0); [mem-decode] off\n", .{}),
@@ -1043,7 +1059,8 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     dropAhead();
     const dal = draft_ahead.meters(meter_buf[n0 + dp.len + swl.len + edl.len ..]);
     const mdl_line = if (decode_window.on()) decode_window.meters(memDecodeSnap(model(mp)), meter_buf[n0 + dp.len + swl.len + edl.len + dal.len ..]) else meter_buf[0..0];
-    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len;
+    const dsl = decode_stop.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }
