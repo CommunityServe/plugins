@@ -267,6 +267,29 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   in about 2% of their words, by at most one bf16 ulp (max_abs 7.8e-3), and the seeded 32-token text changes (md5
   a323144e8b, "Return values without equality duplicates, keeping first-seen order.", becomes efeb6f4ecd, "Return values
   with equality-based duplicates removed, keeping first order."): the reference text from here on.
+- `MLX_SERVE_DSV41_WOA_JOIN` (src/woa_join.zig, patches/turboexl3-zzz9b-woa-join.patch; on, `=0` off, `=check`
+  checked): a wide layer's EXL3 `wo_a` run (WOA_ROWS' run of spans, read from its SCRATCH_HEADS region) without
+  turboexl3's per-group copies, launches and decodes. turboexl3's grouped linear at prefill rows (root.zig
+  `groupedPrefill`) runs `linear` on each of the 8 groups: a strided column slice of the run's rows, which MLX copies
+  whole for the prepare; the prepare; the group's W_hat decoded from its trellis; MLX's matmul; the finish; then one
+  concatenation: 41 launches a run, and each of a 16K layer's runs decoding the same 8 W_hat again. On: one prepare
+  launch for every group reading the run's rows in place, each group's W_hat decoded once a layer (turboexl3's own
+  `Dense.dequantize`) and kept across the layer's runs, MLX's matmul of each group on the same operands, one finish
+  launch writing the run's joined rows: 10 launches a run, 18 at a layer's first. The prepare and finish are
+  turboexl3's prep.metal and finish.metal at the pin with only their index expressions moved (no multiply-add a compiler
+  could contract), so the same words. The kept W_hat (67 MB at the pack's shape) is billed in the prompt term only
+  (`prefillBytes` reads the setting before the load, for calls wider than a span: decode's calls are never wide). A
+  run another path would take (decode or register-path rows, turboexl3's fused-GEMM arm) keeps the stock call.
+  `check` runs both on every run, serves the stock run and logs `[woa-join] check layer= runs= equal= words= differ=
+  max_ulps=` a wide layer.
+- On against `=0` (wj1, w-pio-20261102-0405, two binaries: a = ctl26 (2d0a33f, zzz8x), dylib 3030784171b2; b = this
+  code on zzz8x with the switch off by default, dylib 061842336690, `=1` in the b arms; a warm server, the check arm
+  at margin 3, then a1 b1 b2 a2): cold 16K a 1409.1/1406.1 -> b 1446.9/1440.6 tok/s (+2.57%, pairs +2.68% and
+  +2.45%), new text (slice 3) 1496.6/1495.2 -> 1518.5/1536.0 (+2.10%, pairs +1.46% and +2.73%); 152 prompt rows in every
+  arm; the guard's peak 111.0 GiB. That build also billed the kept W_hat in the decode term (ws_decode_mb 804 -> 884,
+  178 decode rows against 179); here the prompt term only, so decode keeps 179. Exact: the texts the same bytes in
+  every arm (cold d081845201, new-text slice 3 4d5b401f3c), and the check arm's 41 wide-layer lines compared
+  4,026,531,840 words, none different (max_ulps 0).
 - `MLX_SERVE_DSV41_JOINLESS` (src/joinless.zig, patches/turboexl3-zzz8-joinless.patch; on, `=0` off, `check` both): a
   wide prompt call's routed sum and the layer's shared expert in one combine. `=0`: the streamer joins each bank call's
   wave outputs (a concatenate and a take, each evaluated inside the routed call), then the call's outputs again into
