@@ -311,6 +311,40 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   178 decode rows against 179); here the prompt term only, so decode keeps 179. Exact: the texts the same bytes in
   every arm (cold d081845201, new-text slice 3 4d5b401f3c), and the check arm's 41 wide-layer lines compared
   4,026,531,840 words, none different (max_ulps 0).
+- `MLX_SERVE_DSV41_PG2` (src/pg2.zig, src/pg2_t3.zig, patches/turboexl3-zzz9d-pg2-fused-finish.patch; turboexl3's
+  `pgemm`: src/pgemm.zig, src/kernels/pg2/ and its hook in dense.zig's `linearOn`; on, `=0` off, `=check` checked): a
+  prompt's dense EXL3 linears' matmul and finish as one launch. turboexl3's `linearOn` at prefill rows runs
+  the prepare, the W_hat decode, MLX's f16 matmul (z half [rows, N] written: MLX's fused NAX kernel, on M5 Max at its
+  64 x 128 tile, BK 256 and 2 x 4 simdgroups) and the finish (z read back, y written: f16(H128(f16(z)) * svh) per
+  128-column block, kernels/dense/finish.metal). On, at a shape of turboexl3's `pgemm.table`, one kernel runs the two:
+  MLX's fused NAX GEMM body and its gemm loop (MLX 0.32.3's steel_gemm_fused_nax.h `gemm` and gemm_nax.h `gemm_loop`,
+  their statements: SK 32, the 16 x 32 x 16 multiply-accumulate on the f16 operands, f32 accumulation, k in MLX's
+  order) at the tile the pg2u probe measured for that (K, N) on this machine, launched in MLX's own threadgroup shape
+  (32, WN, WM), with the finish's statements as its epilogue: the accumulators rounded to half as MLX's store rounds
+  them, staged in threadgroup memory, and the finish run per (row, 128-column block) on z's halves read from there. The
+  tile only nests BK's k-steps and moves which simdgroup computes which outputs (each simdgroup's N extent a multiple of
+  32: the MMA's column pairs as MLX's), and a call is taken only where MLX runs that regular kernel (no split K), so y
+  is the chain's y word for word, and z (about 1 GiB at a 16K prompt's wq_b) is never allocated. The table (BM x BN,
+  BK, WM x WN simdgroups, swizzle 2 throughout; the fused launch's time over the chain's at 16384 / 7168 / 2048 rows,
+  w-pg2u-20261102-0609; one tile a shape whatever the rows): wq_b (K 1280, N 32768) 32 x 256, 256, 1 x 4 (0.866 /
+  0.870 / 0.900); wo_b (8192, 5120) 32 x 256, 512, 1 x 4 (0.957 / 0.973 / 0.899); the shared expert's w1 and w3 (5120,
+  2304) 32 x 256, 512, 1 x 4 (0.933 / 0.984 / 0.982); its w2 (2304, 5120) 32 x 256, 256, 1 x 4 (0.938 / 0.933 /
+  0.950); wq_a (5120, 1280) 32 x 256, 512, 1 x 4 (0.963 / 0.920 / 0.963); wkv and the compressors' wkv and wgate (5120,
+  512) 64 x 256, 512, 2 x 4 (0.986 / 0.951 / 0.962). `wo_a` (WOA_JOIN's runs, or turboexl3's grouped linear) is not in
+  the table, and decode's register path never reaches the matmul. The table's kernels compile at load (the
+  activations' dtype, and f32 for (5120, 512): the compressors run on f32 rows), so a prompt's first call compiles
+  nothing. `check` serves the chain and, at every call pg2 would take, runs pg2's launch on the same operands and
+  compares the two y word for word (one host read a call); it holds both outputs, so its arm runs at margin 3. A
+  `[pg2] mode= launches= elems=` line at each request's end (counts since load; `checks= words= differ=` under
+  check).
+- On against ctl31 (pg2, w-pio-20261102-0633, two binaries on the G_KITSP1 host with keyed sampling: a = ctl31 (a407f1f,
+  zzz9c), dylib 2c8d5488e421; b = this code on zzz9c, dylib 833ade5320fb, `=1` in the b arms; a warm server, the check
+  arm at margin 3, then a1 b1 b2 a2): cold 16K a 1459.5/1460.3 -> b 1483.2/1490.7 tok/s (+1.85%, pairs +1.62% and
+  +2.08%), new text (slice 3) 1551.4/1555.2 -> 1584.9/1584.7 (+2.03%, pairs +2.16% and +1.90%); 240 fused launches a
+  16K card (16,310,922,240 output elements); 148 prompt and 178 decode rows in a1, b1 and b2 (a2 177 decode rows); the
+  guard's accounted samples 98.9 and 99.9 GiB in the b arms against 108.9 and 105.3 in the a arms. Exact: the texts the
+  same bytes in every arm (cold 65d438d647, new-text slice 3 83a88208e3), and the check arm's 480 calls compared
+  31,172,213,760 words, none different.
 - `MLX_SERVE_DSV41_JOINLESS` (src/joinless.zig, patches/turboexl3-zzz8-joinless.patch; on, `=0` off, `check` both): a
   wide prompt call's routed sum and the layer's shared expert in one combine. `=0`: the streamer joins each bank call's
   wave outputs (a concatenate and a take, each evaluated inside the routed call), then the call's outputs again into

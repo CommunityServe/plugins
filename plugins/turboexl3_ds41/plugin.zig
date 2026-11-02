@@ -93,6 +93,10 @@ pub const q_tail = @import("src/q_tail.zig");
 /// A wide prompt layer's EXL3 `wo_a` run on one prepare and one finish launch for its groups, each group's W_hat decoded
 /// once a layer (`MLX_SERVE_DSV41_WOA_JOIN`, src/woa_join.zig), read by the copied model.
 pub const woa_join = @import("src/woa_join.zig");
+/// A wide prompt layer's dense EXL3 linears' matmul and finish as one launch at this machine's tiles
+/// (`MLX_SERVE_DSV41_PG2`, src/pg2.zig; turboexl3's `pgemm` switch, its warm and `check`'s compare in src/pg2_t3.zig).
+pub const pg2 = @import("src/pg2.zig");
+const pg2_t3 = @import("src/pg2_t3.zig");
 /// A wide prompt layer's input as the last wide layer's whole stream (`MLX_SERVE_DSV41_WHOLE_STREAM`, src/whole_stream.zig),
 /// read by the copied model.
 pub const whole_stream = @import("src/whole_stream.zig");
@@ -460,6 +464,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    // Before the model's first prompt: turboexl3's fused matmul + finish at the PG2 setting.
+    pg2.configure(env.span(.MLX_SERVE_DSV41_PG2)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_PG2 is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    pg2_t3.configure();
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1 (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -571,6 +584,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             return null;
         };
     }
+    // MLX_SERVE_DSV41_PG2: the tabled tiles' kernels compiled now, not in the first prompt.
+    pg2_t3.warm(model(mp).mdl.s, model(mp).mdl.act) catch |e| {
+        log.err("[turboexl3_ds41] pg2's kernels did not build ({s}): the load is refused (MLX_SERVE_DSV41_PG2=0 runs the chain)\n", .{@errorName(e)});
+        ds.table.unload(mp);
+        out.* = Verdict.refuse(.failed, "turboexl3_ds41: pg2's kernels did not build");
+        return null;
+    };
     dropPending();
     if (drafter) |*d| d.deinit();
     drafter = rounds.Drafter.init(gpa, on);
@@ -664,6 +684,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] wide prompt layers' EXL3 wo_a runs as turboexl3's grouped linear (MLX_SERVE_DSV41_WOA_JOIN=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' EXL3 wo_a runs on one prepare and one finish launch for their groups, the rows read in place, each group's W_hat decoded once a layer and kept across its runs (MLX_SERVE_DSV41_WOA_JOIN=0: turboexl3's grouped linear)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' EXL3 wo_a runs as turboexl3's grouped linear, served, and joined, compared word for word (MLX_SERVE_DSV41_WOA_JOIN=check): a [woa-join] check line a wide layer\n", .{}),
+    }
+    switch (pg2.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' dense EXL3 linears as MLX's matmul then the finish (MLX_SERVE_DSV41_PG2=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' dense EXL3 linears' matmul and finish as one launch at this machine's tiles ({d} shapes, MLX_SERVE_DSV41_PG2; =0 off): MLX's fused NAX kernel body and loop with the finish as its epilogue where MLX runs that kernel unsplit, the chain's words; [pg2] at each request's end\n", .{pg2_t3.shapes()}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' dense EXL3 linears checked (MLX_SERVE_DSV41_PG2=check): the chain served, pg2's launch run beside every call it takes ({d} shapes) and compared word for word; [pg2] checks= words= differ= at each request's end\n", .{pg2_t3.shapes()}),
     }
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {
@@ -1142,7 +1167,10 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const stl = stage_trim.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len ..]);
     // MLX_SERVE_DSV41_LOOKAHEAD_WIDE: the request's records read ahead by base / extra and top-k position (the DSpark profile's).
     const lal = if (round_io.on) (if (laHist(model(mp))) |h| la_wide.meters(h, meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
-    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len;
+    // MLX_SERVE_DSV41_PG2: the [pg2] line (the counts since load).
+    const pgc = pg2_t3.counts();
+    const pgl = pg2.meters(pgc[0], pgc[1], meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
 }
