@@ -13,7 +13,10 @@
 //! cache (F_NOCACHE: the file system blocks that hold them, fstatfs `f_bsize`, APFS 4,096 B, straight into an aligned
 //! buffer) on up to 64 threads, each a contiguous run of the sorted rows that keeps its last scale block for the rows
 //! after it, then each span's rows copied out of them; a decode token's rows read past the cache as before, a pread a
-//! half-row. Exact: the same bytes land in the same rows; only how they are read changes.
+//! half-row. A repacked table (`engram/engram-manifest.json`: a row's codes then its scales in one 264 B record) is
+//! read a record a row (`readRecord`): one pread through the blocks that hold it (two blocks for the 6.4% of records
+//! that straddle one), in a whole-table read and a decode token's alike. Exact: the same bytes land in the same rows;
+//! only how they are read changes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -124,6 +127,21 @@ pub fn readRow(fd: c_int, dst: []u8, off: u64) bool {
     return true;
 }
 
+/// The longest record `readRecord` reads with one call (a head_dim of 4096's codes and scales).
+pub const max_record: usize = 4096 + 128;
+
+/// A record's two parts, adjacent at `off` (`w.len` bytes, then `s.len`): one `readRow` of both, split into `w` and
+/// `s` (a record past `max_record`: two). False on a short read.
+pub fn readRecord(fd: c_int, w: []u8, s: []u8, off: u64) bool {
+    const n = w.len + s.len;
+    if (n > max_record) return readRow(fd, w, off) and readRow(fd, s, off + w.len);
+    var rec: [max_record]u8 = undefined;
+    if (!readRow(fd, rec[0..n], off)) return false;
+    @memcpy(w, rec[0..w.len]);
+    @memcpy(s, rec[w.len..n]);
+    return true;
+}
+
 /// One thread's last read through a file's blocks: the next row whose bytes it covers is copied from it, no read.
 pub const Block = struct {
     lo: u64 = std.math.maxInt(u64),
@@ -162,4 +180,29 @@ test "engram_direct setting: on unset, empty or 1; 0 off; anything else refused 
     try std.testing.expect(try parse("1"));
     try std.testing.expect(!try parse("0"));
     for ([_][]const u8{ "on", "2", "01", "true", " 1" }) |v| try std.testing.expectError(error.EngramDirectSetting, parse(v));
+}
+
+test "engram_direct readRecord: a record's codes then scales in one read, split; past the end a short read" {
+    const a = std.testing.allocator;
+    var data: [3 * 264]u8 = undefined;
+    for (&data, 0..) |*x, i| x.* = @truncate(i *% 7 +% 3);
+    const path = try std.fmt.allocPrintSentinel(a, "/tmp/turboexl3_ds41-engram-records-{d}.bin", .{std.c.getpid()}, 0);
+    defer a.free(path);
+    const out = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
+    try std.testing.expect(out >= 0);
+    const wrote = std.c.write(out, &data, data.len);
+    _ = std.c.close(out);
+    defer _ = std.c.unlink(path);
+    try std.testing.expectEqual(@as(isize, data.len), wrote);
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+    try std.testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    var cw: [256]u8 = undefined;
+    var cs: [8]u8 = undefined;
+    const c0 = calls.load(.monotonic);
+    try std.testing.expect(readRecord(fd, &cw, &cs, 264));
+    try std.testing.expectEqual(c0 + 1, calls.load(.monotonic));
+    try std.testing.expectEqualSlices(u8, data[264..520], &cw);
+    try std.testing.expectEqualSlices(u8, data[520..528], &cs);
+    try std.testing.expect(!readRecord(fd, &cw, &cs, 2 * 264 + 100));
 }

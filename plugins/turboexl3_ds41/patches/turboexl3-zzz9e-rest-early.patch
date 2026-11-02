@@ -1,0 +1,36 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -298,6 +298,7 @@
+     pub const MLX_SERVE_DSV41_Q_TAIL: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layer query heads (turboexl3_ds41): wq_b's output kept as the unroped heads and only their last channels roped apart, both read by the gather's scores; the same scores, one head-sized copy fewer a layer (=0: the whole roped copy; check: the copy served, the tail and the scores compared word for word, [q-tail] check lines)" };
+     pub const MLX_SERVE_DSV41_RA_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' read-ahead prediction on the fused hc kernels (turboexl3_ds41): the attention-side mix first, the prediction from one more pass of its norm kernel under the FFN's norm; served bytes unchanged (=0: the op chain)" };
+     pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
++    pub const MLX_SERVE_DSV41_REST_EARLY: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers (turboexl3_ds41): on, a layer's new streams (its routed call's tail kernel with its inputs' small ops) committed at the call's end, before the layer's teardown, so the GPU runs them while the host frees the layer; the same kernels and words; 0: off (the layer's last eval after the teardown)" };
+     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "turboexl3", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' decode (turboexl3, the default: turboexl3_ds41's banked decode; streamer: the streamer's own EXL3 kernels)" };
+     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
+     pub const MLX_SERVE_DSV41_SCRATCH_ATTN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' attention spans (turboexl3_ds41): 1, each span's scores and probabilities in a ring of two per-prompt slots, the gather's launches as write-into twins of their stock texts (compiled at load); check, the fresh launches served and the ring's scores, probabilities and heads compared word for word ([scratch-attn] check lines); the same words (0: fresh buffers)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -58,6 +58,9 @@
+ /// What a wide call's MoE does not read, committed behind its routes before the routing barrier waits on them
+ /// (turboexl3_ds41's src/wide_early.zig, `MLX_SERVE_DSV41_WIDE_EARLY`).
+ const wearly = @import("../../../wide_early.zig");
++/// A wide layer's new streams committed at its call's end, before the layer's teardown (turboexl3_ds41's
++/// src/rest_early.zig, `MLX_SERVE_DSV41_REST_EARLY`).
++const rearly = @import("../../../rest_early.zig");
+ /// A wide layer's heads left unroped, their roped last channels apart, read together by the gather's scores
+ /// (turboexl3_ds41's src/q_tail.zig, `MLX_SERVE_DSV41_Q_TAIL`).
+ const qtail = @import("../../../q_tail.zig");
+@@ -4538,6 +4541,11 @@
+             hold(&sp.whole[0], if (one) xg else none);
+             hold(&sp.whole[1], if (one) pf.sp.pre else none);
+         }
++        // MLX_SERVE_DSV41_REST_EARLY: the new streams (the call's tail kernel and its inputs' small ops) committed at the
++        // last group's end, before this group's and the layer's scopes are torn down: the GPU runs them during the
++        // teardown and the layer's last eval (runLayers) finds them under way. The holds above have just freed the
++        // previous streams, so the new ones take their place in the live set.
++        if (rearly.on and k1 == n_spans) try asyncEvalAll(&.{xg});
+     }
+ }
+ /// `MLX_SERVE_DSV41_WOA_ROWS=check` over a layer's runs: the runs compared, those equal bit for bit, the elements that

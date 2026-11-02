@@ -34,6 +34,8 @@ extern fn q3ld_seq() i64;
 extern fn q3ld_wait(seen: i64, timeout_ns: i64) i64;
 extern fn q3ld_quiesce(timeout_ns: i64) c_int;
 extern fn q3ld_stop() c_int;
+/// dq1b: the gate/up split (0 off, 1 on, 2 checked), set after `q3ld_start` by `run` when `split_mode` is set.
+extern fn q3ld_gu_split(mode: i32) c_int;
 
 /// The pool's Metal event backend (src/host_shims.zig in the plugin): never armed here, every gate off.
 export fn q3ld_mtl_signal(event: ?*anyopaque, value: u64) void {
@@ -41,7 +43,7 @@ export fn q3ld_mtl_signal(event: ?*anyopaque, value: u64) void {
     _ = value;
 }
 
-const counters_n = 75;
+const counters_n = 84;
 /// The pool's counters (q3_lookahead4_exl3.c's SC_ enum).
 const sc_landed = 4;
 const sc_claimed = 8;
@@ -51,7 +53,16 @@ const sc_pre_bound = 51;
 const sc_pre_cancelled = 52;
 const sc_pre_served = 54;
 const sc_parts = 72;
-const res_w = 8;
+const sc_split_tickets = 75;
+const sc_split_read = 76;
+const sc_split_adopted = 77;
+const sc_split_pre = 78;
+const sc_split_pre_issued = 79;
+const sc_split_checked = 82;
+const sc_split_mismatch = 83;
+/// dq1b's split test: the gate/up split `run` sets on each pool (0: none).
+var split_mode: i32 = 0;
+const res_w = 10;
 const st_ok = 0;
 const st_pending = -1;
 
@@ -293,6 +304,7 @@ fn run(file: TempFile, layout: Layout, route: Route, rows: *const Rows) ![counte
     try testing.expectEqual(@as(c_int, 0), q3ld_direct_config(0));
     try testing.expectEqual(@as(c_int, 0), q3ld_parts_config(if (route == .parts) @intCast(block) else 0));
     try testing.expectEqual(@as(c_int, 0), q3ld_start(workers, &ptrs, staging_bytes, @intCast(psize), &res, tickets, &log, tickets, &gauge));
+    if (split_mode != 0) try testing.expectEqual(@as(c_int, 0), q3ld_gu_split(split_mode));
     var stopped = false;
     defer if (!stopped) {
         _ = q3ld_quiesce(10 * std.time.ns_per_s);
@@ -314,7 +326,7 @@ fn run(file: TempFile, layout: Layout, route: Route, rows: *const Rows) ![counte
         if (route == .pre) {
             var bases: [experts]i64 = undefined;
             for (&bases, 0..) |*b, e| b.* = @intCast(recordOffset(layout, l, e) + g.guStart());
-            try testing.expectEqual(@as(i32, 2 * experts), q3ld_pre_read_lens(file.fd, @intCast(file.size), @intCast(100 + l), experts, &bases, &lens));
+            try testing.expectEqual(@as(i32, if (split_mode != 0) 3 * experts else 2 * experts), q3ld_pre_read_lens(file.fd, @intCast(file.size), @intCast(100 + l), experts, &bases, &lens));
             try waitCounter(&counters, sc_pre_started, @intCast(workers * (l + 1)));
         }
         var offsets: [2 * experts]i64 = undefined;
@@ -390,6 +402,48 @@ test "a4k byte gate: the pool's slot rows hold every part from the classic and t
                     try testing.expectEqual(@as(i64, 2 * workers), cnt[sc_pre_bound]);
                     try testing.expectEqual(@as(i64, 2 * workers), cnt[sc_pre_served]);
                     try testing.expectEqual(@as(i64, 2 * (2 * experts - workers)), cnt[sc_pre_cancelled]);
+                },
+            }
+        }
+    }
+}
+
+test "a4k byte gate, dq1b: with the gate/up split checked the slot rows hold every part and every split ticket reads back equal, staged, by PARTS, adopted and bound to the halves' pre-reads" {
+    const a = testing.allocator;
+    var parts = try Parts.init(a, 0xd1b_5eed);
+    defer parts.deinit(a);
+    const img_c = try parts.image(a, .classic);
+    defer a.free(img_c);
+    const img_a = try parts.image(a, .a4k);
+    defer a.free(img_a);
+    const fc = try TempFile.create(a, "classic-split", img_c);
+    defer fc.destroy(a);
+    const fa = try TempFile.create(a, "a4k-split", img_a);
+    defer fa.destroy(a);
+    split_mode = 2;
+    defer split_mode = 0;
+    // a gate/up ticket a record, two layers: each read as two halves, each ticket read again whole and compared
+    const tk: i64 = 2 * experts;
+    for ([_]Route{ .staged, .parts, .spec, .pre }) |route| {
+        for ([_]Layout{ .classic, .a4k }) |layout| {
+            var rows = try Rows.init();
+            defer rows.deinit();
+            const cnt = try run(if (layout == .a4k) fa else fc, layout, route, &rows);
+            try expectRowsHoldParts(&rows, &parts);
+            try testing.expectEqual(tk, cnt[sc_split_tickets]);
+            try testing.expectEqual(tk, cnt[sc_split_checked]);
+            try testing.expectEqual(@as(i64, 0), cnt[sc_split_mismatch]);
+            try testing.expectEqual(2 * tk, cnt[sc_split_read] + cnt[sc_split_adopted] + cnt[sc_split_pre]);
+            switch (route) {
+                .staged, .parts => try testing.expectEqual(2 * tk, cnt[sc_split_read]),
+                // every record read whole by the speculative class: both halves of its gate/up range adopted
+                .spec => try testing.expectEqual(2 * tk, cnt[sc_split_adopted]),
+                // each record's gate/up range pre-read as its halves; each layer's first record's halves in flight at the
+                // submit and bound (two workers), its second record's cancelled and read by the demand
+                .pre => {
+                    try testing.expectEqual(2 * tk, cnt[sc_split_pre_issued]);
+                    try testing.expectEqual(@as(i64, 2 * 2), cnt[sc_split_pre]);
+                    try testing.expectEqual(@as(i64, 2 * 2), cnt[sc_split_read]);
                 },
             }
         }

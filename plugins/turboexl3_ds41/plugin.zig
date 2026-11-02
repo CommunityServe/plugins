@@ -39,6 +39,9 @@ const round_io = @import("src/round_io.zig");
 /// The decode's expert lookahead (`MLX_SERVE_DSV41_LOOKAHEAD`, src/stream_lookahead.zig), read by the copied stream
 /// (exl3_source.zig, experts.zig) through this root.
 pub const stream_lookahead = @import("src/stream_lookahead.zig");
+/// The decode lookahead widened by a credit of records a round past each layer call's budget, and its `[lookahead]`
+/// line (`MLX_SERVE_DSV41_LOOKAHEAD_WIDE`, src/la_wide.zig), read by the copied source and stream.
+pub const la_wide = @import("src/la_wide.zig");
 /// mlx-serve's expert usage profile on the streamed bank (src/expert_usage_cfg.zig: `MLX_SERVE_DSV41_RESIDENT_SEED`,
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_DIR`, `_RECORD`, `_LABEL`), read by the copied EXL3 source through this root: the
 /// prompt rows seeded at the load with each layer's most used experts, and each request's routed experts recorded.
@@ -66,6 +69,12 @@ pub const shared_hoist = @import("src/shared_hoist.zig");
 /// The t3 route's hit wave on turboexl3's grouped banked decode (`MLX_SERVE_DSV41_T3_GROUP`, src/t3_group.zig), read by
 /// src/routed_t3.zig: turboexl3's banked group and DEVROUTE's id for a miss pair.
 pub const t3_group = @import("src/t3_group.zig");
+/// The t3 route's banked calls on turboexl3's grouped texts with an M = 3 member path (`MLX_SERVE_DSV41_HW4B`,
+/// src/hw4b.zig), read by src/routed_t3.zig's banked call.
+pub const hw4b = @import("src/hw4b.zig");
+/// The t3 route's banked calls with turboexl3's grouped banked GEMVs at hw2u's picked variants (`MLX_SERVE_DSV41_HW2`,
+/// src/hw2.zig) on the grouped texts the calls run (hw4b's with it on), read by src/routed_t3.zig's banked call.
+pub const hw2 = @import("src/hw2.zig");
 /// The embedding table read from the pack per lookup (`MLX_SERVE_DSV41_EMBED_PREAD`, src/embed_pread.zig), read by the
 /// copied model.
 pub const embed_pread = @import("src/embed_pread.zig");
@@ -81,34 +90,100 @@ pub const joinless = @import("src/joinless.zig");
 /// A wide prompt layer's joinless combine and hc expand in one kernel (`MLX_SERVE_DSV41_TAIL_FUSE`, src/tail_fuse.zig),
 /// read by the copied model and launched by the copied stream's source.
 pub const tail_fuse = @import("src/tail_fuse.zig");
+/// A decode-lane call's routed sum, shared expert and hc expand in TAIL_FUSE's kernel (`MLX_SERVE_DSV41_DECODE_FUSE`,
+/// src/decode_fuse.zig), read by the copied model and source.
+pub const decode_fuse = @import("src/decode_fuse.zig");
+/// What a wide prompt call's MoE does not read, committed behind its routes before the routing barrier waits on them
+/// (`MLX_SERVE_DSV41_WIDE_EARLY`, src/wide_early.zig), read by the copied model.
+pub const wide_early = @import("src/wide_early.zig");
+/// A wide prompt layer's new streams committed at its call's end, before the layer's teardown
+/// (`MLX_SERVE_DSV41_REST_EARLY`, src/rest_early.zig), read by the copied model.
+pub const rest_early = @import("src/rest_early.zig");
 /// A wide prompt layer's query heads kept unroped, their roped last channels apart (`MLX_SERVE_DSV41_Q_TAIL`,
 /// src/q_tail.zig), read by the copied model.
 pub const q_tail = @import("src/q_tail.zig");
+/// A wide prompt layer's EXL3 `wo_a` run on one prepare and one finish launch for its groups, each group's W_hat decoded
+/// once a layer (`MLX_SERVE_DSV41_WOA_JOIN`, src/woa_join.zig), read by the copied model.
+pub const woa_join = @import("src/woa_join.zig");
+/// A wide prompt layer's dense EXL3 linears' matmul and finish as one launch at this machine's tiles
+/// (`MLX_SERVE_DSV41_PG2`, src/pg2.zig; turboexl3's `pgemm` switch, its warm and `check`'s compare in src/pg2_t3.zig).
+pub const pg2 = @import("src/pg2.zig");
+const pg2_t3 = @import("src/pg2_t3.zig");
 /// A wide prompt layer's input as the last wide layer's whole stream (`MLX_SERVE_DSV41_WHOLE_STREAM`, src/whole_stream.zig),
 /// read by the copied model.
 pub const whole_stream = @import("src/whole_stream.zig");
 /// A wide prompt call's predicted transient loads read while its attention runs, into the windows its routes take
 /// (`MLX_SERVE_DSV41_STAGE`, src/stage.zig), read by the copied stream, its source and the streamer's wide call.
 pub const stage = @import("src/stage.zig");
+/// A wide prompt call's staged records its routes do not take let go before the drive reaches them
+/// (`MLX_SERVE_DSV41_STAGE_TRIM`, src/stage_trim.zig), read by the copied stream.
+pub const stage_trim = @import("src/stage_trim.zig");
+/// dq1b: decode's demand reads with each missed record's gate/up range as two range jobs read side by side
+/// (`MLX_SERVE_DSV41_GU_SPLIT`, src/gu_split.zig), set on the read pool by the copied source at each phase change.
+pub const gu_split = @import("src/gu_split.zig");
+/// The decode's demand reads by record size, part and how they were served (src/demand_split.zig, dq1a's, with
+/// [round-io]); read by the copied stream at each route's settle.
+pub const demand_split = @import("src/demand_split.zig");
+/// dq1b's `[cold-start]` (src/cold_start.zig, with [round-io]): the decode's first calls of each layer against the
+/// layer's last prompt call; read by the copied routed call.
+pub const cold_start = @import("src/cold_start.zig");
 /// A wide prompt layer's predicted transient loads read during the call before it, into the windows that call's groups
 /// let go (`MLX_SERVE_DSV41_STAGE_NEXT`, src/stage_next.zig), read by the copied model, stream and source.
 pub const stage_next = @import("src/stage_next.zig");
+/// Staging's vote floor and every staged record's votes (`MLX_SERVE_DSV41_STAGE_VOTES`, src/stage_votes.zig), read by the
+/// copied stream and source.
+pub const stage_votes = @import("src/stage_votes.zig");
 /// A wide prompt layer's streams after its attention written into one per-prompt region (`MLX_SERVE_DSV41_SCRATCH`,
 /// src/scratch_x1.zig), read by the copied model.
 pub const scratch_x1 = @import("src/scratch_x1.zig");
 /// The Engram tables read past the page cache, through their blocks (`MLX_SERVE_DSV41_ENGRAM_DIRECT`,
 /// src/engram_direct.zig), read by the copied Engram tables.
 pub const engram_direct = @import("src/engram_direct.zig");
+/// A prompt chunk's Engram read thread started first and a prompt grid's tables read on up to 128 threads
+/// (`MLX_SERVE_DSV41_ENGRAM_FIRST`, src/engram_first.zig), read by the copied model and Engram tables.
+pub const engram_first = @import("src/engram_first.zig");
+/// Engram rows kept across a conversation's turns (`MLX_SERVE_DSV41_ENGRAM_DECODE`, `MLX_SERVE_DSV41_ENGRAM_LRU_MB`,
+/// src/engram_decode.zig): an LRU a prompt grid's rows, the decode reads' and the rounds' bonus rows go into, a decode
+/// read's misses read on a pool; read by the copied Engram tables and model.
+pub const engram_decode = @import("src/engram_decode.zig");
+/// A greedy round's next draft launched at the end of the round before it (`MLX_SERVE_DSV41_DRAFT_AHEAD`,
+/// src/draft_ahead.zig).
+pub const draft_ahead = @import("src/draft_ahead.zig");
+/// Decode's window 0 at a few rows, its memory the bank's decode slot rows (`MLX_SERVE_DSV41_DECODE_WINDOW`,
+/// src/decode_window.zig), read by the copied streamer's bill and grow.
+pub const decode_window = @import("src/decode_window.zig");
+/// The decode phase's budget takes part of the stop under the ceiling back, MLX's cache capped at decode instead
+/// (`MLX_SERVE_DSV41_DECODE_STOP`, src/decode_stop.zig), read by the copied bill and source.
+pub const decode_stop = @import("src/decode_stop.zig");
+/// F3: the decode shared expert's EXL3 gate and up finishes, the clamped SwiGLU and the down's prepare in one launch
+/// (`MLX_SERVE_DSV41_SHFIN`, src/shfin.zig; turboexl3's `sharedSwiglu` and `check`'s compare in src/shfin_t3.zig), read by
+/// the copied model.
+pub const shfin = @import("src/shfin.zig");
 /// The wide prompt layers' per-prompt regions (src/scratch.zig), read by the copied model and stream.
 pub const scratch = @import("src/scratch.zig");
 /// A wide prompt call's DIG-X waves write into per-prompt regions (`MLX_SERVE_DSV41_SCRATCH_WAVES`,
 /// src/scratch_waves.zig on src/scratch.zig's `Region`, its twins' texts by src/wave_twins.zig), read by the copied
 /// quant and source.
 pub const scratch_waves = @import("src/scratch_waves.zig");
+/// A wide prompt layer's hyper-connection stages with fewer passes over the stream (`MLX_SERVE_DSV41_HC_FUSE`,
+/// src/hc_fuse.zig, kernels/hc_mix_norm.metal and kernels/hc_expand_norm.metal), read by the copied model.
+pub const hc_fuse = @import("src/hc_fuse.zig");
+/// A wide prompt call's DIG-X waves' 128-row GEMMs with the B stage double-buffered (`MLX_SERVE_DSV41_M1`, src/m1.zig),
+/// read by the copied quant and source.
+pub const m1 = @import("src/m1.zig");
+/// A wide prompt layer's new streams written in place over its x1 region by TAIL_FUSE's write-into twin
+/// (`MLX_SERVE_DSV41_SCRATCH_TAIL`, src/scratch_tail.zig), read by the copied model and source.
+pub const scratch_tail = @import("src/scratch_tail.zig");
+/// Both phases' slot rows over one buffer (`MLX_SERVE_DSV41_BANK_POOL`, src/bank_pool.zig: the switch and the plan),
+/// read by the copied stream and source.
+pub const bank_pool = @import("src/bank_pool.zig");
 /// A wide prompt layer's attention spans' scores and probabilities in a ring of two per-prompt slots
 /// (`MLX_SERVE_DSV41_SCRATCH_ATTN`, src/scratch_attn.zig on src/scratch.zig's `Region`, its twins' texts by
 /// src/attn_twins.zig), read by the copied model.
 pub const scratch_attn = @import("src/scratch_attn.zig");
+/// The wide gather's pv at 64 output columns a threadgroup and its tensor-op launches three-dimensional, the same words
+/// (`MLX_SERVE_DSV41_ATTN_CORE`, src/attn_core.zig), read by the copied model.
+pub const attn_core = @import("src/attn_core.zig");
 /// A profile build (`zig build -Dplugin-profile=true`, never served): the copied stream's profile probes compiled in (its
 /// `sdk` reads this through this root) and the decode verify's GPU timeline (`MLX_SERVE_DSV41_TIMELINE`,
 /// src/verify_tl.zig).
@@ -227,6 +302,24 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    // After the banked group, before the bank opens (its warm-up builds the banked kernels): the M = 3 member path, on
+    // the t3 route's grouped banked decode only (unset: on with it, off without it).
+    hw4b.configure(env.span(.MLX_SERVE_DSV41_HW4B), routed_t3.enabled and t3_group.on) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_HW4B is none of 0, 1, check, or is 1 or check without the t3 route's grouped banked decode ({s}): the load is refused\n", .{@errorName(e)});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // After hw4b (its texts set): the picked GEMV variants on the grouped texts the calls run, on the t3 route's grouped
+    // banked decode only (unset: on with it, off without it); one check mode at a time.
+    hw2.configure(env.span(.MLX_SERVE_DSV41_HW2), routed_t3.enabled and t3_group.on, hw4b.mode == .check) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_HW2 is none of 0, 1, check, or is 1 or check without the t3 route's grouped banked decode, or check beside MLX_SERVE_DSV41_HW4B=check ({s}): the load is refused\n", .{@errorName(e)});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     routed_one.mode = routed_one.modeOf(env.span(.MLX_SERVE_DSV41_ROUTED_ONE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ROUTED_ONE is none of 0, 1, resident, check: the load is refused\n", .{});
         out.* = switch (e) {
@@ -285,8 +378,43 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    bank_pool.configure(env.span(.MLX_SERVE_DSV41_BANK_POOL)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_BANK_POOL is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // The pool's arrays are the host's aliases (HostGpu.alias, mlx-serve's additive ABI entry): a host without it serves
+    // with the pool off, as before the pool.
+    if (bank_pool.on() and !shims.hasAlias()) {
+        log.info("[turboexl3_ds41] [bank-pool] off: the server's host table has no HostGpu.alias entry (its HostGpu {d} bytes, the entry at bytes 96-104: mlx-serve without host-alias.patch); the streamed bank's rows freed and freshly allocated at each phase change, as before the pool\n", .{shims.gpuBytes()});
+        bank_pool.mode = .off;
+    }
+    scratch_tail.configure(env.span(.MLX_SERVE_DSV41_SCRATCH_TAIL)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_TAIL is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    hc_fuse.configure(env.span(.MLX_SERVE_DSV41_HC_FUSE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_HC_FUSE is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     scratch_waves.configure(env.span(.MLX_SERVE_DSV41_SCRATCH_WAVES)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_WAVES is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the bank opens (the copied quant's routeM1 reads it at construction, before SCRATCH_WAVES' twins derive).
+    m1.configure(env.span(.MLX_SERVE_DSV41_M1)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_M1 is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -306,8 +434,29 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    attn_core.configure(env.span(.MLX_SERVE_DSV41_ATTN_CORE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ATTN_CORE is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     stage.configure(env.span(.MLX_SERVE_DSV41_STAGE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE is not 0 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    gu_split.configure(env.span(.MLX_SERVE_DSV41_GU_SPLIT)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_GU_SPLIT is none of 0, 1, check (unset: 1): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    stage_trim.configure(env.span(.MLX_SERVE_DSV41_STAGE_TRIM)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE_TRIM is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -320,8 +469,70 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    stage_votes.configure(env.span(.MLX_SERVE_DSV41_STAGE_VOTES)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE_VOTES is not a number from 0 to 65535 (unset: 8): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     engram_direct.configure(env.span(.MLX_SERVE_DSV41_ENGRAM_DIRECT)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_DIRECT is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    engram_first.configure(env.span(.MLX_SERVE_DSV41_ENGRAM_FIRST)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_FIRST is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    engram_decode.mode = engram_decode.parse(env.span(.MLX_SERVE_DSV41_ENGRAM_DECODE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_DECODE is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    engram_decode.lru_mb = engram_decode.parseMb(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_LRU_MB is not a whole number of MiB from 1 to 16384 (unset: 256): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the model's load: the bank's bill takes the LRU's bytes beside the host's (the load line says the rows).
+    bill.engram_store_bytes = engram_decode.billBytes();
+    // Before the model's load: the decode budget's part of the stop (MLX_SERVE_DSV41_DECODE_STOP).
+    decode_stop.configure(env.span(.MLX_SERVE_DSV41_DECODE_STOP)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_STOP is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    bill.decode_stop_cut = decode_stop.cutBytes();
+    draft_ahead.configure(env.span(.MLX_SERVE_DSV41_DRAFT_AHEAD)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DRAFT_AHEAD is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the model's first decode: F3 at the SHFIN setting.
+    shfin.configure(env.span(.MLX_SERVE_DSV41_SHFIN)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SHFIN is none of 0, 1, check (unset: 1): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the model's load: the bank's bill and the stream's grow read the window's rows.
+    decode_window.configure(env.span(.MLX_SERVE_DSV41_DECODE_WINDOW)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_WINDOW is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -336,6 +547,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     joinless.configure(env.span(.MLX_SERVE_DSV41_JOINLESS)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_JOINLESS is neither 0 nor check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the model's load: its decode instance of TAIL_FUSE's kernel is compiled at load.
+    decode_fuse.configure(env.span(.MLX_SERVE_DSV41_DECODE_FUSE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_FUSE is none of 0, 1, check (unset: 1): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -357,6 +576,20 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         }
         tail_fuse.mode = .off;
     }
+    wide_early.configure(env.span(.MLX_SERVE_DSV41_WIDE_EARLY)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_WIDE_EARLY is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    rest_early.configure(env.span(.MLX_SERVE_DSV41_REST_EARLY)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_REST_EARLY is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     q_tail.configure(env.span(.MLX_SERVE_DSV41_Q_TAIL)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_Q_TAIL is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -364,6 +597,22 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    woa_join.configure(env.span(.MLX_SERVE_DSV41_WOA_JOIN)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_WOA_JOIN is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the model's first prompt: turboexl3's fused matmul + finish at the PG2 setting.
+    pg2.configure(env.span(.MLX_SERVE_DSV41_PG2)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_PG2 is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    pg2_t3.configure();
     seed_free.configure(env.span(.MLX_SERVE_DSV41_SEED_FREE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SEED_FREE is neither 0 nor 1 (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -399,6 +648,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    la_wide.configure(env.span(.MLX_SERVE_DSV41_LOOKAHEAD_WIDE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_LOOKAHEAD_WIDE is not a number from 0 to 64 (unset: 10): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     // Before the model's load, which compiles its decode stretches only when the stage profiler is off.
     stage_prof.configure(env.span(.MLX_SERVE_DSV41_STAGE_PROF));
     prompt_io.configure(env.span(.MLX_SERVE_DSV41_PROMPT_IO));
@@ -429,6 +685,22 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    // MLX_SERVE_DSV41_DSPARK_POLICY: unset or `fixed` the fixed policy on sampled requests (src/rounds.zig `Fixed`), on
+    // MLX_SERVE_DSV41_DSPARK_COSTS's tables or else the built-in ones (`rounds.DEFAULT_COSTS`, fitted on this box); `1` the
+    // live policy; `0` off. A table beside a policy that reads none is refused by name, as a malformed one is.
+    const policy_raw = env.span(.MLX_SERVE_DSV41_DSPARK_POLICY);
+    const fixed_on = if (policy_raw) |v| std.mem.eql(u8, v, "fixed") else true;
+    const costs_raw = env.span(.MLX_SERVE_DSV41_DSPARK_COSTS);
+    if (!fixed_on and costs_raw != null) {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DSPARK_COSTS is the fixed policy's table, and MLX_SERVE_DSV41_DSPARK_POLICY names another (unset or =fixed reads it): the load is refused\n", .{});
+        out.* = Verdict.refuse(.unsupported, "turboexl3_ds41: DsparkCostsSetting");
+        return null;
+    }
+    const fixed: ?rounds.Fixed = if (fixed_on) rounds.Fixed.parse(costs_raw orelse rounds.DEFAULT_COSTS) catch {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DSPARK_COSTS is not v1,v2,...,vN/d (the verify ms by rows from one to N, 2 <= N <= 16, then the draft's ms) nor such tables by context U1:t1+...+tK (the bounds ascending, the last table unbounded, at most 8): the load is refused\n", .{});
+        out.* = Verdict.refuse(.unsupported, "turboexl3_ds41: DsparkCostsSetting");
+        return null;
+    } else null;
     var own = ctx.*;
     own.weights = null;
     const mp = ds.table.load(&own, out) orelse return null;
@@ -437,7 +709,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     prompt_tl.hook = if (ptl_model != null) &ptlStage else null;
     const on: rounds.Switches = .{
         .copy = config.switchOn(env.span(.MLX_SERVE_DSV41_DSPARK_COPY)),
-        .policy = config.switchOff(env.span(.MLX_SERVE_DSV41_DSPARK_POLICY)),
+        .policy = fixed_on or config.switchOff(policy_raw),
+        .fixed = fixed,
     };
     // The policy reads each draft's confidence, as the engine has its built-in model's stages do.
     model(mp).mdl.ds_want_conf = on.policy;
@@ -451,10 +724,17 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             return null;
         };
     }
+    // MLX_SERVE_DSV41_PG2: the tabled tiles' kernels compiled now, not in the first prompt.
+    pg2_t3.warm(model(mp).mdl.s, model(mp).mdl.act) catch |e| {
+        log.err("[turboexl3_ds41] pg2's kernels did not build ({s}): the load is refused (MLX_SERVE_DSV41_PG2=0 runs the chain)\n", .{@errorName(e)});
+        ds.table.unload(mp);
+        out.* = Verdict.refuse(.failed, "turboexl3_ds41: pg2's kernels did not build");
+        return null;
+    };
     dropPending();
     if (drafter) |*d| d.deinit();
     drafter = rounds.Drafter.init(gpa, on);
-    log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.policy) "on (MLX_SERVE_DSV41_DSPARK_POLICY=1)" else "off: every round verifies the whole block (MLX_SERVE_DSV41_DSPARK_POLICY=1: the policy)" });
+    log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.fixed != null) (if (costs_raw != null) "fixed on sampled requests, on MLX_SERVE_DSV41_DSPARK_COSTS's tables (the cut and the backoff by context, never the clock; a greedy request's rounds verify the whole block; MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)" else "fixed on sampled requests, on the built-in tables fitted on an M5 Max (the cut and the backoff by context, never the clock; a greedy request's rounds verify the whole block; MLX_SERVE_DSV41_DSPARK_COSTS other tables, MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)") else if (on.policy) "the live policy (MLX_SERVE_DSV41_DSPARK_POLICY=1: the measured ladder and the round's wall time)" else "off: every round verifies the whole block (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
     log.info("[turboexl3_ds41] read pool parts: {s}\n", .{if (direct_parts.on) "each demand read's parts on the file's block read straight into their rows, the rest staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0: every part staged); [direct-parts] lines at each prompt's and request's end" else "every part staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0)"});
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
     if (dec_prefetch.on) log.info("[turboexl3_ds41] CED decoder prefetch on (MLX_SERVE_DSV41_DEC_PREFETCH): the decoder layers' experts predicted at encoder layer {d}, {d} layers posted per prompt call, into their free rows only\n", .{ dec_prefetch.start, dec_prefetch.per_call });
@@ -462,11 +742,26 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (prompt_io.on) log.info("[turboexl3_ds41] prompt timeline on (MLX_SERVE_DSV41_PROMPT_IO): [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end{s}\n", .{if (prompt_io.split_ra) "; the read-ahead's wait split (=2: a sync at each step)" else ""});
     log.info("[turboexl3_ds41] read-ahead prediction: {s}\n", .{if (ra_fused.on) "on the fused hc kernels (MLX_SERVE_DSV41_RA_FUSED=0: the op chain)" else "the op chain (MLX_SERVE_DSV41_RA_FUSED=0)"});
     log.info("[turboexl3_ds41] decode lookahead's next-layer scores: {s}\n", .{if (late_gemv.on) "MLX's wide GEMV in the weights' half type (MLX_SERVE_DSV41_LATE_GEMV=0: the f32 product)" else "the f32 product (MLX_SERVE_DSV41_LATE_GEMV=0)"});
+    switch (decode_fuse.mode) {
+        .off => {},
+        .on => log.info("[turboexl3_ds41] decode calls' routed sum, shared expert and hc expand in TAIL_FUSE's kernel (MLX_SERVE_DSV41_DECODE_FUSE){s}; [decode-fuse] at each request's end\n", .{if (shared_hoist.on) "" else ": no effect without MLX_SERVE_DSV41_SHARED_HOIST"}),
+        .check => log.info("[turboexl3_ds41] decode calls' tail fused, checked (MLX_SERVE_DSV41_DECODE_FUSE=check): the chain served, the kernel compared with it on every decode call word for word{s}; [decode-fuse] checks= words= differ= at each request's end\n", .{if (shared_hoist.on) "" else ": no effect without MLX_SERVE_DSV41_SHARED_HOIST"}),
+    }
     log.info("[turboexl3_ds41] decode layers' shared expert: {s}\n", .{if (shared_hoist.on) "committed behind the hit wave (MLX_SERVE_DSV41_SHARED_HOIST=0: in the layer's last stretch)" else "in the layer's last stretch (MLX_SERVE_DSV41_SHARED_HOIST=0)"});
     log.info("[turboexl3_ds41] embedding table: {s}\n", .{if (embed_pread.on) "read from the pack at each lookup, not resident (MLX_SERVE_DSV41_EMBED_PREAD=0: resident)" else "resident (MLX_SERVE_DSV41_EMBED_PREAD=0)"});
     log.info("[turboexl3_ds41] vision tower: {s}\n", .{if (vision_lazy.on) "read from the pack for each image, not resident (MLX_SERVE_DSV41_VISION_LAZY=0: resident)" else "resident (MLX_SERVE_DSV41_VISION_LAZY=0)"});
     if (!routed_t3.enabled) log.info("[turboexl3_ds41] routed experts' decode on the streamer's own EXL3 kernels (MLX_SERVE_DSV41_ROUTED=streamer; unset: turboexl3)\n", .{});
     if (routed_t3.enabled) log.info("[turboexl3_ds41] t3 hit wave: {s}\n", .{if (t3_group.on) "turboexl3's grouped banked decode, up to four row-slots of one expert a weight decode, the device route's miss pairs skipped (MLX_SERVE_DSV41_T3_GROUP=0: the banked texts)" else "the banked texts (MLX_SERVE_DSV41_T3_GROUP=0)"});
+    if (routed_t3.enabled and t3_group.on) log.info("[turboexl3_ds41] hw4b: the banked calls {s}\n", .{switch (hw4b.mode) {
+        .on => "on the grouped GEMVs with an M = 3 member path (turboexl3 banked_m3; MLX_SERVE_DSV41_HW4B=0: a lead with three members of an expert on the M = 4 path)",
+        .off => "on the grouped GEMVs, a lead with three members of an expert on the M = 4 path (MLX_SERVE_DSV41_HW4B=0)",
+        .check => "on the grouped GEMVs, the M = 3 path's call beside each, every call's words compared ([hw4b] lines; MLX_SERVE_DSV41_HW4B=check)",
+    }});
+    if (routed_t3.enabled and t3_group.on) log.info("[turboexl3_ds41] hw2: the banked calls {s} (gate|up GEMV variant {s}, down GEMV variant {s})\n", .{ switch (hw2.mode) {
+        .on => "at the picked GEMV variants on the grouped texts they run (MLX_SERVE_DSV41_HW2=0: variant 0)",
+        .off => "at GEMV variant 0 (MLX_SERVE_DSV41_HW2=0)",
+        .check => "at variant 0, the picked variants' call beside it, every call's words compared ([hw2] lines; MLX_SERVE_DSV41_HW2=check)",
+    }, if (hw2.pick_gu.len == 0) "0" else hw2.pick_gu, if (hw2.pick_dn.len == 0) "0" else hw2.pick_dn });
     switch (woa_rows.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' wo_a span by span (MLX_SERVE_DSV41_WOA_ROWS=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' wo_a over runs of {d} rows, one grouped linear a run (MLX_SERVE_DSV41_WOA_ROWS=0: span by span)\n", .{woa_rows.rows}),
@@ -480,12 +775,56 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] wide prompt calls' predicted transient loads staged in their windows while the attention runs (MLX_SERVE_DSV41_STAGE=0: each stream group read by its own route); [prompt-io] staged= adopted= with PROMPT_IO\n", .{})
     else
         log.info("[turboexl3_ds41] wide prompt calls' stream groups read by their own routes (MLX_SERVE_DSV41_STAGE=0)\n", .{});
+    switch (gu_split.mode) {
+        .off => {},
+        .on => log.info("[turboexl3_ds41] decode's demand reads: each missed record's gate/up range as two range jobs read side by side, split at the part boundary nearest its middle (MLX_SERVE_DSV41_GU_SPLIT, on by default; =0: whole); [gu-split] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] decode's demand reads: each missed record's gate/up range as two range jobs, checked (MLX_SERVE_DSV41_GU_SPLIT=check): each split range read again whole and compared with its rows before its publish; [gu-split] checked= mismatch= at each request's end\n", .{}),
+    }
+    switch (stage_trim.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted in file order, none withdrawn (MLX_SERVE_DSV41_STAGE_TRIM=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted hottest first, each one its routes take none of let go unread where no read has started (MLX_SERVE_DSV41_STAGE_TRIM=0: file order, none withdrawn){s}; [stage-trim] at each request's end\n", .{if (stage.on) "" else ": no effect without MLX_SERVE_DSV41_STAGE"}),
+        .check => log.info("[turboexl3_ds41] wide prompt calls' staging trimmed at their routes, checked (MLX_SERVE_DSV41_STAGE_TRIM=check): as =1, each withdrawn ticket's status read back; [stage-trim] verified= bad= at each request's end\n", .{}),
+    }
     if (stage_next.on)
         log.info("[turboexl3_ds41] wide prompt layers' read-ahead and predicted transient loads posted during the call before them, into its persistent rows and the windows its groups let go ({s}); [prompt-io] early= with PROMPT_IO\n", .{if (stage.on) "MLX_SERVE_DSV41_STAGE_NEXT=0: at the layer's start" else "no effect: MLX_SERVE_DSV41_STAGE=0"})
     else
         log.info("[turboexl3_ds41] wide prompt layers' read-ahead and staging posted at the layer's start (MLX_SERVE_DSV41_STAGE_NEXT=0)\n", .{});
     if (stage_next.on) log.info("[turboexl3_ds41] {s}\n", .{if (stage_next.skip_own) "a wide prompt layer the call before it read ahead for skips its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own: its own too)" else "every wide prompt layer also runs its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own)"});
+    if (stage_votes.floor > 0)
+        log.info("[turboexl3_ds41] wide prompt calls stage only the predicted stream misses at least {d} rows of the prediction name, the read-ahead keeping the whole ranking ({s}MLX_SERVE_DSV41_STAGE_VOTES=0: every one); [stage-votes] lines with PROMPT_IO\n", .{ stage_votes.floor, if (stage.on) "" else "no effect: MLX_SERVE_DSV41_STAGE=0; " })
+    else
+        log.info("[turboexl3_ds41] wide prompt calls stage every predicted stream miss their windows hold (MLX_SERVE_DSV41_STAGE_VOTES=0); [stage-votes] lines with PROMPT_IO\n", .{});
+    switch (engram_first.mode) {
+        .off => log.info("[turboexl3_ds41] a prompt chunk's Engram read thread started after the phase change and the embedding, a prompt grid's tables read on up to 64 threads (MLX_SERVE_DSV41_ENGRAM_FIRST=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] a prompt chunk's Engram read thread started first, before the phase change and the embedding, and a prompt grid's tables read on up to {d} threads (MLX_SERVE_DSV41_ENGRAM_FIRST; =0: after them, 64 threads)\n", .{engram_first.grid_threads}),
+        .check => log.info("[turboexl3_ds41] a prompt chunk's Engram reads first and on up to {d} threads, checked (MLX_SERVE_DSV41_ENGRAM_FIRST=check): table 0 read again at 64 threads, the bytes compared; an [engram-first] check line a prompt grid\n", .{engram_first.grid_threads}),
+    }
     if (engram_direct.on) log.info("[turboexl3_ds41] a prompt's Engram rows read once a table, past the page cache through their file system blocks, on up to 64 threads (MLX_SERVE_DSV41_ENGRAM_DIRECT=0: span by span through the page cache)\n", .{}) else log.info("[turboexl3_ds41] Engram rows read span by span through the page cache (MLX_SERVE_DSV41_ENGRAM_DIRECT=0)\n", .{});
+    engram_decode.start();
+    switch (draft_ahead.mode) {
+        .off => log.info("[turboexl3_ds41] a greedy round's draft launched at its own start (MLX_SERVE_DSV41_DRAFT_AHEAD=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] a greedy round's next draft launched at the end of the round before it (MLX_SERVE_DSV41_DRAFT_AHEAD; =0 off): from its next token once its state is committed, when the next plan is the stages' block; the next round takes it when it fits; [draft-ahead] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] a greedy round's next draft launched ahead, checked (MLX_SERVE_DSV41_DRAFT_AHEAD=check): the next round makes its own too, compares ids and confidences word for word and serves its own; [draft-ahead] checks= words= differ= at each request's end\n", .{}),
+    }
+    switch (decode_stop.mode) {
+        .off => log.info("[turboexl3_ds41] decode phase's stop under the ceiling at 2000 MB, the prompt's (MLX_SERVE_DSV41_DECODE_STOP=0): MLX's cache cap unchanged at decode; [decode-stop] off\n", .{}),
+        .on, .check => log.info("[turboexl3_ds41] decode phase's stop under the ceiling at {d} MB, not 2000 (MLX_SERVE_DSV41_DECODE_STOP{s}): its budget takes the {d} MB back for slot rows, MLX's cache capped at {d} MiB from the phase change to decode, the prompt's cap restored at the change back; [decode-stop] at each request's end\n", .{ (2_000_000_000 - decode_stop.cut_bytes) / 1_000_000, if (decode_stop.mode == .check) "=check, as =1" else "; =0 off", decode_stop.cut_bytes / 1_000_000, decode_stop.cache_bytes >> 20 }),
+    }
+    switch (shfin.mode) {
+        .off => log.info("[turboexl3_ds41] the decode shared expert as the host's chain (MLX_SERVE_DSV41_SHFIN=0); [shfin] off\n", .{}),
+        .on => log.info("[turboexl3_ds41] the decode shared expert's gate and up finishes, clamped SwiGLU and down prepare in one launch (MLX_SERVE_DSV41_SHFIN; =0 off): F3 at 5 to 16 rows, two dependent levels fewer a layer, the same words; [shfin] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] the decode shared expert checked (MLX_SERVE_DSV41_SHFIN=check): the host's chain served, F3 run beside every shared expert it takes (a compiled stretch's body once more, eagerly) and compared word for word; [shfin] calls= words= differ= at each request's end\n", .{}),
+    }
+    switch (decode_window.mode) {
+        .off => log.info("[turboexl3_ds41] decode's window 0 at the widest decode route's rows (MLX_SERVE_DSV41_DECODE_WINDOW=0); [mem-decode] off\n", .{}),
+        .on => log.info("[turboexl3_ds41] decode's window 0 at {d} rows (MLX_SERVE_DSV41_DECODE_WINDOW; =0 off): a decode plan admits its declined misses past them, the window's memory the bank's decode slot rows; the [bank-bill] load line, [mem-decode] at each request's end\n", .{decode_window.window_rows}),
+        .check => log.info("[turboexl3_ds41] decode's window 0 at {d} rows, checked (MLX_SERVE_DSV41_DECODE_WINDOW=check): as =1, the plans left past the window counted ([mem-decode] overflow=, 0 by construction)\n", .{decode_window.window_rows}),
+    }
+    switch (engram_decode.mode) {
+        .off => log.info("[turboexl3_ds41] a decode read's Engram rows read from the tables every time (MLX_SERVE_DSV41_ENGRAM_DECODE=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] Engram rows kept across a conversation's turns (MLX_SERVE_DSV41_ENGRAM_DECODE; =0 off): an LRU of {d} MiB (MLX_SERVE_DSV41_ENGRAM_LRU_MB) billed at load, {s}every row a decode read reads put in; a decode read takes the rows it holds and reads the others on a {d}-thread pool; a round's bonus token's rows read while its draft runs; [engram-decode] lines at each request's end\n", .{ engram_decode.lru_mb, if (engram_direct.on) "a prompt grid's distinct rows and " else "(no prompt rows: MLX_SERVE_DSV41_ENGRAM_DIRECT=0) ", engram_decode.pool_threads }),
+        .check => log.info("[turboexl3_ds41] Engram rows kept across a conversation's turns, checked (MLX_SERVE_DSV41_ENGRAM_DECODE=check): the LRU of {d} MiB as with =1, every row of a decode read read on the pool, the held ones compared, the read ones served; [engram-decode] checked= differ= at each request's end\n", .{engram_decode.lru_mb}),
+    }
     switch (scratch_x1.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' streams after the attention in a fresh array each layer (MLX_SERVE_DSV41_SCRATCH=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' streams after the attention written into one per-prompt buffer (MLX_SERVE_DSV41_SCRATCH; =0: a fresh array each layer)\n", .{}),
@@ -501,10 +840,29 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] wide prompt layers' joinless combine and hc expand in one kernel, the new streams written once (MLX_SERVE_DSV41_TAIL_FUSE=0: the chain)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' joinless combine and hc expand as the chain, served, and in one kernel over each call's first and last rows, compared word for word (MLX_SERVE_DSV41_TAIL_FUSE=check): a [tail-fuse] check line a wide call\n", .{}),
     }
+    switch (wide_early.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt calls' shared expert and attention state evaluated by the layer's last eval, after the call (MLX_SERVE_DSV41_WIDE_EARLY=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, before the routing barrier waits: the routes, the next layer's predicted routes, then the shared expert and the attention state (MLX_SERVE_DSV41_WIDE_EARLY=0: after the call)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, and the shared expert is also built the old way and served, the two compared word for word (MLX_SERVE_DSV41_WIDE_EARLY=check): a [wide-early] check line a wide call\n", .{}),
+    }
+    if (rest_early.on)
+        log.info("[turboexl3_ds41] wide prompt layers commit their new streams at the routed call's end, before the layer's teardown: the GPU runs the tail kernel while the host frees the layer (MLX_SERVE_DSV41_REST_EARLY=0: after the teardown)\n", .{})
+    else
+        log.info("[turboexl3_ds41] wide prompt layers' new streams evaluated by the layer's last eval, after its teardown (MLX_SERVE_DSV41_REST_EARLY=0)\n", .{});
     switch (q_tail.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers rope the whole query heads into a copy (MLX_SERVE_DSV41_Q_TAIL=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers keep the query heads unroped and rope their last channels apart, read together by the gather's scores (MLX_SERVE_DSV41_Q_TAIL=0: the whole roped copy)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' whole roped heads served, and the tail roped apart and the two-part scores compared with them word for word (MLX_SERVE_DSV41_Q_TAIL=check): a [q-tail] check line a wide layer\n", .{}),
+    }
+    switch (woa_join.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' EXL3 wo_a runs as turboexl3's grouped linear (MLX_SERVE_DSV41_WOA_JOIN=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' EXL3 wo_a runs on one prepare and one finish launch for their groups, the rows read in place, each group's W_hat decoded once a layer and kept across its runs (MLX_SERVE_DSV41_WOA_JOIN=0: turboexl3's grouped linear)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' EXL3 wo_a runs as turboexl3's grouped linear, served, and joined, compared word for word (MLX_SERVE_DSV41_WOA_JOIN=check): a [woa-join] check line a wide layer\n", .{}),
+    }
+    switch (pg2.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' dense EXL3 linears as MLX's matmul then the finish (MLX_SERVE_DSV41_PG2=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' dense EXL3 linears' matmul and finish as one launch at this machine's tiles ({d} shapes, MLX_SERVE_DSV41_PG2; =0 off): MLX's fused NAX kernel body and loop with the finish as its epilogue where MLX runs that kernel unsplit, the chain's words; [pg2] at each request's end\n", .{pg2_t3.shapes()}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' dense EXL3 linears checked (MLX_SERVE_DSV41_PG2=check): the chain served, pg2's launch run beside every call it takes ({d} shapes) and compared word for word; [pg2] checks= words= differ= at each request's end\n", .{pg2_t3.shapes()}),
     }
     if (stage_prof.on) log.info("[turboexl3_ds41] stage profiler on (MLX_SERVE_DSV41_STAGE_PROF): every stage of a forward synced and timed, the decode stretches eager; [stage-prof] lines at each request's end\n", .{});
     log.info("[turboexl3_ds41] DSpark Markov chain: {s}\n", .{switch (markov.mode) {
@@ -517,12 +875,33 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (prompt_tl.setting.dirPath()) |d| log.info("[turboexl3_ds41] prompt GPU timeline on (MLX_SERVE_DSV41_PROMPT_TL): each prompt's command buffers tagged by layer and stage (pre, attn, moe, rest), ds41-prompt-tl-<pid>-<seq>.json in {s} at each request's end\n", .{d});
     const la = stream_lookahead.setting;
     if (!la.isDefault()) log.info("[turboexl3_ds41] decode lookahead (MLX_SERVE_DSV41_LOOKAHEAD): {d} records read ahead a layer call{s}, idle rule {d}, the stream sized for {d}\n", .{ la.budget, if (la.predicts()) "" else " (the predictor off)", la.idle_busy, la.initBudget() });
+    if (la_wide.on()) log.info("[turboexl3_ds41] decode lookahead widened (MLX_SERVE_DSV41_LOOKAHEAD_WIDE): about {d} records a round read ahead past each layer call's {d}, at most {d} more a call, the stream sized for the lookahead's widest budget{s}; a [lookahead] line at each request's end with the DSpark profile\n", .{ la_wide.per_round, la.budget, la_wide.max_extra, if (la.predicts()) "" else " (no effect: the predictor off)" });
     round_io.on = model(mp).mdl.ds_prof != null;
+    demand_split.on = round_io.on;
+    cold_start.on = round_io.on;
+    if (demand_split.on) log.info("[turboexl3_ds41] [demand-split] on (with [round-io]): the decode's demand ranges by record size, part and how they were served (clean, beside the lookahead, adopted), at each request's end\n", .{});
+    if (cold_start.on) log.info("[turboexl3_ds41] [cold-start] on (with [round-io]): each layer's first three decode calls' misses against its last prompt call's routes (all, the last 8 rows, the top 6 / 12 / 24 / 48 by votes), at each request's end\n", .{});
     if (round_io.on) {
         round_io.start(ioSnap(model(mp)));
         log.info("[turboexl3_ds41] [round-io] on (the DSpark profile): each round's expert stream traffic and the process's disk reads beside its verify time, the decode's and the rest's at each request's end\n", .{});
     }
     if (direct_parts.on) if (partsSnap(model(mp))) |ps| direct_parts.start(ps);
+    if (gu_split.mode != .off) if (splitSnap(model(mp))) |ss| gu_split.start(ss);
+    switch (bank_pool.mode) {
+        .off => log.info("[turboexl3_ds41] the streamed bank's rows freed and freshly allocated at each phase change (MLX_SERVE_DSV41_BANK_POOL=0, or a host without HostGpu.alias)\n", .{}),
+        .on => log.info("[turboexl3_ds41] the streamed bank's rows over one pool (MLX_SERVE_DSV41_BANK_POOL; =0: off): the prompt's windows and the wave sets' regions, then decode's window 0 and whole ext arrays over the same bytes, each pooled array its own buffer (HostGpu.alias); a [bank-pool] plan line at load\n", .{}),
+        .check => log.info("[turboexl3_ds41] the streamed bank's rows over one pool, checked (MLX_SERVE_DSV41_BANK_POOL=check): every range that changes hands filled with 0xFF at its install, a [bank-pool] check line each\n", .{}),
+    }
+    switch (scratch_tail.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' new streams in a fresh buffer a layer (MLX_SERVE_DSV41_SCRATCH_TAIL=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' new streams written in place over their x1 region (MLX_SERVE_DSV41_SCRATCH_TAIL; =0: a fresh buffer a layer; with MLX_SERVE_DSV41_SCRATCH and TAIL_FUSE on): TAIL_FUSE's write-into twin, the region published as the layer's streams, no fresh buffer a layer (a call's last wide layer keeps it)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' new streams over their x1 region, checked (MLX_SERVE_DSV41_SCRATCH_TAIL=check): the stock kernel's fresh streams served, the twin's compared word for word in the same routed call; a [scratch-tail] check line a wide layer\n", .{}),
+    }
+    switch (hc_fuse.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' hc stages as the stock kernels (MLX_SERVE_DSV41_HC_FUSE=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' hc stages fused (MLX_SERVE_DSV41_HC_FUSE; =0: the stock kernels): the attention side's mixes and norm in one launch, the FFN side's expand and norm in one launch into the x1 region, the splits from the mixes after\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' hc stages fused, checked (MLX_SERVE_DSV41_HC_FUSE=check): the stock kernels served, the fused launches compared word for word; an [hc-fuse] check line a side a wide layer\n", .{}),
+    }
     switch (scratch_attn.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' attention spans' scores and probabilities in fresh buffers (MLX_SERVE_DSV41_SCRATCH_ATTN=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' attention spans on a ring of two per-prompt slots (MLX_SERVE_DSV41_SCRATCH_ATTN; =0: fresh buffers): each span's scores and probabilities in its slot, the gather's launches as write-into twins of their stock texts (compiled at load)\n", .{}),
@@ -531,12 +910,31 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     if (scratch_attn.heads_mode != .off) {
         if (scratch_attn.mode != .on) log.info("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_HEADS needs the ring (MLX_SERVE_DSV41_SCRATCH_ATTN on, the default): every run joined\n", .{}) else log.info("[turboexl3_ds41] wide prompt layers' full WOA_ROWS runs' grouped heads written straight into run regions as [rows, og, in], each run's wo_a reading its region (MLX_SERVE_DSV41_SCRATCH_HEADS{s}){s}\n", .{ if (scratch_attn.heads_mode == .on) "; =0: the join" else "=check", if (scratch_attn.heads_mode == .check) ": the join served, each full run's region compared word for word (an h: field on the [scratch-attn] check line)" else "" });
     } else log.info("[turboexl3_ds41] wide prompt layers' WOA_ROWS runs' grouped heads joined (MLX_SERVE_DSV41_SCRATCH_HEADS=0)\n", .{});
+    switch (attn_core.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' attention gather on the stock pv text and launches (MLX_SERVE_DSV41_ATTN_CORE=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' attention gather with pv at 64 output columns a threadgroup and its tensor-op launches three-dimensional, (32, 1, 4) threadgroups, the same words (MLX_SERVE_DSV41_ATTN_CORE; =0: the stock text and launches)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' attention gather checked (MLX_SERVE_DSV41_ATTN_CORE=check): the stock pv text and launches served, every call's scores and pv also run at 64 columns and three-dimensional, compared word for word; [attn-core] check lines a kind every 128 calls, at its first differing word and at the model's end\n", .{}),
+    }
     switch (scratch_waves.mode) {
         .off => log.info("[turboexl3_ds41] prefill waves' intermediates in fresh buffers (MLX_SERVE_DSV41_SCRATCH_WAVES=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] prefill waves into per-prompt regions (MLX_SERVE_DSV41_SCRATCH_WAVES; =0: fresh buffers): their launches as write-into twins of the stock texts (compiled at load) on two sets of a wave's intermediates at {d} rows, an uncarried call's waves on them; [scratch-waves] at each request's end\n", .{scratch_waves.set_rows}),
         .check => log.info("[turboexl3_ds41] prefill waves into per-prompt regions, checked (MLX_SERVE_DSV41_SCRATCH_WAVES=check): the fresh waves served, every launch's region output compared with the fresh one; [scratch-waves] per launch (words, differ, max_abs, max_ulps, over1) at each request's end\n", .{}),
     }
+    switch (m1.mode) {
+        .off => log.info("[turboexl3_ds41] m1: the prefill waves' 128-row GEMMs on the 128-row texts (MLX_SERVE_DSV41_M1=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] m1: the prefill waves' 128-row GEMMs double-buffered (MLX_SERVE_DSV41_M1; =0: the 128-row texts), self-checked at load against the 128-row texts, the scratch twins derived from them; [m1] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] m1: the prefill waves' 128-row GEMMs served, the double-buffered ones beside them on every wave's inputs, every z word compared, the waves off the scratch regions (MLX_SERVE_DSV41_M1=check); [m1] at each request's end\n", .{}),
+    }
     return mp;
+}
+
+/// MLX_SERVE_DSV41_LOOKAHEAD_WIDE: the lookahead's records by base / extra and top-k position since load; null without the
+/// EXL3 source.
+fn laHist(m: *ds.Model) ?la_wide.Hist {
+    const r = m.mdl.streamed orelse return null;
+    if (r.math != .source) return null;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    return src.lookaheadHist();
 }
 
 /// The stream's PARTS counters now (`direct_parts`); null without the EXL3 source.
@@ -547,32 +945,47 @@ fn partsSnap(m: *ds.Model) ?direct_parts.Snap {
     return direct_parts.Snap.of(src.stats());
 }
 
+/// The stream's gate/up split counters now (`gu_split`); null without the EXL3 source.
+fn splitSnap(m: *ds.Model) ?gu_split.Snap {
+    const r = m.mdl.streamed orelse return null;
+    if (r.math != .source) return null;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    return gu_split.Snap.of(src.stats());
+}
+
 /// The stream's counters and the process's disk reads now (`round_io`).
 fn ioSnap(m: *ds.Model) round_io.Snap {
     const pr = round_io.proc();
-    const r = m.mdl.streamed orelse return .{ .phys = pr.phys, .pageins = pr.pageins };
-    if (r.math != .source) return .{ .phys = pr.phys, .pageins = pr.pageins };
-    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
-    const s = src.stats();
-    return .{
-        .misses = s.expert_cache_misses,
-        .hits = s.expert_cache_hits,
-        .demand = s.expert_bytes_read,
-        .spec = s.spec_bytes,
-        .abandoned = s.spec_abandoned_bytes,
-        .claimed = s.claimed,
-        .issued = s.spec_issued,
-        .wall_ns = s.read_wall_ns,
-        .wait_ns = s.read_wait_ns,
-        .adopt = s.adopt_bytes,
+    // The Engram reads' (both modes): the LRU's hits and evictions, the tables' read calls, the first Engram layer's waits.
+    var o: round_io.Snap = .{
         .phys = pr.phys,
         .pageins = pr.pageins,
+        .engram_hits = engram_decode.hits.load(.monotonic),
+        .engram_ios = engram_direct.calls.load(.monotonic),
+        .lru_evictions = engram_decode.evictions.load(.monotonic),
+        .engram_wait_ns = engram_direct.wait_ns[0].load(.monotonic),
     };
+    const r = m.mdl.streamed orelse return o;
+    if (r.math != .source) return o;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    const s = src.stats();
+    o.misses = s.expert_cache_misses;
+    o.hits = s.expert_cache_hits;
+    o.demand = s.expert_bytes_read;
+    o.spec = s.spec_bytes;
+    o.abandoned = s.spec_abandoned_bytes;
+    o.claimed = s.claimed;
+    o.issued = s.spec_issued;
+    o.wall_ns = s.read_wall_ns;
+    o.wait_ns = s.read_wait_ns;
+    o.adopt = s.adopt_bytes;
+    return o;
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {
     dropOpen(model(mp));
     dropPending();
+    dropAhead();
     if (drafter) |*d| d.deinit();
     drafter = null;
     ds.table.unload(mp);
@@ -635,7 +1048,36 @@ fn roundState(m: *ds.Model, f: *const abi.Forward, out: *const abi.ForwardOut) u
     const st = if (m.mdl.dec_state) |*s| s else return .{ .refused = Verdict.refuse(.failed, "turboexl3_ds41: a round needs the prompt's state") };
     if (f.positions.len > 0 and st.n != f.positions.slice()[0]) return .{ .refused = Verdict.refuse(.failed, "turboexl3_ds41: the position does not follow the model's state") };
     settlePending(&drafter.?);
+    // MLX_SERVE_DSV41_DECODE_WINDOW: MLX's peak over the request's decode, from its first round (`[mem-decode]`).
+    if (decode_window.on() and !mem_decode_armed) {
+        _ = mlx.mlx_reset_peak_memory();
+        mem_decode_armed = true;
+    }
     return .{ .st = st };
+}
+
+/// MLX_SERVE_DSV41_DECODE_WINDOW: MLX's peak reset for this request's decode (at its first round; `resumePrompt` clears it).
+var mem_decode_armed = false;
+
+/// MLX_SERVE_DSV41_DECODE_WINDOW's `[mem-decode]` snapshot: MLX's bytes now and since the decode's first round, the
+/// footprint, and the stream's decode admissions.
+fn memDecodeSnap(m: *ds.Model) decode_window.Snap {
+    var active: usize = 0;
+    var cache: usize = 0;
+    var peak: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    _ = mlx.mlx_get_peak_memory(&peak);
+    var s: decode_window.Snap = .{ .active = active, .cache = cache, .peak = peak, .footprint = decode_window.footprint(), .declined = 0, .forced = 0, .overflow = 0, .window = 0 };
+    const r = m.mdl.streamed orelse return s;
+    if (r.math != .source) return s;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    const d = src.stream.decodeAdmissions();
+    s.declined = d.declined;
+    s.forced = d.forced;
+    s.overflow = d.overflow;
+    s.window = d.window;
+    return s;
 }
 
 const Drafted = struct { d: dsv41.DsparkDraft, round: Round };
@@ -648,7 +1090,12 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
     const max = @min(dsv41.maxVerifyDrafts(m.mdl), @as(usize, accept_cap), abi.max_round_tokens - 1);
     const plan = dr.plan(st.n, t1, max, accept_cap, m.mdl.ds_block);
     if (plan == .stage) {
-        var d = try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
+        // MLX_SERVE_DSV41_DRAFT_AHEAD: the draft the round before launched, when it fits.
+        var d = if (try aheadTake(m, st, t1)) |a| a else blk: {
+            // MLX_SERVE_DSV41_ENGRAM_DECODE: the bonus token's Engram rows read while the draft runs.
+            dsv41.engramEarly(m.mdl, st, t1);
+            break :blk try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
+        };
         errdefer d.deinit(gpa);
         d.len = dr.cut(d.confidence[0..@min(d.len, max)]);
         routesRound(m, "stage", st.n, d.ids[0 .. d.len + 1]);
@@ -656,6 +1103,8 @@ fn draft(m: *ds.Model, dr: *rounds.Drafter, st: *dsv41.State, t1: u32, accept_ca
         @memcpy(round.conf[0..d.len], d.confidence[0..d.len]);
         return .{ .d = d, .round = round };
     }
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: a launched draft no stage round takes.
+    dropAhead();
     const copied: []const u32 = if (plan == .copy) plan.copy else &.{};
     const ids = try gpa.alloc(u32, copied.len + 1);
     ids[0] = t1;
@@ -683,6 +1132,7 @@ fn msOf(ns: u64) f32 {
 
 fn roundFailed(e: anyerror) Verdict {
     round_io.abandon();
+    dropAhead();
     log.err("[turboexl3_ds41] draft round failed: {s}\n", .{@errorName(e)});
     if (drafter) |*d| d.history.lose();
     return Verdict.named(.failed, @errorName(e));
@@ -699,6 +1149,7 @@ fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callco
     };
     const t1 = f.tokens.slice()[0];
     const rec = tlBegin(m);
+    drafter.?.greedy = true;
     var p = draft(m, &drafter.?, st, t1, f.accept_cap) catch |e| return roundFailed(e);
     defer p.d.deinit(gpa);
     p.round.tl = rec;
@@ -720,7 +1171,60 @@ fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callco
     fillRound(&out.round, r.tokens, @intCast(p.d.len + 1), st.n);
     out.round.accepted = r.accepted;
     out.round.next_token = r.next_token;
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: the next round's draft from this round's next token, launched before the engine's
+    // turn (the cap the next round would get: this one's less the tokens it kept).
+    if (draft_ahead.on()) aheadLaunch(m, st, r.next_token, f.accept_cap -| @as(u32, @intCast(r.tokens.len)));
     return .ok;
+}
+
+/// MLX_SERVE_DSV41_DRAFT_AHEAD: the launched draft the next greedy round may take (one at most).
+var ahead: ?dsv41.DraftAhead = null;
+
+/// MLX_SERVE_DSV41_DRAFT_AHEAD: the launched draft let go (its GPU work runs out), counted dropped.
+fn dropAhead() void {
+    if (ahead) |*a| {
+        a.deinit();
+        ahead = null;
+        draft_ahead.dropped += 1;
+    }
+}
+
+/// MLX_SERVE_DSV41_DRAFT_AHEAD: the next greedy round's draft from `t1` launched now, when that round's plan would be the
+/// stages' block (`rounds.Drafter.wouldStage` at the cap `cap`); its bonus token's Engram rows read early with it.
+fn aheadLaunch(m: *ds.Model, st: *dsv41.State, t1: u32, cap: u32) void {
+    dropAhead();
+    const dr = if (drafter) |*d| d else return;
+    if (!dsv41.draftAheadOk(m.mdl)) return;
+    const max = @min(dsv41.maxVerifyDrafts(m.mdl), @as(usize, cap), abi.max_round_tokens - 1);
+    if (!dr.wouldStage(st.n, t1, max, cap, m.mdl.ds_block)) return;
+    // MLX_SERVE_DSV41_ENGRAM_DECODE: the bonus token's Engram rows read while the draft runs.
+    dsv41.engramEarly(m.mdl, st, t1);
+    ahead = dsv41.dsparkDraftLaunch(m.mdl, gpa, st, t1) catch {
+        draft_ahead.failed += 1;
+        return;
+    };
+    draft_ahead.launched += 1;
+}
+
+/// MLX_SERVE_DSV41_DRAFT_AHEAD: the launched draft read, when it is the one `dsparkDraft` would make now (a greedy round,
+/// the same token, position and state), else dropped; with `check` the round's own draft is made too, compared with it
+/// and served. Null: no draft fits.
+fn aheadTake(m: *ds.Model, st: *dsv41.State, t1: u32) !?dsv41.DsparkDraft {
+    if (ahead == null) return null;
+    if (!drafter.?.greedy or !dsv41.draftAheadFits(m.mdl, st, &ahead.?, t1)) {
+        dropAhead();
+        return null;
+    }
+    var a = ahead.?;
+    ahead = null;
+    defer a.deinit();
+    var d = try dsv41.dsparkDraftCollect(m.mdl, gpa, &a);
+    draft_ahead.taken += 1;
+    if (draft_ahead.mode != .check) return d;
+    defer d.deinit(gpa);
+    const own = try dsv41.dsparkDraft(m.mdl, gpa, st, t1);
+    draft_ahead.compare(d.ids, own.ids, d.confidence, own.confidence, d.len, own.len);
+    return own;
 }
 
 /// The first half of a round the engine accepts under its own sampling: the verified rows' ids and logits.
@@ -732,6 +1236,9 @@ fn draftVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     };
     const t1 = f.tokens.slice()[0];
     const rec = tlBegin(m);
+    drafter.?.greedy = false;
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: a sampled round takes no launched draft.
+    dropAhead();
     var p = draft(m, &drafter.?, st, t1, f.accept_cap) catch |e| return roundFailed(e);
     defer p.d.deinit(gpa);
     p.round.tl = rec;
@@ -800,6 +1307,8 @@ fn dropPending() void {
 /// a decode token the forward keeps on the GPU read once the forward has read it (at the next round or forward).
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     round_io.abandon();
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: a forward moves the state past any launched draft.
+    dropAhead();
     const dr = if (drafter) |*d| d else return ds.table.forward(mp, f, out);
     settlePending(dr);
     const at: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
@@ -828,6 +1337,10 @@ var req_kept: usize = 0;
 
 /// The built-in's resume: the drafter's request begins on the prompt prefix the state kept.
 fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
+    // MLX_SERVE_DSV41_DECODE_WINDOW: the next request's decode peak taken from its own first round.
+    mem_decode_armed = false;
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: a new prompt's state takes no launched draft.
+    dropAhead();
     const n = ds.table.cache.resume_prompt.?(mp, slot, prompt, media_rows);
     req_prompt = prompt.len;
     req_kept = @min(@as(usize, @intCast(n)), prompt.len);
@@ -837,12 +1350,13 @@ fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: ab
     return n;
 }
 
-var meter_buf: [131072]u8 = undefined;
+var meter_buf: [262144]u8 = undefined;
 
 /// The request's DSpark rounds beside the engine's `[spec-stats]`, which counts every native round a stage round; the
 /// stage profiler's lines (src/stage_prof.zig) when it is on; the expert stream's counters since the last request, and
-/// the one-call path's (src/routed_one.zig) when it is on; the Markov chain's drafts (src/markov.zig) when it is on; each
-/// round's stream traffic (src/round_io.zig) with the DSpark profile.
+/// the one-call path's (src/routed_one.zig) when it is on; the Markov chain's drafts (src/markov.zig) when it is on; the
+/// Engram LRU's (src/engram_decode.zig) when it is on; each round's stream traffic (src/round_io.zig) with the DSpark
+/// profile.
 fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     _ = slot;
     ptlWrite(model(mp));
@@ -856,9 +1370,34 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const n0 = head.len + mid.len + tail.len;
     const dp = if (partsSnap(model(mp))) |ps| direct_parts.meters(ps, meter_buf[n0..]) else meter_buf[n0..n0];
     const swl = scratch_waves.meters(meter_buf[n0 + dp.len ..]);
-    const n = n0 + dp.len + swl.len;
+    const edl = engram_decode.meters(meter_buf[n0 + dp.len + swl.len ..]);
+    // MLX_SERVE_DSV41_DRAFT_AHEAD: the request's last round's launched draft has no round after it.
+    dropAhead();
+    const dal = draft_ahead.meters(meter_buf[n0 + dp.len + swl.len + edl.len ..]);
+    const mdl_line = if (decode_window.on()) decode_window.meters(memDecodeSnap(model(mp)), meter_buf[n0 + dp.len + swl.len + edl.len + dal.len ..]) else meter_buf[0..0];
+    const dsl = decode_stop.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len ..]);
+    const stl = stage_trim.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len ..]);
+    // MLX_SERVE_DSV41_LOOKAHEAD_WIDE: the request's records read ahead by base / extra and top-k position (the DSpark profile's).
+    const lal = if (round_io.on) (if (laHist(model(mp))) |h| la_wide.meters(h, meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
+    // MLX_SERVE_DSV41_PG2: the [pg2] line (the counts since load).
+    const pgc = pg2_t3.counts();
+    const pgl = pg2.meters(pgc[0], pgc[1], meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len ..]);
+    // MLX_SERVE_DSV41_HW4B: the [hw4b] line (on or check; check's compares since the last request's end).
+    const hwl = hw4b.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len ..]);
+    // MLX_SERVE_DSV41_M1: the [m1] line (on or check; check's compares since the last request's end).
+    const m1l = m1.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len ..]);
+    const dfl = decode_fuse.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len ..]);
+    // MLX_SERVE_DSV41_HW2: the [hw2] line (on or check; check's compares since the last request's end).
+    const h2l = hw2.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len ..]);
+    // MLX_SERVE_DSV41_SHFIN: the [shfin] line (the counts since load).
+    const sfl = shfin.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len + h2l.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len + h2l.len + sfl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len]);
+    // dq1b: the decode's demand ranges by class, the gate/up split's counts, the cold start's first calls.
+    const dmd = demand_split.meters(meter_buf[n + io.len ..]);
+    const gsl = if (gu_split.mode != .off) (if (splitSnap(model(mp))) |ss| gu_split.meters(ss, meter_buf[n + io.len + dmd.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
+    const csl = cold_start.meters(meter_buf[n + io.len + dmd.len + gsl.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is

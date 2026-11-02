@@ -88,6 +88,33 @@ pub const Set = struct {
 };
 
 pub var sets: [2]Set = .{ .{}, .{} };
+/// MLX_SERVE_DSV41_BANK_POOL (src/bank_pool.zig): the twelve regions the copied stream's pool holds, set by set in
+/// `Set`'s field order (x0, x1, zg, zu, hd, z), at `set_rows` rows: `Set.ensure`'s shapes.
+pub const pool_shapes: [12]scratch.Shape = blk: {
+    const r: c_int = @intCast(set_rows);
+    const one = [6]scratch.Shape{
+        .{ .shape = .{ r, 1, hidden, 0 }, .ndim = 3, .dtype = .float16 },
+        .{ .shape = .{ r, 1, hidden, 0 }, .ndim = 3, .dtype = .float16 },
+        .{ .shape = .{ r, inter, 0, 0 }, .ndim = 2, .dtype = .float32 },
+        .{ .shape = .{ r, inter, 0, 0 }, .ndim = 2, .dtype = .float32 },
+        .{ .shape = .{ r, 1, inter, 0 }, .ndim = 3, .dtype = .float16 },
+        .{ .shape = .{ r, hidden, 0, 0 }, .ndim = 2, .dtype = .float32 },
+    };
+    break :blk one ++ one;
+};
+/// MLX_SERVE_DSV41_BANK_POOL: the pool's arrays for the two sets' regions (`pool_shapes`' order), each region keeping a
+/// reference until `dropPool`.
+pub fn adoptPool(arrays: []const A) !void {
+    if (arrays.len != pool_shapes.len) return error.ScratchWavesPool;
+    for (0..2) |k| {
+        inline for (.{ "x0", "x1", "zg", "zu", "hd", "z" }, 0..) |f, j| try @field(sets[k], f).adoptPooled(arrays[k * 6 + j], pool_shapes[k * 6 + j]);
+    }
+}
+pub fn dropPool() void {
+    for (&sets) |*s| {
+        inline for (.{ "x0", "x1", "zg", "zu", "hd", "z" }) |f| @field(s, f).dropPooled();
+    }
+}
 /// Whether the call's waves may take the regions.
 var call_live: bool = false;
 /// A `[1]` uint32 zeros the first launch of a wave binds as its `dep` (nothing to order: the set's last user drained).

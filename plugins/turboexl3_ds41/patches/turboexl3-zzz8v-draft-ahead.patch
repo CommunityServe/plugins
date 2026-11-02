@@ -1,0 +1,138 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -272,6 +272,7 @@
+     pub const MLX_SERVE_DSV41_DECODE_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "split where its curves fit the pack, else flat", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode slot rows (turboexl3_ds41): unset, the flat bill's decode bytes split across the layers by its development corpus's misses-a-row curves, each layer between its prompt rows and 256, where the curves fit the pack (flat rows where they do not); flat: flat rows; split: the split required (refused by name, rows flat, where it does not fit)" };
+     pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
+     pub const MLX_SERVE_DSV41_DIRECT_PARTS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 read pool parts (turboexl3_ds41): each demand read's parts whose file offset, length and row lie on the file's block read straight into their rows (the gate's code on this pack: a third of a record no longer copied), the others staged and copied, the same bytes; [direct-parts] lines at each prompt's and request's end (=0: every part staged and copied)" };
++    pub const MLX_SERVE_DSV41_DRAFT_AHEAD: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 greedy round's next DSpark draft (turboexl3_ds41): launched at the end of the round before it, from its next token once its state is committed, when the next plan is the stages' block, and taken by the next round when it fits (the same token, position and state); the same ops, served bytes unchanged (unset or 1: on; 0: off; check: on, the next round makes its own draft too, compares the ids and confidences word for word and serves its own, [draft-ahead] lines)" };
+     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
+     pub const MLX_SERVE_DSV41_DSPARK_COSTS: Var = .{ .kind = .kill, .type = .text, .default = "unset", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark fixed verify policy's tables (turboexl3_ds41; with MLX_SERVE_DSV41_DSPARK_POLICY unset or =fixed only, refused beside =0 or =1; sampled requests only, a greedy request's rounds verify the whole block; unset: the built-in tables fitted on an M5 Max, src/rounds.zig DEFAULT_COSTS): v1,v2,...,vN/d, the verify ms by rows from one to N (2..16) then the ms a stage draft takes, or such tables by context U1:t1+U2:t2+...+tK (the bounds ascending positions, the last table unbounded, at most 8; a round reads the first table whose bound exceeds its position), fitted once per box and pack; the cut and the drafting backoff read it instead of the measured ladder and the round's wall time, so a request's text is the same run to run; refused by name when malformed" };
+     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "fixed", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy (turboexl3_ds41): fixed, the default, on sampled requests: the drafts the calibrated confidence pays for and the drafting backoff on a fixed cost table by context (MLX_SERVE_DSV41_DSPARK_COSTS, else the built-in tables fitted on an M5 Max), never the clock, so a request's text is the same run to run; a greedy request's rounds verify the whole block; =1 the live policy (the measured verify ladder and the round's wall time); =0 off: every round verifies the whole block" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -5429,12 +5429,78 @@
+     defer m.ds_draft_ns = @intCast((monoUs() - t0) * 1000);
+     return draftRows(m, gpa, st, t1, false);
+ }
++/// turboexl3_ds41 (MLX_SERVE_DSV41_DRAFT_AHEAD, the plugin's src/draft_ahead.zig): a draft launched ahead of its round
++/// (`dsparkDraftLaunch`), its graph built from the state as it stood and handed to the GPU, read by
++/// `dsparkDraftCollect`: the token and position it drafts from, the state's generation, and `draftRows`' three outputs
++/// (held handles).
++pub const DraftAhead = struct {
++    t1: u32,
++    n: usize,
++    gen: u64,
++    want_conf: bool,
++    ev: [3]A = .{ none, none, none },
++    launch_ns: u64 = 0,
++    pub fn deinit(self: *DraftAhead) void {
++        for (&self.ev) |*x| if (x.ctx != null) {
++            _ = mlx.mlx_array_free(x.*);
++            x.* = none;
++        };
++    }
++};
++/// turboexl3_ds41 (MLX_SERVE_DSV41_DRAFT_AHEAD): whether a draft can be launched ahead: the stages loaded, the Markov
++/// chain not checked (its compare reads both chains at the draft) and the stage profiler off (it syncs inside).
++pub fn draftAheadOk(m: *const Dsv41Model) bool {
++    return m.dspark != null and m.n_mtp > 0 and markov.mode != .check and !prof.on;
++}
++/// turboexl3_ds41 (MLX_SERVE_DSV41_DRAFT_AHEAD): whether `a` is the draft `dsparkDraft(m, _, st, t1)` would make now:
++/// the same token, the same position, the same state.
++pub fn draftAheadFits(m: *const Dsv41Model, st: *const State, a: *const DraftAhead, t1: u32) bool {
++    return a.t1 == t1 and a.n == st.n and a.gen == m.state_gen;
++}
++/// turboexl3_ds41 (MLX_SERVE_DSV41_DRAFT_AHEAD): `dsparkDraft`'s graph from `t1` at the state as it stands, handed to the
++/// GPU (`mlx_async_eval`) and not read: the draft runs while the host does other work, `dsparkDraftCollect` reads it.
++/// The same ops as `dsparkDraft`'s (`draftGraph`).
++pub fn dsparkDraftLaunch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) !DraftAhead {
++    if (!draftAheadOk(m)) return error.DraftAheadUnsupported;
++    const t0 = monoUs();
++    var sc = Scope.init(gpa, m.s);
++    defer sc.deinit();
++    const g = try draftGraph(&sc, m, st, t1, false);
++    var out: DraftAhead = .{ .t1 = t1, .n = st.n, .gen = m.state_gen, .want_conf = g.want_conf };
++    errdefer out.deinit();
++    for (&out.ev, g.ev) |*slot, x| hold(slot, x);
++    const v = mlx.mlx_vector_array_new_data(&out.ev, out.ev.len);
++    defer _ = mlx.mlx_vector_array_free(v);
++    try mlx.check(mlx.mlx_async_eval(v));
++    out.launch_ns = @intCast((monoUs() - t0) * 1000);
++    return out;
++}
++/// turboexl3_ds41 (MLX_SERVE_DSV41_DRAFT_AHEAD): a launched draft read as `dsparkDraft` reads its own (`draftRead`); the
++/// draft's time (`ds_draft_ns`) its launch's and its read's.
++pub fn dsparkDraftCollect(m: *Dsv41Model, gpa: std.mem.Allocator, a: *DraftAhead) !DsparkDraft {
++    const t0 = monoUs();
++    defer m.ds_draft_ns = a.launch_ns + @as(u64, @intCast((monoUs() - t0) * 1000));
++    var sc = Scope.init(gpa, m.s);
++    defer sc.deinit();
++    try evalAll(&a.ev);
++    return draftRead(&sc, m, gpa, a.t1, &a.ev, a.want_conf, false);
++}
+ /// `keep_logits` also copies the Markov-biased rows to the host.
+ fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
+     try prof.begin(m.s, .draft, m.ds_block, &.{});
+     defer prof.end();
+     var sc = Scope.init(gpa, m.s);
+     defer sc.deinit();
++    const g = try draftGraph(&sc, m, st, t1, keep_logits);
++    var ev = g.ev;
++    try evalAll(&ev);
++    if (g.check) if (g.fused) |f| try markov.compare(f, g.all, if (g.want_conf) ev[1] else null, g.rows_all);
++    return draftRead(&sc, m, gpa, t1, &ev, g.want_conf, keep_logits);
++}
++/// `draftRows`' graph (its arrays `sc`'s): the ids, the confidences (the ids again without them) and the rows `keep_logits`
++/// or the Markov check reads (the ids again otherwise); the fused chain's outputs for the check.
++const DraftGraph = struct { ev: [3]A, all: A, rows_all: A, fused: ?markov.Out, want_conf: bool, check: bool };
++fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool) !DraftGraph {
+     const c = &m.cfg;
+     const B = m.ds_block;
+     const n = st.n;
+@@ -5445,19 +5511,19 @@
+     for (0..B) |k| ids[k] = @intCast(if (k == 0) t1 else c.dsv4_dspark_noise_token_id);
+     var uids: [16]u32 = undefined;
+     for (uids[0..B], ids[0..B]) |*u, v| u.* = @intCast(v);
+-    const emb = try embedIds(m, &sc, uids[0..B], m.act);
++    const emb = try embedIds(m, sc, uids[0..B], m.act);
+     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(d) });
+-    var pre = try onehotPre(&sc, m, B);
++    var pre = try onehotPre(sc, m, B);
+     try prof.mark(.embed, &.{ x, pre });
+     const window = @min(c.sliding_window, n);
+     var dummy: Shared = .{};
+     for (0..m.n_mtp) |si| {
+         prof.layer();
+-        const keys = try st.ds[si].read(&sc, n - window, n);
+-        x = try block(&sc, m, st, m.n_layers + si, x, &pre, n, &dummy, keys);
++        const keys = try st.ds[si].read(sc, n - window, n);
++        x = try block(sc, m, st, m.n_layers + si, x, &pre, n, &dummy, keys);
+     }
+-    const hout = try hcCollapse(&sc, x, pre);
+-    const logits = try sc.astype(try m.head.apply(&sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
++    const hout = try hcCollapse(sc, x, pre);
++    const logits = try sc.astype(try m.head.apply(sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
+     try prof.mark(.head, &.{logits});
+     var cur = try sc.ints(ids[0..1], &.{1});
+     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
+@@ -5493,9 +5559,15 @@
+         confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.slice(hout, 0, k, k + 1), .float32), me }, -1), try sc.t2(ds.conf));
+     };
+     const rows_all = if (!keep_logits and !check) all else if (ops) try sc.concat(rows_k[0..B], 0) else fused.?.rows.?;
+-    var ev = [_]A{ all, if (!want_conf) all else if (conf_ops) try sc.concat(confs[0..B], 0) else fused.?.conf.?, rows_all };
+-    try evalAll(&ev);
+-    if (check) if (fused) |f| try markov.compare(f, all, if (want_conf) ev[1] else null, rows_all);
++    const ev = [_]A{ all, if (!want_conf) all else if (conf_ops) try sc.concat(confs[0..B], 0) else fused.?.conf.?, rows_all };
++    return .{ .ev = ev, .all = all, .rows_all = rows_all, .fused = fused, .want_conf = want_conf, .check = check };
++}
++/// `draftRows`' read of its evaluated outputs `ev` (`draftGraph`'s): the ids after `t1`, the confidences and the block's
++/// length by the threshold, and the rows with `keep_logits`.
++fn draftRead(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, t1: u32, ev: []const A, want_conf: bool, keep_logits: bool) !DsparkDraft {
++    const B = m.ds_block;
++    const all = ev[0];
++    const rows_all = ev[2];
+     const out_ids = try gpa.alloc(u32, B + 1);
+     errdefer gpa.free(out_ids);
+     out_ids[0] = t1;

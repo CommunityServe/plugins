@@ -6,7 +6,10 @@
 //! issued and those claimed, the demand bytes copied out of lookahead records, the wall time with a demand read in flight
 //! and the host's time blocked on reads; and the process's physical disk reads and page-ins (`proc_pid_rusage`): every
 //! byte the drive moved for it, and how many of its pages it read back in through a mapping. A decode's misses wait on
-//! GPU event gates, not on the host: its `read_wait` stays near 0 and the drive's bytes are the measure.
+//! GPU event gates, not on the host: its `read_wait` stays near 0 and the drive's bytes are the measure. The Engram
+//! tables' reads beside them: the rows the Engram LRU served (MLX_SERVE_DSV41_ENGRAM_DECODE, src/engram_decode.zig) and
+//! the rows it gave way, the tables' read calls (the IOs, src/engram_direct.zig's counter: the verify's, the bonus
+//! row's) and the first Engram layer's wait on its rows.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -25,6 +28,10 @@ pub const Snap = struct {
     adopt: u64 = 0,
     phys: u64 = 0,
     pageins: u64 = 0,
+    engram_hits: u64 = 0,
+    engram_ios: u64 = 0,
+    lru_evictions: u64 = 0,
+    engram_wait_ns: u64 = 0,
 
     /// `b - a`, field by field (0 where a counter went back).
     pub fn sub(b: Snap, a: Snap) Snap {
@@ -122,9 +129,10 @@ fn mb(x: u64) f64 {
 }
 
 fn traffic(w: *std.Io.Writer, d: Snap) void {
-    w.print("misses={d} hits={d} demand_mb={d:.1} adopt_mb={d:.1} phys_mb={d:.1} spec_mb={d:.1} abandoned_mb={d:.1} claimed={d} issued={d} pageins={d} read_wall_ms={d:.1} read_wait_ms={d:.1}", .{
+    w.print("misses={d} hits={d} demand_mb={d:.1} adopt_mb={d:.1} phys_mb={d:.1} spec_mb={d:.1} abandoned_mb={d:.1} claimed={d} issued={d} pageins={d} read_wall_ms={d:.1} read_wait_ms={d:.1} engram_hits={d} engram_ios={d} lru_evictions={d} engram_wait_ms={d:.2}", .{
         d.misses,  d.hits,   mb(d.demand), mb(d.adopt), mb(d.phys), mb(d.spec), mb(d.abandoned), d.claimed, d.issued,
-        d.pageins, @as(f64, @floatFromInt(d.wall_ns)) / 1e6, @as(f64, @floatFromInt(d.wait_ns)) / 1e6,
+        d.pageins, @as(f64, @floatFromInt(d.wall_ns)) / 1e6, @as(f64, @floatFromInt(d.wait_ns)) / 1e6, d.engram_hits, d.engram_ios,
+        d.lru_evictions, @as(f64, @floatFromInt(d.engram_wait_ns)) / 1e6,
     }) catch {};
 }
 
@@ -173,7 +181,7 @@ test "round io: a round's traffic is its commit's counters less its draft's; an 
     end(.{ .misses = 999 }, 6, 1, 1);
     var buf: [4096]u8 = undefined;
     const out = meters(.{ .misses = 230, .hits = 40, .demand = 2_500_000_000, .phys = 4_000_000_000, .spec = 300_000_000, .claimed = 3, .issued = 9, .wall_ns = 37_000_000 }, &buf);
-    try testing.expect(std.mem.indexOf(u8, out, "[round-io] r=0 rows=6 verify_ms=120.50 round_ms=126.00 misses=40 hits=30 demand_mb=480.0 adopt_mb=0.0 phys_mb=900.0 spec_mb=300.0 abandoned_mb=0.0 claimed=3 issued=9 pageins=0 read_wall_ms=32.0 read_wait_ms=0.0\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "[round-io] r=0 rows=6 verify_ms=120.50 round_ms=126.00 misses=40 hits=30 demand_mb=480.0 adopt_mb=0.0 phys_mb=900.0 spec_mb=300.0 abandoned_mb=0.0 claimed=3 issued=9 pageins=0 read_wall_ms=32.0 read_wait_ms=0.0 engram_hits=0 engram_ios=0 lru_evictions=0 engram_wait_ms=0.00\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "[round-io] decode rounds=1 rows=6 verify_ms=120.5 round_ms=126.0 misses=40 hits=30 demand_mb=480.0 adopt_mb=0.0 phys_mb=900.0") != null);
     // the rest: the request's 130 misses, 1500 MB demand and 2000 MB physical, less the round's
     try testing.expect(std.mem.indexOf(u8, out, "[round-io] rest misses=90 hits=10 demand_mb=1020.0 adopt_mb=0.0 phys_mb=1100.0 spec_mb=0.0") != null);
@@ -182,6 +190,23 @@ test "round io: a round's traffic is its commit's counters less its draft's; an 
     const next = meters(.{ .misses = 231, .hits = 40, .demand = 2_500_000_000, .phys = 4_000_000_000, .spec = 300_000_000, .claimed = 3, .issued = 9, .wall_ns = 37_000_000 }, &buf);
     try testing.expect(std.mem.indexOf(u8, next, "[round-io] decode rounds=0 rows=0") != null);
     try testing.expect(std.mem.indexOf(u8, next, "[round-io] rest misses=1 hits=0") != null);
+}
+
+test "round io: a round's Engram reads: the LRU's hits and evictions, the tables' IOs and the first Engram layer's wait" {
+    const saved = on;
+    defer {
+        on = saved;
+        start(.{});
+    }
+    on = true;
+    start(.{ .engram_ios = 1_000_000 });
+    begin(.{ .engram_hits = 100, .engram_ios = 1_500_000, .lru_evictions = 7, .engram_wait_ns = 9_000_000 });
+    end(.{ .engram_hits = 196, .engram_ios = 1_500_096, .lru_evictions = 9, .engram_wait_ns = 9_850_000 }, 6, 80_000_000, 86_000_000);
+    var buf: [4096]u8 = undefined;
+    const out = meters(.{ .engram_hits = 196, .engram_ios = 1_500_096, .lru_evictions = 9, .engram_wait_ns = 9_850_000 }, &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "read_wait_ms=0.0 engram_hits=96 engram_ios=96 lru_evictions=2 engram_wait_ms=0.85\n") != null);
+    // the rest: the prompt's 500,000 IOs, its 100 hits, 7 evictions and 9 ms
+    try testing.expect(std.mem.indexOf(u8, out, "[round-io] rest misses=0 hits=0 demand_mb=0.0 adopt_mb=0.0 phys_mb=0.0 spec_mb=0.0 abandoned_mb=0.0 claimed=0 issued=0 pageins=0 read_wall_ms=0.0 read_wait_ms=0.0 engram_hits=100 engram_ios=500000 lru_evictions=7 engram_wait_ms=9.00\n") != null);
 }
 
 test "round io: off, nothing is kept or printed; a counter that went back reads 0" {

@@ -145,4 +145,21 @@ pub fn build(b: *std.Build) void {
     });
     root.addImport("turboexl3", t3);
     root.addImport("turboexl3_kit", tkit);
+    // MLX_SERVE_DSV41_SCRATCH_TAIL's GPU check (src/gpu_check.zig): TAIL_FUSE's write-into twin and SCRATCH's hc expand in
+    // place, compiled on the GPU at the served template arguments, their words against the stock kernels'. An executable
+    // over the kit's `mlx` and a host tree's staged MLX (-Dgpu-check-mlx=<host tree>/lib/mlx, also its rpath): `zig build
+    // gpu-check` builds it (CPU only); only a GPU window runs it.
+    if (b.option([]const u8, "gpu-check-mlx", "A host tree's staged MLX (<tree>/lib/mlx): `zig build gpu-check` builds src/gpu_check.zig against it")) |mlx_dir| {
+        const gc = b.addExecutable(.{ .name = "gpu_check", .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "mlx_serve", .module = kit }},
+        }) });
+        gc.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{mlx_dir}) });
+        gc.root_module.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
+        gc.root_module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{mlx_dir}) });
+        b.step("gpu-check", "Build src/gpu_check.zig against -Dgpu-check-mlx (run it only inside a GPU window)").dependOn(&b.addInstallArtifact(gc, .{}).step);
+    }
 }

@@ -1,0 +1,85 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -317,6 +317,7 @@
+     pub const MLX_SERVE_DSV41_SCRATCH: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' streams after the attention (turboexl3_ds41): written into one per-prompt buffer, not a fresh MLX allocation each layer; the same words (=0: a fresh array each layer; =check: the fresh array served and the region's compared with it word for word)" };
+     pub const MLX_SERVE_DSV41_SEED_FREE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 usage seed's rows free until routed (turboexl3_ds41): the prompt's read-ahead may take a row the load's seed filled that no route has used, for an expert its prediction ranks before the seeded one, and the CED decoder prefetch one whose expert its prediction does not name" };
+     pub const MLX_SERVE_DSV41_SHARED_HOIST: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode layer's shared expert committed on its own when the routed call returns (turboexl3_ds41): it runs behind the device hit wave, while a layer with misses waits on their bytes; the same kernels, served bytes unchanged (=0: in the layer's last stretch)" };
++    pub const MLX_SERVE_DSV41_SHFIN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode shared expert (turboexl3_ds41): F3, the EXL3 gate and up finishes, the clamped SwiGLU and the down's prepare in one launch at 5 to 16 rows, two dependent levels fewer a layer, the same words (unset or 1: on, zzz9p; 0: the host's chain; check: the host's chain served, F3 run beside every shared expert it takes (a compiled stretch's body once more, eagerly) and compared word for word, [shfin] lines)" };
+     pub const MLX_SERVE_DSV41_ROUTES: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode route recorder (turboexl3_ds41's route-recording builds only, zig build -Droute-rec=true): an absolute directory; each request's decode routes (expert.routes' file) and its rounds' tokens written there at its end" };
+     pub const MLX_SERVE_DSV41_STAGE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' staging (turboexl3_ds41): on, the prediction's stream misses read into the transient windows the call's first stream groups take while the layer's attention runs, the call adopting them (its first stream groups the staged ones it routes, each filled from the rest), the same records and a reorder of the groups; 0: each stream group read by its own route" };
+     pub const MLX_SERVE_DSV41_STAGE_NEXT: Var = .{ .kind = .kill, .type = .text, .default = "only", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 next wide prompt layer's staging (turboexl3_ds41, with MLX_SERVE_DSV41_STAGE): predicted from this layer's FFN rows, its read-ahead and its predicted transient loads read during this layer's call, into its persistent rows and the windows the call's groups let go, the next layer then running no read-ahead of its own; reads only, the same words (=own: its own read-ahead too; =0: at the layer's start)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+--- a/plugins/deepseek_v41/deepseek_v41.zig
++++ b/plugins/deepseek_v41/deepseek_v41.zig
+@@ -67,6 +67,10 @@
+ /// A wide layer's heads left unroped, their roped last channels apart, read together by the gather's scores
+ /// (turboexl3_ds41's src/q_tail.zig, `MLX_SERVE_DSV41_Q_TAIL`).
+ const qtail = @import("../../../q_tail.zig");
++/// turboexl3_ds41's src/shfin.zig and src/shfin_t3.zig (`MLX_SERVE_DSV41_SHFIN`): F3, the decode shared expert's EXL3
++/// gate and up finishes, the clamped SwiGLU and the down's prepare in one launch, and `check`'s compare.
++const shfin = @import("../../../shfin.zig");
++const shfin_t3 = @import("../../../shfin_t3.zig");
+ /// turboexl3_ds41 (MLX_SERVE_DSV41_SCRATCH_ATTN, the plugin's src/scratch_attn.zig): a wide layer's attention spans'
+ /// scores and probabilities in a ring of two per-prompt slots, the gather's launches as their twins.
+ const sat = @import("../../../scratch_attn.zig");
+@@ -3924,13 +3928,20 @@
+         const act = try flatKernel(sc, m.moe_act_kernel, &.{ y, try sc.ones(&.{ci(L)}, .float32), lim }, &.{ ci(L), ci(n) }, m.act, L * n, &.{.{ .name = "N", .v = ci(n) }});
+         return ly.shared[2].apply(sc, act);
+     };
++    // turboexl3_ds41 (MLX_SERVE_DSV41_SHFIN): F3 where it takes the call; under `check` the host's chain is served and F3's
++    // output compared with it.
++    if (ly.shared_gu == null) if (ly.shared[0].x3) |w1| if (ly.shared[1].x3) |w3| if (ly.shared[2].x3) |w2| if (try shfin_t3.fused(sc.s, x, w1, w3, w2, m.cfg.dsv4_swiglu_limit, m.act)) |fy| {
++        return sc.keep(fy);
++    };
+     const g, const u = if (ly.shared_gu) |*gu| blk: {
+         const y = try gu.apply(sc, x);
+         const n = dim(y, -1) / 2;
+         break :blk .{ try sc.slice(y, -1, 0, n), try sc.slice(y, -1, n, 2 * n) };
+     } else .{ try ly.shared[0].apply(sc, x), try ly.shared[1].apply(sc, x) };
+     const sh = try clampedSwiglu(sc, g, u, m.cfg.dsv4_swiglu_limit);
+-    return ly.shared[2].apply(sc, try sc.astype(sh, m.act));
++    const sy = try ly.shared[2].apply(sc, try sc.astype(sh, m.act));
++    if (ly.shared_gu == null) if (ly.shared[0].x3) |w1| if (ly.shared[1].x3) |w3| if (ly.shared[2].x3) |w2| try shfin_t3.check(sc.s, x, w1, w3, w2, m.cfg.dsv4_swiglu_limit, m.act, sy);
++    return sy;
+ }
+ pub fn addShared(sc: *Scope, m: *const Dsv41Model, y: A, sy: A) !A {
+     return sc.astype(try sc.add(y, try sc.astype(sy, .float32)), m.act);
+@@ -5165,16 +5176,36 @@
+         _ = mlx.mlx_vector_array_free(res);
+         res = .{ .ctx = null };
+         try RegionBody(kind).run(r.m, li, &res, in);
+-    } else try mlx.check(mlx.mlx_closure_apply(&res, f, in));
++    } else {
++        try mlx.check(mlx.mlx_closure_apply(&res, f, in));
++        // turboexl3_ds41 (MLX_SERVE_DSV41_SHFIN=check): a compiled stretch holding the shared expert ran traced, so its body
++        // runs once more, eagerly on its own inputs, F3 checked there and the outputs dropped.
++        if (shfin.mode == .check) try shfinRecheck(kind, r, li, in);
++    }
+     for (out, 0..) |*o, i| {
+         var x = mlx.mlx_array_new();
+         o.* = try sc.res(mlx.mlx_vector_array_get(&x, res, i), &x);
+     }
+ }
++/// turboexl3_ds41 (MLX_SERVE_DSV41_SHFIN=check): the stretches holding the shared expert run their body eagerly on `in`.
++fn shfinRecheck(comptime kind: Region, r: *const LayerRegions, li: usize, in: mlx.mlx_vector_array) !void {
++    switch (kind) {
++        .ffn, .ffn_post, .ffn_shared => {},
++        else => return,
++    }
++    var res: mlx.mlx_vector_array = .{ .ctx = null };
++    defer if (res.ctx != null) {
++        _ = mlx.mlx_vector_array_free(res);
++    };
++    try RegionBody(kind).run(r.m, li, &res, in);
++}
+ fn RegionBody(comptime kind: Region) type {
+     return struct {
+         fn call(res: *mlx.mlx_vector_array, in: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+             const r: *const LayerRegions = @ptrCast(@alignCast(payload.?));
++            // turboexl3_ds41 (MLX_SERVE_DSV41_SHFIN=check): the body traced, its arrays hold no values to compare.
++            shfin.tracing = true;
++            defer shfin.tracing = false;
+             run(r.m, r.li, res, in) catch return -1;
+             return 0;
+         }
