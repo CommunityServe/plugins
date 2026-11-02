@@ -72,6 +72,9 @@ pub const t3_group = @import("src/t3_group.zig");
 /// The t3 route's banked calls on turboexl3's grouped texts with an M = 3 member path (`MLX_SERVE_DSV41_HW4B`,
 /// src/hw4b.zig), read by src/routed_t3.zig's banked call.
 pub const hw4b = @import("src/hw4b.zig");
+/// The t3 route's banked calls with turboexl3's grouped banked GEMVs at hw2u's picked variants (`MLX_SERVE_DSV41_HW2`,
+/// src/hw2.zig) on the grouped texts the calls run (hw4b's with it on), read by src/routed_t3.zig's banked call.
+pub const hw2 = @import("src/hw2.zig");
 /// The embedding table read from the pack per lookup (`MLX_SERVE_DSV41_EMBED_PREAD`, src/embed_pread.zig), read by the
 /// copied model.
 pub const embed_pread = @import("src/embed_pread.zig");
@@ -293,6 +296,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // the t3 route's grouped banked decode only (unset: on with it, off without it).
     hw4b.configure(env.span(.MLX_SERVE_DSV41_HW4B), routed_t3.enabled and t3_group.on) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_HW4B is none of 0, 1, check, or is 1 or check without the t3 route's grouped banked decode ({s}): the load is refused\n", .{@errorName(e)});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // After hw4b (its texts set): the picked GEMV variants on the grouped texts the calls run, on the t3 route's grouped
+    // banked decode only (unset: on with it, off without it); one check mode at a time.
+    hw2.configure(env.span(.MLX_SERVE_DSV41_HW2), routed_t3.enabled and t3_group.on, hw4b.mode == .check) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_HW2 is none of 0, 1, check, or is 1 or check without the t3 route's grouped banked decode, or check beside MLX_SERVE_DSV41_HW4B=check ({s}): the load is refused\n", .{@errorName(e)});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -713,6 +725,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => "on the grouped GEMVs, a lead with three members of an expert on the M = 4 path (MLX_SERVE_DSV41_HW4B=0)",
         .check => "on the grouped GEMVs, the M = 3 path's call beside each, every call's words compared ([hw4b] lines; MLX_SERVE_DSV41_HW4B=check)",
     }});
+    if (routed_t3.enabled and t3_group.on) log.info("[turboexl3_ds41] hw2: the banked calls {s} (gate|up GEMV variant {s}, down GEMV variant {s})\n", .{ switch (hw2.mode) {
+        .on => "at the picked GEMV variants on the grouped texts they run (MLX_SERVE_DSV41_HW2=0: variant 0)",
+        .off => "at GEMV variant 0 (MLX_SERVE_DSV41_HW2=0)",
+        .check => "at variant 0, the picked variants' call beside it, every call's words compared ([hw2] lines; MLX_SERVE_DSV41_HW2=check)",
+    }, if (hw2.pick_gu.len == 0) "0" else hw2.pick_gu, if (hw2.pick_dn.len == 0) "0" else hw2.pick_dn });
     switch (woa_rows.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' wo_a span by span (MLX_SERVE_DSV41_WOA_ROWS=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' wo_a over runs of {d} rows, one grouped linear a run (MLX_SERVE_DSV41_WOA_ROWS=0: span by span)\n", .{woa_rows.rows}),
@@ -1323,7 +1340,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     // MLX_SERVE_DSV41_M1: the [m1] line (on or check; check's compares since the last request's end).
     const m1l = m1.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len ..]);
     const dfl = decode_fuse.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len ..]);
-    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len;
+    // MLX_SERVE_DSV41_HW2: the [hw2] line (on or check; check's compares since the last request's end).
+    const h2l = hw2.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len + h2l.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     // dq1b: the decode's demand ranges by class, the gate/up split's counts, the cold start's first calls.
     const dmd = demand_split.meters(meter_buf[n + io.len ..]);

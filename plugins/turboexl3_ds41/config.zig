@@ -238,6 +238,7 @@ test {
     _ = @import("src/shared_hoist.zig");
     _ = @import("src/t3_group.zig");
     _ = @import("src/hw4b.zig");
+    _ = @import("src/hw2.zig");
     _ = @import("src/embed_pread.zig");
     _ = @import("src/vision_lazy.zig");
     _ = @import("src/scratch_tail.zig");

@@ -338,6 +338,30 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
     44.1 tok/s (+0.17%; pairs -0.23, +0.45, +0.91, -0.45); greedy 56.2 56.4 56.0 56.2 against 56.1 56.6 56.6 56.3
     (+0.36%; pairs -0.18, +0.35, +1.07, +0.18); the texts the same bytes in every arm, check's `[hw4b]` differ 0 and
     max_ulps 0 over 8498 and 6949 calls. Merged on (zzz9j).
+- `MLX_SERVE_DSV41_HW2` (src/hw2.zig, patches/turboexl3-zzz9m-hw2.patch; turboexl3's `group_variants`,
+  `Config.banked_variant_gu` and `banked_variant_dn`; on by default with the t3 route's grouped banked decode, `=0`
+  off, `=check`): the t3 route's banked calls with the grouped gate|up and down GEMVs at hw2u's picked variant, t4 for
+  both, on the grouped texts the calls run (hw4b's M = 3 texts with `MLX_SERVE_DSV41_HW4B` on). t4 is the texts with
+  `EXL3_T1V 4`: a codeword's two pair sums become t as one half2 (1024 plus each pair's sum), widened, added and 2048
+  subtracted, every step on integers below 2^24, so t is today's route's word for word, with one shift and one add a
+  weight fewer. Every variant reads, decodes and sums each weight as today's texts do (the same codewords, decoded
+  values, FMA sequence, accumulators and folds), so every row-slot's words are the same. Unset is off without the
+  grouped banked decode; `1` or `check` without it is refused, and so is `check` beside `MLX_SERVE_DSV41_HW4B=check`.
+  `check` runs the call at variant 0 and at the picks for every banked call, compares their f32 words on the device (a
+  sync a call) and serves variant 0's rows. `[hw2]` at each request's end: the mode, the picks, and in check the calls,
+  words, differing words, the largest ulp distance and absolute difference.
+  - hw2u's microbench (w-hw2u-20261102-0023; the whole banked call at a verify's 36 pairs on the recorded p10, median
+    and p90 profiles, chain medians, µs a call): today's 902.0, 1029.1 and 1239.3 at K3, 888.3, 981.6 and 1162.9 at
+    K2; t4 at both GEMVs -24.3, -21.5 and -21.3 at K3, -17.4, -21.1 and -12.6 at K2; the ten other variants (tile
+    pairs, a rolling prefetch, x held as half4, the four-member path as two passes, shuffled tile words, the other
+    routes to t and three mixes) slower in every cell. Every variant's words today's (968 records, 100,859,088 words),
+    and every route to t exact over all 65536 codeword states read from I16 and U16 words.
+  - Read as hw2 (M5 Max, w-20261102-1025; code-ctx16384 card then greedy, a = ctl25 5ccb44791b50, b = hw2
+    d43b09222a94 at 1, both on G_KIT1271; a1 b1 b2 a2 b3 a3 a4 b4): card 43.9 43.9 43.6 43.9 against 44.0 43.9 43.6
+    44.1 tok/s (+0.17%; pairs +0.23, 0.00, 0.00, +0.46); greedy 55.8 55.9 55.6 55.6 against 56.0 56.1 55.2 55.8
+    (+0.09%; pairs +0.36, +0.36, -0.72, +0.36); the texts the same bytes in every arm, check's `[hw2]` differ 0 and
+    max_ulps 0 over 8531 and 7018 calls, the bank rows 150 / 174 in every arm. Measured on today's grouped texts
+    (before hw4b); merged on both (zzz9m).
 - `MLX_SERVE_DSV41_WOA_ROWS` (src/woa_rows.zig, patches/turboexl3-zzz7-woa-rows.patch; on, `=0` off, `check` both): a
   wide layer's EXL3 `wo_a` over runs of 4096 rows of its attention spans. `=0`: each 256-row span runs its own grouped
   linear as its attention ends: at prefill rows turboexl3 decodes each of the 8 slices' trellis to W_hat and multiplies
