@@ -594,6 +594,27 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   pairs -0.03% and +4.34%); 147 prompt and 176 decode rows in every arm; the guard's accounted peak 106.4/100.2 GiB in
   the b arms against 107.8/107.8 in the a arms. Exact: the texts the same bytes in every arm (cold 65d438d647, new-text
   slice 3 83a88208e3).
+- `MLX_SERVE_DSV41_TRANSIENT_KEEP` (src/transient_keep.zig, patches/turboexl3-zzz9q-transient-keep.patch; on, `=0`
+  off, `=check` on and counting): a wide prompt layer with another wide one after it keeps its attention projections'
+  large outputs (the attention norm's rows, `wq_b`'s heads, their roped tail: 1.4 GB at 16K rows, each at least 64 MiB)
+  past its teardown by an extra reference, and the next wide layer's start hands their buffers to MLX's cache. `=0`: the
+  layer's scope frees them at its end, past MLX's cache limit (the routed call's freed transients already fill it), so
+  they go back to Metal and the next layer allocates them anew as it encodes them, ~15 ms of host a GB in a host-bound
+  stage (pt5 w-pio-20261102-1502's one-op-a-buffer arm: `wq_b`'s 1.07 GB output's encode 19.2 ms of host a regular wide
+  layer, the GPU idle 5.1 ms of it). On, `release` lifts the cache limit, frees the references (each buffer to the cache,
+  the newest there) and puts the limit back at once; the layer's first allocation trims the cache from its oldest
+  buffers, and its same-shaped arrays take these. The same kernels over the same inputs, only the buffers move, so the
+  same words (a text gate). The kept arrays were alive through the routed call either way, so after the teardown they
+  sit beside only the tail's in-flight buffers; the cache is over its limit by their bytes only from the next layer's
+  start (its graph build) to its first allocation. `[transient-keep] mode= layers= arrays= mb=` (`reused=` with check:
+  the kept buffers the next layer's own projections took) at each request's end.
+  - Read as tk1 (M5 Max, w-pio-20261102-1746; a = ctl44 ae169b3ed1b3, b = tk1 at 1 (2d9981be3fd8), both on G_KITSP1
+    with keyed sampling; a warm server, then a1 b1 b2 a2, each a cold code-ctx16384 card request then the new-text 16K
+    slice 3): cold 1597.9 1602.2 against 1612.1 1608.2 tok/s (+0.63%; pairs +0.89, +0.37), new text 1710.4 1712.0
+    against 1732.7 1728.0 (+1.12%; pairs +1.30, +0.93); the texts the same bytes in every arm (cold 65d438d647,
+    new-text slice 3 83a88208e3), the bank rows 148 / 178 in every arm, the guard's accounted peak 108.7 / 104.2 GiB in
+    the b arms against 103.8 / 108.8 in the a arms (step footprint 96.6 / 92.1 against 91.7 / 96.7); `[transient-keep]
+    layers=19 arrays=57` a request (mb=24909 the card, 22686 the slice). Measured on zzz9p; merged on (zzz9q).
 - `MLX_SERVE_DSV41_DIRECT_PARTS` (src/direct_parts.zig, src/direct_parts_test.zig, patches/turboexl3-zzz8i-direct-parts.patch:
   the copied read pool's PARTS route; on, `=0` off): a record is
   read as its gate/up span and its down span, each in one F_NOCACHE preadv into a worker's 9 MiB staging buffer and a

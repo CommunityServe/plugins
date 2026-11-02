@@ -99,6 +99,9 @@ pub const wide_early = @import("src/wide_early.zig");
 /// A wide prompt layer's new streams committed at its call's end, before the layer's teardown
 /// (`MLX_SERVE_DSV41_REST_EARLY`, src/rest_early.zig), read by the copied model.
 pub const rest_early = @import("src/rest_early.zig");
+/// A wide prompt layer's attention projections' large outputs kept past its teardown, their buffers to MLX's cache at the
+/// next wide layer's start (`MLX_SERVE_DSV41_TRANSIENT_KEEP`, src/transient_keep.zig), read by the copied model.
+pub const transient_keep = @import("src/transient_keep.zig");
 /// A wide prompt layer's query heads kept unroped, their roped last channels apart (`MLX_SERVE_DSV41_Q_TAIL`,
 /// src/q_tail.zig), read by the copied model.
 pub const q_tail = @import("src/q_tail.zig");
@@ -583,6 +586,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    transient_keep.configure(env.span(.MLX_SERVE_DSV41_TRANSIENT_KEEP)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_TRANSIENT_KEEP is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     rest_early.configure(env.span(.MLX_SERVE_DSV41_REST_EARLY)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_REST_EARLY is neither 0 nor 1 (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -844,6 +854,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] wide prompt calls' shared expert and attention state evaluated by the layer's last eval, after the call (MLX_SERVE_DSV41_WIDE_EARLY=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, before the routing barrier waits: the routes, the next layer's predicted routes, then the shared expert and the attention state (MLX_SERVE_DSV41_WIDE_EARLY=0: after the call)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, and the shared expert is also built the old way and served, the two compared word for word (MLX_SERVE_DSV41_WIDE_EARLY=check): a [wide-early] check line a wide call\n", .{}),
+    }
+    switch (transient_keep.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' attention projections' outputs freed at the layer's teardown (MLX_SERVE_DSV41_TRANSIENT_KEEP=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers keep their attention projections' large outputs past the teardown, their buffers to MLX's cache at the next wide layer's start (MLX_SERVE_DSV41_TRANSIENT_KEEP=0: freed at the teardown): [transient-keep] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers keep their attention projections' large outputs past the teardown, their buffers to MLX's cache at the next wide layer's start, and count the buffers taken back (MLX_SERVE_DSV41_TRANSIENT_KEEP=check): [transient-keep] reused= at each request's end\n", .{}),
     }
     if (rest_early.on)
         log.info("[turboexl3_ds41] wide prompt layers commit their new streams at the routed call's end, before the layer's teardown: the GPU runs the tail kernel while the host frees the layer (MLX_SERVE_DSV41_REST_EARLY=0: after the teardown)\n", .{})
@@ -1397,7 +1412,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const dmd = demand_split.meters(meter_buf[n + io.len ..]);
     const gsl = if (gu_split.mode != .off) (if (splitSnap(model(mp))) |ss| gu_split.meters(ss, meter_buf[n + io.len + dmd.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
     const csl = cold_start.meters(meter_buf[n + io.len + dmd.len + gsl.len ..]);
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len]);
+    // MLX_SERVE_DSV41_TRANSIENT_KEEP: the [transient-keep] line (on or check; since the last request's end).
+    const tkl = transient_keep.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is
