@@ -304,6 +304,30 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   verifies, the usage seed with SEED_FREE, ROUTED=turboexl3, A B B A): 40.0 and 40.1 tok/s on the card's decode against
   39.3 and 39.2, 47.0 and 47.0 greedy against 46.1 and 45.6, the misses a round the same (62.4 greedy, 82.3 card; 63.5
   and 83.1 in the last arm), the texts the same in every arm.
+- `MLX_SERVE_DSV41_SHFIN` (src/shfin.zig, src/shfin_t3.zig, patches/turboexl3-zzz9p-shfin.patch; turboexl3's
+  `sharedSwiglu`: root.zig, `Dense.swigluPrep` and kernels/dense/swiglu_prep.metal; on, `=0` the host's chain,
+  `=check`): a decode layer's shared expert with the gate's and up's finishes, the clamped SwiGLU and the down's prepare
+  in one launch (F3). At a verify's rows (5 to 16: DEC-ONE keeps up to 4 as they are) the shared expert ran the gate's
+  and the up's prepare, GEMV and finish, the host's clamped SwiGLU in f32 (one compiled elementwise launch in the
+  stretch), then the down's prepare, GEMV and finish. On, the two finishes, the SwiGLU and the down's prepare are one
+  launch (`dense.text_swiglu_prep`: for each 128-wide block, text_dfinish's statements on the gate's and the up's
+  planes, MLX's Minimum, Maximum, Sigmoid and Multiply functors in clampedSwiGLU's order in f32, the activation dtype's
+  rounding, then text_prep_s's statements, nothing between them stored): three launches and two dependent levels fewer
+  a layer, the same words (turboexl3's CPU test holds the statements). The output is the chain's words, so what reads it
+  is unchanged: SHARED_HOIST's `ffn_shared` stretch hands it to DECODE_FUSE's kernel or to `ffn_post_shared`, or
+  `ffn_post`'s `withShared` adds it. `check` serves the host's chain and, for every shared expert F3 takes, runs F3 on
+  the same input and compares the down's output word for word (after a compiled stretch, its body once more, eagerly).
+  `[shfin] mode= calls= words=` at each request's end, since load (on, the calls F3's code ran: a compiled stretch's
+  traces, its replays running F3 uncounted; under check every call, and `differ=`).
+  - The probe (f3u, w-f3u-20261102-1410): every word the host chain's at rows 1 to 16 (taken at 5 to 16; bf16, and f32
+    at 6 and 12); the 40-layer trunk chain at rows 5, 6 and 8 -0.056, -0.029 and -0.218 ms a verify against the host's
+    chain (medians, A B B A in 3 rounds, every run the first's words).
+  - Read as f3 (M5 Max, w-20261102-1413; code-ctx16384 card then greedy, a = ctl27 42a2a45fae3c, b = f3 at 1; a1 b1 b2
+    a2 b3 a3 a4 b4): card 44.0 44.0 44.1 44.3 against 44.4 44.4 44.3 43.9 tok/s (+0.34%; pairs +0.91, +0.91, +0.45,
+    -0.90; round 111.07 -> 110.75 ms); greedy 56.4 56.0 56.2 56.3 against 56.3 56.3 56.4 56.3 (+0.18%; pairs -0.18,
+    +0.54, +0.36, 0.00; round 86.95 -> 86.85 ms); the texts the same bytes in every arm, check's `[shfin]` differ 0
+    over 9503 calls (4899 by the card's end), the bank rows 147 / 176 in every measured arm. Measured on zzz8y (before
+    DECODE_FUSE, GU_SPLIT, HW4B and HW2); merged on (zzz9p).
 - `MLX_SERVE_DSV41_T3_GROUP` (src/t3_group.zig, patches/turboexl3-zzz8b-t3-group.patch; on with the t3 route, the
   default, `=0` off): the t3 route's device hit wave on turboexl3's grouped banked decode
   (`Config.banked_group` 4, turboexl3 65c72d1). A verify's 36 routed pairs a layer name about 23 distinct experts

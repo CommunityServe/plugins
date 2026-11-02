@@ -155,6 +155,10 @@ pub const decode_window = @import("src/decode_window.zig");
 /// The decode phase's budget takes part of the stop under the ceiling back, MLX's cache capped at decode instead
 /// (`MLX_SERVE_DSV41_DECODE_STOP`, src/decode_stop.zig), read by the copied bill and source.
 pub const decode_stop = @import("src/decode_stop.zig");
+/// F3: the decode shared expert's EXL3 gate and up finishes, the clamped SwiGLU and the down's prepare in one launch
+/// (`MLX_SERVE_DSV41_SHFIN`, src/shfin.zig; turboexl3's `sharedSwiglu` and `check`'s compare in src/shfin_t3.zig), read by
+/// the copied model.
+pub const shfin = @import("src/shfin.zig");
 /// The wide prompt layers' per-prompt regions (src/scratch.zig), read by the copied model and stream.
 pub const scratch = @import("src/scratch.zig");
 /// A wide prompt call's DIG-X waves write into per-prompt regions (`MLX_SERVE_DSV41_SCRATCH_WAVES`,
@@ -518,6 +522,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    // Before the model's first decode: F3 at the SHFIN setting.
+    shfin.configure(env.span(.MLX_SERVE_DSV41_SHFIN)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_SHFIN is none of 0, 1, check (unset: 1): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     // Before the model's load: the bank's bill and the stream's grow read the window's rows.
     decode_window.configure(env.span(.MLX_SERVE_DSV41_DECODE_WINDOW)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_WINDOW is none of 0, 1, check (unset: on): the load is refused\n", .{});
@@ -797,6 +809,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     switch (decode_stop.mode) {
         .off => log.info("[turboexl3_ds41] decode phase's stop under the ceiling at 2000 MB, the prompt's (MLX_SERVE_DSV41_DECODE_STOP=0): MLX's cache cap unchanged at decode; [decode-stop] off\n", .{}),
         .on, .check => log.info("[turboexl3_ds41] decode phase's stop under the ceiling at {d} MB, not 2000 (MLX_SERVE_DSV41_DECODE_STOP{s}): its budget takes the {d} MB back for slot rows, MLX's cache capped at {d} MiB from the phase change to decode, the prompt's cap restored at the change back; [decode-stop] at each request's end\n", .{ (2_000_000_000 - decode_stop.cut_bytes) / 1_000_000, if (decode_stop.mode == .check) "=check, as =1" else "; =0 off", decode_stop.cut_bytes / 1_000_000, decode_stop.cache_bytes >> 20 }),
+    }
+    switch (shfin.mode) {
+        .off => log.info("[turboexl3_ds41] the decode shared expert as the host's chain (MLX_SERVE_DSV41_SHFIN=0); [shfin] off\n", .{}),
+        .on => log.info("[turboexl3_ds41] the decode shared expert's gate and up finishes, clamped SwiGLU and down prepare in one launch (MLX_SERVE_DSV41_SHFIN; =0 off): F3 at 5 to 16 rows, two dependent levels fewer a layer, the same words; [shfin] at each request's end\n", .{}),
+        .check => log.info("[turboexl3_ds41] the decode shared expert checked (MLX_SERVE_DSV41_SHFIN=check): the host's chain served, F3 run beside every shared expert it takes (a compiled stretch's body once more, eagerly) and compared word for word; [shfin] calls= words= differ= at each request's end\n", .{}),
     }
     switch (decode_window.mode) {
         .off => log.info("[turboexl3_ds41] decode's window 0 at the widest decode route's rows (MLX_SERVE_DSV41_DECODE_WINDOW=0); [mem-decode] off\n", .{}),
@@ -1372,7 +1389,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const dfl = decode_fuse.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len ..]);
     // MLX_SERVE_DSV41_HW2: the [hw2] line (on or check; check's compares since the last request's end).
     const h2l = hw2.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len ..]);
-    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len + h2l.len;
+    // MLX_SERVE_DSV41_SHFIN: the [shfin] line (the counts since load).
+    const sfl = shfin.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len + h2l.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len + m1l.len + dfl.len + h2l.len + sfl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     // dq1b: the decode's demand ranges by class, the gate/up split's counts, the cold start's first calls.
     const dmd = demand_split.meters(meter_buf[n + io.len ..]);
