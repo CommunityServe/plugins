@@ -915,6 +915,27 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   pairs +1.85/+1.84), the new-text slice 1588.5/1587.6 -> 1596.1/1616.7 (+1.16%; pairs +0.48/+1.83); texts identical
   in every arm; chk's 38 `[scratch-tail]` check lines differ=0; bank rows 147/176, 146/175 in one arm of each binary
   (b1, a2: the load's); the guard's peak not up (b's largest 106.2 against a's 108.1).
+- `MLX_SERVE_DSV41_ENGRAM_FIRST` (src/engram_first.zig, patches/turboexl3-zzz9n-engram-first.patch; on by default,
+  `=0` off, `=check`): a prompt chunk's Engram rows read sooner and on more threads. Off, extendIds starts the chunk's Engram read
+  thread after the phase change and the embedding, and the thread reads a prompt grid's table (about 155K distinct 4 KB
+  rows a table on a cold 16K card, one direct pread a row) on at most 64 threads: the first Engram layer (L1) waits for
+  table 0, 383-406 ms on the cold card and 290-328 ms on the new-text slice (w-pio-20261102-0840, -1002, -1013; table 0
+  read in 925-936 / 752-770 ms), the GPU idle meanwhile. On, the ids are hashed and the thread started first, before the
+  phase change, and a prompt grid's tables read on up to 128 threads (a machine parameter: a deeper queue for the small
+  reads beside the expert stream's). `check` also reads table 0 at 64 threads and compares the bytes
+  (`[engram-first] check table=0 rows= bytes= differ=`). Exact: the same rows, read into the same buffers and served the
+  same. Measured (ew1, w-pio-20261102-1135: ctl39 ae17e03db754 against ew1 a2000ad09c62, both on G_KITSP1, two runs an
+  arm): the cold 16K card 1550.0/1565.2 -> 1584.5/1580.7 tok/s (+1.60%; pairs +2.23/+0.99), the new-text slice
+  1661.3/1631.5 -> 1665.3/1689.7 (+1.89%; pairs +0.24/+3.57); texts identical in every arm; chk's `[engram-first]`
+  differ=0 (155,080 and 138,288 rows); bank rows 147/176 in every measured arm. The read: L1's wait0 398.0/400.1 ->
+  158.9/166.0 ms on the card and 353.6/358.5 -> 180.7/189.0 ms on the slice (table 0 read in 940.9/943.8 -> 771.8/771.5
+  and 765.6/771.2 -> 667.9/673.5 ms); the wider reads slow the expert stream beside them (L0's moe rwait 96.5/95.2 ->
+  122.8/120.3 and L1's 69.1/72.2 -> 94.0/93.1 ms on the card; 22.9/22.9 -> 35.5/39.0 and 62.3/63.8 -> 81.1/83.3 on the
+  slice). The card's L0 also shows other_ms 636 -> 408 ms (layer 963 -> 756), which the Engram wait does not explain (L0
+  has none, and the slice's L0 does not show it): unexplained, not claimed. Memory (from the code): the same host
+  buffers, allocated earlier: about 48 MB over the phase change and the embedding (the row ids, the thread's copy, table
+  0's read buffers, 64 more threads' stacks), at most about 45 MB more at L1's activation peak; nothing in GPU/MLX memory
+  or the page cache (direct reads).
 
 ## The pack
 

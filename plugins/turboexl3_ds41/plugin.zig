@@ -139,6 +139,9 @@ pub const scratch_x1 = @import("src/scratch_x1.zig");
 /// The Engram tables read past the page cache, through their blocks (`MLX_SERVE_DSV41_ENGRAM_DIRECT`,
 /// src/engram_direct.zig), read by the copied Engram tables.
 pub const engram_direct = @import("src/engram_direct.zig");
+/// A prompt chunk's Engram read thread started first and a prompt grid's tables read on up to 128 threads
+/// (`MLX_SERVE_DSV41_ENGRAM_FIRST`, src/engram_first.zig), read by the copied model and Engram tables.
+pub const engram_first = @import("src/engram_first.zig");
 /// Engram rows kept across a conversation's turns (`MLX_SERVE_DSV41_ENGRAM_DECODE`, `MLX_SERVE_DSV41_ENGRAM_LRU_MB`,
 /// src/engram_decode.zig): an LRU a prompt grid's rows, the decode reads' and the rounds' bonus rows go into, a decode
 /// read's misses read on a pool; read by the copied Engram tables and model.
@@ -466,6 +469,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    engram_first.configure(env.span(.MLX_SERVE_DSV41_ENGRAM_FIRST)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_FIRST is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     engram_decode.mode = engram_decode.parse(env.span(.MLX_SERVE_DSV41_ENGRAM_DECODE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_DECODE is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -762,6 +772,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.info("[turboexl3_ds41] wide prompt calls stage only the predicted stream misses at least {d} rows of the prediction name, the read-ahead keeping the whole ranking ({s}MLX_SERVE_DSV41_STAGE_VOTES=0: every one); [stage-votes] lines with PROMPT_IO\n", .{ stage_votes.floor, if (stage.on) "" else "no effect: MLX_SERVE_DSV41_STAGE=0; " })
     else
         log.info("[turboexl3_ds41] wide prompt calls stage every predicted stream miss their windows hold (MLX_SERVE_DSV41_STAGE_VOTES=0); [stage-votes] lines with PROMPT_IO\n", .{});
+    switch (engram_first.mode) {
+        .off => log.info("[turboexl3_ds41] a prompt chunk's Engram read thread started after the phase change and the embedding, a prompt grid's tables read on up to 64 threads (MLX_SERVE_DSV41_ENGRAM_FIRST=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] a prompt chunk's Engram read thread started first, before the phase change and the embedding, and a prompt grid's tables read on up to {d} threads (MLX_SERVE_DSV41_ENGRAM_FIRST; =0: after them, 64 threads)\n", .{engram_first.grid_threads}),
+        .check => log.info("[turboexl3_ds41] a prompt chunk's Engram reads first and on up to {d} threads, checked (MLX_SERVE_DSV41_ENGRAM_FIRST=check): table 0 read again at 64 threads, the bytes compared; an [engram-first] check line a prompt grid\n", .{engram_first.grid_threads}),
+    }
     if (engram_direct.on) log.info("[turboexl3_ds41] a prompt's Engram rows read once a table, past the page cache through their file system blocks, on up to 64 threads (MLX_SERVE_DSV41_ENGRAM_DIRECT=0: span by span through the page cache)\n", .{}) else log.info("[turboexl3_ds41] Engram rows read span by span through the page cache (MLX_SERVE_DSV41_ENGRAM_DIRECT=0)\n", .{});
     engram_decode.start();
     switch (draft_ahead.mode) {

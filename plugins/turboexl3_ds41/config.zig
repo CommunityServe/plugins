@@ -222,6 +222,7 @@ test {
     _ = @import("src/cold_start.zig");
     _ = @import("src/scratch_x1.zig");
     _ = @import("src/engram_direct.zig");
+    _ = @import("src/engram_first.zig");
     _ = @import("src/engram_decode.zig");
     _ = @import("src/draft_ahead.zig");
     _ = @import("src/decode_window.zig");
