@@ -343,6 +343,29 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   (+1.5%); the guard's sampled peak 105.3 GiB. Exact: the seeded cold text is the same in every arm (md5 efeb6f4ecd), and
   `check` (w-pio-20261101-0809) compared every wide call's first and last 2048 rows, 40 calls and 3,355,443,200 words,
   with none different.
+- `MLX_SERVE_DSV41_WIDE_EARLY` (src/wide_early.zig, patches/turboexl3-zzz8y-wide-early.patch; on, `=0` off, `check`
+  checked): what a wide prompt call's MoE does not read, committed behind its routes before the routing barrier waits on
+  them (the TAIL_FUSE path). `=0`: the barrier evaluates the routes and waits; the next layer's predicted routes
+  (STAGE_NEXT) start behind it once the ids are on the host, and the shared expert and the layer's attention state are
+  evaluated by the layer's last eval, after the call's groups: the GPU idles through the barrier's host work and the
+  call's first read wait (about 37 ms a 16K-row encoder layer, pt3 w-pio-20261101-2207), then runs the shared expert
+  (about 25 ms) at the layer's end. On, the copied model commits the routes (cast to the int32 ids the streamer reads,
+  its own cast made here), then the prediction, then the shared expert with the attention state, each its own commit;
+  the barrier waits on the first only, and the layer's last eval is left the tail kernel. The same kernels over the same
+  inputs, so the same words; the MoE stage holds the shared expert's evaluation (every array of it is made when the host
+  encodes it ahead of the call: 1.03 GB at 16K rows), which the prompt bill counts (`prefillBytes` reads the setting
+  before the load; only calls wider than a span, so not decode's bill), so the bank opens with the prompt rows the rest
+  affords. `check` also builds the shared expert the old way and serves it (evaluated after the call's groups), compared
+  with the early one word for word: `[wide-early] check layer= words= differ= max_ulps= max_abs=` a wide call.
+- On against `=0` (hg1, w-pio-20261102-0114, two binaries: a = ctl25 (2ff23cb, zzz8w), b = this code on zzz8w, =1 in the
+  b arms; a warm server and the check arm (margin 3), then a1 b1 b2 a2): cold 16K a 1414.0/1400.3 -> b 1418.6/1425.1
+  tok/s (+1.04%, pairs +0.33% and +1.77%), new text (slice 3) 1490.4/1486.2 -> 1498.1/1502.6 (+0.81%, pairs +0.52% and
+  +1.10%); the encoder's moe stage 4105/4147 -> 4054/4060 ms, its read waits 645/699 -> 616/627; 153 -> 150 prompt rows
+  (the bill's 1.03 GB) and 177 decode rows in every arm; the guard's peak 110.9 GiB. On zzz8x the prompt bill takes the
+  same bytes and the decode bill none (DECODE_STOP's cut is the decode budget's; decode's calls are never wide), so the
+  16K cells' 150 prompt rows and zzz8x's 179 decode rows. Exact: the texts the same bytes in every arm (cold d081845201,
+  new-text slice 3 4d5b401f3c), and the check arm compared 41 wide calls' shared experts, 3,205,017,600 words, none
+  different (max_ulps 0).
 - `MLX_SERVE_DSV41_DIRECT_PARTS` (src/direct_parts.zig, src/direct_parts_test.zig, patches/turboexl3-zzz8i-direct-parts.patch:
   the copied read pool's PARTS route; on, `=0` off): a record is
   read as its gate/up span and its down span, each in one F_NOCACHE preadv into a worker's 9 MiB staging buffer and a

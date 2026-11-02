@@ -81,6 +81,9 @@ pub const joinless = @import("src/joinless.zig");
 /// A wide prompt layer's joinless combine and hc expand in one kernel (`MLX_SERVE_DSV41_TAIL_FUSE`, src/tail_fuse.zig),
 /// read by the copied model and launched by the copied stream's source.
 pub const tail_fuse = @import("src/tail_fuse.zig");
+/// What a wide prompt call's MoE does not read, committed behind its routes before the routing barrier waits on them
+/// (`MLX_SERVE_DSV41_WIDE_EARLY`, src/wide_early.zig), read by the copied model.
+pub const wide_early = @import("src/wide_early.zig");
 /// A wide prompt layer's query heads kept unroped, their roped last channels apart (`MLX_SERVE_DSV41_Q_TAIL`,
 /// src/q_tail.zig), read by the copied model.
 pub const q_tail = @import("src/q_tail.zig");
@@ -410,6 +413,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         }
         tail_fuse.mode = .off;
     }
+    wide_early.configure(env.span(.MLX_SERVE_DSV41_WIDE_EARLY)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_WIDE_EARLY is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     q_tail.configure(env.span(.MLX_SERVE_DSV41_Q_TAIL)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_Q_TAIL is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -590,6 +600,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] wide prompt layers' tail as the chain: the combine's f32 sum, its rounding and the hc expand ({s})\n", .{if (tail_fuse.explicit) "MLX_SERVE_DSV41_TAIL_FUSE=0" else "MLX_SERVE_DSV41_JOINLESS off: the tail kernel is the combine's"}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' joinless combine and hc expand in one kernel, the new streams written once (MLX_SERVE_DSV41_TAIL_FUSE=0: the chain)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' joinless combine and hc expand as the chain, served, and in one kernel over each call's first and last rows, compared word for word (MLX_SERVE_DSV41_TAIL_FUSE=check): a [tail-fuse] check line a wide call\n", .{}),
+    }
+    switch (wide_early.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt calls' shared expert and attention state evaluated by the layer's last eval, after the call (MLX_SERVE_DSV41_WIDE_EARLY=0)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, before the routing barrier waits: the routes, the next layer's predicted routes, then the shared expert and the attention state (MLX_SERVE_DSV41_WIDE_EARLY=0: after the call)\n", .{}),
+        .check => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, and the shared expert is also built the old way and served, the two compared word for word (MLX_SERVE_DSV41_WIDE_EARLY=check): a [wide-early] check line a wide call\n", .{}),
     }
     switch (q_tail.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers rope the whole query heads into a copy (MLX_SERVE_DSV41_Q_TAIL=0)\n", .{}),
