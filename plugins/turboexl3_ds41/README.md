@@ -299,6 +299,24 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
     39.7, 46.9 and 46.6 greedy against 46.8 and 46.3, the texts the same in every arm. A wash at today's misses: the
     hit wave's saving turns into the miss parts' byte wait while the decode's reads are bound by the drive. It removes
     work and pays as misses fall.
+- `MLX_SERVE_DSV41_HW4B` (src/hw4b.zig, patches/turboexl3-zzz9j-hw4b.patch; turboexl3's `Config.banked_m3`; on by
+  default with the t3 route's grouped banked decode, `=0` off, `=check`): the t3 route's banked calls (the decode hit
+  wave's and each miss part's) on turboexl3's grouped texts with an M = 3 member path. A lead with three row-slots of
+  one expert runs it, where the grouped texts ran the M = 4 path with a fourth member's FMAs padding. Every member is
+  fed in the one-member order (turboexl3's `turboexl3_gemv_group`), so every row-slot's words are the grouped texts'.
+  Unset is off without the grouped banked decode (`MLX_SERVE_DSV41_ROUTED=streamer` or `MLX_SERVE_DSV41_T3_GROUP=0`);
+  `1` or `check` without it is refused. `check` runs the grouped texts' call and the M = 3 one for every banked call,
+  compares their f32 words on the device (a sync a call) and serves the grouped texts' rows. `[hw4b]` at each
+  request's end: the mode, turboexl3's `banked_m3`, and in check the calls, words, differing words, the largest ulp
+  distance and absolute difference.
+  - The microbench (hw4u, w-hw4u-20261102-0359; hw5u, w-hw5u-20261102-0648, reproduced it): every word of hd, hs and y
+    the grouped texts' at rows 1-64 with one id on 1 to 16 row-slots, K3 and K2; -1.5 to -16.8 µs a banked call on
+    the recorded routes' profiles, the 3-member sweeps -9.8% to -10.9%, flat with no 3-member lead.
+  - Read as hw4b (M5 Max, w-20261102-0923; code-ctx16384 card then greedy, a = ctl29 6e9c8b0a279a, b = hw4b
+    502c5238bc37 at 1, both on G_KIT1271; a1 b1 b2 a2 b3 a3 a4 b4): card 44.1 44.2 44.0 44.3 against 44.0 44.4 44.4
+    44.1 tok/s (+0.17%; pairs -0.23, +0.45, +0.91, -0.45); greedy 56.2 56.4 56.0 56.2 against 56.1 56.6 56.6 56.3
+    (+0.36%; pairs -0.18, +0.35, +1.07, +0.18); the texts the same bytes in every arm, check's `[hw4b]` differ 0 and
+    max_ulps 0 over 8498 and 6949 calls. Merged on (zzz9j).
 - `MLX_SERVE_DSV41_WOA_ROWS` (src/woa_rows.zig, patches/turboexl3-zzz7-woa-rows.patch; on, `=0` off, `check` both): a
   wide layer's EXL3 `wo_a` over runs of 4096 rows of its attention spans. `=0`: each 256-row span runs its own grouped
   linear as its attention ends: at prefill rows turboexl3 decodes each of the 8 slices' trellis to W_hat and multiplies

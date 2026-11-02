@@ -5,13 +5,14 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .mlx_serve_kit = .{ .path = "../../.kit/kit" },
-        // turboexl3 (davidtai/turboexl3): the EXL3 kernels and its plugin-kit launcher, at 0af7618 on its DeepSeek-V4.1
+        // turboexl3 (davidtai/turboexl3): the EXL3 kernels and its plugin-kit launcher, at e1aae61 on its DeepSeek-V4.1
         // kernels branch: 65c72d1 (PR 3: the banked decode, moeClampedBanked, for the streamer's banked waves and device
         // route, and its grouped texts with the skip id, Config.banked_group 4; 5-row chunks on the lean text) + pgemm
-        // (pg2: a dense linear's prefill matmul and finish as one launch at this machine's tiles).
+        // (pg2: a dense linear's prefill matmul and finish as one launch at this machine's tiles) + the grouped banked
+        // decode's M=3 member path (Config.banked_m3, hw4b).
         .turboexl3 = .{
-            .url = "https://github.com/davidtai/turboexl3/archive/0af76182fb913fe71971ee66078f8797553795f7.tar.gz",
-            .hash = "turboexl3-0.1.0-tZE8b4RbPQH3gyB7P0md1oyvzun1rZDxzgXZvDPuTDOZ",
+            .url = "https://github.com/davidtai/turboexl3/archive/e1aae61f4c2e1dde9c0991ae3d8835d6d91e54d4.tar.gz",
+            .hash = "turboexl3-0.1.0-tZE8b7fjPQGxpBUUYXnBEa9PCjdnIIhVdUyabWH-Eo3N",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "scripts", "patches", "tests", "NOTICE", "README.md" },

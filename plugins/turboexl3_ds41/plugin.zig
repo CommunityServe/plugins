@@ -69,6 +69,9 @@ pub const shared_hoist = @import("src/shared_hoist.zig");
 /// The t3 route's hit wave on turboexl3's grouped banked decode (`MLX_SERVE_DSV41_T3_GROUP`, src/t3_group.zig), read by
 /// src/routed_t3.zig: turboexl3's banked group and DEVROUTE's id for a miss pair.
 pub const t3_group = @import("src/t3_group.zig");
+/// The t3 route's banked calls on turboexl3's grouped texts with an M = 3 member path (`MLX_SERVE_DSV41_HW4B`,
+/// src/hw4b.zig), read by src/routed_t3.zig's banked call.
+pub const hw4b = @import("src/hw4b.zig");
 /// The embedding table read from the pack per lookup (`MLX_SERVE_DSV41_EMBED_PREAD`, src/embed_pread.zig), read by the
 /// copied model.
 pub const embed_pread = @import("src/embed_pread.zig");
@@ -275,6 +278,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     routed_t3.configureGroup() catch |e| {
         log.err("[turboexl3_ds41] turboexl3 refused its banked group {d} ({s}): the load is refused\n", .{ t3_group.bankedGroup(), @errorName(e) });
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // After the banked group, before the bank opens (its warm-up builds the banked kernels): the M = 3 member path, on
+    // the t3 route's grouped banked decode only (unset: on with it, off without it).
+    hw4b.configure(env.span(.MLX_SERVE_DSV41_HW4B), routed_t3.enabled and t3_group.on) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_HW4B is none of 0, 1, check, or is 1 or check without the t3 route's grouped banked decode ({s}): the load is refused\n", .{@errorName(e)});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -669,6 +681,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     log.info("[turboexl3_ds41] vision tower: {s}\n", .{if (vision_lazy.on) "read from the pack for each image, not resident (MLX_SERVE_DSV41_VISION_LAZY=0: resident)" else "resident (MLX_SERVE_DSV41_VISION_LAZY=0)"});
     if (!routed_t3.enabled) log.info("[turboexl3_ds41] routed experts' decode on the streamer's own EXL3 kernels (MLX_SERVE_DSV41_ROUTED=streamer; unset: turboexl3)\n", .{});
     if (routed_t3.enabled) log.info("[turboexl3_ds41] t3 hit wave: {s}\n", .{if (t3_group.on) "turboexl3's grouped banked decode, up to four row-slots of one expert a weight decode, the device route's miss pairs skipped (MLX_SERVE_DSV41_T3_GROUP=0: the banked texts)" else "the banked texts (MLX_SERVE_DSV41_T3_GROUP=0)"});
+    if (routed_t3.enabled and t3_group.on) log.info("[turboexl3_ds41] hw4b: the banked calls {s}\n", .{switch (hw4b.mode) {
+        .on => "on the grouped GEMVs with an M = 3 member path (turboexl3 banked_m3; MLX_SERVE_DSV41_HW4B=0: a lead with three members of an expert on the M = 4 path)",
+        .off => "on the grouped GEMVs, a lead with three members of an expert on the M = 4 path (MLX_SERVE_DSV41_HW4B=0)",
+        .check => "on the grouped GEMVs, the M = 3 path's call beside each, every call's words compared ([hw4b] lines; MLX_SERVE_DSV41_HW4B=check)",
+    }});
     switch (woa_rows.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' wo_a span by span (MLX_SERVE_DSV41_WOA_ROWS=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' wo_a over runs of {d} rows, one grouped linear a run (MLX_SERVE_DSV41_WOA_ROWS=0: span by span)\n", .{woa_rows.rows}),
@@ -1269,7 +1286,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     // MLX_SERVE_DSV41_PG2: the [pg2] line (the counts since load).
     const pgc = pg2_t3.counts();
     const pgl = pg2.meters(pgc[0], pgc[1], meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len ..]);
-    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len;
+    // MLX_SERVE_DSV41_HW4B: the [hw4b] line (on or check; check's compares since the last request's end).
+    const hwl = hw4b.meters(meter_buf[n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len ..]);
+    const n = n0 + dp.len + swl.len + edl.len + dal.len + mdl_line.len + dsl.len + stl.len + lal.len + pgl.len + hwl.len;
     const io = if (round_io.on) round_io.meters(ioSnap(model(mp)), meter_buf[n..]) else meter_buf[n..n];
     // dq1b: the decode's demand ranges by class, the gate/up split's counts, the cold start's first calls.
     const dmd = demand_split.meters(meter_buf[n + io.len ..]);

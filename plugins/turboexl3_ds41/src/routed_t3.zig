@@ -13,6 +13,7 @@ const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
 const t3 = @import("turboexl3");
 const t3_group = @import("t3_group.zig");
+const hw4b = @import("hw4b.zig");
 
 /// Set at load from `MLX_SERVE_DSV41_ROUTED` (`config.routedT3`), before the bank opens.
 pub var enabled: bool = false;
@@ -112,7 +113,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         /// miss part, every array waited (gate and up at the gate value, down at the part's).
         pub fn downBanked(self: *const Self, g: *G, x: T, ids: T, banks: *const [3]Bank) !T {
             const tb = t3Banks(banks);
-            const y = try g.adopt(try t3.moeClampedBanked(g.s, x, &tb, ids, .mul1, self.state.limit));
+            const y = try g.adopt(try hw4b.banked(g.s, x, &tb, ids, .mul1, self.state.limit));
             const st = self.state;
             const pairs_n: u32 = @intCast(g.shapeOf(ids).dim(0));
             st.tally.banked += 1;
