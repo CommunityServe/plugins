@@ -458,6 +458,31 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   4438 and 4470, the host's waits on bytes 526 and 559 against 603 and 603, 91.86 GB read against 95.23 and 867
   read-ahead records posted against 1082; adoption held (3954 against 3944). Exact: the texts are the policy-off
   references in every arm (cold d081845201, new-text slice 3 4d5b401f3c).
+- `MLX_SERVE_DSV41_STAGE_VOTES` (src/stage_votes.zig, patches/turboexl3-zzz9a-stage-votes.patch; on at the floor 8, `=N`
+  the floor N, 1 to 65535, `=0` off; with `MLX_SERVE_DSV41_STAGE`): a wide prompt call's staging takes only the
+  predicted stream misses that at least N rows of the prediction name. Staging reads the prediction's stream misses past
+  the seed ranks, hottest first, so its tail is the experts a few rows name, the ones the call routes least often: on a
+  cold 16K card (ctl25's a arms, w-pio-20261102-0114) 786 staged records were never adopted, 10.47 GB of the prompt
+  pass's 102.6 GB. On, the plan (`stage_votes.plan`, for `stageGroups` and STAGE_NEXT's `stageNext`) stops at the
+  first expert of the ranking under the floor; the read-ahead into the persistent rows keeps the whole ranking, and an
+  expert the floor takes out that the call routes is read by its own route. On or off, every staged record keeps its
+  votes: a `[stage-votes] floor=
+  posted= adopted= cut= p1= a1= c1= ... p64= a64= c64=` line at the end of each prompt that staged, with
+  `MLX_SERVE_DSV41_PROMPT_IO` (bucket N: N to 2N - 1 votes, the last 64 and more; p staged, a adopted by a route of the
+  call, c taken out of a plan by the floor). `posted` is every record the prompt staged; `[stream-stats prompt]`'s
+  counters start at the prompt's first routed call, after the first wide layer's own read-ahead has staged, so on a
+  warm server its stage_posted is lower by that layer's staging (adopted agrees). Then the staged jobs by their read
+  records no route adopted (`jobs= jwaste= jall= j0= j1= j2= j4= j8=`; a job STAGE_TRIM withdrew is not counted).
+  Exact: the floor picks which records are staged, never the routes.
+- The floor 8 against `=0` (sv1, w-pio-20261102-0252, two binaries: a = ctl27 (f6aa81b, zzz8y), dylib 42a2a45fae3c;
+  b = this code on zzz8y with the floor off by default, dylib ac1a4670fddd, `=8` in the b arms; a warm server, then a1
+  b1 b2 a2): cold 16K a 1419.7/1415.2 -> b 1429.0/1428.0 tok/s (+0.78%, pairs +0.66% and +0.90%), new text (slice 3)
+  1500.8/1490.4 -> 1513.7/1497.5 (+0.67%, pairs +0.86% and +0.48%); 150 prompt / 179 decode rows in every arm. Read
+  102.25 -> 100.27 GB cold, 70.32 -> 68.52 new; the staging's waste 775 -> 624 records cold, 212 -> 109 new. The floor
+  took 957 records out of the cold card's staging (4268 -> 3311 posted), 806 of which the call adopted (3493 -> 2687):
+  808 more demand reads, about 151 records saved. What stays wasted is mostly high-vote (64 and more: 750 of 1104
+  adopted; 32 to 63: 151 wasted): the prediction's misses, which a higher floor does not reach. Exact: the texts the
+  same in every arm.
 
 - An a4k bank (patches/turboexl3-zzz8m-a4k.patch, src/mlx_serve/sdk/weights/streamed/expert/a4k.zig; the manifest declares
   it, `expert-manifest-v2.json`'s `sidecar.layout` "a4k"): each record's three codes start on a 4 KiB block, so the

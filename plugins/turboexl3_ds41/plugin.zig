@@ -99,6 +99,9 @@ pub const stage_trim = @import("src/stage_trim.zig");
 /// A wide prompt layer's predicted transient loads read during the call before it, into the windows that call's groups
 /// let go (`MLX_SERVE_DSV41_STAGE_NEXT`, src/stage_next.zig), read by the copied model, stream and source.
 pub const stage_next = @import("src/stage_next.zig");
+/// Staging's vote floor and every staged record's votes (`MLX_SERVE_DSV41_STAGE_VOTES`, src/stage_votes.zig), read by the
+/// copied stream and source.
+pub const stage_votes = @import("src/stage_votes.zig");
 /// A wide prompt layer's streams after its attention written into one per-prompt region (`MLX_SERVE_DSV41_SCRATCH`,
 /// src/scratch_x1.zig), read by the copied model.
 pub const scratch_x1 = @import("src/scratch_x1.zig");
@@ -346,6 +349,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    stage_votes.configure(env.span(.MLX_SERVE_DSV41_STAGE_VOTES)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE_VOTES is not a number from 0 to 65535 (unset: 8): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     engram_direct.configure(env.span(.MLX_SERVE_DSV41_ENGRAM_DIRECT)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ENGRAM_DIRECT is neither 0 nor 1 (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -580,6 +590,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     else
         log.info("[turboexl3_ds41] wide prompt layers' read-ahead and staging posted at the layer's start (MLX_SERVE_DSV41_STAGE_NEXT=0)\n", .{});
     if (stage_next.on) log.info("[turboexl3_ds41] {s}\n", .{if (stage_next.skip_own) "a wide prompt layer the call before it read ahead for skips its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own: its own too)" else "every wide prompt layer also runs its own read-ahead (MLX_SERVE_DSV41_STAGE_NEXT=own)"});
+    if (stage_votes.floor > 0)
+        log.info("[turboexl3_ds41] wide prompt calls stage only the predicted stream misses at least {d} rows of the prediction name, the read-ahead keeping the whole ranking ({s}MLX_SERVE_DSV41_STAGE_VOTES=0: every one); [stage-votes] lines with PROMPT_IO\n", .{ stage_votes.floor, if (stage.on) "" else "no effect: MLX_SERVE_DSV41_STAGE=0; " })
+    else
+        log.info("[turboexl3_ds41] wide prompt calls stage every predicted stream miss their windows hold (MLX_SERVE_DSV41_STAGE_VOTES=0); [stage-votes] lines with PROMPT_IO\n", .{});
     if (engram_direct.on) log.info("[turboexl3_ds41] a prompt's Engram rows read once a table, past the page cache through their file system blocks, on up to 64 threads (MLX_SERVE_DSV41_ENGRAM_DIRECT=0: span by span through the page cache)\n", .{}) else log.info("[turboexl3_ds41] Engram rows read span by span through the page cache (MLX_SERVE_DSV41_ENGRAM_DIRECT=0)\n", .{});
     engram_decode.start();
     switch (draft_ahead.mode) {

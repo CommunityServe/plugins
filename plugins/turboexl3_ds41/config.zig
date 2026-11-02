@@ -213,6 +213,7 @@ test {
     _ = @import("src/stage.zig");
     _ = @import("src/stage_trim.zig");
     _ = @import("src/stage_next.zig");
+    _ = @import("src/stage_votes.zig");
     _ = @import("src/scratch_x1.zig");
     _ = @import("src/engram_direct.zig");
     _ = @import("src/engram_decode.zig");
