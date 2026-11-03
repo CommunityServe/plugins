@@ -2838,20 +2838,32 @@ fn aneSelfCheck(m: *Model, st: *AneState) !void {
     var hn = mlx.mlx_array_new();
     const shape = [_]c_int{ ci(st.chunk_rows), ci(d) };
     const h = try sc.res(mlx.mlx_random_normal(&hn, &shape, 2, m.act, 0, 1, none, m.s), &hn);
-    const ref = try sc.astype(try sharedExpert(&sc, m, 0, &m.layers[0], h), .float32);
     const x = try aneInput(&sc, st, h);
-    try evalAll(&.{ ref, x });
+    try mlx.check(mlx.mlx_array_eval(x));
     const ptr: [*]const f16 = @ptrCast(@alignCast(mlx.mlx_array_data_uint8(x) orelse return error.HostRead));
-    const ran = st.progs.run(0, ptr);
-    if (!ran.ok) return error.AneSharedEval;
+    // Every covered layer against its GPU chain, layer 0 last so its output stays in the planes for the pack check.
+    var worst: struct { li: usize = 0, cos: f32 = 2, ratio: f32 = 1, ran: ane_mod.Programs.Ran = .{ .ok = true, .unit_ns = @splat(0) } } = .{};
+    var li = st.layers;
+    while (li > 0) {
+        li -= 1;
+        var lsc = Scope.init(m.gpa, m.s);
+        defer lsc.deinit();
+        const ref = try lsc.astype(try sharedExpert(&lsc, m, li, &m.layers[li], h), .float32);
+        try mlx.check(mlx.mlx_array_eval(ref));
+        const ran = st.progs.run(li, ptr);
+        if (!ran.ok) return error.AneSharedEval;
+        const yl = try aneOutput(&lsc, st, st.chunk_rows, d);
+        const dot = try lsc.sum(try lsc.reshape(try lsc.mul(yl, ref), &.{-1}), 0, false);
+        const ny = try lsc.sum(try lsc.reshape(try lsc.mul(yl, yl), &.{-1}), 0, false);
+        const nr = try lsc.sum(try lsc.reshape(try lsc.mul(ref, ref), &.{-1}), 0, false);
+        const v = [3]f32{ (try sc_mod.hostF32(dot))[0], (try sc_mod.hostF32(ny))[0], (try sc_mod.hostF32(nr))[0] };
+        const cos = v[0] / @sqrt(v[1] * v[2]);
+        // `!(cos >= worst.cos)` also takes a NaN, which then fails the check below.
+        if (!(cos >= worst.cos)) worst = .{ .li = li, .cos = cos, .ratio = @sqrt(v[1] / v[2]), .ran = ran };
+    }
+    log.info("[sushi_ds41] ane shared: self-check {d} layers, {d} random rows: worst cos {d:.6} (layer {d}) vs the GPU chain, |ane|/|gpu| {d:.4}, unit ms {d:.2}/{d:.2}\n", .{ st.layers, st.chunk_rows, worst.cos, worst.li, worst.ratio, @as(f64, @floatFromInt(worst.ran.unit_ns[0])) / 1e6, @as(f64, @floatFromInt(worst.ran.unit_ns[1])) / 1e6 });
+    if (!(worst.cos > 0.99)) return error.AneSharedSelfCheck;
     const y = try aneOutput(&sc, st, st.chunk_rows, d);
-    const dot = try sc.sum(try sc.reshape(try sc.mul(y, ref), &.{-1}), 0, false);
-    const ny = try sc.sum(try sc.reshape(try sc.mul(y, y), &.{-1}), 0, false);
-    const nr = try sc.sum(try sc.reshape(try sc.mul(ref, ref), &.{-1}), 0, false);
-    const v = [3]f32{ (try sc_mod.hostF32(dot))[0], (try sc_mod.hostF32(ny))[0], (try sc_mod.hostF32(nr))[0] };
-    const cos = v[0] / @sqrt(v[1] * v[2]);
-    log.info("[sushi_ds41] ane shared: self-check layer 0, {d} random rows: cos {d:.6} vs the GPU chain, |ane|/|gpu| {d:.4}, unit ms {d:.2}/{d:.2}\n", .{ st.chunk_rows, cos, @sqrt(v[1] / v[2]), @as(f64, @floatFromInt(ran.unit_ns[0])) / 1e6, @as(f64, @floatFromInt(ran.unit_ns[1])) / 1e6 });
-    if (!(cos > 0.99)) return error.AneSharedSelfCheck;
     if (!st.pack) return;
     // The GPU-packed planes: the same rows must give the same output, bit for bit.
     const y0 = try sc.contiguous(y);

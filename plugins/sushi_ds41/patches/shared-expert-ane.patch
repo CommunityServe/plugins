@@ -1,5 +1,5 @@
 diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
-index beff764..6fcbc76 100644
+index beff764..f50bd14 100644
 --- a/src/sushi/dsv41/dsv41_model.zig
 +++ b/src/sushi/dsv41/dsv41_model.zig
 @@ -20,6 +20,7 @@ const model_mod = @import("../model.zig");
@@ -63,7 +63,7 @@ index beff764..6fcbc76 100644
      const sy = try shared.value(sc, x);
      exl3.kernels.setDecodeParams(dec);
      const y = try sc.astype(try sc.keep(try exl3.rate_groups.moePrefillEarly(sc.s, x, rb, flat, scores, k, limit, early)), .float32);
-@@ -2578,6 +2599,465 @@ fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A)
+@@ -2578,6 +2599,477 @@ fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A)
      return ly.shared[2].apply(sc, act);
  }
  
@@ -306,20 +306,32 @@ index beff764..6fcbc76 100644
 +    var hn = mlx.mlx_array_new();
 +    const shape = [_]c_int{ ci(st.chunk_rows), ci(d) };
 +    const h = try sc.res(mlx.mlx_random_normal(&hn, &shape, 2, m.act, 0, 1, none, m.s), &hn);
-+    const ref = try sc.astype(try sharedExpert(&sc, m, 0, &m.layers[0], h), .float32);
 +    const x = try aneInput(&sc, st, h);
-+    try evalAll(&.{ ref, x });
++    try mlx.check(mlx.mlx_array_eval(x));
 +    const ptr: [*]const f16 = @ptrCast(@alignCast(mlx.mlx_array_data_uint8(x) orelse return error.HostRead));
-+    const ran = st.progs.run(0, ptr);
-+    if (!ran.ok) return error.AneSharedEval;
++    // Every covered layer against its GPU chain, layer 0 last so its output stays in the planes for the pack check.
++    var worst: struct { li: usize = 0, cos: f32 = 2, ratio: f32 = 1, ran: ane_mod.Programs.Ran = .{ .ok = true, .unit_ns = @splat(0) } } = .{};
++    var li = st.layers;
++    while (li > 0) {
++        li -= 1;
++        var lsc = Scope.init(m.gpa, m.s);
++        defer lsc.deinit();
++        const ref = try lsc.astype(try sharedExpert(&lsc, m, li, &m.layers[li], h), .float32);
++        try mlx.check(mlx.mlx_array_eval(ref));
++        const ran = st.progs.run(li, ptr);
++        if (!ran.ok) return error.AneSharedEval;
++        const yl = try aneOutput(&lsc, st, st.chunk_rows, d);
++        const dot = try lsc.sum(try lsc.reshape(try lsc.mul(yl, ref), &.{-1}), 0, false);
++        const ny = try lsc.sum(try lsc.reshape(try lsc.mul(yl, yl), &.{-1}), 0, false);
++        const nr = try lsc.sum(try lsc.reshape(try lsc.mul(ref, ref), &.{-1}), 0, false);
++        const v = [3]f32{ (try sc_mod.hostF32(dot))[0], (try sc_mod.hostF32(ny))[0], (try sc_mod.hostF32(nr))[0] };
++        const cos = v[0] / @sqrt(v[1] * v[2]);
++        // `!(cos >= worst.cos)` also takes a NaN, which then fails the check below.
++        if (!(cos >= worst.cos)) worst = .{ .li = li, .cos = cos, .ratio = @sqrt(v[1] / v[2]), .ran = ran };
++    }
++    log.info("[sushi_ds41] ane shared: self-check {d} layers, {d} random rows: worst cos {d:.6} (layer {d}) vs the GPU chain, |ane|/|gpu| {d:.4}, unit ms {d:.2}/{d:.2}\n", .{ st.layers, st.chunk_rows, worst.cos, worst.li, worst.ratio, @as(f64, @floatFromInt(worst.ran.unit_ns[0])) / 1e6, @as(f64, @floatFromInt(worst.ran.unit_ns[1])) / 1e6 });
++    if (!(worst.cos > 0.99)) return error.AneSharedSelfCheck;
 +    const y = try aneOutput(&sc, st, st.chunk_rows, d);
-+    const dot = try sc.sum(try sc.reshape(try sc.mul(y, ref), &.{-1}), 0, false);
-+    const ny = try sc.sum(try sc.reshape(try sc.mul(y, y), &.{-1}), 0, false);
-+    const nr = try sc.sum(try sc.reshape(try sc.mul(ref, ref), &.{-1}), 0, false);
-+    const v = [3]f32{ (try sc_mod.hostF32(dot))[0], (try sc_mod.hostF32(ny))[0], (try sc_mod.hostF32(nr))[0] };
-+    const cos = v[0] / @sqrt(v[1] * v[2]);
-+    log.info("[sushi_ds41] ane shared: self-check layer 0, {d} random rows: cos {d:.6} vs the GPU chain, |ane|/|gpu| {d:.4}, unit ms {d:.2}/{d:.2}\n", .{ st.chunk_rows, cos, @sqrt(v[1] / v[2]), @as(f64, @floatFromInt(ran.unit_ns[0])) / 1e6, @as(f64, @floatFromInt(ran.unit_ns[1])) / 1e6 });
-+    if (!(cos > 0.99)) return error.AneSharedSelfCheck;
 +    if (!st.pack) return;
 +    // The GPU-packed planes: the same rows must give the same output, bit for bit.
 +    const y0 = try sc.contiguous(y);
@@ -529,7 +541,7 @@ index beff764..6fcbc76 100644
  /// Whether the layer's routed chain, queued from the cache map, writes the new hyper-connection stream itself: a trellis
  /// layer of the backbone at decode width, where `hcExpand` is the kernel and nothing reads the sum.
  fn foldsExpand(m: *const Model, sh: *const Shared, li: usize, x1: A) bool {
-@@ -2624,6 +3104,15 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
+@@ -2624,6 +3116,15 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
              }
              return out;
          }
@@ -545,3 +557,19 @@ index beff764..6fcbc76 100644
          // At decode widths the GPU runs the shared expert while the host reads the picks and fills the misses, and the
          // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
          const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
+diff --git a/src/sushi/dsv41/dsv41_stream.zig b/src/sushi/dsv41/dsv41_stream.zig
+index f900433..5abc256 100644
+--- a/src/sushi/dsv41/dsv41_stream.zig
++++ b/src/sushi/dsv41/dsv41_stream.zig
+@@ -67,7 +67,10 @@ pub const Stream = struct {
+     fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?model.SharedOp) anyerror!A {
+         const self: *Stream = @ptrCast(@alignCast(ctx));
+         const y = try self.apply(sc, layer, x, idx, wts);
+-        return if (shared) |op| sc.add(y, try sc.astype(try op.value(sc, x), .float32)) else y;
++        // `.none`: the routed sum alone, as in `stqRoutedEarly` (the caller adds or drops the shared expert).
++        const op = shared orelse return y;
++        if (op == .none) return y;
++        return sc.add(y, try sc.astype(try op.value(sc, x), .float32));
+     }
+ 
+     fn leaseOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, idx: A) anyerror!model.Experts.Lease {

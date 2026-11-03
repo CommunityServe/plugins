@@ -67,7 +67,10 @@ pub const Stream = struct {
     fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?model.SharedOp) anyerror!A {
         const self: *Stream = @ptrCast(@alignCast(ctx));
         const y = try self.apply(sc, layer, x, idx, wts);
-        return if (shared) |op| sc.add(y, try sc.astype(try op.value(sc, x), .float32)) else y;
+        // `.none`: the routed sum alone, as in `stqRoutedEarly` (the caller adds or drops the shared expert).
+        const op = shared orelse return y;
+        if (op == .none) return y;
+        return sc.add(y, try sc.astype(try op.value(sc, x), .float32));
     }
 
     fn leaseOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, idx: A) anyerror!model.Experts.Lease {
