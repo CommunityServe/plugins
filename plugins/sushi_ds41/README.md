@@ -15,7 +15,8 @@ Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`
 (ddalcu/mlx-serve#1000).
 
 The slice is sushi ec2f5a29 (main, past v1.4.1; NOTICE). The numbers below were measured on the slice of sushi 3fc47d8a
-and later ones; none is re-measured on ec2f5a29 yet. This repo's edits to the slice are `patches/index-nax.patch`,
+and later ones. Against the cc1981df slice, ec2f5a29 measured prefill +1.5-2.4% (8k-64k) and decode +1.2-4.6% on an
+M5 Ultra, output byte-identical (https://github.com/CommunityServe/plugins/pull/28). This repo's edits to the slice are `patches/index-nax.patch`,
 `patches/prefill-pipeline.patch` and `patches/stream-ablation.patch`, applied in that order by `scripts/sync-sushi.sh`.
 
 Measured on M4 Max 128 GB, Sushi-STQ-1.75bpw, greedy:
