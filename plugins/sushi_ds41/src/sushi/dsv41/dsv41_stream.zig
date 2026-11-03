@@ -173,7 +173,17 @@ pub const StqStream = struct {
             .can = canQueue,
             .queue = queueOpaque,
             .settle = settleOpaque,
-        } };
+        }, .all_resident = allResident };
+    }
+
+    /// Every expert layer routes through its resident map (`Engine.residentRoute`): none is streamed or released for a
+    /// prefill, so no route fills a slab or the union from the host.
+    fn allResident(ctx: *anyopaque) bool {
+        const self: *StqStream = @ptrCast(@alignCast(ctx));
+        for (self.engine.layers, 0..) |*layer, li| {
+            if (layer.active and self.engine.residentRoute(@intCast(li)) == null) return false;
+        }
+        return true;
     }
 
     fn canQueue(ctx: *anyopaque, layer: usize) bool {
@@ -322,7 +332,10 @@ pub const StqStream = struct {
         const fill_before = self.engine.layers[@intCast(layer)].stats.fill_ns;
         var early: exl3.rate_groups.EarlyPlanes = .{};
         defer early.deinit();
-        // The caller evaluates the sum before a later layer can refill the union: the next layer's picks read it.
+        // The caller only submits the sum (at decode widths, and at prefill widths when the layers pipeline), so no wait
+        // here guards the slabs. A later layer's refill still comes after it: that layer's picks, read above before any
+        // slab write, need this sum. Across a chunk boundary nothing orders the next chunk's first refill after this
+        // chunk's last layers, so `extendState` drains before it returns when the experts stream.
         const out = try model.stqRoutedEarly(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared, if (staged) &early else null, null);
         if (staged) {
             const Start = struct {

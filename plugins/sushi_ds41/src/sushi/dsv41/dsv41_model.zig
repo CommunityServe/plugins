@@ -197,6 +197,9 @@ pub const Experts = union(enum) {
         can_prefetch: ?*const fn (ctx: *anyopaque, layer: usize) bool = null,
         /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
         spec: ?Spec = null,
+        /// Whether every layer maps its picks to resident slots on the GPU right now, so no route writes a slab from
+        /// the host. Null: the hook may stream (`streamsExperts`).
+        all_resident: ?*const fn (ctx: *anyopaque) bool = null,
     };
 
     pub const Spec = struct {
@@ -734,6 +737,13 @@ pub const Model = struct {
     pack_kv: bool = true,
     /// Tests: each layer completes on the GPU before the next is built, the decode schedule's reference.
     sync_layers: bool = false,
+    /// Prefill-width layers in flight: a layer is submitted, not waited on, and the host waits only on the oldest of
+    /// more than `pipe_depth` (`SUSHI_DS41_PREFILL_PIPELINE`; 0 waits on every layer, as before).
+    pipe_depth: usize = 2,
+    /// The in-flight layers' output streams, oldest at `pipe_head` (`pipeSubmit`).
+    pipe_q: [pipe_max]A = @splat(none),
+    pipe_head: usize = 0,
+    pipe_n: usize = 0,
     /// TEMPORARY A/B: a decode-width STQ layer queues its routed chain from the stream's cache map before the host
     /// reads its picks (`Experts.Spec`); off, it waits for them.
     route_spec: bool = true,
@@ -753,6 +763,7 @@ pub const Model = struct {
     profile: ?*Profile = null,
 
     pub fn deinit(self: *Model) void {
+        pipeDrain(self) catch {};
         if (self.profile) |pf| self.gpa.destroy(pf);
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
@@ -2359,6 +2370,77 @@ pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *co
     return sc.add(y, try sc.astype(sy, .float32));
 }
 
+/// The most prefill layers `pipe_depth` keeps in flight.
+pub const pipe_max = 8;
+
+/// Whether a pass of `rows` pipelines its layers (`pipe_depth`): prefill widths only, and none of the diagnostics that
+/// time or read a layer when it ends. A DSpark verify is never that wide (`ring_slack` rows at most), so verify and
+/// decode keep their own schedules.
+///
+/// Safe with a streamed (non-resident) expert layer too: its hook reads the layer's picks on the host before it
+/// writes any slab, and that read waits for the router, which needs the previous layer's routed output, so no queued
+/// layer still reads a slab being refilled. That ordering holds only inside one pass: the next chunk's first picks do
+/// not wait for this chunk's last layers, so `extendState` drains before it returns when the experts stream
+/// (`streamsExperts`), and interleaving two chunks' layers (a wavefront) under this pipeline would let a slab write race
+/// a queued reader of the other chunk.
+fn pipeOn(m: *const Model, rows: usize) bool {
+    comptime std.debug.assert(cfg_mod.ring_slack <= exl3.kernels.DECODE_ROWS_MAX);
+    return m.pipe_depth > 0 and rows > exl3.kernels.DECODE_ROWS_MAX and !m.sync_layers and m.profile == null and m.trace == null and m.tap == null;
+}
+
+/// Whether a route may write an expert slab from the host: a hook that does not say every layer is resident.
+fn streamsExperts(m: *const Model) bool {
+    return switch (m.experts) {
+        .resident => false,
+        .hook => |hk| if (hk.all_resident) |f| !f(hk.ctx) else true,
+    };
+}
+
+/// Queues a layer's arrays `ev` and tracks its output stream `x`; past `pipe_depth` layers in flight, waits for the
+/// oldest. The same graphs and kernels as an evaluation in place, so the same bytes: only when the host waits changes,
+/// and the GPU no longer drains while the host builds the next layer.
+fn pipeSubmit(m: *Model, ev: []const A, x: A) !void {
+    try submitAll(ev);
+    if (m.pipe_n == pipe_max) try pipeWaitOldest(m);
+    m.pipe_q[(m.pipe_head + m.pipe_n) % pipe_max] = handle(x);
+    m.pipe_n += 1;
+    while (m.pipe_n > m.pipe_depth) try pipeWaitOldest(m);
+}
+
+fn pipeWaitOldest(m: *Model) !void {
+    const slot = &m.pipe_q[m.pipe_head];
+    const x = slot.*;
+    slot.* = none;
+    m.pipe_head = (m.pipe_head + 1) % pipe_max;
+    m.pipe_n -= 1;
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_array_eval(x));
+}
+
+/// Waits for every pipelined layer and forgets them, then for everything else queued on the stream (the pass-begin
+/// and compressor submits the ring does not track). A failed wait still empties the queue.
+///
+/// With no layer in flight it returns at once and skips that stream sync too, on purpose: decode and verify passes
+/// never pipeline and reach this on every step (`finishPass`, `resetState`), so they pay no sync for it. A pipelined
+/// pass keeps at least one layer in the ring until it is drained, so its untracked submits never sit on the stream
+/// behind an empty ring.
+pub fn pipeDrain(m: *Model) !void {
+    if (m.pipe_n == 0) return;
+    var first: ?anyerror = null;
+    while (m.pipe_n > 0) pipeWaitOldest(m) catch |e| {
+        if (first == null) first = e;
+    };
+    _ = mlx.mlx_synchronize(m.s);
+    if (first) |e| return e;
+}
+
+/// Queues `xs` on the GPU without waiting for them.
+fn submitAll(xs: []const A) !void {
+    const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
+}
+
 /// Queues `x` on the GPU without waiting for it.
 pub fn submit(x: A) !void {
     try submitWith(x, &.{});
@@ -2480,7 +2562,7 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
             try p.mark(.routed, &.{out});
             if (hk.host_ns) |f| p.hostShare(f(hk.ctx) - host0);
         }
-        if (!early) try mlx.check(mlx.mlx_array_eval(out));
+        if (!early) try if (pipeOn(m, dim(h, 0))) submit(out) else mlx.check(mlx.mlx_array_eval(out));
         return out;
     }
     if (fusedOn(sc, m) and dim(h, 0) > 1 and c.dim % 8 == 0) return moeWide(sc, m, li, h, r, try sharedExpert(sc, m, li, ly, h));
@@ -2662,6 +2744,8 @@ pub fn ensureState(m: *Model) !*State {
 }
 
 pub fn resetState(m: *Model) void {
+    // Layers still in flight read the state about to be freed: let them finish first.
+    pipeDrain(m) catch {};
     m.dropAhead();
     if (m.dec_state) |*st| st.deinit();
     m.dec_state = null;
@@ -3090,7 +3174,8 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
     errdefer _ = mlx.mlx_array_free(x);
     errdefer _ = mlx.mlx_array_free(cpre);
     // A decode-width pass builds layer 0 on these lazily: the embedding is a few microseconds of GPU work.
-    if (L > exl3.kernels.DECODE_ROWS_MAX) try evalAll(if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre });
+    const made: []const A = if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre };
+    if (pipeOn(m, L)) try submitAll(made) else if (L > exl3.kernels.DECODE_ROWS_MAX) try evalAll(made);
     return .{ .st = st, .ids = ids, .p0 = p0, .span = span, .rows = rows, .x = x, .cpre = cpre, .sh = try Shared.init(gpa, (L + span - 1) / span), .img = img };
 }
 
@@ -3415,7 +3500,8 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     if (m.cfg.engram.layerAt(li)) |ei| if (ei + 1 == m.engrams.len) aheadEngram(m, p) catch {};
     const c = &m.cfg;
     // At decode widths a layer is submitted, not waited on: the next layer's router picks are the one host read.
-    const wait = m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX;
+    const piped = pipeOn(m, L);
+    const wait = (m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX) and !piped;
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     if (p.st.ds.len > 0) for (c.dspark.targets[0..c.dspark.n_targets], 0..) |tl, t| if (tl == li) {
@@ -3439,6 +3525,7 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     try appendVerifyArrays(gpa, &ev, p.st, li);
     if (m.trace) |t| try t.put("stream_{d}", .{li}, p.x);
     if (prof(m, L)) |pf| return pf.mark(.expand, ev.items);
+    if (piped) return pipeSubmit(m, ev.items, p.x);
     if (wait) return evalAll(ev.items);
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
@@ -3494,6 +3581,8 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
     const t0 = readStart();
     defer readDone(.head, t0);
     try mlx.check(mlx.mlx_array_eval(res));
+    // The logits waited for every pipelined layer of the pass: forget their handles, so no caller has to.
+    try pipeDrain(m);
     reportReads(L);
     return res;
 }
@@ -3694,6 +3783,11 @@ pub fn cedFork(m: *const Model, p: *const Pass, want: Want) !?Pass {
 /// So the chunk runs the encoder layers and the split layer's compressor over every row, then stops: no decoder, no
 /// DSpark rows, no head. A caller that takes a restore point at this boundary, or whose next chunk is no wider than the
 /// window, must not use it: the rings it leaves are not the ones the window reads.
+///
+/// A pipelined chunk (`pipeOn`) returns with up to `pipe_depth` layers and the split layer's compressor still queued
+/// when the experts are resident: the next chunk keeps the GPU busy behind them. The caller drains (`pipeDrain`)
+/// before it reads the state (a restore point, a capture) or ends the prompt; `finishPass` and `resetState` drain too.
+/// With streamed experts it drains itself, so the next chunk's first slab refill waits for no queued reader.
 pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows, ahead: []const u32) !void {
     const split = m.ced_split orelse return error.Dsv41NoCedSplit;
     errdefer m.dropAhead();
@@ -3712,7 +3806,12 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(m.gpa);
     try appendStateArrays(m.gpa, &ev, &st.layers[split]);
-    try evalAll(ev.items);
+    if (!pipeOn(m, ids.len)) {
+        try evalAll(ev.items);
+    } else {
+        try submitAll(ev.items);
+        if (streamsExperts(m)) try pipeDrain(m);
+    }
     reportEngramWait(m, ids.len);
     st.n = pass.p0 + ids.len;
     m.state_only_used += 1;
