@@ -212,6 +212,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     dsv.setIndexNax(m.mdl);
     log.info("[sushi_ds41] wide-span attention: {s}\n", .{if (m.mdl.attn_nax) "matmul2d (the M5's matrix units)" else "attnFused (simdgroup matrices)"});
     log.info("[sushi_ds41] decode index scan: {s}\n", .{if (m.mdl.index_nax) "matmul2d (the M5's matrix units)" else "scalar kernel"});
+    // Prototype, off unless `SUSHI_DS41_ANE_SHARED` is set: the shared expert of wide prefill chunks on the Neural Engine.
+    dsv.setAneShared(m.mdl);
     const idx_nax = index_nax.fits(c.index_heads, c.index_head_dim, .bfloat16);
     log.info("[sushi_ds41] prefill index scores: {s}\n", .{if (idx_nax) "matmul2d (the M5's matrix units)" else "indexScoresTile (simdgroup matrices)"});
     // As sushi's server does: a synced per-stage `[dsv41-prof]` line per wide chunk, and with the verify profile per

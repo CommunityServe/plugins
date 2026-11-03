@@ -1,6 +1,7 @@
 //! The Metal tests of `index_nax.zig` (`indexScoresNax` against `indexScoresTile`). The root of
 //! `zig build gpu-test -Dmlx-lib=<dir>` only (it links that MLX and sets SUSHI_DS41_GPU_TEST); skipped without an M5.
-//! It also runs `vision_key.zig`'s and `ablation_test.zig`'s tests, which need MLX but no M5, and
+//! It also runs `vision_key.zig`'s and `ablation_test.zig`'s tests, which need MLX but no M5, `ane_test.zig`'s (the ANE
+//! programs of `SUSHI_DS41_ANE_SHARED`), and
 //! `prefill_pipe_test.zig`, which needs the tiny checkpoint (`DSV41_TINY`). The attention kernel's own Metal tests are
 //! the slice's (`dsv41_model.zig`). As the plugin's root does, it is the `mlx_host` of the slice's `sushi_exl3` module.
 const std = @import("std");
@@ -19,6 +20,7 @@ test {
     _ = @import("vision_key.zig");
     _ = @import("prefill_pipe_test.zig");
     _ = @import("ablation_test.zig");
+    _ = @import("ane_test.zig");
 }
 
 fn randn(sc: *Scope, shape: []const c_int, seed: u64, dt: mlx.mlx_dtype) !A {
