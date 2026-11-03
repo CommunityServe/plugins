@@ -93,6 +93,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(stage_rows).step);
+    // MLX_SERVE_DSV41_FLASH_ATTN's MLX-free parts (the settings, the kernel's heads-region twin, check's stats):
+    // src/flash_plan.zig as a test of its own.
+    const flash_plan = b.addTest(.{ .name = "flash_plan", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/flash_plan.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(flash_plan).step);
     // MLX_SERVE_DSV41_DIRECT_PARTS's byte gate: the copied read pool's C file alone (no MLX) reading the pack's record
     // layout through the PARTS route and the staging route, the same slot bytes (src/direct_parts_test.zig).
     const parts_gate = b.addTest(.{ .name = "direct_parts", .root_module = b.createModule(.{

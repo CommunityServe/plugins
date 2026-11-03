@@ -57,6 +57,9 @@ var soffs: [slots]A = .{ none, none };
 var no_dep: A = none;
 /// Each slot's last pv's carrier: the slot's next qk binds it.
 var last_read: [slots]A = .{ none, none };
+/// MLX_SERVE_DSV41_FLASH_ATTN on (src/flash_attn.zig) clears it at load: the spans write no scores or probabilities, so
+/// a layer keeps the ring's span bookkeeping and the heads regions but makes no S or P regions.
+pub var ring_regions: bool = true;
 /// The slot geometry the regions hold: rows, heads, columns a slot.
 var g_rows: usize = 0;
 var g_heads: usize = 0;
@@ -76,6 +79,16 @@ pub fn layerBegin(eligible: bool, rows: usize, heads: usize, nk: usize) !bool {
     live = false;
     next = 0;
     if (mode == .off or !eligible) return false;
+    if (!ring_regions) {
+        s_region.free();
+        p_region.free();
+        g_rows = rows;
+        g_heads = heads;
+        g_nk = nk;
+        try ensureNoDep();
+        live = true;
+        return true;
+    }
     const words = rows * heads * nk;
     const n: c_int = @intCast(slots * words);
     const had = s_region.arr.ctx != null and p_region.arr.ctx != null and g_rows == rows and g_heads == heads and g_nk == nk;
@@ -94,13 +107,21 @@ pub fn layerBegin(eligible: bool, rows: usize, heads: usize, nk: usize) !bool {
         g_heads = heads;
         g_nk = nk;
     }
-    if (no_dep.ctx == null) {
-        const z: u32 = 0;
-        no_dep = mlx.mlx_array_new_data(&z, &[_]c_int{1}, 1, .uint32);
-        if (no_dep.ctx == null) return error.ScratchAttnDep;
-    }
+    try ensureNoDep();
     live = true;
     return true;
+}
+
+fn ensureNoDep() !void {
+    if (no_dep.ctx != null) return;
+    const z: u32 = 0;
+    no_dep = mlx.mlx_array_new_data(&z, &[_]c_int{1}, 1, .uint32);
+    if (no_dep.ctx == null) return error.ScratchAttnDep;
+}
+
+/// A `[1]` uint32 zeros: what a launch with nothing to follow binds as its `dep`.
+pub fn noDep() A {
+    return no_dep;
 }
 
 /// The layer's end: no span takes the ring until the next wide layer begins.
@@ -111,7 +132,7 @@ pub fn layerEnd() void {
 /// The slot a span of `rows` rows, `heads` heads and `nk` columns takes (the next one), or null (the fresh path): not
 /// live, or the span past a slot's geometry.
 pub fn take(rows: usize, heads: usize, nk: usize) ?u1 {
-    if (!live) return null;
+    if (!live or !ring_regions) return null;
     if (rows == 0 or rows > g_rows or heads != g_heads or nk > g_nk) {
         spans_fresh += 1;
         return null;
@@ -145,6 +166,8 @@ pub fn releaseAll() void {
     for (&run_regions) |*r| r.free();
     for (&run_release) |*x| drop(x);
     for (&run_last) |*x| drop(x);
+    for (run_all[0..run_n]) |*x| drop(x);
+    run_n = 0;
     h_rows = 0;
     h_groups = 0;
     h_in = 0;
@@ -205,6 +228,10 @@ var span_live = false;
 var span_row: u32 = 0;
 /// The current run's last pv carrier of each span parity (the publish gates both).
 var run_last: [slots]A = .{ none, none };
+/// MLX_SERVE_DSV41_FLASH_ATTN: every span's carrier of the current run (its spans are not chained; the publish gates all).
+const max_run_spans = 32;
+var run_all: [max_run_spans]A = @splat(none);
+var run_n: usize = 0;
 pub var runs_in: u64 = 0;
 pub var runs_fresh: u64 = 0;
 
@@ -231,7 +258,11 @@ pub fn headsLayerBegin(eligible: bool, rows: usize, groups: usize, in: usize, dt
 /// Before a span's attention: whether its run takes a region (`full`: the run has its `woa.rows` rows), whether the span
 /// starts the run, and its first row in the run.
 pub fn headsSpan(full: bool, starts_run: bool, row: usize) void {
-    if (starts_run) for (&run_last) |*x| drop(x);
+    if (starts_run) {
+        for (&run_last) |*x| drop(x);
+        for (run_all[0..run_n]) |*x| drop(x);
+        run_n = 0;
+    }
     headsSpanAt(full, starts_run, row);
 }
 
@@ -256,6 +287,13 @@ pub fn headsTarget() ?Target {
 pub fn headsWrote(j: u1, carrier: A) !void {
     try hold(&run_last[j], carrier);
 }
+/// MLX_SERVE_DSV41_FLASH_ATTN: a span's flash kernel wrote the region (no chain between spans): its carrier joins the
+/// run's publish.
+pub fn headsWroteFree(carrier: A) !void {
+    if (run_n == max_run_spans) return error.ScratchHeadsRunSpans;
+    try hold(&run_all[run_n], carrier);
+    run_n += 1;
+}
 
 /// A run's end: its region published for its `wo_a` (a new handle the caller owns; the host's event wait over the
 /// region and the last pv carrier of each span parity), the next run on the other region; null: the run kept the join.
@@ -269,7 +307,7 @@ pub fn headsRunEnd(s: mlx.mlx_stream) !?A {
     span_live = false;
     run_next +%= 1;
     runs_in += 1;
-    var gated: [3]A = undefined;
+    var gated: [3 + max_run_spans]A = undefined;
     var n: usize = 1;
     gated[0] = run_regions[run_cur].arr;
     for (run_last) |c| {
@@ -278,9 +316,14 @@ pub fn headsRunEnd(s: mlx.mlx_stream) !?A {
             n += 1;
         }
     }
+    for (run_all[0..run_n]) |c| {
+        gated[n] = c;
+        n += 1;
+    }
     if (n == 1) return error.ScratchHeadsUnwritten;
-    var outs: [3]A = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
-    defer for (outs[1..]) |x| {
+    var outs: [3 + max_run_spans]A = undefined;
+    for (outs[0..n]) |*x| x.* = mlx.mlx_array_new();
+    defer for (outs[1..n]) |x| {
         _ = mlx.mlx_array_free(x);
     };
     errdefer _ = mlx.mlx_array_free(outs[0]);

@@ -213,6 +213,9 @@ pub const scratch_attn = @import("src/scratch_attn.zig");
 /// The wide gather's pv at 64 output columns a threadgroup and its tensor-op launches three-dimensional, the same words
 /// (`MLX_SERVE_DSV41_ATTN_CORE`, src/attn_core.zig), read by the copied model.
 pub const attn_core = @import("src/attn_core.zig");
+/// A wide prompt layer's attention spans as one flash kernel, not exact (`MLX_SERVE_DSV41_FLASH_ATTN`, src/flash_attn.zig,
+/// kernels/attn_flash.metal), read by the copied model; its last-row logits dump (`MLX_SERVE_DSV41_FLASH_DUMP`).
+pub const flash_attn = @import("src/flash_attn.zig");
 /// A profile build (`zig build -Dplugin-profile=true`, never served): the copied stream's profile probes compiled in (its
 /// `sdk` reads this through this root) and the decode verify's GPU timeline (`MLX_SERVE_DSV41_TIMELINE`,
 /// src/verify_tl.zig).
@@ -673,6 +676,25 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN), env.span(.MLX_SERVE_DSV41_FLASH_DUMP)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_FLASH_ATTN is none of 0, 1, check (unset: on), or MLX_SERVE_DSV41_FLASH_DUMP is not an absolute directory: the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // FLASH_ATTN on serves every wide span from the flash kernel and the ring makes no S or P regions, so the checks
+    // that run the ring beside it refuse an explicit =1 and turn the default off (the gather served, as they check it).
+    if (flash_attn.mode == .on and (scratch_attn.mode == .check or q_tail.mode == .check)) {
+        if (flash_attn.explicit) {
+            log.err("[turboexl3_ds41] MLX_SERVE_DSV41_FLASH_ATTN=1 with MLX_SERVE_DSV41_SCRATCH_ATTN=check or MLX_SERVE_DSV41_Q_TAIL=check: the load is refused (the flash kernel replaces the ring's spans)\n", .{});
+            out.* = Verdict.refuse(.unsupported, "turboexl3_ds41: FlashAttnCombination");
+            return null;
+        }
+        flash_attn.mode = .off;
+        log.info("[turboexl3_ds41] MLX_SERVE_DSV41_SCRATCH_ATTN=check or MLX_SERVE_DSV41_Q_TAIL=check: flash attention off for this load (its default), the gather served\n", .{});
+    }
+    scratch_attn.ring_regions = flash_attn.mode != .on;
     woa_join.configure(env.span(.MLX_SERVE_DSV41_WOA_JOIN)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_WOA_JOIN is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -1067,6 +1089,12 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] wide prompt layers' attention gather with pv at 64 output columns a threadgroup and its tensor-op launches three-dimensional, (32, 1, 4) threadgroups, the same words (MLX_SERVE_DSV41_ATTN_CORE; =0: the stock text and launches)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' attention gather checked (MLX_SERVE_DSV41_ATTN_CORE=check): the stock pv text and launches served, every call's scores and pv also run at 64 columns and three-dimensional, compared word for word; [attn-core] check lines a kind every 128 calls, at its first differing word and at the model's end\n", .{}),
     }
+    switch (flash_attn.mode) {
+        .off => log.info("[turboexl3_ds41] wide prompt layers' attention spans on the gather (MLX_SERVE_DSV41_FLASH_ATTN=0; unset: the flash kernel)\n", .{}),
+        .on => log.info("[turboexl3_ds41] wide prompt layers' attention spans as one flash kernel (MLX_SERVE_DSV41_FLASH_ATTN; =0: the gather): keys in blocks of 128, an online softmax, the scores and probabilities never in memory (no S or P ring), {d} heads a threadgroup, the heads into SCRATCH_HEADS' run regions; NOT exact\n", .{16 * flash_attn.hgn}),
+        .check => log.info("[turboexl3_ds41] wide prompt layers' flash attention checked (MLX_SERVE_DSV41_FLASH_ATTN=check): the gather served, its launches fresh and the flash kernel beside every span, compared; a [flash-attn] check line a wide layer, [flash-attn] sample lines on two spans a layer\n", .{}),
+    }
+    if (flash_attn.dump_dir) |d| log.info("[turboexl3_ds41] each request's last prompt row's logits to {s}/fa1-logits-<pid>-<request>.bin (MLX_SERVE_DSV41_FLASH_DUMP)\n", .{d});
     switch (scratch_waves.mode) {
         .off => log.info("[turboexl3_ds41] prefill waves' intermediates in fresh buffers (MLX_SERVE_DSV41_SCRATCH_WAVES=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] prefill waves into per-prompt regions (MLX_SERVE_DSV41_SCRATCH_WAVES; =0: fresh buffers): their launches as write-into twins of the stock texts (compiled at load) on two sets of a wave's intermediates at {d} rows, an uncarried call's waves on them; [scratch-waves] at each request's end\n", .{scratch_waves.set_rows}),
@@ -1494,13 +1522,18 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     round_io.abandon();
     // MLX_SERVE_DSV41_DRAFT_AHEAD: a forward moves the state past any launched draft.
     dropAhead();
-    const dr = if (drafter) |*d| d else return ds.table.forward(mp, f, out);
+    const dr = if (drafter) |*d| d else {
+        const v0 = ds.table.forward(mp, f, out);
+        if (v0.isOk()) flashDump(mp, f, out);
+        return v0;
+    };
     settlePending(dr);
     const at: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
     const on_gpu = f.ids.ctx != null and f.rows == 1 and f.logits != .all_rows;
     const in: ?v4plugin.Ids = if (on_gpu) null else v4plugin.Ids.of(f) catch null;
     defer if (in) |x| x.deinit();
     const v = ds.table.forward(mp, f, out);
+    if (v.isOk()) flashDump(mp, f, out);
     if (v.isOk()) routesStep(model(mp), f.rows, 0, 0, &.{}, 0, true);
     if (!v.isOk() or f.slots.len > 1 or (!on_gpu and in == null)) {
         dr.history.lose();
@@ -1516,6 +1549,12 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     return v;
 }
 
+/// MLX_SERVE_DSV41_FLASH_DUMP (src/flash_attn.zig): a prompt forward's last row's logits to the dump dir.
+fn flashDump(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) void {
+    if (flash_attn.dump_dir == null or f.rows < 2 or out.logits.ctx == null) return;
+    flash_attn.dumpLogits(model(mp).mdl.s, .{ .ctx = out.logits.ctx });
+}
+
 /// The request's prompt and the prefix its state kept (`resumePrompt`): the usage record's token counts.
 var req_prompt: usize = 0;
 var req_kept: usize = 0;
@@ -1527,6 +1566,7 @@ fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: ab
     // MLX_SERVE_DSV41_DRAFT_AHEAD: a new prompt's state takes no launched draft.
     dropAhead();
     const n = ds.table.cache.resume_prompt.?(mp, slot, prompt, media_rows);
+    flash_attn.requestBegin();
     req_prompt = prompt.len;
     req_kept = @min(@as(usize, @intCast(n)), prompt.len);
     routesBegin(model(mp));

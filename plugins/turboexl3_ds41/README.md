@@ -1079,6 +1079,47 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   1570.7 (+1.32%, pairs +1.55% / +1.08%); its check arm 0 differing words and max_ulps 0 on every line (qk_t 2461
   calls, pv 2504, qk 43); the guard's peak not up (a 108.4 / 104.3, b 99.8 / 108.5); the bank's rows 147 / 176 in
   both a arms and b2 (b1 opened at 146, the bill's load-time noise).
+- `MLX_SERVE_DSV41_FLASH_ATTN` (src/flash_attn.zig, its MLX-free parts src/flash_plan.zig, src/kernels/attn_flash.metal,
+  patches/turboexl3-zzz9z-flash-attn.patch; on by default, `=0` the gather, `=check`): a wide prompt layer's attention span as
+  one flash kernel in place of the gather's three launches (Q_TAIL's qk_t, sm, pv at DT 64) and the SCRATCH_ATTN ring's
+  scores and probabilities. One threadgroup is a query row and 64 heads (16 simdgroups), which share the row's keys (one KV
+  head; the keys are the values); the keys go in blocks of 128 (the window's rows, then the picks in their order); per
+  block each simdgroup scores its 32 keys for its 16 heads on the tensor units (dec_attn's 16 x 32 x 16 op, Q_TAIL's tail
+  for the last 64 dims), the block's max per head joins the running max through threadgroup memory, exp(scale * s - m)
+  goes to threadgroup memory as f16 (16 KB), and the simdgroup accumulates its 128 output dims over the block (f32,
+  rescaled by exp(m_old - m_new)); the sink starts the state (m = sink, l = 1); the epilogue divides by l, inverse-ropes
+  the last 64 dims and stores the heads straight into SCRATCH_HEADS' run region (a twin derived at load, as pv's heads
+  twin is). No S or P is written, so the ring makes no regions (126 MB; the prompt bill is unchanged, so an A/B's rows
+  stay the same); the spans are not chained by the ring's slots (every span's carrier gates its run's publish). NOT exact:
+  the probabilities round to f16 against the running max before the division (the gather's sm divides first), the
+  accumulator is rescaled in f32 and the sum's order differs. `check` serves the gather and runs its launches fresh and the
+  kernel beside every span: `[flash-attn] check layer= spans= words= differ= differ_pct= max_abs= max_rel= rms_rel=` a
+  wide layer (max_rel floored at the span's served rms), and on the middle and last span of each wide layer `[flash-attn]
+  sample` (an index layer's picks: the mean share of a row's picks its next row also picks, and the mean union of 4, 8
+  and 16 rows' picks in units of 512; every layer: the share of (row, 128-key block) whose largest probability over all
+  64 heads is below 2^-11 and 2^-8, and of (row, head, block) below 2^-11). `MLX_SERVE_DSV41_FLASH_DUMP=<absolute dir>`
+  writes each request's last prompt row's logits (f32) as `fa1-logits-<pid>-<request>.bin`. SCRATCH_ATTN=check and
+  Q_TAIL=check turn the default off for their load (the gather they check served); an explicit `=1` with them refuses the
+  load by name (`FlashAttnCombination`), and an explicit `=1` refuses a wide span the kernel cannot take
+  (`FlashAttnShape`; by default the gather's fresh launches serve it). SCRATCH_HEADS=check serves the run's join from the
+  kernel's own heads and compares the region with it. On by default since David's 2026-11-03 rule (flash attention judged
+  on speed and quality, not on identical words) and fa1p/fa1q below (merged on by default by David, 2026-11-03).
+  - Read as fa1p (M5 Max, w-pio-20261103-1329; a = ctl53 bf2eb6b6b7dd, b = this at `=1` (f34b259c7147), both on G_KITBM
+    with keyed sampling, the bill pinned, rows 141 / 170 in every arm; warm (a), c1 (b at `check`), then a1 b1 b2 a2, each a
+    cold code-ctx16384 card request then the new-text 16K slice 3): cold 1695.8 1692.4 against 1692.3 1715.4 tok/s (+0.58%;
+    pairs -0.21, +1.36), new text 1759.5 1764.8 against 1800.7 1798.4 (+2.12%; pairs +2.34, +1.90); the 32-token texts the
+    same in every arm; the footprint 128-140 MB lower (no ring); c1: 3.8-7.5% of a wide layer's bf16 head words differ, by
+    at most one bf16 ulp (rms_rel 5.5e-4 to 8.4e-4).
+  - Read as fa1q (w-fa1q-20261103-1348; exact against `=1`, one server each): the texts first differ at token 96 of the
+    card (T 1.0; 0.164 of the positions equal), 438 of greedy (0.947), 300 of a 32K code prompt (0.799), 56 of a prose
+    summary (0.263) and 3 of a 16K code explanation (0.033), each after a near tie and coherent in both arms; at the
+    prompts' last rows KL(exact || flash) 3.8e-3 to 4.5e-2 and the top token the same on 5 of 6, flipped on one near tie
+    (fa1p's slice 3: "```" 0.531 / "def" 0.468 exact, 0.438 / 0.562 flash).
+  fa1u (w-fa1u-20261103-1204, the microbench: a 256-row span at 16128 over 8192 compressed rows, NK 640, GROUPED; against
+  the served trio, A B B A x3, medians): 64 independent spans an evaluation 563.1 -> 515.8 us a span (0.916; 32 heads a
+  threadgroup 0.992), 8 chained spans 618.4 -> 555.7 (0.899; 32 heads 0.799); the window-only span (NK 128) 153.0 ->
+  165.4 (1.081); against an f64 reference on 8 rows the heads' rms relative error 1.663e-3 (the trio's 1.665e-3);
+  against the trio 11.0% of the bf16 words differ, by at most one bf16 ulp.
 - `MLX_SERVE_DSV41_SCRATCH` (src/scratch.zig: the regions; src/scratch_x1.zig, src/kernels/hc_expand_into.metal,
   patches/turboexl3-zzz8r-scratch-x1.patch; on, `=0` off, `check` checked): a wide prompt layer's streams after its
   attention (`x1`, [rows, 4, 5120] f32, 1.34 GB at 16K rows) written into one per-prompt buffer, not a fresh MLX
