@@ -14,7 +14,9 @@ Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`
 (ddalcu/mlx-serve#1002), host-decoded media (`MediaInput`, ddalcu/mlx-serve#1003) and the array-based aux snapshot hooks
 (ddalcu/mlx-serve#1000).
 
-The numbers below were measured on the slice of sushi 3fc47d8a; the slice is now sushi cc1981df (NOTICE).
+The slice is sushi ec2f5a29 (main, past v1.4.1; NOTICE). The numbers below were measured on the slice of sushi 3fc47d8a
+and later ones; none is re-measured on ec2f5a29 yet. This repo's edits to the slice are `patches/index-nax.patch`,
+`patches/prefill-pipeline.patch` and `patches/stream-ablation.patch`, applied in that order by `scripts/sync-sushi.sh`.
 
 Measured on M4 Max 128 GB, Sushi-STQ-1.75bpw, greedy:
 
@@ -37,41 +39,40 @@ runs against sushi v1.4.0 serving the same pack:
 Text matches sushi (prompt 2 identical, prompt 1 identical for the first 239 characters, a known near-tie), with
 DSpark on or off.
 
-With the wide-span attention on the M5's matrix units (`src/attn_nax.zig`), same machine and pack, A/B against the
-simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2343 (1.12x to 1.14x); KLD against the FP8 teacher
-0.1849, against 0.1854 for the simdgroup kernel. Decode does not run it (spans of 16 rows or fewer).
-
 - DSpark: greedy and sampled requests (the engine accepts a sampled block; the plugin drafts and keeps what it accepts). `{"mtp": false}` in the model settings keeps the stages off.
 - Prefix cache: a restore point at the prompt's last token, images included: it is keyed by its ids and a hash of the
   image rows they cover (`src/vision_key.zig`), so two images, whose placeholder ids are the same, never share one.
 - Images: one frame, decoded by mlx-serve (`MediaInput`); the plugin lays it out as the release's processor does. The
   bf16 tower is requantized to affine 8-bit (group 128) at load, as sushi does.
-- Token embedding: an affine-quantized embedding stays in its shard and a forward reads its rows from SSD, as sushi does;
-  the bytes it frees go to the expert cache.
+- Token embedding: resident on the GPU and billed with the trunk, as sushi does since 3568d932.
 - Memory: sushi runs each forward under an MLX transient cap that needs its patched MLX; mlx-serve's MLX has none, so
   the plugin keeps its own buffer-pool caps and bills the prefill pool in the expert room.
-- Attention: on an M5 GPU (`applegpu_g17` or later, macOS 26.2 or later) a prompt's wide spans run on the matrix
-  units through Metal 4 tensor ops (`src/attn_nax.zig`), within 3e-5 of the simdgroup kernel, with the picked
-  compressed rows read packed from the store as sushi's kernel reads them; other GPUs keep that kernel. The edit to the
-  slice that calls it is `patches/attn-nax.patch` (`fusedHeads`).
-- Index scores: on an M5 GPU a prompt's wide spans score their compressed blocks on the matrix units
+- Attention, decode index scan and prefill, from the sushi slice: the wide-span attention on the M5's matrix units and
+  the decode index scan of the packed keys on them (sushi fafc69c8, byte for byte the scalar kernel's scores), each
+  kept only if its load-time trial agrees with the SIMD kernel (`setAttnNax`, `setIndexNax`; other GPUs and a declined
+  trial keep that kernel); the attention epilogue in the kernel's store, state-only CED chunks, the shared expert on
+  the routed prefill launches, the hyper-connection mix tile and the decode fold of the hyper-connection expand.
+- Index scores, prefill: sushi's matrix-unit scan covers only decode widths (16 rows or fewer) and the candidate
+  gather, so on an M5 GPU a prompt's wide spans score their compressed blocks on the matrix units here
   (`src/index_nax.zig`, `patches/index-nax.patch`): 16 query rows share each staged 32-key tile, with the relu, head
   weights and head sum in registers. 3.3x on the scorer (0.70 against 2.32 ms a 256-row span at 24k blocks); the
   scores are within 1.2e-7 of `indexScoresTile`'s and 10 of 194 million top-512 picks differ on real 32k-64k prompts,
-  so long-prompt text can differ from the simdgroup scorer after a few tokens, as with the matmul2d attention.
+  so long-prompt text can differ from the simdgroup scorer after a few tokens.
+- Expert prefetch: off, sushi's default since a7242135 (its `--ssd-prefetch` defaults to 0); the plugin has no switch.
 - Prefill: the whole prompt in one host call (`whole_prompt_prefill`), chunked here at `prefill_width` as sushi does; a
-  long prompt is one uncancellable call. A chunk that another chunk follows skips its CED decoder tail
-  (`patches/ced-state.patch`, `extendState`): it runs the layers below the split and the split layer's compressor, since
-  the next chunk's tail overwrites the 128-row rings that tail would fill. Prefill 8k / 32k / 64k 2466 / 2758 / 2729 to
-  2562 / 3079 / 3063 tok/s on the M5 Ultra; text and logprobs are byte-identical on 8k to 64k prompts, a merged tail, an
-  image and a prefix-cache restore.
+  long prompt is one uncancellable call. A chunk that another chunk follows, both wider than the window, skips its CED
+  decoder tail (`extendState`, from the slice since sushi 022b9222): it runs the layers below the split and the split
+  layer's compressor, since the next chunk's tail overwrites the 128-row rings that tail would fill. Measured when it was
+  this repo's patch: prefill 8k / 32k / 64k 2466 / 2758 / 2729 to 2562 / 3079 / 3063 tok/s on the M5 Ultra; text and
+  logprobs byte-identical on 8k to 64k prompts, a merged tail, an image and a prefix-cache restore.
 - Prefill pipeline: a prefill-width layer is submitted, not waited on, with up to 2 in flight
   (`SUSHI_DS41_PREFILL_PIPELINE`, 0 turns it off; `patches/prefill-pipeline.patch`, `pipeOn`). Same graphs, same bytes.
 - Directional ablation (`Caps.ablation`, mlx-serve's `--ablation-profiles`): a request's direction is removed from
   every write to the hyper-connection stream: the embedding (text and image rows, and the DSpark stages' block input),
   each attention output, each FFN output (in the fused decode kernel's expanded stream through its component formula)
   and each Engram value. Armed per call on `forward`, `NativeDrafter.step` and `verify`; a request without one runs
-  the graphs unchanged. The slice edit is `patches/stream-ablation.patch` (applied last).
+  the graphs unchanged. An armed request does not take the slice's decode fold of the hyper-connection expand, so its
+  FFN output is ablated before the expand. The slice edit is `patches/stream-ablation.patch` (applied last).
 - Calibration tap: `SUSHI_DS41_TAP_DIR=<dir>` writes each prompt's stream (the mean of the hc copies entering every
   layer and leaving the last, for the prefix pass's last 4 rows and the last token) as `tap-<seq>.npy` (f32
   `[layers + 1, rows, dim]`) plus a line in `index.jsonl`. Route speculation is off only for the passes it records.

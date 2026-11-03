@@ -31,7 +31,7 @@ const ablation = @import("src/ablation.zig");
 const tap_files = @import("src/tap.zig");
 
 /// Shown at install and in Settings.
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 pub const plugin = kit.sdk.Plugin{
     .name = "sushi_ds41",
