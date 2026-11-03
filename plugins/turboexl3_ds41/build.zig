@@ -93,6 +93,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(stage_rows).step);
+    // MLX_SERVE_DSV41_FLASH_ATTN's MLX-free parts (the settings, the kernel's heads-region twin, check's stats):
+    // src/flash_plan.zig as a test of its own.
+    const flash_plan = b.addTest(.{ .name = "flash_plan", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/flash_plan.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(flash_plan).step);
     // MLX_SERVE_DSV41_DIRECT_PARTS's byte gate: the copied read pool's C file alone (no MLX) reading the pack's record
     // layout through the PARTS route and the staging route, the same slot bytes (src/direct_parts_test.zig).
     const parts_gate = b.addTest(.{ .name = "direct_parts", .root_module = b.createModule(.{
@@ -122,6 +130,19 @@ pub fn build(b: *std.Build) void {
         a4k_run.has_side_effects = true;
     }
     b.top_level_steps.get("test").?.step.dependOn(&a4k_run.step);
+    // MLX_SERVE_DSV41_DEMAND_FIRST's byte gate (df1): the copied read pool's C file alone (no MLX), with its test hooks
+    // (-DQ3LD_INJECT: scripted per-offset faults and sleeps, delays before the lookahead's reads and the demand ranges),
+    // reading a temp file's records through the lookahead and the demand at each mode, every slot row the file's bytes
+    // (src/demand_first_test.zig).
+    const df_gate = b.addTest(.{ .name = "demand_first", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/demand_first_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    df_gate.root_module.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" } });
+    df_gate.root_module.addIncludePath(b.path(csrc));
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(df_gate).step);
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/turboexl3_sdk.zig"),
         .target = target,

@@ -27,7 +27,7 @@ export fn q3ld_mtl_signal(event: ?*anyopaque, value: u64) void {
     _ = value;
 }
 
-const abi = 2026110202;
+const abi = 2026110203;
 const counters_n = 84;
 /// The pool's SC_PARTS_DIRECT, SC_PARTS_DIRECT_BYTES, SC_PARTS_STAGED_BYTES.
 const sc_parts = 72;

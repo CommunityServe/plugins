@@ -195,6 +195,7 @@ test {
     _ = @import("src/markov_plan.zig");
     _ = @import("src/prompt_io.zig");
     _ = @import("src/dec_prefetch.zig");
+    _ = @import("src/l39_last.zig");
     _ = @import("src/direct_parts.zig");
     _ = @import("src/round_io.zig");
     _ = @import("src/stream_lookahead.zig");
@@ -211,6 +212,10 @@ test {
     _ = @import("src/wide_early.zig");
     _ = @import("src/rest_early.zig");
     _ = @import("src/transient_keep.zig");
+    _ = @import("src/buffer_mb.zig");
+    _ = @import("src/bill_pin.zig");
+    _ = @import("src/decode_cache.zig");
+    _ = @import("src/decode_floor.zig");
     _ = @import("src/rest_async.zig");
     _ = @import("src/q_tail.zig");
     _ = @import("src/engram_twin.zig");
@@ -220,9 +225,11 @@ test {
     _ = @import("src/whole_stream.zig");
     _ = @import("src/stage.zig");
     _ = @import("src/stage_trim.zig");
+    _ = @import("src/stage_copy.zig");
     _ = @import("src/stage_next.zig");
     _ = @import("src/stage_votes.zig");
     _ = @import("src/gu_split.zig");
+    _ = @import("src/demand_first.zig");
     _ = @import("src/demand_split.zig");
     _ = @import("src/cold_start.zig");
     _ = @import("src/scratch_x1.zig");

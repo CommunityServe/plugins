@@ -1,0 +1,47 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -273,6 +273,7 @@
+     pub const MLX_SERVE_DSV41_BUFFER_MB: Var = .{ .kind = .kill, .type = .text, .default = "prompt (500)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompts' MLX command-buffer split (turboexl3_ds41, through the host's HostGpu.command_buffer_limits): unset, empty or prompt, 500 MB from each phase change to a prompt, MLX's own split put back at the change to decode; N: N MB; 0: off; a user's MLX_MAX_MB_PER_BUFFER wins; a host without the entry keeps MLX's split; the same words" };
+     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
+     pub const MLX_SERVE_DSV41_COMPILE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 compiled decode stretches (=0: every op eager)" };
++    pub const MLX_SERVE_DSV41_DECODE_FLOOR: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode bill (turboexl3_ds41): unset, empty or 1, the decode phase's working set billed with a decode floor of 128 MiB, not a prompt pass's 512 (480 MiB more for the decode slot rows at the 32K rung); 0: the prompt pass's floor" };
+     pub const MLX_SERVE_DSV41_DECODE_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "split where its curves fit the pack, else flat", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode slot rows (turboexl3_ds41): unset, the flat bill's decode bytes split across the layers by its development corpus's misses-a-row curves, each layer between its prompt rows and 256, where the curves fit the pack (flat rows where they do not); flat: flat rows; split: the split required (refused by name, rows flat, where it does not fit)" };
+     pub const MLX_SERVE_DSV41_DEC_INVARIANT: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 indexer linears' decode rows the same words at any verify width (turboexl3_ds41): unset or 1, the indexer's head weights and index keys (plain bf16 linears MLX runs as its gemv for one row and as gemv_wide or its GEMM for more) at 2 to 6 rows on a batched twin of MLX's one-row gemv, every row that gemv's words, the weight read once a launch, the launch per weight shape and rows from this machine's timings; one row and wider calls keep MLX's matmul (one row: its gemv); check, on and every twin call compared with MLX's one-row matmul of each row, word for word ([gemv-twin] check lines), and the call's own matmul against the same words, reported ([gemv-twin] wide-vs-m1 lines); 0: MLX's matmul at every width" };
+     pub const MLX_SERVE_DSV41_L39_LAST: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 replaying prompt chunk's last decoder layer (turboexl3_ds41): unset, empty or 1, its routed call over the last row only (the one row the logits read; the window KV, the drafter's rows and decode state the stock ones), forced through the wide lane's waves and combine; 0: every tail row routed; check, the 128-row call served and its last row compared with the one-row call's word for word ([l39-last] differ=)" };
+diff -ruN -x .generated a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/bill.zig
+--- a/plugins/deepseek_v41/bill.zig
++++ b/plugins/deepseek_v41/bill.zig
+@@ -33,6 +33,14 @@
+ /// under the ceiling the decode phase's budget takes back (MLX's cache capped at decode instead), set at the load before
+ /// the bank opens; 0 off. The prompt phase's budget keeps the whole stop.
+ pub var decode_stop_cut: u64 = 0;
++/// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FLOOR, the plugin's src/decode_floor.zig): the runtime floor the decode phase's
++/// working set is billed with, set at the load before the bank opens; null: a prompt pass's, PREFILL_RUNTIME_FLOOR_BYTES.
++pub var decode_floor: ?u64 = null;
++/// The decode phase's working set at `context` positions: the state at `context + stream_generation`, one row's arrays and
++/// the decode floor (`decode_floor`, else a prompt pass's).
++fn wsDecode(config: *const cfg_mod.Config, context: u64) u64 {
++    return dsv41_mod.prefillBytes(config, kvPerToken(config), context + stream_generation, 1, decode_floor orelse PREFILL_RUNTIME_FLOOR_BYTES);
++}
+ /// turboexl3_ds41 (MLX_SERVE_DSV41_BILL_PIN, the plugin's src/bill_pin.zig): the memory in use the budget reads, given the
+ /// live reading (null: the live reading, as before), set at the load before the bank opens; `in_use_pinned` names what
+ /// it did, for the `[bank-bill]` line.
+@@ -57,7 +65,7 @@
+     if (host_ceiling) |ceiling| box = @min(box, ceiling() -| wired_margin -| stream_host_bytes -| engram_store_bytes);
+     return .{
+         .prompt = box -| prefillAt(config, context, stream_call_rows),
+-        .decode = (if (box > 0) box + decode_stop_cut else 0) -| prefillAt(config, context + stream_generation, 1),
++        .decode = (if (box > 0) box + decode_stop_cut else 0) -| wsDecode(config, context),
+     };
+ }
+ /// The bytes the host lets the plugin still allocate on the GPU (set by the plugin's load); null in mlx-serve itself.
+@@ -75,7 +83,7 @@
+         .store = engram_store_bytes,
+         .in_use = inUse(),
+         .ws_prompt = prefillAt(config, context, stream_call_rows),
+-        .ws_decode = prefillAt(config, context + stream_generation, 1),
++        .ws_decode = wsDecode(config, context),
+         .decode_cut = decode_stop_cut,
+     };
+ }

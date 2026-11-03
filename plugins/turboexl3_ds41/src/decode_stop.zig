@@ -24,6 +24,10 @@ pub var mode: Mode = .on;
 pub const cut_bytes: u64 = 1_000_000_000;
 /// MLX's cache cap at decode.
 pub const cache_bytes: usize = 1 << 30;
+/// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_CACHE, src/decode_cache.zig): the cut and the cap in force, set at load before
+/// the bill reads the cut; `cut_bytes` and `cache_bytes` unless DECODE_CACHE moves them.
+pub var cut_now: u64 = cut_bytes;
+pub var cache_now: usize = cache_bytes;
 
 /// The cap in effect before decode's (restored at the change back to a prompt); null outside decode.
 var prompt_cap: ?usize = null;
@@ -54,7 +58,7 @@ pub fn on() bool {
 
 /// The bill's decode cut (`bill.decode_stop_cut`): `cut_bytes` on, 0 off.
 pub fn cutBytes() u64 {
-    return if (on()) cut_bytes else 0;
+    return if (on()) cut_now else 0;
 }
 
 /// The phase change to decode, after the grow: MLX's cache capped at `cache_bytes` (never raised: a tighter cap stays),
@@ -62,8 +66,8 @@ pub fn cutBytes() u64 {
 pub fn enterDecode() void {
     if (!on() or prompt_cap != null) return;
     var prev: usize = 0;
-    _ = mlx.mlx_set_cache_limit(&prev, cache_bytes);
-    if (prev < cache_bytes) {
+    _ = mlx.mlx_set_cache_limit(&prev, cache_now);
+    if (prev < cache_now) {
         var tmp: usize = 0;
         _ = mlx.mlx_set_cache_limit(&tmp, prev);
     }
@@ -85,7 +89,7 @@ pub fn enterPrompt() void {
 pub fn meters(buf: []u8) []const u8 {
     if (mode == .off) return buf[0..0];
     var w: std.Io.Writer = .fixed(buf);
-    w.print("[decode-stop] mode={t} cut_mb={d} cache_mb={d} prompt_cache_mb={d} enters={d} exits={d}\n", .{ mode, cut_bytes >> 20, cache_bytes >> 20, last_prompt_cap >> 20, enters, exits }) catch return buf[0..0];
+    w.print("[decode-stop] mode={t} cut_mb={d} cache_mb={d} prompt_cache_mb={d} enters={d} exits={d}\n", .{ mode, cut_now >> 20, cache_now >> 20, last_prompt_cap >> 20, enters, exits }) catch return buf[0..0];
     return w.buffered();
 }
 
