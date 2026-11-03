@@ -220,6 +220,7 @@ test {
     _ = @import("src/whole_stream.zig");
     _ = @import("src/stage.zig");
     _ = @import("src/stage_trim.zig");
+    _ = @import("src/stage_copy.zig");
     _ = @import("src/stage_next.zig");
     _ = @import("src/stage_votes.zig");
     _ = @import("src/gu_split.zig");

@@ -131,6 +131,9 @@ pub const stage = @import("src/stage.zig");
 /// A wide prompt call's staged records its routes do not take let go before the drive reaches them
 /// (`MLX_SERVE_DSV41_STAGE_TRIM`, src/stage_trim.zig), read by the copied stream.
 pub const stage_trim = @import("src/stage_trim.zig");
+/// A wide prompt call's persistent loads whose record a staged window row holds filled by copying that row
+/// (`MLX_SERVE_DSV41_STAGE_COPY`, src/stage_copy.zig), read by the copied stream.
+pub const stage_copy = @import("src/stage_copy.zig");
 /// dq1b: decode's demand reads with each missed record's gate/up range as two range jobs read side by side
 /// (`MLX_SERVE_DSV41_GU_SPLIT`, src/gu_split.zig), set on the read pool by the copied source at each phase change.
 pub const gu_split = @import("src/gu_split.zig");
@@ -481,6 +484,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     stage_trim.configure(env.span(.MLX_SERVE_DSV41_STAGE_TRIM)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE_TRIM is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    stage_copy.configure(env.span(.MLX_SERVE_DSV41_STAGE_COPY)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_STAGE_COPY is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -855,6 +865,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .off => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted in file order, none withdrawn (MLX_SERVE_DSV41_STAGE_TRIM=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted hottest first, each one its routes take none of let go unread where no read has started (MLX_SERVE_DSV41_STAGE_TRIM=0: file order, none withdrawn){s}; [stage-trim] at each request's end\n", .{if (stage.on) "" else ": no effect without MLX_SERVE_DSV41_STAGE"}),
         .check => log.info("[turboexl3_ds41] wide prompt calls' staging trimmed at their routes, checked (MLX_SERVE_DSV41_STAGE_TRIM=check): as =1, each withdrawn ticket's status read back; [stage-trim] verified= bad= at each request's end\n", .{}),
+    }
+    {
+        var sc_buf: [512]u8 = undefined;
+        log.info("{s}", .{stage_copy.loadLine(&sc_buf)});
     }
     if (stage_next.on)
         log.info("[turboexl3_ds41] wide prompt layers' read-ahead and predicted transient loads posted during the call before them, into its persistent rows and the windows its groups let go ({s}); [prompt-io] early= with PROMPT_IO\n", .{if (stage.on) "MLX_SERVE_DSV41_STAGE_NEXT=0: at the layer's start" else "no effect: MLX_SERVE_DSV41_STAGE=0"})
@@ -1527,7 +1541,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const etl = engram_twin.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len ..]);
     // df1: the lookahead behind the demand (MLX_SERVE_DSV41_DEMAND_FIRST): the request's [demand-first] line.
     const dfl1 = if (demand_first.mode != .off) (if (dfSnap(model(mp))) |dfs| demand_first.meters(dfs, meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len]);
+    // MLX_SERVE_DSV41_STAGE_COPY: the [stage-copy] lines ("" off).
+    const scl = stage_copy.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is

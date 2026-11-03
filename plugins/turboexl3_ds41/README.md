@@ -763,6 +763,33 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   job holding one of its call's experts, so the waste sits record by record inside them; the b arms posted in rank
   order, their stream stats the a arms' (read 101.75 / 70.41 GB, 6049 misses, 4228 staged, 3441 adopted). Exact: the
   texts the same in every arm.
+- `MLX_SERVE_DSV41_STAGE_COPY` (src/stage_copy.zig, patches/turboexl3-zzz9v-stage-copy.patch; on by default, `=0` off,
+  `=check` on and checked; with `MLX_SERVE_DSV41_STAGE`): a wide prompt call's persistent load whose record a staged
+  window row already holds is filled by copying that row, not read from the file again. The call's own seed (its
+  actual counts) can rank a staged expert inside the persistent room: the plan gives it a persistent row (held rows
+  serve transient misses only) and the route read it again while its staged copy sat in a window. On the cold
+  code-ctx16384 card (pt6, w-pio-20261102-2311) 618 of 3,371 staged records went unadopted, 147 at layer 0 and 134 at
+  layer 1; the hottest vote bins lost the most. On, such a load reads nothing and is filled at its part's wait
+  (`waitGu`, `waitDown`, a flush's settle or the route's gate): the staged part holding its row waited for if still
+  reading, then the row copied into the persistent row on the copy threads; a route's transient read into such a row,
+  or a staging post into it, fills the copy first. The staged row counts as adopted. `=check` reads each copied record
+  again from the file into a scratch row and compares it byte for byte. It also counts a seeded call's in-call
+  evictions (a plan's eviction of an expert a later route of the call routes, read again then). `[stage-copy] mode=
+  copied= mb= waited= wait_ms= copy_ms= lost= checked= differ=` and `[stage-copy] calls: evictions= by_seed= later=
+  later_seed= remiss= remiss_mb=` at each request's end. Exact: the plans, slots, victims and protection are the
+  stock's; a record is the same bytes in any row.
+  - Read as sc1 (M5 Max, w-pio-20261103-0051; a = ctl48 b528be70e900, b = sc1 944a215df8cd at 1, both on G_KITSP1 with
+    keyed sampling; a warm server, c1 (b at `check`), then a1 b1 b2 a2, each a cold code-ctx16384 card request then
+    the new-text 16K slice 3): cold 1619.9 1613.1 against 1636.7 1659.3 tok/s (+1.95%; pairs +1.04, +2.86), new text
+    1747.0 1729.7 against 1760.1 1757.5 (+1.18%; pairs +0.75, +1.61); the texts the same bytes in every arm (cold
+    65d438d647, new-text slice 3 83a88208e3), the bank rows 146 / 175 in every arm; the encoder's MoE 4149 / 4161
+    against 3907 / 3880 ms and its read wait 714 / 741 against 173 / 152 ms, the cold read 88.20 against 80.85 GB,
+    unadopted staged records 618 against 66. c1: 552 records copied on the card and 130 on the slice, every one read
+    again and compared: differ 0, lost 0. The guard's accounted peak 108.1 / 101.5 GiB in the a arms against 108.3 /
+    109.0 in the b arms (step footprint 94.5 / 87.7 against 94.4 / 95.2), 30-s samples that land at a different
+    point of each arm's requests; merged under David's peak rule (2026-11-03): "peak not up" judged on each request's
+    measured footprint, the server's footprint after each request, 95.2 GiB in every arm and request (b1's card 94.5).
+    Measured on zzz9t; merged on (zzz9v).
 - `MLX_SERVE_DSV41_STAGE_NEXT` (src/stage_next.zig, patches/turboexl3-zzz8j-stage-next.patch; on, `=0` off, `=own` as
   this patch left it; with `MLX_SERVE_DSV41_STAGE`): a wide prompt layer's read-ahead and predicted transient loads read during the call before
   it. `=0`: staging posts a layer's stream misses at the layer's start, so they read under its attention (~4.5 GB a
