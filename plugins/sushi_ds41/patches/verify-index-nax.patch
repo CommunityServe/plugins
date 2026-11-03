@@ -1,47 +1,17 @@
 diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
-index 71817ef..df8ae49 100644
+index 71817ef..d708016 100644
 --- a/src/sushi/dsv41/dsv41_model.zig
 +++ b/src/sushi/dsv41/dsv41_model.zig
-@@ -749,6 +749,9 @@ pub const Model = struct {
-     /// Prefill-width layers in flight: a layer is submitted, not waited on, and the host waits only on the oldest of
-     /// more than `pipe_depth` (`SUSHI_DS41_PREFILL_PIPELINE`; 0 waits on every layer, as before).
-     pipe_depth: usize = 2,
-+    /// A narrow index scan of at least this many rows over a long key list runs the matmul2d scorer (`decodeIndexNax`;
-+    /// `SUSHI_DS41_DECODE_INDEX_NAX=<rows>`, 0 keeps every narrow scan on the packed kernel).
-+    decode_index_nax_rows: usize = 2,
-     /// The in-flight layers' output streams, oldest at `pipe_head` (`pipeSubmit`).
-     pipe_q: [pipe_max]A = @splat(none),
-     pipe_head: usize = 0,
-@@ -1732,7 +1735,12 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0:
+@@ -1732,7 +1732,11 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0:
          idx = try kernels.candidateKeys(sc, try topkRows(sc, m, scores, kk), cand.*, bs);
      } else {
          const packed_scan = rows.pack != null and narrowIndex(sc, m, Ls, nb);
 -        var scores = if (packed_scan) // [Ls, nb]
-+        // A verify block of 2+ rows over a long key list: unpack once and score on the matrix units, where every row
-+        // shares each key tile, instead of the packed kernel that reads and decodes every key once a row.
-+        const nax_scan = packed_scan and decodeIndexNax(m, Ls, nb, ih, ihd, rows.dtype);
++        // 2+ verify rows over a long list: unpack once so the rows share each key tile on the matrix scorer.
++        const nax_scan = packed_scan and Ls >= 2 and nb >= 32768 and index_nax.fits(ih, ihd, rows.dtype);
 +        var scores = if (nax_scan) // [Ls, nb]
 +            try index_nax.indexScoresNax(sc, q, try rows.rows(sc, nb), wts, wscale, p0, r, 0)
 +        else if (packed_scan)
              try kernels.indexScoresPacked(sc, q, try sc.slice(rows.buf, 0, 0, nb), try sc.slice(rows.sbuf, 0, 0, nb), wts, wscale, p0, r, rows.pack.?.mode, rows.pack.?.group)
          else
              try indexScores(sc, m, q, try rows.rows(sc, nb), wts, wscale, p0, r);
-@@ -1765,6 +1773,18 @@ fn streamsIndex(sc: *const Scope, m: *const Model, Ls: usize, nb: usize) bool {
-     return fusedOn(sc, m) and m.trace == null and !narrowIndex(sc, m, Ls, nb) and nb > m.index_stream_tile and kernels.indexTileFits(c.index_heads, c.index_head_dim, nb);
- }
- 
-+/// Whether a narrow (packed) index scan of `Ls` rows over `nb` keys unpacks and runs the matmul2d scorer instead
-+/// (`decode_index_nax_rows`, `SUSHI_DS41_DECODE_INDEX_NAX`). M5 Ultra, one layer-20 scan: 2 rows x1.19 at 128k keys and
-+/// x1.55 at 1M, 6 rows x2.30 and x3.12. One row loses (x0.83-0.99), so it stays on the packed kernel. Same scores to
-+/// 3.8e-7 relative and the same top-512 on random keys.
-+fn decodeIndexNax(m: *const Model, Ls: usize, nb: usize, ih: usize, ihd: usize, dt: mlx.mlx_dtype) bool {
-+    const min_rows = m.decode_index_nax_rows;
-+    return min_rows > 0 and Ls >= min_rows and nb >= decode_index_nax_keys and index_nax.fits(ih, ihd, dt);
-+}
-+
-+/// The fewest keys a decode scan takes the matrix scorer for: below it the unpack's fixed cost is not worth paying.
-+const decode_index_nax_keys: usize = 32768;
-+
- /// Whether `indexScores` runs the scalar kernel (a few rows), which reads packed keys as they are.
- fn narrowIndex(sc: *const Scope, m: *const Model, Ls: usize, nb: usize) bool {
-     return fusedOn(sc, m) and nb > 0 and Ls <= NARROW_ROWS and m.cfg.index_heads * m.cfg.index_head_dim <= 8192;

@@ -222,11 +222,6 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         const text = std.mem.span(raw);
         if (pipeSetting(text)) |n| m.mdl.pipe_depth = n else log.warn("[sushi_ds41] SUSHI_DS41_PREFILL_PIPELINE=\"{s}\" is not a layer count: kept {d} (0 turns the pipeline off)\n", .{ text, m.mdl.pipe_depth });
     }
-    if (std.c.getenv("SUSHI_DS41_DECODE_INDEX_NAX")) |raw| {
-        const text = std.mem.span(raw);
-        if (std.fmt.parseInt(usize, text, 10)) |n| m.mdl.decode_index_nax_rows = n else |_| log.warn("[sushi_ds41] SUSHI_DS41_DECODE_INDEX_NAX=\"{s}\" is not a row count: kept {d} (0 turns it off)\n", .{ text, m.mdl.decode_index_nax_rows });
-    }
-    log.info("[sushi_ds41] decode index scan: matmul2d from {d} rows (0 = off)\n", .{m.mdl.decode_index_nax_rows});
     // The profiles time each stage when it ends, so they turn the pipeline off (`pipeOn`) whatever the setting.
     if (m.mdl.profile != null)
         log.info("[sushi_ds41] prefill pipeline: off (a SUSHI_DSV41_*_PROFILE diagnostic waits on every layer)\n", .{})

@@ -67,12 +67,8 @@ simdgroup kernel: prefill 8k 1906 to 2138 tok/s, 32k 2075 to 2368, 64k 2050 to 2
   image and a prefix-cache restore.
 - Prefill pipeline: a prefill-width layer is submitted, not waited on, with up to 2 in flight
   (`SUSHI_DS41_PREFILL_PIPELINE`, 0 turns it off; `patches/prefill-pipeline.patch`, `pipeOn`). Same graphs, same bytes.
-- Decode index scan: a DSpark verify of 2 or more rows over 32k+ index groups unpacks the keys once and scores them
-  with the matmul2d scorer (`src/index_nax.zig`), so the rows share each key tile instead of each reading and decoding
-  every key. It covers the four full-scan index layers; the candidate layers after layer 20 keep their gather.
-  `SUSHI_DS41_DECODE_INDEX_NAX=<rows>` sets the floor (default 2, 0 turns it off; `patches/verify-index-nax.patch`,
-  `decodeIndexNax`). Decode on the M5 Ultra after 128k / 200k of context 96.2 / 142.0 to 97.5 / 146.7 tok/s, flat
-  below 64k; greedy text and logprobs byte-identical.
+- Decode index scan: a verify of 2+ rows over 32k+ index groups uses the matrix scorer (`patches/verify-index-nax.patch`).
+  Decode after 128k / 200k +1.3% / +3.3% on the M5 Ultra; text and logprobs byte-identical.
 - Directional ablation (`Caps.ablation`, mlx-serve's `--ablation-profiles`): a request's direction is removed from
   every write to the hyper-connection stream: the embedding (text and image rows, and the DSpark stages' block input),
   each attention output, each FFN output (in the fused decode kernel's expanded stream through its component formula)
