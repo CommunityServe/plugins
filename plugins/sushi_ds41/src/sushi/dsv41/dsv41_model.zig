@@ -2876,9 +2876,10 @@ fn aneSelfCheck(m: *Model, st: *AneState) !void {
 ///   under it.
 /// - Output planes: layer L's add reads them on the GPU, possibly after `aneMoe` returned. Layer L+1 waits for its
 ///   own input `x` (built from layer L's output, so after that add) before its ANE run writes them.
-/// - The next chunk's layer 0 does not depend on this chunk's last add, but every wide pass ends in `finishPass`,
-///   whose head read is followed by `pipeDrain`, so the GPU is idle by then.
-/// Dropping the wait for `x` breaks the second point first.
+/// - The next chunk's layer 0 does not depend on this chunk's last add, and nothing between chunks waits for it: a chunk
+///   another follows ends in `extendState`, which drains only when the experts stream. So `aneMoe` synchronizes the
+///   stream at layer 0, before the chunk's first plane write (the warm eval included): one wait per chunk.
+/// Dropping the wait for `x` breaks the second point, the layer-0 sync the third.
 fn aneLayerOut(m: *const Model, out: A) !void {
     try if (pipeOn(m, dim(out, 0))) submit(out) else mlx.check(mlx.mlx_array_eval(out));
 }
@@ -2890,6 +2891,8 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     const rows = dim(h, 0);
     if (st.disabled or m.tap != null or li >= st.layers or rows < st.min_rows or rows > st.chunk_rows) return null;
     if (li == 0) {
+        // The previous chunk's last covered layer may still be reading the output planes (`aneLayerOut`).
+        try mlx.check(mlx.mlx_synchronize(m.s));
         st.chunk = .{};
         st.chunks += 1;
         st.chunk_skip = false;
