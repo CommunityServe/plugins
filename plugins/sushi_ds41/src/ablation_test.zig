@@ -1,5 +1,5 @@
 //! The Metal tests of the directional ablation's write sites (`dsv41_model.ablate`, `ablateExpanded`,
-//! `ablateEngramValue`): run under `zig build gpu-test` (rooted at `attn_nax_test.zig`).
+//! `ablateEngramValue`): run under `zig build gpu-test` (rooted at `gpu_test.zig`).
 const std = @import("std");
 const mlx = @import("sushi/mlx.zig");
 const sc_mod = @import("sushi/dsv41/dsv41_scope.zig");
