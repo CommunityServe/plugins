@@ -20,7 +20,7 @@ const TDtype = struct { name: [*:0]const u8, dt: mlx.mlx_dtype };
 const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
 
 /// A kernel's source and signature; the pipeline is built on first use.
-const Def = struct {
+pub const Def = struct {
     name: [*:0]const u8,
     ins: []const [*:0]const u8,
     outs: []const [*:0]const u8,
@@ -31,7 +31,7 @@ const Def = struct {
 
 const Grid = [3]usize;
 
-fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid: Grid, tg: Grid, ints: []const Tmpl, dts: []const TDtype, result: []A) !void {
+pub fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid: Grid, tg: Grid, ints: []const Tmpl, dts: []const TDtype, result: []A) !void {
     const k = try qat_mod.kernelNew(&def.built, def.name, def.ins, def.outs, def.source, def.header);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -43,7 +43,7 @@ fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid:
     try qat_mod.applyKernel(sc, k, inputs, cfg, result);
 }
 
-fn f32Const(sc: *Scope, vals: []const f32) !A {
+pub fn f32Const(sc: *Scope, vals: []const f32) !A {
     return sc.floats(vals, &.{ci(vals.len)});
 }
 
@@ -1259,7 +1259,7 @@ const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
 /// holds a 16 x 16 fragment as 8 elements, rows `dsv41_nax_r` (lane, i) and columns `dsv41_nax_c` (lane, i), four
 /// contiguous columns a row. `dsv41_nax_mma` runs one 16 x N x KK multiply-accumulate on register fragments (one of N and
 /// KK is 32): `a` is 16 x KK, `b` KK x N, a dimension of 32 two consecutive 16-wide fragments.
-const ATTN_NAX_HEADER =
+pub const ATTN_NAX_HEADER =
     \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
     \\inline short dsv41_nax_r(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 4) | ((short(lane) >> 1) & 3)) + (i >> 2) * 8; }
     \\inline short dsv41_nax_c(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 2) | (short(lane) & 1)) * 4 + (i & 3); }
