@@ -1732,9 +1732,8 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
         idx = try kernels.candidateKeys(sc, try topkRows(sc, m, scores, kk), cand.*, bs);
     } else {
         const packed_scan = rows.pack != null and narrowIndex(sc, m, Ls, nb);
-        // 2+ verify rows over a long list: unpack once so the rows share each key tile on the matrix scorer.
-        const nax_scan = packed_scan and Ls >= 2 and nb >= 32768 and index_nax.fits(ih, ihd, rows.dtype);
-        var scores = if (nax_scan) // [Ls, nb]
+        const rows_share_key_tiles = packed_scan and Ls >= 2 and nb >= 32768 and index_nax.fits(ih, ihd, rows.dtype);
+        var scores = if (rows_share_key_tiles) // [Ls, nb]
             try index_nax.indexScoresNax(sc, q, try rows.rows(sc, nb), wts, wscale, p0, r, 0)
         else if (packed_scan)
             try kernels.indexScoresPacked(sc, q, try sc.slice(rows.buf, 0, 0, nb), try sc.slice(rows.sbuf, 0, 0, nb), wts, wscale, p0, r, rows.pack.?.mode, rows.pack.?.group)
