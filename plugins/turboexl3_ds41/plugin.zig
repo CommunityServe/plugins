@@ -187,6 +187,9 @@ pub const decode_window = @import("src/decode_window.zig");
 /// The decode phase's budget takes part of the stop under the ceiling back, MLX's cache capped at decode instead
 /// (`MLX_SERVE_DSV41_DECODE_STOP`, src/decode_stop.zig), read by the copied bill and source.
 pub const decode_stop = @import("src/decode_stop.zig");
+/// Decode's MLX cache without the prompt's leftovers, its cap and DECODE_STOP's cut from decode's own use
+/// (`MLX_SERVE_DSV41_DECODE_CACHE`, src/decode_cache.zig), read by the copied model at the phase change.
+pub const decode_cache = @import("src/decode_cache.zig");
 /// F3: the decode shared expert's EXL3 gate and up finishes, the clamped SwiGLU and the down's prepare in one launch
 /// (`MLX_SERVE_DSV41_SHFIN`, src/shfin.zig; turboexl3's `sharedSwiglu` and `check`'s compare in src/shfin_t3.zig), read by
 /// the copied model.
@@ -584,6 +587,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // Before the model's load: the bank's bill takes the LRU's bytes beside the host's (the load line says the rows).
     bill.engram_store_bytes = engram_decode.billBytes();
     // Before the model's load: the decode budget's part of the stop (MLX_SERVE_DSV41_DECODE_STOP).
+    // MLX_SERVE_DSV41_DECODE_CACHE: before DECODE_STOP's cut reaches the bill (it moves the cut and the cap).
+    decode_cache.configure(env.span(.MLX_SERVE_DSV41_DECODE_CACHE)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_CACHE is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     decode_stop.configure(env.span(.MLX_SERVE_DSV41_DECODE_STOP)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DECODE_STOP is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
@@ -966,7 +977,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     }
     switch (decode_stop.mode) {
         .off => log.info("[turboexl3_ds41] decode phase's stop under the ceiling at 2000 MB, the prompt's (MLX_SERVE_DSV41_DECODE_STOP=0): MLX's cache cap unchanged at decode; [decode-stop] off\n", .{}),
-        .on, .check => log.info("[turboexl3_ds41] decode phase's stop under the ceiling at {d} MB, not 2000 (MLX_SERVE_DSV41_DECODE_STOP{s}): its budget takes the {d} MB back for slot rows, MLX's cache capped at {d} MiB from the phase change to decode, the prompt's cap restored at the change back; [decode-stop] at each request's end\n", .{ (2_000_000_000 - decode_stop.cut_bytes) / 1_000_000, if (decode_stop.mode == .check) "=check, as =1" else "; =0 off", decode_stop.cut_bytes / 1_000_000, decode_stop.cache_bytes >> 20 }),
+        .on, .check => log.info("[turboexl3_ds41] decode phase's stop under the ceiling at {d} MB, not 2000 (MLX_SERVE_DSV41_DECODE_STOP{s}): its budget takes the {d} MB back for slot rows, MLX's cache capped at {d} MiB from the phase change to decode, the prompt's cap restored at the change back; [decode-stop] at each request's end\n", .{ (2_000_000_000 -| decode_stop.cut_now) / 1_000_000, if (decode_stop.mode == .check) "=check, as =1" else "; =0 off", decode_stop.cut_now / 1_000_000, decode_stop.cache_now >> 20 }),
     }
     switch (shfin.mode) {
         .off => log.info("[turboexl3_ds41] the decode shared expert as the host's chain (MLX_SERVE_DSV41_SHFIN=0); [shfin] off\n", .{}),
@@ -1010,6 +1021,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     {
         var bp_buf: [1536]u8 = undefined;
         log.info("{s}", .{bill_pin.loadLine(&bp_buf)});
+    }
+    {
+        var dc_buf: [512]u8 = undefined;
+        log.info("{s}", .{decode_cache.loadLine(&dc_buf)});
     }
     {
         var df_buf: [512]u8 = undefined;

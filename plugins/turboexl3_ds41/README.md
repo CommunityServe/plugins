@@ -1012,6 +1012,42 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   chk then A B B A, B A A B): greedy 56.60 -> 57.08 tok/s (+0.84%, round 86.36 -> 85.53 ms, misses 38.5 -> 36.9 a
   round), card 44.40 -> 44.78 (+0.84%); the decode rows 177 -> 179 in every pair (a2 opened 152 prompt rows at its
   in_use of 102,183 MiB, the others 153); the texts the same in every arm (card f7dfb7a5d4, greedy fd06ee302a).
+- `MLX_SERVE_DSV41_DECODE_CACHE` (src/decode_cache.zig; the copied model's early release in
+  patches/turboexl3-zzzza1-decode-cache.patch; on by default, `=0` off): decode's MLX cache without the prompt's
+  leftovers, its cap and DECODE_STOP's cut from decode's own use. A prompt's last chunk lets the SCRATCH_ATTN ring go
+  at the change to decode (its S and P slots, 125.8 MB, and SCRATCH_HEADS' two phase-B run regions, 2 x 268,435,456 B:
+  632 MiB), but after `src.phase`, whose synchronize, clearCache, grow and DECODE_STOP cap (1 GiB) have run, so the
+  buffers land in decode's cache (867-884 MiB at a 32-token decode's end, 71-100 at a 524-1024-token one; wm1p, pt7,
+  pt7d, l39d). On: the ring let go before the phase change, as SCRATCH's are; decode's cache capped at 512 MiB (twice
+  decode's own early 235-252 MiB; db1's 256 MiB cap churned with the leftovers in it); DECODE_STOP's cut 512 MiB more
+  (1,536,870,912 B), one more decode slot row. Exact: buffer lifetimes, the cache's size and the rows' count move; no
+  op changes. Decode holds the row and less cache, under each request's peak (David's "server's peak" ruling); the
+  next prompt allocates its ring fresh, about 10 ms.
+  - Read as left1p (M5 Max, w-pio-20261103-1509; two binaries on G_KITBM 46bbf9bd8b4e with keyed sampling: a = ctl55m
+    a29fe7928c06 (ctl55 + the `[mem-prompt]` meter), b = left1 2c8b5189ad0d (this code, then off by default) at `=1`;
+    a warm server (a), c1 (b, unmeasured), a1 b1 b2 a2, each a cold code-ctx16384 card then the new-text 16K slice 3,
+    max_tokens 32; the bill pinned, in_use_mb=29930): the rows a 139 / 170, b 139 / 171; cold 1705.9 1696.2 against
+    1694.1 1694.2 tok/s (-0.41%; pairs -0.69, -0.12), new text 1791.4 1803.0 against 1796.6 1798.9 (+0.03%; pairs
+    +0.29, -0.23); the texts the same bytes in every arm (cold 9ba62bb0e0, slice 936bcc1bdf); the cold prompts' work
+    the same in every arm (`[prompt-io]`: 80 calls, 96.21 GB read, 6,425 misses), a2's 220 ms faster in its
+    non-attention, non-MoE time; the prompted peaks std16k a 96,912 97,135 against b 96,913 96,823 MiB (mean -156),
+    slice a 96,121 95,813 against b 96,036 95,907 (+4); decode's MLX cache at each 32-token end a 748 / 750 MiB
+    against b 108 / 110, its footprint a 95,059-95,093 against b 94,882-94,922 (170 MiB less with the row).
+  - Read as left1d (w-20261103-1527; the same binaries and host, w0 and the b arms at `=1`; the standard decode
+    config, w0 a1 b1 b2 a2 b3 a3 a4 b4; the bill pinned, in_use_mb=29840): the rows a 140 / 170, b 140 / 171; card
+    47.9 48.0 47.8 47.8 against 47.9 48.1 47.9 47.7 tok/s (+0.05%; pairs 0.00, +0.21, +0.21, -0.21; misses a round
+    64.89 -> 64.21), greedy 55.9 55.8 55.8 55.7 against 56.0 56.1 56.1 56.7 (+0.76%; pairs +0.18, +0.54, +0.54, +1.80;
+    misses 43.21 -> 42.39); the texts the same bytes in every arm (card f63f392a55, greedy c820f267f5); at decode's
+    first round MLX's cache a 650 MiB against b 10, the footprint about 165 MiB less with the row; decode's footprint
+    2,374-2,388 MiB under the lowest prompted peak; the decode-only greedy request's whole peak +473 MiB (the row);
+    the card requests' peaks a 97,275 97,602 97,591 97,607 against b 97,603 97,617 97,604 97,348.
+  - Merged by David's ruling (2026-11-03, "Merge"): the cold -0.41% (left1p) failed the pre-registered >= 0 gate and
+    is noise, since LEFT acts only at a prompt's change to decode and cannot reach a server's first prompt, whose
+    reads and misses were the same in both arms; the card peak 10 MiB over a's highest (left1d) failed the peak gate
+    and is noise as with the floor's, the prompt's MLX peaks taking the same values in both arms (mean 94,406 MiB);
+    the gate of decode 1 GiB under the lowest prompted peak (left1p, failed in both arms) was stricter than the
+    server-peak ruling and is discarded. Measured on ctl55m (zzzza0); merged on (zzzza1), on by default (main and
+    David, 2026-11-03).
 - `MLX_SERVE_DSV41_BILL_PIN` (src/bill_pin.zig, the generated bill's `in_use_pin` hook in
   patches/turboexl3-zzz9x-bill-pin.patch; off by default: unset or empty, the live reading as before; `=<file>`
   pinned): the memory in use the streamed bank's bill reads, pinned in a file for a window's servers. The slot rows

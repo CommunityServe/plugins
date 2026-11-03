@@ -214,6 +214,7 @@ test {
     _ = @import("src/transient_keep.zig");
     _ = @import("src/buffer_mb.zig");
     _ = @import("src/bill_pin.zig");
+    _ = @import("src/decode_cache.zig");
     _ = @import("src/decode_floor.zig");
     _ = @import("src/rest_async.zig");
     _ = @import("src/q_tail.zig");
