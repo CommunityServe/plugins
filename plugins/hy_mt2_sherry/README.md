@@ -81,8 +81,11 @@ same pack to a directory you can serve with `--model`.
 - **Vision / audio / MoE**: the pack has none.
 - **Other gemma/hunyuan dense packs**: only packs carrying `sherry_embed_bits` (or `model_file: sherry_model.py`) are
   claimed; the forward hard-codes the STQ1_0 projections, the 6-bit affine embedding, tied head and `use_qk_norm`.
-- **The pack's full 262144-token window as a default**: KV is 64 KiB/token, so `context_cap` is 32768. A longer
-  `--ctx-size` is refused by the host; raise the constant in `config.zig` and reinstall if you have the memory.
+- **The pack's full 262144-token window by default**: KV is 64 KiB/token, so a 262144 context would bill 16 GiB.
+  `context_cap` defaults to 32768; `mlx-serve --ctx-size 65536` (or any value up to the pack's window, which
+  `/v1/models` reports as `model_max_tokens`) raises it — verified serving at 65536. mlx-serve's per-model `ctx_size`
+  setting does **not** reach an outside plugin (`LoadCtx.settings_json` arrives empty), so the server flag is the
+  lever.
 - **Speculative decoding**: PLD may run; its verify rows take the batch kernel up to 64 rows per slot (`Caps` marks
   no exactness contract and there is no native drafter).
 

@@ -48,6 +48,15 @@ pub const Config = struct {
 /// so a translation model gets a sane default instead of an admission refusal at load.
 const served_context: u64 = 32768;
 
+/// The default context this pack serves: well under its 262144-token window, because its KV is 64 KiB/token and a
+/// full window would bill 16 GiB. `context_cap` is only the default — mlx-serve's `--ctx-size` raises it (it serves
+/// 65536 when asked), and `max_position_embeddings` stays the pack's own window so `/v1/models` reports the ceiling.
+/// mlx-serve's per-model `ctx_size` setting does not reach a plugin (`LoadCtx.settings_json` arrives empty), so the
+/// server-wide flag is the lever.
+fn contextCap(max_position_embeddings: u64) u64 {
+    return @min(max_position_embeddings, served_context);
+}
+
 const Raw = struct {
     model_type: []const u8 = "",
     vocab_size: u32 = 0,
@@ -78,6 +87,7 @@ fn refuse(comptime why: []const u8) abi.Verdict {
 }
 
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
+    // This plugin has no per-model setting of its own; mlx-serve hands an outside plugin an empty table.
     _ = settings_json;
     if (span != null) return abi.Verdict.refuse(.unsupported, "hy_mt2_sherry: no layer split");
     const parsed = std.json.parseFromSlice(Raw, gpa, config_json.slice(), .{ .ignore_unknown_fields = true }) catch
@@ -132,7 +142,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         .num_key_value_heads = kv,
         .head_dim = hd,
         .max_position_embeddings = r.max_position_embeddings,
-        .context_cap = @min(r.max_position_embeddings, served_context),
+        .context_cap = contextCap(r.max_position_embeddings),
         // The GEMV kernel loads `x` through `device half4*`: activations stay fp16, as mlx-lm runs this pack.
         .act_dtype = .f16,
         .model_type = abi.Str.of(model_types[0]),
@@ -300,6 +310,12 @@ test "hy_mt2_sherry parse: a query width the GEMV cannot walk is refused, not se
     var p: abi.Parsed = .{};
     const v = parseFiles(&.{.{ .name = "config.json", .bytes = narrow }}, true, &p);
     try testing.expect(!v.isOk() and p.private == null);
+}
+
+test "hy_mt2_sherry context: the default cap is 32768 and never past the pack's own window" {
+    try testing.expectEqual(@as(u64, 32768), contextCap(262144));
+    // A pack trained shorter keeps its own window.
+    try testing.expectEqual(@as(u64, 8192), contextCap(8192));
 }
 
 test "hy_mt2_sherry sizes: the prefill transient is every projection tile of a layer, not three" {
