@@ -57,7 +57,7 @@ PLD's verify rows take the batch kernel up to 64 rows per slot; the 64-row cross
 ## Check
 
 ```bash
-scripts/build.sh hy_mt2_sherry      # 9 MLX-free tests + ReleaseFast
+scripts/build.sh hy_mt2_sherry      # 16 MLX-free tests + ReleaseFast
 scripts/check.sh hy_mt2_sherry      # conformance suite on the built-in fixture pack
 scripts/check.sh hy_mt2_sherry --model ~/.mlx-serve/models/Sube126/Hy-MT2-1.8B-1.25Bit-MLX
 scripts/lint.sh

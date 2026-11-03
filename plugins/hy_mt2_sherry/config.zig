@@ -113,10 +113,14 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         !(alpha64 > 0) or !(alpha64 < 1e9) or
         r.max_position_embeddings == 0)
         return refuse("hy_mt2_sherry: config.json dimensions out of range");
-    // Both STQ kernels assume the output rows divide by R_ROWS = 8.
-    if ((r.num_attention_heads * hd) % 8 != 0 or (kv * hd) % 8 != 0 or
-        r.intermediate_size % 8 != 0 or r.hidden_size % 8 != 0)
+    // Both STQ kernels assume the output rows divide by R_ROWS = 8, and the GEMV walks `x` in 2048-wide chunks
+    // (`NCH = K / 2048`), so every STQ input width must be a multiple of 2048 too: hidden for q/k/v/gate/up, the
+    // query width for o_proj, the ffn width for down_proj.
+    const q_width = r.num_attention_heads * hd;
+    if (q_width % 8 != 0 or (kv * hd) % 8 != 0 or r.intermediate_size % 8 != 0 or r.hidden_size % 8 != 0)
         return refuse("hy_mt2_sherry: a projection width is not a multiple of 8");
+    if (r.hidden_size % 2048 != 0 or q_width % 2048 != 0 or r.intermediate_size % 2048 != 0)
+        return refuse("hy_mt2_sherry: a projection input width is not a multiple of 2048");
 
     var p: abi.Parsed = .{ .caps = .{ .batches_decode = true } };
     p.shell = .{
@@ -182,6 +186,18 @@ pub fn embedBytes(c: *const Config) u64 {
     const v: u64 = c.vocab_size;
     const h: u64 = c.hidden_size;
     return v * (h * 6 / 32) * 4 + 2 * v * (h / c.embed_group) * 2;
+}
+
+/// The dense f16 tiles one layer's seven projections materialize while a wide prefill builds it: every `stqMatmul`
+/// hands its tile to the GEMM and only the layer's `evalKeep` frees them, so all seven are live at once. Upper bound
+/// per tile: [N, K] f16. This is the prefill transient `bill` reports.
+pub fn perLayerPrefillBytes(c: *const Config) u64 {
+    const h: u64 = c.hidden_size;
+    const ff: u64 = c.intermediate_size;
+    const q: u64 = @as(u64, c.num_attention_heads) * c.head_dim;
+    const kv: u64 = @as(u64, c.num_key_value_heads) * c.head_dim;
+    const elems = q * h + 2 * kv * h + h * q + ff * h * 2 + h * ff;
+    return 2 * elems;
 }
 
 /// Resident bytes of the whole pack: the STQ linears, the embedding, every RMSNorm weight.
@@ -271,6 +287,32 @@ test "hy_mt2_sherry parse: a non-Sherry or non-STQ-shaped pack is refused by nam
         const v = parseFiles(&.{.{ .name = "config.json", .bytes = json }}, true, &p);
         try testing.expect(!v.isOk() and v.why.len > 0 and p.private == null);
     }
+}
+
+test "hy_mt2_sherry parse: a query width the GEMV cannot walk is refused, not served with zeros" {
+    // 16 heads x head_dim 64 = 1024-wide o_proj input: NCH would be 0 and decode would project o_proj to zeros.
+    const narrow =
+        \\{"model_type":"hunyuan_v1_dense","vocab_size":120818,"hidden_size":2048,"intermediate_size":6144,
+        \\"num_hidden_layers":32,"num_attention_heads":16,"num_key_value_heads":4,"head_dim":64,
+        \\"rope_scaling":{"type":"dynamic","alpha":1000.0},"max_position_embeddings":262144,
+        \\"tie_word_embeddings":true,"use_qk_norm":true,"sherry_embed_bits":6}
+    ;
+    var p: abi.Parsed = .{};
+    const v = parseFiles(&.{.{ .name = "config.json", .bytes = narrow }}, true, &p);
+    try testing.expect(!v.isOk() and p.private == null);
+}
+
+test "hy_mt2_sherry sizes: the prefill transient is every projection tile of a layer, not three" {
+    var p: abi.Parsed = .{};
+    const files = [_]fixture.File{.{ .name = "config.json", .bytes = good_short }};
+    try testing.expect(parseFiles(&files, true, &p).isOk());
+    defer freeParsed(&p);
+    const c = of(&p);
+    // q/o 2048x2048, k/v 512x2048, gate/up 6144x2048, down 2048x6144, all f16.
+    const elems = 2048 * 2048 * 2 + 512 * 2048 * 2 + 6144 * 2048 * 2 + 2048 * 6144;
+    try testing.expectEqual(2 * elems, perLayerPrefillBytes(c));
+    const mib = perLayerPrefillBytes(c) >> 20;
+    try testing.expect(mib >= 92 and mib <= 93);
 }
 
 test "hy_mt2_sherry sizes: one layer and the whole pack match the published 454 MB" {

@@ -292,8 +292,8 @@ fn bill(p: *const abi.Parsed, shape: *const abi.Shape, out: *abi.Bill) callconv(
         .load_bytes = config.residentBytes(k) + (32 << 20), // + kernels, freqs, graph handles
         // 2 (K and V) x kv_heads x head_dim x layers x 2 B (f16).
         .kv_per_token = 2 * @as(u64, k.num_key_value_heads) * k.head_dim * k.num_hidden_layers * 2,
-        // One dequant tile per projection is live while a layer builds: gate/up/down at 6144 x 2048 f16 = 25 MB.
-        .prefill_streams = 3 * 25 << 20,
+        // Every projection's dense tile is live until the layer's evalKeep: the pack's own geometry is 92 MiB.
+        .prefill_streams = config.perLayerPrefillBytes(k),
     };
 }
 
@@ -312,10 +312,58 @@ fn newRef(src: c.mlx_array) c.mlx_array {
     return r;
 }
 
-fn take(src: *const kit.abi.quant.Source, name: []const u8, dst: *c.mlx_array) bool {
+/// Take tensor `name` into `dst`, refusing (by name) one whose dtype or shape is not what the kernels read: config
+/// JSON is untrusted, and a short `qs` buffer would make the GEMV read past it.
+fn takeShaped(src: *const kit.abi.quant.Source, dst: *c.mlx_array, name: []const u8, dtype: c.mlx_dtype, shape: []const c_int) bool {
     const t = src.tensor(name);
-    if (t.ctx == null) return false;
-    return c.mlx_array_set(dst, .{ .ctx = t.ctx }) == 0;
+    if (t.ctx == null) {
+        noteRefusal(name, .missing);
+        return false;
+    }
+    const a: c.mlx_array = .{ .ctx = t.ctx };
+    // The host narrows f16 tables to bf16 at load (`[dtype] narrowed ... 1-D f16 tables to bf16`); `narrowF16` casts
+    // every table the kernels read back, so either float width is accepted here and only the shape must match.
+    const float_ok = dtype == @as(c.mlx_dtype, @intCast(c.MLX_FLOAT16)) and
+        (c.mlx_array_dtype(a) == @as(c.mlx_dtype, @intCast(c.MLX_FLOAT16)) or
+            c.mlx_array_dtype(a) == @as(c.mlx_dtype, @intCast(c.MLX_BFLOAT16)));
+    const ok = (float_ok or c.mlx_array_dtype(a) == dtype) and
+        shapeMatches(c.mlx_array_dtype(a), @intCast(c.mlx_array_ndim(a)), c.mlx_array_shape(a), c.mlx_array_dtype(a), shape);
+    if (!ok) {
+        noteRefusal(name, .shape);
+        return false;
+    }
+    return c.mlx_array_set(dst, a) == 0;
+}
+
+/// The first tensor `load` refused and why: static, so the refusal can name it (one load runs at a time).
+var refused_name: [128]u8 = undefined;
+var refused_len: usize = 0;
+var refused_reason: enum { none, missing, shape } = .none;
+
+fn noteRefusal(name: []const u8, reason: @TypeOf(refused_reason)) void {
+    refused_len = @min(name.len, refused_name.len);
+    @memcpy(refused_name[0..refused_len], name[0..refused_len]);
+    refused_reason = reason;
+}
+
+/// Whether a tensor's dtype and shape are exactly what a kernel was told to read.
+pub fn shapeMatches(got_dtype: c.mlx_dtype, got_dim: c_int, got: [*c]const c_int, want_dtype: c.mlx_dtype, want: []const c_int) bool {
+    if (got_dtype != want_dtype) return false;
+    if (got_dim != @as(c_int, @intCast(want.len))) return false;
+    for (want, 0..) |w, i| if (got[i] != w) return false;
+    return true;
+}
+
+/// `[rows, cols]` of `dtype`.
+fn take2(src: *const kit.abi.quant.Source, dst: *c.mlx_array, name: []const u8, dtype: c.mlx_dtype, rows: u32, cols: u32) bool {
+    const shape = [_]c_int{ @intCast(rows), @intCast(cols) };
+    return takeShaped(src, dst, name, dtype, &shape);
+}
+
+/// `[n]` of `dtype`.
+fn take1(src: *const kit.abi.quant.Source, dst: *c.mlx_array, name: []const u8, dtype: c.mlx_dtype, n: u32) bool {
+    const shape = [_]c_int{@intCast(n)};
+    return takeShaped(src, dst, name, dtype, &shape);
 }
 
 /// The host narrows every 1-D f16 table (the RMSNorm weights) to bf16 at load; mixing bf16 with f16 activations
@@ -395,10 +443,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     }
     m.stq_lut = c.mlx_array_new_data(&lut, &[_]c_int{ 32, 4 }, 2, @intCast(c.MLX_FLOAT16));
 
-    var all = take(src, "model.embed_tokens.weight", &m.embed_w) and
-        take(src, "model.embed_tokens.scales", &m.embed_scales) and
-        take(src, "model.embed_tokens.biases", &m.embed_biases) and
-        take(src, "model.norm.weight", &m.norm);
+    const u8_dt: c.mlx_dtype = @intCast(c.MLX_UINT8);
+    const u32_dt: c.mlx_dtype = @intCast(c.MLX_UINT32);
+    const f16_dt: c.mlx_dtype = @intCast(c.MLX_FLOAT16);
+    const ng = cfg.hidden_size / cfg.embed_group;
+    const mut = cfg.vocab_size;
+    var all = take2(src, &m.embed_w, "model.embed_tokens.weight", u32_dt, mut, cfg.hidden_size * cfg.embed_bits / 32) and
+        take2(src, &m.embed_scales, "model.embed_tokens.scales", f16_dt, mut, ng) and
+        take2(src, &m.embed_biases, "model.embed_tokens.biases", f16_dt, mut, ng) and
+        take1(src, &m.norm, "model.norm.weight", f16_dt, cfg.hidden_size);
     var name_buf: [128]u8 = undefined;
     for (layers, 0..) |*l, i| {
         inline for (.{
@@ -406,7 +459,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             .{ "self_attn.query_layernorm", "qn" }, .{ "self_attn.key_layernorm", "kn" },
         }) |w| {
             const name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.{s}.weight", .{ i, w[0] }) catch unreachable;
-            all = all and take(src, name, &@field(l, w[1]));
+            const width: u32 = if (std.mem.indexOf(u8, w[0], "query") != null or std.mem.indexOf(u8, w[0], "key") != null)
+                cfg.head_dim
+            else
+                cfg.hidden_size;
+            all = all and take1(src, &@field(l, w[1]), name, f16_dt, width);
         }
         inline for (.{
             .{ "self_attn.q_proj", "q" }, .{ "self_attn.k_proj", "k" }, .{ "self_attn.v_proj", "v" },
@@ -414,18 +471,27 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             .{ "mlp.down_proj", "down" },
         }) |w| {
             const base = std.fmt.bufPrint(&name_buf, "model.layers.{d}.{s}.", .{ i, w[0] }) catch unreachable;
+            const st = &@field(l, w[1]);
             var buf2: [128]u8 = undefined;
             const qs_name = std.fmt.bufPrint(&buf2, "{s}qs", .{base}) catch unreachable;
-            all = all and take(src, qs_name, &@field(l, w[1]).qs);
+            all = all and take2(src, &st.qs, qs_name, u8_dt, st.n, st.k / 8);
             const sign_name = std.fmt.bufPrint(&buf2, "{s}sign", .{base}) catch unreachable;
-            all = all and take(src, sign_name, &@field(l, w[1]).sign);
+            all = all and take2(src, &st.sign, sign_name, u8_dt, st.n, st.k / 32);
             const scales_name = std.fmt.bufPrint(&buf2, "{s}scales", .{base}) catch unreachable;
-            all = all and take(src, scales_name, &@field(l, w[1]).scales);
+            all = all and take2(src, &st.scales, scales_name, f16_dt, st.n, st.k / qk_k);
         }
     }
     if (!all) {
+        const named = refused_name[0..refused_len];
         unload(m);
-        out.* = Verdict.refuse(.failed, why ++ "a weight is missing");
+        out.* = switch (refused_reason) {
+            .missing => Verdict.named(.failed, "hy_mt2_sherry: a weight is missing"),
+            .shape => Verdict.named(.failed, "hy_mt2_sherry: a weight has the wrong shape or dtype"),
+            .none => Verdict.named(.failed, "hy_mt2_sherry: a weight is missing"),
+        };
+        if (refused_len > 0) {
+            std.debug.print("[hy_mt2_sherry] refused {s}: {s}\n", .{ @tagName(refused_reason), named });
+        }
         return null;
     }
 
@@ -549,21 +615,20 @@ const Graph = struct {
         return g.op(c.mlx_transpose_axes, .{ x, &axes, axes.len });
     }
 
-    /// Evaluate `keep`, then free every other array this graph made; `keep` stays the only live one.
-    fn evalKeep(g: *Graph, keep: c.mlx_array) !void {
+    /// Evaluate `keep`, then free every other array this graph made and keep exactly one reference on `keep`.
+    /// Owns a new reference on `keep` (the caller's handle is freed like the rest), so a caller whose `keep` is a
+    /// plain local array must hand the result back to the caller's variable.
+    fn evalKeep(g: *Graph, keep: c.mlx_array) !c.mlx_array {
         const vec = c.mlx_vector_array_new_data(&[_]c.mlx_array{keep}, 1);
         defer _ = c.mlx_vector_array_free(vec);
         try expectOk(c.mlx_eval(vec));
-        var kept = false;
-        for (g.live.items) |a| {
-            if (a.ctx == keep.ctx) {
-                kept = true;
-            } else {
-                _ = c.mlx_array_free(a);
-            }
-        }
+        var out = c.mlx_array_new();
+        errdefer _ = c.mlx_array_free(out);
+        try expectOk(c.mlx_array_set(&out, keep));
+        for (g.live.items) |a| _ = c.mlx_array_free(a);
         g.live.clearRetainingCapacity();
-        if (!kept) try g.live.append(gpa, keep);
+        try g.live.append(gpa, out);
+        return out;
     }
 };
 
@@ -644,7 +709,7 @@ fn runTrunk(m: *Model, f: *const abi.Forward, ops: *const abi.CacheOps, out: *ab
     var x = try embedRows(m, &g, ids, @intCast(total_u32));
     // A wide forward's dequant tiles (total rows > 64) are freed per layer; the batch GEMV path has none.
     const per_layer = total_u32 > 64;
-    if (per_layer and rows > 1) try g.evalKeep(x);
+    if (per_layer and rows > 1) x = try g.evalKeep(x);
 
     for (m.layers, 0..) |l, li| {
         const h = try g.op(c.mlx_fast_rms_norm, .{ x, l.ln1, k.rms_norm_eps });
@@ -693,7 +758,7 @@ fn runTrunk(m: *Model, f: *const abi.Forward, ops: *const abi.CacheOps, out: *ab
         const up = try stqLinearRows(m, &g, &l.up, h2, total_u32);
         const mlp = try stqLinearRows(m, &g, &l.down, try g.op(c.mlx_multiply, .{ act, up }), total_u32);
         x = try g.op(c.mlx_add, .{ summed, mlp });
-        if (per_layer) try g.evalKeep(x);
+        if (per_layer) x = try g.evalKeep(x);
     }
 
     const normed = try g.op(c.mlx_fast_rms_norm, .{ x, m.norm, k.rms_norm_eps });
@@ -811,7 +876,7 @@ fn decoder(m: *Model, g: *Graph, ops: *const abi.CacheOps, cache: abi.Handle, id
     const hidden: c_int = @intCast(k.hidden_size);
     var x = try embed(m, g, ids, t);
     // A prompt's dequant tiles are freed per layer; decode keeps the whole (tiny) graph to one eval at the end.
-    if (t > 1) try g.evalKeep(x);
+    if (t > 1) x = try g.evalKeep(x);
 
     const nh: c_int = @intCast(k.num_attention_heads);
     const nkv: c_int = @intCast(k.num_key_value_heads);
@@ -862,7 +927,7 @@ fn decoder(m: *Model, g: *Graph, ops: *const abi.CacheOps, cache: abi.Handle, id
         x = try g.op(c.mlx_add, .{ summed, mlp });
 
         // Drop the layer's dequant tiles now; only the residual survives into the next layer.
-        if (t > 1) try g.evalKeep(x);
+        if (t > 1) x = try g.evalKeep(x);
     }
 
     const normed = try g.op(c.mlx_fast_rms_norm, .{ x, m.norm, k.rms_norm_eps });
@@ -1029,5 +1094,22 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
 }
 
 test {
+    _ = config;
     _ = @import("src/conformance_fixture.zig");
+}
+
+test "load: a tensor whose shape or dtype is not what the kernel reads is refused" {
+    const u8_dt: c.mlx_dtype = @intCast(c.MLX_UINT8);
+    const f16_dt: c.mlx_dtype = @intCast(c.MLX_FLOAT16);
+    const want = [_]c_int{ 512, 64 }; // k_proj.qs at hidden 2048
+    const exact = [_]c_int{ 512, 64 };
+    const short = [_]c_int{ 512, 32 };
+    const wide = [_]c_int{ 512, 64 };
+    try std.testing.expect(shapeMatches(u8_dt, 2, &exact, u8_dt, &want));
+    // A qs buffer half the declared width: the GEMV would read past it.
+    try std.testing.expect(!shapeMatches(u8_dt, 2, &short, u8_dt, &want));
+    // f16 scales passed where u8 qs is read.
+    try std.testing.expect(!shapeMatches(f16_dt, 2, &wide, u8_dt, &want));
+    // A 3-D tensor where a 2-D one is read.
+    try std.testing.expect(!shapeMatches(u8_dt, 3, &wide, u8_dt, &want));
 }

@@ -4,8 +4,8 @@
 //!   * STQ1_0: `qs` (u8, one 4-bit codebook slot per 4-weight group), `sign` (u8, one sign bit per group) and
 //!     `scales` (f16, one per 256-weight block), laid out as in the pack. Weight `k` of a block sits at row `k % 16`
 //!     of its 16-column slice, which is the pack's `_INV_PERM`.
-//!   * embedding: MLX affine 6-bit, group 64. The checkpoint writes `biases` (the group's low end) under the name
-//!     `.scales` and `scales` (the step) under `.biases`; the plugin reads what mlx-lm's QuantizedEmbedding hands out.
+//!   * embedding: MLX affine 6-bit, group 64. Each name holds what it says: `scales` is the step (what a pack from
+//!     `mx.quantize` puts there), `biases` the group's low end.
 //!
 //! `Expected` keeps the float weights every tensor was quantized from, so a test can hold the kernels to them.
 
@@ -98,12 +98,20 @@ fn halfOf(w: f32) f16 {
     return @bitCast(f16Bits(w));
 }
 
+/// Weight `p` of group `g` inside a 256-weight block, the pack's `_INV_PERM`: group `g` starts at column
+/// `(g / 16) * 64 + (g % 16)` and its four lanes sit 16 columns apart.
+pub fn laneColumn(g: usize, p: usize) usize {
+    return (g / 16) * 64 + (g % 16) + p * 16;
+}
+
 /// Quantize one [rows, cols] f32 matrix to the pack's STQ1_0 buffers. Caller frees the three.
 pub fn quantizeStq(a: std.mem.Allocator, rows: usize, cols: usize, w: []const f32) !struct { qs: []u8, sign: []u8, scales: []u16 } {
     const nb = cols / 256;
     const qs = try a.alloc(u8, rows * cols / 8);
     const sign = try a.alloc(u8, rows * cols / 32);
     const scales = try a.alloc(u16, rows * nb);
+    @memset(qs, 0);
+    @memset(sign, 0);
     for (0..rows) |r| {
         const row = w[r * cols ..][0..cols];
         for (0..nb) |b| {
@@ -115,13 +123,14 @@ pub fn quantizeStq(a: std.mem.Allocator, rows: usize, cols: usize, w: []const f3
             scales[r * nb + b] = @as(u16, @bitCast(scale));
             for (0..64) |g| {
                 var target: [4]f32 = undefined;
-                for (0..4) |p| target[p] = block[g * 4 + p] / d;
+                for (0..4) |p| target[p] = block[laneColumn(g, p)] / d;
                 var best_err = std.math.inf(f32);
                 var best_code: u5 = 0;
                 var best_sign = false;
                 for (0..2) |sg| {
                     const group = &lane_table[sg];
-                    for (0..32) |c| {
+                    // The nibble holds 16 codes; codes 16..31 are their sign-flipped twins and do not fit.
+                    for (0..16) |c| {
                         const l = group[c];
                         const err = (l[0] - target[0]) * (l[0] - target[0]) +
                             (l[1] - target[1]) * (l[1] - target[1]) +
@@ -157,21 +166,22 @@ pub fn dequantizeStq(a: std.mem.Allocator, rows: usize, cols: usize, qs: []const
                 const code: u5 = @intCast((qs[r * (cols / 8) + b * 32 + g / 2] >> @intCast(4 * (g % 2))) & 0x0F);
                 const sg = (sign[r * (cols / 32) + b * 8 + g / 8] >> @intCast(g % 8)) & 1 != 0;
                 const l = lanes(code, sg);
-                for (l, 0..) |v, p| out[r * cols + b * 256 + g * 4 + p] = v * d;
+                for (l, 0..) |v, p| out[r * cols + b * 256 + laneColumn(g, p)] = v * d;
             }
         }
     }
     return out;
 }
 
-/// The embedding [vocab, hidden] quantized to 6-bit affine, group 64: packed words, scales (the step) and biases
-/// (the low end), each [vocab, hidden / 64] f16. Caller frees all three.
+/// The embedding [vocab, hidden] quantized to 6-bit affine, group 64: `words` packs the codes, `scales` holds each
+/// group's step and `biases` its low end. Caller frees all three.
 pub fn quantizeEmbedding(a: std.mem.Allocator, w: []const f32) !struct { words: []u32, scales: []u16, biases: []u16 } {
     const ng = hidden / embed_group;
     const words_per_group = embed_group * embed_bits / 32; // 64 fields x 6 bits, packed into 12 words
     const words = try a.alloc(u32, vocab_size * ng * words_per_group);
     const scales = try a.alloc(u16, vocab_size * ng);
     const biases = try a.alloc(u16, vocab_size * ng);
+    @memset(words, 0);
     const levels: f32 = 63;
     for (0..vocab_size) |r| {
         for (0..ng) |g| {
@@ -188,7 +198,6 @@ pub fn quantizeEmbedding(a: std.mem.Allocator, w: []const f32) !struct { words: 
             scales[r * ng + g] = @as(u16, @bitCast(step));
             biases[r * ng + g] = @as(u16, @bitCast(low));
             const base = (r * ng + g) * words_per_group;
-            for (0..words_per_group) |i| words[base + i] = 0;
             const l0 = f16Float(@as(u16, @bitCast(low)));
             for (0..64) |j| {
                 const code: u32 = @intFromFloat(@round(std.math.clamp((group[j] - l0) / d, 0, 63)));
@@ -204,6 +213,33 @@ pub fn quantizeEmbedding(a: std.mem.Allocator, w: []const f32) !struct { words: 
         }
     }
     return .{ .words = words, .scales = scales, .biases = biases };
+}
+
+/// A 6-bit affine embedding's [rows, cols] float from the three buffers the formulas above produce.
+pub fn dequantizeEmbedding(a: std.mem.Allocator, rows: usize, words: []const u32, scales: []const u16, biases: []const u16) ![]f32 {
+    const ng = colsPerEmbeddingRow();
+    const wpg = embed_group * embed_bits / 32;
+    const out = try a.alloc(f32, rows * ng * embed_group);
+    for (0..rows) |r| {
+        for (0..ng) |g| {
+            const step = f16Float(scales[r * ng + g]);
+            const low = f16Float(biases[r * ng + g]);
+            for (0..64) |j| {
+                const bit = j * 6;
+                const wi = bit / 32;
+                const sh: u32 = @intCast(bit % 32);
+                var code: u32 = words[(r * ng + g) * wpg + wi] >> @intCast(sh);
+                if (sh + 6 > 32) code |= words[(r * ng + g) * wpg + wi + 1] << @intCast(32 - sh);
+                out[r * ng * embed_group + g * embed_group + j] =
+                    @as(f32, @floatFromInt(code & 0x3F)) * step + low;
+            }
+        }
+    }
+    return out;
+}
+
+fn colsPerEmbeddingRow() usize {
+    return hidden / embed_group;
 }
 
 // ── the pack files ──
@@ -301,10 +337,10 @@ pub fn build(a: std.mem.Allocator) !Pack {
     };
     {
         const e = try quantizeEmbedding(a, embed_float);
+        // The names are the buffers: `scales` is the affine step, `biases` the group's low end.
         try raws.append(a, .{ .name = "model.embed_tokens.weight", .shape = &.{ vocab_size, hidden * embed_bits / 32 }, .dtype = "U32", .bytes = std.mem.sliceAsBytes(e.words) });
-        // mlx-lm's QuantizedEmbedding passes `.scales` first: the checkpoint's `biases` (the low end) lives there.
-        try raws.append(a, .{ .name = "model.embed_tokens.scales", .shape = &.{ vocab_size, hidden / embed_group }, .dtype = "F16", .bytes = std.mem.sliceAsBytes(e.biases) });
-        try raws.append(a, .{ .name = "model.embed_tokens.biases", .shape = &.{ vocab_size, hidden / embed_group }, .dtype = "F16", .bytes = std.mem.sliceAsBytes(e.scales) });
+        try raws.append(a, .{ .name = "model.embed_tokens.scales", .shape = &.{ vocab_size, hidden / embed_group }, .dtype = "F16", .bytes = std.mem.sliceAsBytes(e.scales) });
+        try raws.append(a, .{ .name = "model.embed_tokens.biases", .shape = &.{ vocab_size, hidden / embed_group }, .dtype = "F16", .bytes = std.mem.sliceAsBytes(e.biases) });
     }
     {
         const ones = try a.alloc(f32, hidden);
@@ -608,25 +644,13 @@ test "conformance fixture: the 6-bit embedding in the pack decodes to its float 
     const bi_bytes = tensorBytes(pack, "model.embed_tokens.biases") orelse return error.NoTensor;
     const words = try a.alloc(u32, words_bytes.len / 4);
     for (words, 0..) |*w, i| w.* = std.mem.readInt(u32, words_bytes[i * 4 ..][0..4], .little);
-    const ng = hidden / embed_group;
-    const wpg = embed_group * embed_bits / 32;
-    var worst: f32 = 0;
-    for (0..vocab_size) |r| {
-        for (0..ng) |g| {
-            const step = f16Float(std.mem.readInt(u16, sc_bytes[(r * ng + g) * 2 ..][0..2], .little));
-            const low = f16Float(std.mem.readInt(u16, bi_bytes[(r * ng + g) * 2 ..][0..2], .little));
-            for (0..64) |j| {
-                const bit = j * 6;
-                const wi = bit / 32;
-                const sh: u32 = @intCast(bit % 32);
-                var code: u32 = words[(r * ng + g) * wpg + wi] >> @intCast(sh);
-                if (sh + 6 > 32) code |= words[(r * ng + g) * wpg + wi + 1] << @intCast(32 - sh);
-                code &= 0x3F;
-                const rec = @as(f32, @floatFromInt(code)) * step + low;
-                const want = pack.embed_float[r * hidden + g * 64 + j];
-                worst = @max(worst, @abs(rec - want) / step);
-            }
-        }
+    const sc = try a.alloc(u16, sc_bytes.len / 2);
+    for (sc, 0..) |*d, i| d.* = std.mem.readInt(u16, sc_bytes[i * 2 ..][0..2], .little);
+    const bi = try a.alloc(u16, bi_bytes.len / 2);
+    for (bi, 0..) |*d, i| d.* = std.mem.readInt(u16, bi_bytes[i * 2 ..][0..2], .little);
+    const back = try dequantizeEmbedding(a, vocab_size, words, sc, bi);
+    for (back, pack.embed_float) |got, want| {
+        const g = (want - got) / @max(@abs(want), 1e-6);
+        try testing.expect(@abs(got - want) <= 0.02 or @abs(g) < 1e-3);
     }
-    try testing.expect(worst <= 1.0);
 }
