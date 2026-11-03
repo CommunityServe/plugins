@@ -1034,6 +1034,32 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   the variable (no `pinned=` in its `[bank-bill]`). Exact: only the input the row count comes from is fixed; the rows,
   the plans and the words follow from it as from any reading (a route's bytes are the records' in any row). Merged on
   (zzz9x) as the windows' rows pin (main and David, 2026-11-03); nothing measured.
+- `MLX_SERVE_DSV41_DECODE_FLOOR` (src/decode_floor.zig, the generated bill's `decode_floor` hook and `wsDecode` in
+  patches/turboexl3-zzzza0-decode-floor.patch; on by default, `=0` off): the streamed bank's decode bill with a decode
+  phase's runtime floor. The decode budget (`streamBudget`) takes the decode phase's working set out: the state at
+  `context + stream_generation` positions (3200 B a token on the pack, 131 MB at the 32768-token rung's 40960), a
+  row's arrays and `PREFILL_RUNTIME_FLOOR_BYTES` (512 MiB, a prompt pass's floor), the sum times 5/4: 804 MiB, 640 of
+  it the floor. Decode's runtime need beside its state is MLX's peak over its active bytes, 51 MiB on the 16K card and
+  29 on greedy (l39d's `[mem-decode]`, w-20261103-0515); MLX's cache is the stop's (the 1 GiB cap under DECODE_STOP).
+  On, the floor is 128 MiB: the working set 324 MiB, 480 MiB back to the decode slot rows (one more row at 470 MiB;
+  two where the remainder under a row is 460 MiB or more); the prompt's bill and rows are unchanged. Exact: only the
+  decode rows' count moves. The decode phase holds that much more, under each request's peak (David, 2026-11-03:
+  "server's peak"; a request's peak is its prompt's, and a 1024-token decode peaks about 3.4 GiB below it, wf1d
+  w-20261103-1256).
+  - Read as dfl1d (M5 Max, w-20261103-1414; two binaries on G_KITBM 46bbf9bd8b4e with keyed sampling: a = ctl53m
+    fb6081a6b38e (ctl53 + the `[mem-prompt]` meter), b = dfl1 5d6f2c19b7ad (this code, then off by default) at `=1`,
+    w0 too; the standard decode config, w0 a1 b1 b2 a2 b3 a3 a4 b4; the bill pinned, in_use_mb=29164, w0 wrote it and
+    the others read it): the rows a 141 / 170, b 141 / 171 (ws_decode 804 against 324 MiB; a's remainder 352 MiB);
+    card 47.8 47.7 47.8 47.8 against 47.9 48.0 48.0 47.9 tok/s (+0.37%; pairs +0.21, +0.63, +0.42, +0.21; misses a
+    round 61.26 -> 60.47, the round 106.3 -> 105.9 ms); greedy 56.3 56.8 56.8 56.8 against 57.0 57.2 57.2 57.2
+    (+0.84%; pairs +1.24, +0.70, +0.70, +0.70; misses 43.70 -> 42.80, the round 88.3 -> 87.7 ms); the texts the same
+    bytes in every arm (card d63fabe7ba, greedy 4d36d6e8aa); decode's footprint 94,904-94,914 MiB, 2,902-2,908 under
+    the lowest prompted request's peak (97,816), the decode-only greedy request's whole peak 94,446 -> 94,911 (+464
+    MiB, the row). The card requests' `[mem-prompt]` peaks a 97,824 97,816 97,831 97,831 against b 97,816 97,820
+    97,903 97,819: b3's 72 MiB over a's highest failed the pre-registered "not up" gate, ruled noise (David,
+    2026-11-03: "Noise, merge"): MLX's prompt peak is 94,764 MiB in all 8 card requests, so the 72 MiB is non-MLX
+    memory the change cannot reach. Measured on ctl53m (zzz9y); merged on (zzzza0), on by default (main and David,
+    2026-11-03).
 - `MLX_SERVE_DSV41_SCRATCH_ATTN` (src/scratch_attn.zig, src/attn_twins.zig, patches/turboexl3-zzz8p-scratch-attn.patch;
   on, `=0` off, `=check`): a wide prompt layer's attention spans write their scores (f32 [L, H, NK]) and probabilities
   (f16) into a ring of two per-prompt slots (S and P, 256 x 64 x 640 words a slot, 126 MB) instead of fresh MLX buffers:
