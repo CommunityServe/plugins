@@ -134,6 +134,10 @@ pub const stage_trim = @import("src/stage_trim.zig");
 /// dq1b: decode's demand reads with each missed record's gate/up range as two range jobs read side by side
 /// (`MLX_SERVE_DSV41_GU_SPLIT`, src/gu_split.zig), set on the read pool by the copied source at each phase change.
 pub const gu_split = @import("src/gu_split.zig");
+/// df1: decode's lookahead reads behind its demand reads, and in mode 2 a claimed record's untaken pieces read by the
+/// demand (`MLX_SERVE_DSV41_DEMAND_FIRST`, src/demand_first.zig), set on the read pool by the copied source at each phase
+/// change.
+pub const demand_first = @import("src/demand_first.zig");
 /// The decode's demand reads by record size, part and how they were served (src/demand_split.zig, dq1a's, with
 /// [round-io]); read by the copied stream at each route's settle.
 pub const demand_split = @import("src/demand_split.zig");
@@ -463,6 +467,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     gu_split.configure(env.span(.MLX_SERVE_DSV41_GU_SPLIT)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_GU_SPLIT is none of 0, 1, check (unset: 1): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    demand_first.configure(env.span(.MLX_SERVE_DSV41_DEMAND_FIRST)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DEMAND_FIRST is none of 0, 1, 2 (unset: 2): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -835,6 +846,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] decode's demand reads: each missed record's gate/up range as two range jobs read side by side, split at the part boundary nearest its middle (MLX_SERVE_DSV41_GU_SPLIT, on by default; =0: whole); [gu-split] at each request's end\n", .{}),
         .check => log.info("[turboexl3_ds41] decode's demand reads: each missed record's gate/up range as two range jobs, checked (MLX_SERVE_DSV41_GU_SPLIT=check): each split range read again whole and compared with its rows before its publish; [gu-split] checked= mismatch= at each request's end\n", .{}),
     }
+    switch (demand_first.mode) {
+        .off => log.info("[turboexl3_ds41] decode's lookahead reads on the lane's rule, in chunks, claimed records read by their lookahead thread (MLX_SERVE_DSV41_DEMAND_FIRST=0)\n", .{}),
+        .first => log.info("[turboexl3_ds41] decode's lookahead reads behind its demand reads (MLX_SERVE_DSV41_DEMAND_FIRST=1, the order alone): an unclaimed lookahead record reads only while no demand read is queued or running, in 1 MiB pieces; [demand-first] at each request's end\n", .{}),
+        .help => log.info("[turboexl3_ds41] decode's lookahead reads behind its demand reads, a claimed record's untaken pieces read by the demand (MLX_SERVE_DSV41_DEMAND_FIRST, on by default at 2; =1: the order alone; =0: off): an unclaimed lookahead record reads only while no demand read is queued or running, in 1 MiB pieces, and a demand range waiting on a claimed record reads its own untaken pieces; [demand-first] at each request's end\n", .{}),
+    }
     switch (stage_trim.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted in file order, none withdrawn (MLX_SERVE_DSV41_STAGE_TRIM=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt calls' staged jobs posted hottest first, each one its routes take none of let go unread where no read has started (MLX_SERVE_DSV41_STAGE_TRIM=0: file order, none withdrawn){s}; [stage-trim] at each request's end\n", .{if (stage.on) "" else ": no effect without MLX_SERVE_DSV41_STAGE"}),
@@ -961,6 +977,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     }
     if (direct_parts.on) if (partsSnap(model(mp))) |ps| direct_parts.start(ps);
     if (gu_split.mode != .off) if (splitSnap(model(mp))) |ss| gu_split.start(ss);
+    if (demand_first.mode != .off) if (dfSnap(model(mp))) |dfs| demand_first.start(dfs);
     switch (bank_pool.mode) {
         .off => log.info("[turboexl3_ds41] the streamed bank's rows freed and freshly allocated at each phase change (MLX_SERVE_DSV41_BANK_POOL=0, or a host without HostGpu.alias)\n", .{}),
         .on => log.info("[turboexl3_ds41] the streamed bank's rows over one pool (MLX_SERVE_DSV41_BANK_POOL; =0: off): the prompt's windows and the wave sets' regions, then decode's window 0 and whole ext arrays over the same bytes, each pooled array its own buffer (HostGpu.alias); a [bank-pool] plan line at load\n", .{}),
@@ -1025,6 +1042,14 @@ fn splitSnap(m: *ds.Model) ?gu_split.Snap {
     if (r.math != .source) return null;
     const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
     return gu_split.Snap.of(src.stats());
+}
+
+/// The read pool's df1 counters and its adoption waits now (`demand_first`); null without the EXL3 source.
+fn dfSnap(m: *ds.Model) ?demand_first.Snap {
+    const r = m.mdl.streamed orelse return null;
+    if (r.math != .source) return null;
+    const src: *Exl3Source = @ptrCast(@alignCast(r.ctx));
+    return demand_first.Snap.of(src.demandFirstStats());
 }
 
 /// The stream's counters and the process's disk reads now (`round_io`).
@@ -1500,7 +1525,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const tkl = transient_keep.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len ..]);
     // eg2: the Engram twin's request (MLX_SERVE_DSV41_ENGRAM_TWIN).
     const etl = engram_twin.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len ..]);
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len]);
+    // df1: the lookahead behind the demand (MLX_SERVE_DSV41_DEMAND_FIRST): the request's [demand-first] line.
+    const dfl1 = if (demand_first.mode != .off) (if (dfSnap(model(mp))) |dfs| demand_first.meters(dfs, meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is

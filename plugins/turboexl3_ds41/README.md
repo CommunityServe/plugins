@@ -140,6 +140,41 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   move: the speculative class's two threads were busy with the budget's records (640 / 617 MB a round read, 369 / 409
   of it abandoned unrouted), so the extras waited queued behind them and were dropped unstarted at their call's settle,
   or, routed, cancelled by the demand read that needed them.
+- `MLX_SERVE_DSV41_DEMAND_FIRST` (src/demand_first.zig, src/demand_first_test.zig; the copied read pool's
+  `q3ld_demand_first`, ABI 2026110203, patches/turboexl3-zzz9u-demand-first.patch; on at `2` by default, `=1` the order
+  alone, `=0` off): decode's lookahead reads behind its demand reads. The order (`=1`, and part of `=2`): an unclaimed
+  lookahead record starts and continues only while no
+  demand read is queued or running (on every lookahead thread; the lane's rule let thread 0 read beside one), in 1 MiB
+  pieces (doubled until 64 cover a slot) in place of quarter-slot chunks, so a demand read that starts meanwhile waits
+  behind at most one piece a thread and the record pauses at its next piece, its landed pieces kept. `=2` (the
+  default): also, a claimed record's untaken pieces go to the demand ranges that need them: a deadline-free range whose
+  record is claimed
+  and not all in reads the record's untaken pieces under its own bytes itself, into the record's staging, beside the
+  lookahead thread, and adopts the range once every piece under it is in (ahead of the record's landed prefix). A
+  record whose pieces are all taken while demand still reads them is left to its last reader; a failed piece fails the
+  record once no reader is left (its ranges then read the stock way). The source sets the pool's mode at each phase
+  change (decode's the setting, the prompt's off); a record keeps the mode it started with. `[demand-first]` at each
+  request's end: the pieces read, the stops for demand inside a lane chunk and those chunks' rest (MB), mode 2's
+  demand-read runs (count, MB, ms), records landed by the demand, releases, early adoptions and failures, and the
+  adoption waits and their time. The motivation (ctl48's profile, pt6d): 51% of the card's K = 3 gate/up ranges start
+  beside an unclaimed lookahead chunk and take 1.82 ms against 1.59 ms clean, 58% of the lookahead's bytes are never
+  claimed, and claimed records still reading cost 11 ms a round on the card, 7 greedy. Exact: the same file bytes into
+  the same staging and rows; only which thread reads a piece, and when, changes. Its byte gate
+  (src/demand_first_test.zig, the pool's C file alone with its test hooks, in `zig build test`): a record claimed in
+  flight, a demand read beside an unclaimed record, a failed piece and rounds of random delays, at each mode, every slot
+  row the file's bytes.
+  - Read as df1d, `=1` alone (M5 Max, w-20261103-0004; code-ctx16384 card then greedy, a = ctl48 b528be70e900, b = df1
+    7e1cad69a020 at 1, both on G_KITSP1 a34826975049 with keyed sampling; a1 b1 b2 a2 b3 a3 a4 b4): card 48.5 48.1 48.4
+    48.0 against 47.8 46.9 47.7 47.9 tok/s (-1.40%, every pair negative), greedy 58.5 57.8 58.3 57.7 against 58.0 57.4
+    57.9 57.9 (-0.47%); the texts the same bytes in every arm. The claims about the same (20.5 -> 20.4 a round), the
+    abandoned records 373 -> 235, the card's verify 1.6 ms longer: with the lookahead yielding to every demand read the
+    claimed records land later (`[demand-first]` adopt_waits 5468, adopt_wait_ms 3669 a card request). Not merged alone.
+  - Read as df2o, `=2` against `=0` on one binary (df1 7e1cad69a020; the same config). Its first window
+    (w-20261103-0019) was invalid on rows: 147 / 176 in a1 b1 b2 a2 b3, 145 / 174 in a3, 146 / 175 in a4 and b4 (the
+    bank bill's ceiling moved at load), its numbers card +1.15%, greedy +1.81%. The rerun (w-20261103-0036): the rows
+    146 / 175 in every arm, the texts the same bytes (card 8074f27375, greedy 0a1c2b8690); card 48.0 47.4 48.0 48.0
+    against 47.9 48.2 48.4 48.3 tok/s (+0.73%; pairs -0.21, +1.69, +0.83, +0.62), greedy 58.0 57.3 58.0 58.0 against
+    58.7 58.7 58.8 58.4 (+1.43%; pairs +1.21, +2.44, +1.38, +0.69). Merged on at 2 (zzz9u).
 - `MLX_SERVE_DSV41_GU_SPLIT` (src/gu_split.zig; the copied read pool's `q3ld_gu_split`, ABI 2026110202,
   patches/turboexl3-zzz9h-gu-split.patch; on by default, `=0` off, `=check`): decode's demand reads with each missed
   record's gate/up range read as two range jobs of one ticket, side by side, split at the part boundary nearest the

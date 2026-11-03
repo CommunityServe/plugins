@@ -122,6 +122,19 @@ pub fn build(b: *std.Build) void {
         a4k_run.has_side_effects = true;
     }
     b.top_level_steps.get("test").?.step.dependOn(&a4k_run.step);
+    // MLX_SERVE_DSV41_DEMAND_FIRST's byte gate (df1): the copied read pool's C file alone (no MLX), with its test hooks
+    // (-DQ3LD_INJECT: scripted per-offset faults and sleeps, delays before the lookahead's reads and the demand ranges),
+    // reading a temp file's records through the lookahead and the demand at each mode, every slot row the file's bytes
+    // (src/demand_first_test.zig).
+    const df_gate = b.addTest(.{ .name = "demand_first", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/demand_first_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    df_gate.root_module.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" } });
+    df_gate.root_module.addIncludePath(b.path(csrc));
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(df_gate).step);
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/turboexl3_sdk.zig"),
         .target = target,

@@ -223,6 +223,7 @@ test {
     _ = @import("src/stage_next.zig");
     _ = @import("src/stage_votes.zig");
     _ = @import("src/gu_split.zig");
+    _ = @import("src/demand_first.zig");
     _ = @import("src/demand_split.zig");
     _ = @import("src/cold_start.zig");
     _ = @import("src/scratch_x1.zig");

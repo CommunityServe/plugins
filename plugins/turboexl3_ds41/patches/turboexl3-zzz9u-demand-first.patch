@@ -1,0 +1,563 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -273,6 +273,7 @@
+     pub const MLX_SERVE_DSV41_DECODE_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "split where its curves fit the pack, else flat", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode slot rows (turboexl3_ds41): unset, the flat bill's decode bytes split across the layers by its development corpus's misses-a-row curves, each layer between its prompt rows and 256, where the curves fit the pack (flat rows where they do not); flat: flat rows; split: the split required (refused by name, rows flat, where it does not fit)" };
+     pub const MLX_SERVE_DSV41_DEC_INVARIANT: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 indexer linears' decode rows the same words at any verify width (turboexl3_ds41): unset or 1, the indexer's head weights and index keys (plain bf16 linears MLX runs as its gemv for one row and as gemv_wide or its GEMM for more) at 2 to 6 rows on a batched twin of MLX's one-row gemv, every row that gemv's words, the weight read once a launch, the launch per weight shape and rows from this machine's timings; one row and wider calls keep MLX's matmul (one row: its gemv); check, on and every twin call compared with MLX's one-row matmul of each row, word for word ([gemv-twin] check lines), and the call's own matmul against the same words, reported ([gemv-twin] wide-vs-m1 lines); 0: MLX's matmul at every width" };
+     pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
++    pub const MLX_SERVE_DSV41_DEMAND_FIRST: Var = .{ .kind = .kill, .type = .text, .default = "2", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode's lookahead reads behind its demand reads (turboexl3_ds41, df1): unset, empty or 2 (zzz9u), an unclaimed lookahead record reads only while no demand read is queued or running (every lookahead thread), in 1 MiB pieces, so it stops at the next piece once a demand read starts, and a claimed record's unread pieces are read by the demand reads waiting on it, each its own, adopted as soon as its own bytes landed; 1, the order alone; 0, off; reads only, the served bytes the same at every setting" };
+     pub const MLX_SERVE_DSV41_DIRECT_PARTS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 read pool parts (turboexl3_ds41): each demand read's parts whose file offset, length and row lie on the file's block read straight into their rows (the gate's code on this pack: a third of a record no longer copied), the others staged and copied, the same bytes; [direct-parts] lines at each prompt's and request's end (=0: every part staged and copied)" };
+     pub const MLX_SERVE_DSV41_DRAFT_AHEAD: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 greedy round's next DSpark draft (turboexl3_ds41): launched at the end of the round before it, from its next token once its state is committed, when the next plan is the stages' block, and taken by the next round when it fits (the same token, position and state); the same ops, served bytes unchanged (unset or 1: on; 0: off; check: on, the next round makes its own draft too, compares the ids and confidences word for word and serves its own, [draft-ahead] lines)" };
+     pub const MLX_SERVE_DSV41_DECODE_STOP: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode stop (turboexl3_ds41): the decode phase's budget takes 1.0e9 B of the 2.0e9 B stop under the ceiling back for its slot rows (two more on the M5 Max at 16K), MLX's cache capped at 1 GiB from the phase change to decode and the prompt's cap restored at the change back; the prompt's budget and rows unchanged; the same bytes (unset or 1: on; 0: off; check: as 1, [decode-stop] lines)" };
+diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
+--- a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
++++ b/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
+@@ -132,6 +132,24 @@
+  *   dq1a's measurement rides along (RES_W 10): word 8 the range's lookahead flags (bit 0: an unclaimed speculative chunk
+  *   in flight at its start; >> 1: those started while it read; a pre-bound range's: its pre-read's), word 9 its wait (an
+  *   adopted range's for its record's chunks; a pre-bound range's for its pre-read).
++ *
++ * DEMAND FIRST (turboexl3_ds41 df1, ABI 2026110203): q3ld_demand_first(mode), at any time (the stream's phase change: its
++ *   decode the setting's mode, its prompt 0), orders the speculative class behind demand.  A record keeps the mode it
++ *   started with.  Mode 1: an UNCLAIMED record starts and continues only while no demand job is queued or executes
++ *   (busy == 0 for every speculative thread, where the lane's rule let thread 0 run beside one), and is read in PIECES of
++ *   df_piece bytes (1 MiB, doubled until 64 pieces cover a slot) instead of chunks, so the rule is met at every piece
++ *   boundary: a demand job that starts while a piece is in flight sits behind at most that piece per thread, and the
++ *   record pauses at the next boundary, its landed pieces kept, until demand drains.  Claimed records read their chunks
++ *   back to back as before.  Mode 2: mode 1, and a CLAIMED record's untaken pieces go to the demand ranges that need
++ *   them.  A record started in mode 2 keeps two piece bitmaps (taken: handed to a reader; done: landed); its speculative
++ *   thread takes the first run of untaken pieces (one piece unclaimed, a chunk's worth claimed); a deadline-free demand
++ *   range that finds its record claimed and its bytes not all landed reads the untaken pieces under its own bytes itself
++ *   (preadv into the record's staging at their offsets, as the speculative thread would) instead of waiting, and adopts
++ *   the range once every piece under it is done (not only the record's landed prefix).  The landed prefix is the done
++ *   pieces' leading run.  A reader's failed or short piece fails the record once no reader is left (its waiting ranges
++ *   then read the stock way).  A record whose pieces are all taken while others still read it is released by its
++ *   speculative thread; its last reader lands it.  Exact: the same file bytes into the same staging and the same rows;
++ *   only which thread reads a piece, and when.  Counters of its own (q3ld_df_stats, DF_*): SC_N stays.
+  */
+ #include <errno.h>
+ #include <mach/mach_time.h>
+@@ -303,6 +321,12 @@
+     int32_t readers;    /* demand ranges copying out of buf */
+     int32_t adopted;    /* ranges served since it was queued */
+     char *buf;
++    /* DEMAND FIRST (df1): the mode the record started with; mode 2's pieces handed to a reader and landed (bit p: bytes
++     * [p * df_piece, (p + 1) * df_piece) from `aligned`, the last cut at `span`), its readers now, a reader's failure */
++    int df;
++    uint64_t df_taken, df_done;
++    int32_t df_live;
++    int32_t df_bad;
+ } spec_t;
+ 
+ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+@@ -334,6 +358,26 @@
+ static int64_t dq_flags(int at_start, uint64_t s0) { return (int64_t)((spec_chunk_starts - s0) << 1) | (at_start ? 1 : 0); }
+ static uint64_t spec_order = 0;
+ static int64_t *sc = 0;
++/* DEMAND FIRST (df1): 0 off, 1 demand first, 2 also claimed pieces to the demand (q3ld_demand_first); the piece (1 MiB,
++ * doubled until DF_MAX_PIECES cover a slot: q3ld_spec_config); the counters since the start (q3ld_df_stats) */
++#define DF_PIECE_MIN ((int64_t)1 << 20)
++#define DF_MAX_PIECES 64
++enum {
++    DF_PIECES = 0,        /* unclaimed lookahead reads made in pieces (modes 1, 2) */
++    DF_STOPS,             /* unclaimed records that stopped for demand inside one of the lane's chunks */
++    DF_STOP_BYTES,        /* ... the rest of those chunks: what the lane would still have read beside the demand */
++    DF_HELP_RUNS,         /* mode 2: runs of a claimed record's pieces read by a demand worker */
++    DF_HELP_BYTES,
++    DF_HELP_NS,           /* ... the time in those reads */
++    DF_HELP_LANDS,        /* mode 2: records landed by their last reader, a demand worker (the speculative thread gone) */
++    DF_RELEASES,          /* mode 2: claimed records a speculative thread left with every piece taken and readers on */
++    DF_EARLY_ADOPTS,      /* mode 2: ranges adopted with every piece under them done, ahead of the landed prefix */
++    DF_FAILED,            /* mode 2: records failed by a reader's piece */
++    DF_N
++};
++static int demand_first = 0;
++static int64_t df_piece = DF_PIECE_MIN;
++static int64_t df_stats[DF_N];
+ 
+ /* ---- the pre-read class (lookahead3) */
+ #define MAX_PRE 32
+@@ -958,6 +1002,133 @@
+     return -1;
+ }
+ 
++/* ---------------------------------------------------------------- DEMAND FIRST (df1): the pieces (caller holds mu) */
++static int df_npieces(const spec_t *s) { return (int)((s->span + df_piece - 1) / df_piece); }
++static int df_chunk_pieces(void) { const int64_t n = (spec_chunk + df_piece - 1) / df_piece; return n > 0 ? (int)n : 1; }
++static int64_t df_end(const spec_t *s, int p) { const int64_t e = (int64_t)p * df_piece; return e < s->span ? e : s->span; }
++
++static uint64_t df_mask(int a, int b) {   /* bits [a, b), 0 <= a, b <= 64 */
++    if (b <= a) return 0;
++    const uint64_t hi = b >= 64 ? ~0ULL : (1ULL << b) - 1;
++    return hi & ~((1ULL << a) - 1);
++}
++
++/* mode 2: the first run of untaken pieces in [a, b) (b capped at the record's pieces), at most `most` long: its first
++ * piece (*end its end), or -1 */
++static int df_run(const spec_t *s, int a, int b, int most, int *end) {
++    const int n = df_npieces(s);
++    if (b > n) b = n;
++    int p = a;
++    while (p < b && ((s->df_taken >> p) & 1)) p++;
++    if (p >= b) return -1;
++    int e = p + 1;
++    while (e < b && e - p < most && !((s->df_taken >> e) & 1)) e++;
++    *end = e;
++    return p;
++}
++
++/* mode 2: a piece left to take and no reader failed */
++static int df_open(const spec_t *s) {
++    int e;
++    return !s->df_bad && df_run(s, 0, DF_MAX_PIECES, 1, &e) >= 0;
++}
++
++/* mode 2: every piece under the record's bytes [off, off + total) landed */
++static int df_covers(const spec_t *s, int64_t off, int64_t total) {
++    if (s->df_bad) return 0;
++    const int64_t a = off - s->aligned, b = off + total - s->aligned;
++    if (a < 0 || b > s->span) return 0;
++    const uint64_t m = df_mask((int)(a / df_piece), (int)((b + df_piece - 1) / df_piece));
++    return m && (s->df_done & m) == m;
++}
++
++/* mode 2: a reader's pieces [a, b) ended (ok: every byte of them landed).  The landed prefix moves over the done
++ * pieces' leading run; a failure marks the record, which fails once no reader is left. */
++static void df_landed(spec_t *s, int a, int b, int ok) {
++    s->df_live -= 1;
++    if (!ok) s->df_bad = 1;
++    else s->df_done |= df_mask(a, b);
++    if (!s->df_bad) {
++        const int n = df_npieces(s);
++        int p = (int)(s->got / df_piece);
++        while (p < n && ((s->df_done >> p) & 1)) p++;
++        s->got = df_end(s, p);
++        int64_t payload = s->aligned + s->got - s->base;
++        if (payload > s->len) payload = s->len;               /* EXL3_LANE_PORT */
++        s->landed = payload > 0 ? payload : 0;
++    }
++    pthread_cond_broadcast(&land_cv);
++}
++
++/* mode 2: a record no speculative thread owns ends with its last reader: landed (every piece done), or failed (a reader
++ * failed); with pieces untaken and no reader it waits for a speculative thread (pickable) */
++static void df_end_released(spec_t *s) {
++    if (s->state != SP_INFLIGHT || s->running || s->df_live > 0) return;
++    if (!s->df_bad && s->got < s->span) return;
++    if (!s->df_bad && s->landed > 0) {
++        sc[SC_LANDED] += 1;
++        df_stats[DF_HELP_LANDS] += 1;
++        s->state = SP_LANDED;
++    } else {
++        s->landed = 0;
++        sc[SC_FAILED] += 1;
++        df_stats[DF_FAILED] += 1;
++        s->state = SP_FAILED;
++    }
++    EV(4, s->base);
++    pthread_cond_broadcast(&land_cv);
++    pthread_cond_broadcast(&done_cv);
++}
++
++/* modes 1, 2: an unclaimed record stopped for demand at its landed prefix: counted when the stop falls inside one of the
++ * lane's chunks (the rest of that chunk is what the lane would still have read beside the demand) */
++static void df_stop(const spec_t *s) {
++    const int64_t r = s->got % spec_chunk;
++    if (!r) return;
++    int64_t left = spec_chunk - r;
++    if (left > s->span - s->got) left = s->span - s->got;
++    df_stats[DF_STOPS] += 1;
++    df_stats[DF_STOP_BYTES] += left;
++}
++
++/* mode 2: the demand range [off, off + total) of claimed record s reads the first run of its untaken pieces itself:
++ * preadv into the record's staging at their offsets, as the speculative thread would (drops mu for the read).  1 when it
++ * read (the caller looks again), 0 when none of its pieces was left to take. */
++static int df_help(spec_t *s, int64_t off, int64_t total) {
++    if (s->df_bad) return 0;
++    const int64_t a = off - s->aligned, b = off + total - s->aligned;
++    int pb = 0;
++    const int pa = df_run(s, (int)(a / df_piece), (int)((b + df_piece - 1) / df_piece), DF_MAX_PIECES, &pb);
++    if (pa < 0) return 0;
++    s->df_taken |= df_mask(pa, pb);
++    s->df_live += 1;
++    const int64_t at = (int64_t)pa * df_piece, n = df_end(s, pb) - at;
++    char *dst = s->buf + at;
++    const int fd = s->fd;
++    const off_t foff = (off_t)(s->aligned + at);
++    pthread_mutex_unlock(&mu);
++    gauge_enter();
++    const int64_t t = q3ld_monotonic_ns();
++    int64_t done = 0;
++    int err = 0;
++    while (done < n) {
++        struct iovec iov = { dst + done, (size_t)(n - done) };
++        ssize_t r = do_preadv(fd, &iov, 1, foff + done);
++        if (r < 0) { err = 1; break; }
++        if (r == 0) break;
++        done += r;
++    }
++    const int64_t dt = q3ld_monotonic_ns() - t;
++    gauge_exit();
++    pthread_mutex_lock(&mu);
++    df_stats[DF_HELP_RUNS] += 1;
++    df_stats[DF_HELP_BYTES] += done;
++    df_stats[DF_HELP_NS] += dt;
++    df_landed(s, pa, pb, !err && done == n);
++    df_end_released(s);
++    return 1;
++}
++
+ /* ---------------------------------------------------------------- speculative: demand-side adoption */
+ /* Serve one demand range from a speculative record.  Returns -1 when no record serves it (the caller reads
+  * it the stock way), else the range status (ST_OK, or ST_DEADLINE when the deadline passed while waiting). */
+@@ -973,9 +1144,13 @@
+         spec_t *s = &spec[i];
+         int64_t need = rg->offset + total - s->base;
+         if (s->landed >= need && (s->state == SP_LANDED || s->state == SP_INFLIGHT)) break;
++        /* DEMAND FIRST mode 2: every piece under the range landed, ahead of the record's landed prefix */
++        if (s->state == SP_INFLIGHT && s->df == 2 && df_covers(s, rg->offset, total)) { df_stats[DF_EARLY_ADOPTS] += 1; break; }
+         /* adoptable only if it will land: a landed-short record (EOF) or an unclaimed / queued one is not */
+         if (s->state != SP_INFLIGHT || !s->claimed) { pthread_mutex_unlock(&mu); return -1; }
+         if (!waited) { waited = 1; sc[SC_ADOPT_WAITS] += 1; }
++        /* DEMAND FIRST mode 2: the range's untaken pieces read by this worker instead of waited for */
++        if (s->df == 2 && job->deadline < 0 && df_help(s, rg->offset, total)) continue;
+         if (job->deadline >= 0) {
+             int64_t left = job->deadline - q3ld_monotonic_ns();
+             if (left <= 0) {
+@@ -1325,6 +1500,7 @@
+ 
+ /* ---------------------------------------------------------------- speculative: reader threads */
+ static int rule_ok(int ti) {   /* THE QUEUE RULE, demand side, for speculative thread ti (caller holds mu) */
++    if (demand_first) return qlen == 0 && busy == 0;          /* DEMAND FIRST: no demand job queued or executing */
+     return qlen == 0 && busy <= (ti == 0 ? SPEC_MAX_DEMAND_BUSY : spec_idle_busy);
+ }
+ 
+@@ -1336,8 +1512,10 @@
+     return n;
+ }
+ 
+-static int pickable(const spec_t *s) {   /* queued, or parked (in flight, unowned) */
+-    return s->state == SP_QUEUED || (s->state == SP_INFLIGHT && !s->running);
++static int pickable(const spec_t *s) {   /* queued, or parked (in flight, unowned; DEMAND FIRST mode 2: a piece left) */
++    if (s->state == SP_QUEUED) return 1;
++    if (s->state != SP_INFLIGHT || s->running) return 0;
++    return s->df != 2 || df_open(s);
+ }
+ 
+ /* caller holds mu: claimed (parked) first, then the nearest class, then the oldest; -1 if none */
+@@ -1419,9 +1597,14 @@
+             if (s->file_size - s->aligned < s->span) s->span = s->file_size - s->aligned;
+             s->got = 0;
+             s->landed = 0;
++            s->df = demand_first;                                 /* DEMAND FIRST: the record's mode, all its reads */
++            s->df_taken = s->df_done = 0;
++            s->df_live = 0;
++            s->df_bad = 0;
+         }
+         s->running = 1;
+         spec_inflight += 1;
++        int64_t df_stop_at = -1;                                  /* DEMAND FIRST: the last stop counted */
+         for (;;) {
+             /* chunk boundary (also before the first chunk) */
+             if ((s->abandon || stopping) && !s->claimed) {
+@@ -1435,6 +1618,23 @@
+                 else { sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); }
+                 break;
+             }
++            if (s->df == 2 && !df_open(s)) {
++                /* DEMAND FIRST mode 2: every piece taken, or a reader failed.  No reader left: a reader failed (every
++                 * piece landed would have landed it above).  Else the last reader ends it (df_end_released). */
++                if (s->df_live == 0) {
++                    s->landed = 0;
++                    sc[SC_FAILED] += 1;
++                    df_stats[DF_FAILED] += 1;
++                    spec_end(s, SP_FAILED);
++                } else {
++                    df_stats[DF_RELEASES] += 1;
++                    s->running = 0;
++                    spec_inflight -= 1;
++                    pthread_cond_broadcast(&done_cv);
++                    pthread_cond_broadcast(&spec_cv);
++                }
++                break;
++            }
+             if (!s->claimed && !stopping && s->prio > 0 && (!rule_ok(ti) || nearer_queued(s->prio))) {
+                 /* PARK: free this thread for demand-nearer work; any thread resumes the record later */
+                 sc[SC_PARKS] += 1;
+@@ -1446,6 +1646,7 @@
+             }
+             if (!s->claimed && !stopping && !rule_ok(ti)) {
+                 sc[SC_PAUSES] += 1;
++                if (s->df && s->got != df_stop_at) { df_stop_at = s->got; df_stop(s); }
+                 pthread_cond_wait(&spec_cv, &mu);
+                 continue;
+             }
+@@ -1462,13 +1663,28 @@
+             }
+             EV(s->claimed ? 7 : (ti > 0 ? 8 : 3), s->claimed ? s->base : nq);
+             SPEC_HOLD(s);
+-            int64_t n = s->span - s->got;
+-            if (n > spec_chunk) n = spec_chunk;
+-            char *dst = s->buf + s->got;
++            int64_t at, n;
++            int pa = 0, pb = 0;
++            if (s->df == 2) {
++                /* DEMAND FIRST mode 2: the first run of untaken pieces, one piece unclaimed, a chunk's worth claimed (none
++                 * left: readers took the rest meanwhile, and the boundary ends or releases it) */
++                if (s->df_bad || (pa = df_run(s, 0, DF_MAX_PIECES, s->claimed ? df_chunk_pieces() : 1, &pb)) < 0) continue;
++                s->df_taken |= df_mask(pa, pb);
++                s->df_live += 1;
++                at = (int64_t)pa * df_piece;
++                n = df_end(s, pb) - at;
++            } else {
++                at = s->got;
++                n = s->span - s->got;
++                const int64_t step = s->df && !s->claimed ? df_piece : spec_chunk;   /* DEMAND FIRST: unclaimed, in pieces */
++                if (n > step) n = step;
++            }
++            char *dst = s->buf + at;
+             int fd = s->fd;
+-            off_t off = (off_t)(s->aligned + s->got);
++            off_t off = (off_t)(s->aligned + at);
+             const int dq_uc = !s->claimed;            /* dq1a: an unclaimed chunk (the demand ranges' lookahead flags) */
+             if (dq_uc) { spec_reading += 1; spec_chunk_starts += 1; }
++            if (s->df && dq_uc) df_stats[DF_PIECES] += 1;
+             pthread_mutex_unlock(&mu);
+             SPEC_DELAY();
+             int64_t done = 0;
+@@ -1484,6 +1700,10 @@
+             if (dq_uc) spec_reading -= 1;
+             sc[SC_SPEC_CHUNKS] += 1;
+             sc[SC_SPEC_BYTES] += done;
++            if (s->df == 2) {                                 /* DEMAND FIRST mode 2: the bitmaps; the boundary decides */
++                df_landed(s, pa, pb, !err && done == n);
++                continue;
++            }
+             if (err) { s->landed = 0; sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); break; }
+             s->got += done;
+             int64_t payload = s->aligned + s->got - s->base;
+@@ -1528,6 +1748,8 @@
+     spec_inflight = 0;
+     spec_reading = 0;
+     spec_chunk_starts = 0;                            /* dq1a */
++    df_piece = DF_PIECE_MIN;                          /* DEMAND FIRST: DF_MAX_PIECES pieces cover a slot */
++    while (df_piece * DF_MAX_PIECES < slot_bytes) df_piece *= 2;
+     spec_configured = 1;
+     pthread_mutex_unlock(&mu);
+     return 0;
+@@ -1550,7 +1772,7 @@
+     if (tb_denom == 0 && q3ld_init() != 0) return -1;
+     pthread_mutex_lock(&mu);
+     if (running || !spec_configured || nw < 1 || nw > MAX_WORKERS || psize <= 0 || sbytes % psize
+-        || (nspec && (spec_slot_bytes % psize || spec_chunk % psize))) { pthread_mutex_unlock(&mu); return -1; }
++        || (nspec && (spec_slot_bytes % psize || spec_chunk % psize || df_piece % psize))) { pthread_mutex_unlock(&mu); return -1; }
+     for (int i = 0; i < nspec; i++) {
+         if (((uintptr_t)spec[i].buf) % (uintptr_t)psize) { pthread_mutex_unlock(&mu); return -1; }
+     }
+@@ -1578,6 +1800,8 @@
+     wd_stop = 0; wd_running = 0;
+     qcap = n_tickets * 2; qhead = 0; __atomic_store_n(&qlen, 0, __ATOMIC_RELAXED);
+     gu_split = 0;                                     /* GU SPLIT: a new pool reads ranges whole until told */
++    demand_first = 0;                                 /* DEMAND FIRST: the lane's rule until told */
++    memset(df_stats, 0, sizeof(df_stats));
+     res = res_arr; nt = n_tickets; logbuf = log_arr; logn = n_log; gauge = gauge_arr;
+     staging_bytes = sbytes; page_size = psize;
+     __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0;
+@@ -1887,6 +2111,10 @@
+         s->aligned = b / page_size * page_size;
+         s->span = s->got = s->landed = 0;
+         s->adopted = 0;
++        s->df = 0;                                      /* DEMAND FIRST: set at its start */
++        s->df_taken = s->df_done = 0;
++        s->df_live = 0;
++        s->df_bad = 0;
+         sc[SC_SUBMITTED] += 1;
+         sc[SC_H_SUBMITTED + origin - 1] += 1;
+         queued += 1;
+@@ -2104,6 +2332,7 @@
+     free(ranges); free(queue); free(pre_of); free(sub_len); ranges = 0; queue = 0; pre_of = 0; sub_len = 0;
+     free(split_left); free(split_chk); free(split_words); free(pre_of_b);
+     split_left = 0; split_chk = 0; split_words = 0; pre_of_b = 0; gu_split = 0;
++    demand_first = 0;
+     for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
+     pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
+     res = 0; logbuf = 0; gauge = 0; sc = 0;
+@@ -2454,7 +2683,27 @@
+     return 0;
+ }
+ 
+-int32_t q3ld_abi(void) { return 2026110202; }              /* dq1b: GU SPLIT (q3ld_gu_split, the SC_SPLIT_* counters), RES_W 10 (dq1a's lookahead flags and wait); 2026110101 PARTS route; 2026102401 SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
++/* DEMAND FIRST (df1): the speculative class's order behind demand for the reads from here on (any time; the stream's
++ * phase change): 0 off (the lane's rule, chunks), 1 demand first, 2 demand first and claimed records' untaken pieces to
++ * the demand ranges that need them.  A record keeps the mode it started with.  Returns 0, -1 for another mode. */
++int q3ld_demand_first(int32_t mode) {
++    if (mode < 0 || mode > 2) return -1;
++    pthread_mutex_lock(&mu);
++    demand_first = mode;
++    pthread_cond_broadcast(&spec_cv);            /* the queue rule may differ */
++    pthread_mutex_unlock(&mu);
++    return 0;
++}
++
++/* DEMAND FIRST: the counters since the pool started (DF_*) -> out[min(n, DF_N)]; returns DF_N. */
++int32_t q3ld_df_stats(int64_t *out, int32_t n) {
++    pthread_mutex_lock(&mu);
++    for (int32_t i = 0; i < n && i < DF_N; i++) out[i] = df_stats[i];
++    pthread_mutex_unlock(&mu);
++    return DF_N;
++}
++
++int32_t q3ld_abi(void) { return 2026110203; }              /* df1: DEMAND FIRST (q3ld_demand_first, q3ld_df_stats); 2026110202 dq1b: GU SPLIT (q3ld_gu_split, the SC_SPLIT_* counters), RES_W 10 (dq1a's lookahead flags and wait); 2026110101 PARTS route; 2026102401 SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
+ int32_t q3ld_max_gates(void) { return MAX_GATES; }
+ int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
+ int32_t q3ld_max_pre(void) { return MAX_PRE; }
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -77,6 +77,10 @@
+ /// `MLX_SERVE_DSV41_GU_SPLIT` (the plugin's src/gu_split.zig, dq1b): decode's demand reads with each record's gate/up
+ /// range in two range jobs, read side by side (the read pool's `q3ld_gu_split`, set at each phase change).
+ const gu_split = @import("mlx_host").gu_split;
++/// `MLX_SERVE_DSV41_DEMAND_FIRST` (the plugin's src/demand_first.zig, df1): decode's lookahead reads behind its demand
++/// reads, and in mode 2 a claimed record's untaken pieces read by the demand (the read pool's `q3ld_demand_first`, set at
++/// each phase change).
++const demand_first = @import("mlx_host").demand_first;
+ /// `MLX_SERVE_DSV41_STAGE_NEXT` (the plugin's src/stage_next.zig): the next routed layer's read-ahead and staging during
+ /// the current layer's call (`nextAhead`, `Stream.readAheadNext`, `Stream.stageNext`).
+ const stage_next = @import("mlx_host").stage_next;
+@@ -722,6 +726,8 @@
+                         self.stream.directPartsLive(false);
+                         // MLX_SERVE_DSV41_GU_SPLIT is decode's: its reads (the grow's fills, its misses) split from here.
+                         self.stream.guSplit(gu_split.poolMode());
++                        // MLX_SERVE_DSV41_DEMAND_FIRST is decode's: its lookahead behind its demand from here.
++                        self.stream.demandFirst(demand_first.poolMode());
+                         // MLX_SERVE_DSV41_SCRATCH_WAVES: the prompt's regions let go (MLX keeps a buffer while a command uses it).
+                         scratch_waves.releaseAll();
+                         self.released = (try h.releaseTransient()) > 0;
+@@ -739,6 +745,8 @@
+                         self.stream.directPartsLive(true);
+                         // MLX_SERVE_DSV41_GU_SPLIT: the prompt's reads whole, as without it.
+                         self.stream.guSplit(0);
++                        // MLX_SERVE_DSV41_DEMAND_FIRST: the prompt's pool as without it.
++                        self.stream.demandFirst(0);
+                         dec_prefetch.reset();
+                         // `shrink` frees the grown rows and checks MLX's active bytes dropped by them, so no command may
+                         // still hold them (the grow's own fills, a decode's last eval): a phase change right after the
+@@ -766,6 +774,10 @@
+     }
+     pub fn stats(self: *Source) expert_stream.Stats {
+         return self.source.stats();
++    }
++    /// MLX_SERVE_DSV41_DEMAND_FIRST: the read pool's df1 counters and its adoption waits (`Stream.demandFirstStats`).
++    pub fn demandFirstStats(self: *Source) [sdk_ext.expert.io.df_n + 2]i64 {
++        return self.stream.demandFirstStats();
+     }
+ };
+ /// `x`'s words as `dt` (MLX's view: the same buffer, bitcast), in `g`'s scope.
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weights/streamed/sdk_ext/expert/io.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/io.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/io.zig
+@@ -25,6 +25,8 @@
+     pub extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
+     pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
+     pub extern fn q3ld_gu_split(mode: i32) c_int;
++    pub extern fn q3ld_demand_first(mode: i32) c_int;
++    pub extern fn q3ld_df_stats(out: *[df_n]i64, n: i32) i32;
+     pub extern fn q3ld_direct_config(on: i32) c_int;
+     pub extern fn q3ld_parts_config(block: i64) c_int;
+     pub extern fn q3ld_parts_live(on: i32) c_int;
+@@ -65,12 +67,18 @@
+     pub const abi = c;
+     pub const status_words = res_w;
+ } else struct {};
+-/// The C pool's ABI (`q3ld_abi`): 2026110202, turboexl3_ds41's dq1b (`q3ld_gu_split`, `Pool.guSplit`: each record's gate/up
++/// The C pool's ABI (`q3ld_abi`): 2026110203, turboexl3_ds41's df1 (`q3ld_demand_first`, `Pool.demandFirst`: the lookahead's
++/// reads behind demand; `q3ld_df_stats`, `Pool.demandFirstStats`); 2026110202, turboexl3_ds41's dq1b (`q3ld_gu_split`, `Pool.guSplit`: each record's gate/up
+ /// range read as two range jobs of one ticket; the `split_*` counters; ten status words a ticket: `Result.lookahead` and
+ /// `Result.wait_ns`); 2026110101, the PARTS route (`Options.parts_block`) and its counters (2026102401:
+ /// SCATTER ranges; 2026101401: DIRECT reads as a construction-time route; 2026101201: the submit-wide WITHDRAW over the
+ /// range-job queue).
+-pub const abi_version = 2026110202;
++pub const abi_version = 2026110203;
++/// df1's counters (`q3ld_df_stats`, the C pool's DF_* order): unclaimed lookahead reads made in pieces; unclaimed records
++/// stopped for demand inside one of the lane's chunks and the rest of those chunks (bytes); mode 2: runs of a claimed
++/// record's pieces read by a demand worker, their bytes and time (ns), records landed by a demand worker, claimed records
++/// released by their speculative thread, ranges adopted ahead of the landed prefix, records failed by a reader's piece.
++pub const df_n = 10;
+ pub const max_workers = 8;
+ /// Records per job (one fill unit).
+ pub const max_items = 8;
+@@ -336,8 +344,9 @@
+             return error.InvalidOptions;
+         if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
+             s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
++        var df_probe: [df_n]i64 = @splat(0);
+         if (c.q3ld_abi() != abi_version or c.q3ld_counters_n() != counters_n or c.q3ld_max_spec() != max_spec or c.q3ld_max_pre() != max_pre or
+-            c.q3ld_max_gates() != max_gates or c.q3ld_max_gate_tickets() != max_gate_tickets) return error.PoolAbi;
++            c.q3ld_max_gates() != max_gates or c.q3ld_max_gate_tickets() != max_gate_tickets or c.q3ld_df_stats(&df_probe, 0) != df_n) return error.PoolAbi;
+         const self = try allocator.create(Pool);
+         errdefer allocator.destroy(self);
+         const staging = try std.posix.mmap(null, @intCast(opt.workers * opt.staging_bytes), .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+@@ -394,6 +403,22 @@
+     pub fn guSplit(self: *Pool, mode: u32) void {
+         _ = self;
+         _ = c.q3ld_gu_split(@intCast(mode));
++    }
++    /// turboexl3_ds41's df1 (`q3ld_demand_first`), for the reads from here on, at any time: 0 off (the lane's queue rule,
++    /// the lookahead read in chunks); 1 demand first (an unclaimed lookahead record starts and continues only while no
++    /// demand job is queued or executes, read in pieces, so it stops at the next piece once demand starts); 2 also hands
++    /// a claimed record's untaken pieces to the demand ranges waiting on it (each reads its own, into the record's
++    /// staging). A record keeps the mode it started with. Either way the rows get the file's bytes.
++    pub fn demandFirst(self: *Pool, mode: u32) void {
++        _ = self;
++        _ = c.q3ld_demand_first(@intCast(mode));
++    }
++    /// df1's counters since the start (`df_n`, in `q3ld_df_stats`'s order).
++    pub fn demandFirstStats(self: *Pool) [df_n]i64 {
++        _ = self;
++        var out: [df_n]i64 = @splat(0);
++        _ = c.q3ld_df_stats(&out, df_n);
++        return out;
+     }
+     /// After the owned consumers settle: expire unbound reads and wait for the pool's activity to stop.
+     /// Ready speculative records and their tags stay intact. A timeout refuses the phase change.
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io_stub.zig b/sdk/weights/streamed/sdk_ext/expert/io_stub.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/io_stub.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/io_stub.zig
+@@ -15,6 +15,12 @@
+     pub fn q3ld_gu_split(_: i32) c_int {
+         return -1;
+     }
++    pub fn q3ld_demand_first(_: i32) c_int {
++        return -1;
++    }
++    pub fn q3ld_df_stats(_: *[io.df_n]i64, _: i32) i32 {
++        return 0;
++    }
+     pub fn q3ld_start(_: i32, _: [*]const u64, _: i64, _: i64, _: [*]i64, _: i64, _: [*]i64, _: i64, _: *[6]i64) c_int {
+         return -1;
+     }
+diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+--- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+@@ -3772,6 +3772,19 @@
+             pub fn guSplit(self: *Stream, mode: u32) void {
+                 self.pool.guSplit(mode);
+             }
++            /// turboexl3_ds41 (df1, MLX_SERVE_DSV41_DEMAND_FIRST: the source's decode phase the setting's mode, its prompt
++            /// phase off): the read pool's demand-first order for the reads from here on (`expert_io.Pool.demandFirst`).
++            pub fn demandFirst(self: *Stream, mode: u32) void {
++                self.pool.demandFirst(mode);
++            }
++            /// df1's counters (`expert_io.Pool.demandFirstStats`), then the pool's adoption waits and their time (ns).
++            pub fn demandFirstStats(self: *Stream) [expert_io.df_n + 2]i64 {
++                var out: [expert_io.df_n + 2]i64 = undefined;
++                out[0..expert_io.df_n].* = self.pool.demandFirstStats();
++                out[expert_io.df_n] = self.pool.counter(.adopt_waits);
++                out[expert_io.df_n + 1] = self.pool.counter(.adopt_wait_ns);
++                return out;
++            }
+             pub fn stats(self: *Stream) Stats {
+                 var s = self.counters;
+                 s.expert_read_seconds = @as(f64, @floatFromInt(self.read_ns)) / 1e9;
