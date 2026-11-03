@@ -1,9 +1,10 @@
 # turboexl3_ds41
 
 Serves DeepSeek-V4.1-Flash's EXL3 packs in the streaming repack
-(OpensourceWTF/DeepSeek-V4.1-Flash-1017-streaming-repack-exl3-2.81bpw). The routed experts stream from SSD, and turboexl3
-runs the EXL3 trunk. The plugin claims a `deepseek_v41` pack only when its config carries exllamav3's
-`quantization_config` (`quant_method` exl3); the built-in deepseek_v41 keeps every other pack.
+(https://huggingface.co/OpensourceWTF/DeepSeek-V4.1-Flash-1017-streaming-repack-exl3/tree/2.81bpw).
+The routed experts stream from SSD, and turboexl3 runs the EXL3 trunk. The plugin claims a `deepseek_v41` pack only
+when its config carries exllamav3's `quantization_config` (`quant_method` exl3); the built-in deepseek_v41 keeps every
+other pack.
 
     scripts/build.sh turboexl3_ds41                                  # from the repo root: tests, then ReleaseFast
     plugins/turboexl3_ds41/scripts/prepare.sh                        # generate src/mlx_serve/ (build.sh runs it)
