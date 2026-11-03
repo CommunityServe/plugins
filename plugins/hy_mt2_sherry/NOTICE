@@ -1,0 +1,12 @@
+hy_mt2_sherry vendors the model definition and Metal kernels of the Hy-MT2 1.25-bit MLX pack:
+
+  Sube126/Hy-MT2-1.8B-1.25Bit-MLX    Apache-2.0
+  kuotient/Hy-MT2-1.8B-1.25Bit-MLX   Apache-2.0 (the parent this pack modifies)
+  AngelSlim/Hy-MT2-1.8B-1.25Bit-GGUF Apache-2.0 (the Sherry QAT checkpoint and STQ1_0 layout)
+  tencent/Hy-MT2-1.8B                Apache-2.0 (the base model)
+
+`plugin.zig`'s `gemv_src` and `dequant_src` are ports of `sherry_model.py`'s `_GEMV_SRC` and `_DEQUANT_SRC`, and the
+STQ codebook and `half4` table are its `_CODEBOOK` / `_STQ_LUT`. The decoder is a port of mlx-lm's
+`mlx_lm/models/hunyuan_v1_dense.py` (Apple, MIT) with the STQ linears from the pack.
+
+STQ1_0 itself follows llama.cpp PR #22836 (ggml-org/llama.cpp, MIT).

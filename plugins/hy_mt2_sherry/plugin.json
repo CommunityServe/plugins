@@ -1,0 +1,14 @@
+{
+  "name": "hy_mt2_sherry",
+  "kind": "model",
+  "version": "0.1.0",
+  "summary": "Hy-MT2-1.8B 1.25-bit translation packs (Sherry/STQ1_0 in MLX): hunyuan_v1_dense with the STQ linear layout and a 6-bit affine embedding.",
+  "models": [
+    "Sube126/Hy-MT2-1.8B-1.25Bit-MLX",
+    "kuotient/Hy-MT2-1.8B-1.25Bit-MLX"
+  ],
+  "requires_mlx_serve": ">=26.11.1",
+  "fixture": "kit",
+  "maintainers": [],
+  "license": "MIT"
+}
