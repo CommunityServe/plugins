@@ -980,6 +980,28 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   chk then A B B A, B A A B): greedy 56.60 -> 57.08 tok/s (+0.84%, round 86.36 -> 85.53 ms, misses 38.5 -> 36.9 a
   round), card 44.40 -> 44.78 (+0.84%); the decode rows 177 -> 179 in every pair (a2 opened 152 prompt rows at its
   in_use of 102,183 MiB, the others 153); the texts the same in every arm (card f7dfb7a5d4, greedy fd06ee302a).
+- `MLX_SERVE_DSV41_BILL_PIN` (src/bill_pin.zig, the generated bill's `in_use_pin` hook in
+  patches/turboexl3-zzz9x-bill-pin.patch; off by default: unset or empty, the live reading as before; `=<file>`
+  pinned): the memory in use the streamed bank's bill reads, pinned in a file for a window's servers. The slot rows
+  come from the bill's budget at the bank's open (`streamBudget`: MLX's recommended working set less the wired margin,
+  the host's and the Engram LRU's bytes and the memory in use, hw.memsize less the available pages), and the memory in
+  use is every process's, read live, so what the other processes hold that minute moves the rows: since the box's
+  macOS 27.2 restart (2026-11-03) they hold about 5-6 GB more, the rows fell from 147 / 176 to 134-136 / 163-165 and
+  drift between the servers of one window (cc1d's a1 opened 134 / 164 with 18 MiB of decode budget over its last row,
+  ce1's a2 134 / 163). Pinned, the file holds the memory in use in bytes on one decimal line: a valid value is used in
+  place of the live reading at every one of the bill's reads; with no file the bank's open reads it live, writes it (a
+  temporary beside the file, renamed over it) and uses it, so the servers after it read the same value and open the
+  same rows. A file holding no value (empty, not a whole number, 0, 1 TiB or more) or a path of 1024 bytes or more
+  refuses the load by name (`BillPinFile`, `BillPinSetting`). The load line `[turboexl3_ds41] the streamed bank's
+  bill: pinned= in_use_mb= file=`, and `[bank-bill]` gains `pinned=` (`off`, `read`, `wrote`, `unwritten`: the write
+  failed and the live reading was used) after its `in_use_mb=`, which is the pinned value when pinned (off: the live
+  reading at that line, after the bank's rows were allocated, as before). For a window: one file per window, removed
+  by the launcher before the window starts and named in SENV (`MLX_SERVE_DSV41_BILL_PIN=$D/.pin-<name>-<epoch>.txt`),
+  so its first server (the warm one or w0) writes it and every later one reads it; the rows are then the first
+  server's in every arm (a later server's own residents are not read again), and a binary without this code ignores
+  the variable (no `pinned=` in its `[bank-bill]`). Exact: only the input the row count comes from is fixed; the rows,
+  the plans and the words follow from it as from any reading (a route's bytes are the records' in any row). Merged on
+  (zzz9x) as the windows' rows pin (main and David, 2026-11-03); nothing measured.
 - `MLX_SERVE_DSV41_SCRATCH_ATTN` (src/scratch_attn.zig, src/attn_twins.zig, patches/turboexl3-zzz8p-scratch-attn.patch;
   on, `=0` off, `=check`): a wide prompt layer's attention spans write their scores (f32 [L, H, NK]) and probabilities
   (f16) into a ring of two per-prompt slots (S and P, 256 x 64 x 640 words a slot, 126 MB) instead of fresh MLX buffers:

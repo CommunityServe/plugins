@@ -105,6 +105,9 @@ pub const transient_keep = @import("src/transient_keep.zig");
 /// MLX's command-buffer split raised for prompts through the host's `HostGpu.command_buffer_limits`
 /// (`MLX_SERVE_DSV41_BUFFER_MB`, src/buffer_mb.zig), read by the copied streamed source at its phase changes.
 pub const buffer_mb = @import("src/buffer_mb.zig");
+/// The memory in use the streamed bank's bill reads, pinned in a file for a window's servers (`MLX_SERVE_DSV41_BILL_PIN`,
+/// src/bill_pin.zig): the generated bill's `in_use_pin` and `in_use_pinned` hooks.
+pub const bill_pin = @import("src/bill_pin.zig");
 /// A wide prompt layer followed by another wide one committed at its end, not waited for (`MLX_SERVE_DSV41_REST_ASYNC`,
 /// src/rest_async.zig), read by the copied model.
 pub const rest_async = @import("src/rest_async.zig");
@@ -287,6 +290,16 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     t3kit.bind(ctx.host.?);
     // The streamed bank's slot rows fit within the host's ceiling, not only the device's working set.
     bill.host_ceiling = &shims.memoryCeiling;
+    // MLX_SERVE_DSV41_BILL_PIN: the memory in use the bill reads at the bank's open, pinned in a file (unset: live).
+    bill_pin.configure(env.span(.MLX_SERVE_DSV41_BILL_PIN)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_BILL_PIN names no usable pin (a path under 1024 bytes whose file, when it exists, holds the memory in use in bytes on one decimal line): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    bill.in_use_pin = if (bill_pin.on()) &bill_pin.pin else null;
+    bill.in_use_pinned = &bill_pin.modeName;
     // MLX_SERVE_DSV41_BUFFER_MB: the prompt's split through the host's HostGpu.command_buffer_limits (null on a host
     // without the entry); a user's MLX_MAX_MB_PER_BUFFER wins.
     buffer_mb.configure(env.span(.MLX_SERVE_DSV41_BUFFER_MB), env.span(.MLX_MAX_MB_PER_BUFFER), kit.host.Host.of(ctx.host) catch null) catch |e| {
@@ -945,6 +958,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     {
         var bm_buf: [512]u8 = undefined;
         log.info("{s}", .{buffer_mb.loadLine(&bm_buf)});
+    }
+    {
+        var bp_buf: [1536]u8 = undefined;
+        log.info("{s}", .{bill_pin.loadLine(&bp_buf)});
     }
     switch (transient_keep.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' attention projections' outputs freed at the layer's teardown (MLX_SERVE_DSV41_TRANSIENT_KEEP=0)\n", .{}),
