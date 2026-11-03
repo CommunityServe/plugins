@@ -259,6 +259,38 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   warm server's fills evicted residents and its prompt lost 2 to 3%; with the rule a warm server's second prompt posted
   no fill (w-pio-20261101-0338). Over the usage seed it does not help: with SEED_FREE, S=10 took 984.7 tok/s against
   986.4 to 997.3 without it, its decoder misses 1404 against 1320.
+- `MLX_SERVE_DSV41_L39_LAST` (src/l39_last.zig, patches/turboexl3-zzz9y-l39-last.patch; on by default, `=0` off,
+  `=check` on and checked): a replaying prompt chunk's last decoder layer routes its last row only. The CED decoder
+  (layers 20..39) runs over the chunk's last 128 rows; each layer's output rows are read on by the next layer's window
+  KV and, at the DSpark targets (37, 38, 39: their inputs), by the drafter's rings, but the last layer's output rows
+  by nothing but the logits (the last row). On, that layer's router and shared expert run over every row as `moe` runs
+  them and the joinless routed call over the last row only, forced through the wide lane (the same waves and combine);
+  the other rows' routed output is zero. On ctl48's cold code-ctx16384 card layer 39 routes about 138 experts, 61 of
+  them misses (0.68 GB). The window KV, the drafter's rows and decode's state are the stock ones by construction; the
+  logits are the stock ones when the one-row call's words are the 128-row call's, which `=check` measures: the stock
+  call served, its last row compared with the one-row call's word for word. `[l39-last] mode= calls= words= differ=`
+  at each request's end. The layer's residency differs (its call admits the last row's misses only). A request whose
+  prompt is cached runs no replaying chunk, so there is no tail to act on (`calls=0`).
+  - Read as l39 (M5 Max, w-pio-20261103-0456; two binaries on G_KITBM 46bbf9bd8b4e with keyed sampling: a = ctl52
+    1b27a658a93c (zzz9x), b = l39 f5508aead568 (this code, then off by default) at `=1`; a warm server (a), then c1 (b
+    at `=check`, unmeasured), a1 b1 b2 a2, each a cold code-ctx16384 card request then the new-text 16K slice 3,
+    max_tokens 32; the bank's bill pinned for the window (in_use_mb=32539: the warm server wrote it, the other five
+    read it), the rows 134 / 163 in every arm): cold 1633.3 1633.8 against 1648.0 1641.4 tok/s (+0.68%; pairs +0.90,
+    +0.47), new text 1748.1 1662.7 against 1751.8 1751.4 (+2.71%; pairs +0.21, +5.33); c1's `[l39-last]` compared
+    5,120 words on each request, differ=0; the texts the same bytes in every arm, c1's included (cold 65d438d647,
+    new-text slice 3 83a88208e3); the decoder tail's misses 1,233 -> 1,165 on the cold card and 570 -> 535 on the
+    slice (layer 39's 69 -> 1 and 35 -> 0), its reads 13.68 -> 13.07 GB and 6.31 -> 6.00 GB; each request's footprint
+    89.7 GiB in every arm (not up).
+  - Read as l39d (M5 Max, w-20261103-0515; the same two binaries and host, the b arms and w0 at `=1`; the standard
+    decode config: --wired-margin-gib 2, EVICT, COOL, the code-ctx16384 card then greedy, max_tokens 1024, usage seed
+    rec1 + SEED_FREE, the DSpark verify policy and copy rounds off, keyed sampling; w0 a1 b1 b2 a2 b3 a3 a4 b4; the
+    bill pinned (in_use_mb=32656: w0 wrote it), the rows 134 / 163 in every arm): card 45.90 46.00 46.10 45.90 against
+    46.00 46.10 46.00 46.00 tok/s (+0.11%; pairs +0.22, +0.22, -0.22, +0.22; round 110.46 -> 110.34 ms), its prefill
+    (not a gate) 1632.6 1636.0 1635.9 1651.6 against 1644.3 1647.8 1656.0 1649.2 (+0.63%); greedy 54.60 54.60 54.60
+    54.60 against 54.70 54.70 54.50 54.50 (+0.00%; pairs +0.18, +0.18, -0.18, -0.18; round 91.93 -> 91.98 ms); the
+    texts the same bytes in every arm (card 8074f27375, greedy 0a1c2b8690); each request's footprint not up. The
+    greedy request reuses the cached prompt, so no replaying chunk runs there and l39 has no tail to act on (`calls=0`
+    on it, `calls=1` on the card). Measured on zzz9x; merged on (zzz9y), on by default (main, 2026-11-03).
 - `MLX_SERVE_DSV41_SCRATCH_WAVES` (src/scratch_waves.zig on src/scratch.zig's `Region`, the twins' texts by
   src/wave_twins.zig, their launches and the wiring in patches/turboexl3-zzz8n-scratch-waves.patch; on by default, `=0`
   off, `check`): a wide prompt call's DIG-X waves write their intermediates into per-prompt regions, not fresh buffers.

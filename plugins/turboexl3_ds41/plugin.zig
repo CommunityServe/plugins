@@ -27,6 +27,9 @@ pub const prompt_io = @import("src/prompt_io.zig");
 /// The CED decoder layers' experts read into their rows while the encoder runs, when `MLX_SERVE_DSV41_DEC_PREFETCH`
 /// asks (src/dec_prefetch.zig, posted by the copied source, planned by the copied model).
 pub const dec_prefetch = @import("src/dec_prefetch.zig");
+/// A replaying prompt chunk's last decoder layer routes its last row only (`MLX_SERVE_DSV41_L39_LAST`, src/l39_last.zig:
+/// armed and served by the copied model, its one-row call forced through the copied experts' wide lane).
+pub const l39_last = @import("src/l39_last.zig");
 /// The read pool's demand ranges part by part, the parts on the file's block read straight into their rows
 /// (`MLX_SERVE_DSV41_DIRECT_PARTS`, src/direct_parts.zig, read by the copied source at the stream's construction).
 pub const direct_parts = @import("src/direct_parts.zig");
@@ -765,6 +768,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+    l39_last.configure(env.span(.MLX_SERVE_DSV41_L39_LAST)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_L39_LAST is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     dec_prefetch.configure(env.span(.MLX_SERVE_DSV41_DEC_PREFETCH)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_DEC_PREFETCH is neither S nor S:K (S an encoder layer from 1, K 1..32) nor 0: the load is refused\n", .{});
         out.* = switch (e) {
@@ -838,6 +848,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     log.info("[turboexl3_ds41] DSpark copy rounds {s}, verify policy {s}\n", .{ if (on.copy) "on" else "off (MLX_SERVE_DSV41_DSPARK_COPY=0)", if (on.fixed != null) (if (costs_raw != null) "fixed on sampled requests, on MLX_SERVE_DSV41_DSPARK_COSTS's tables (the cut and the backoff by context, never the clock; greedy requests: the next line; MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)" else "fixed on sampled requests, on the built-in tables fitted on an M5 Max (the cut and the backoff by context, never the clock; greedy requests: the next line; MLX_SERVE_DSV41_DSPARK_COSTS other tables, MLX_SERVE_DSV41_DSPARK_POLICY=1 the live policy, =0 off)") else if (on.policy) "the live policy (MLX_SERVE_DSV41_DSPARK_POLICY=1: the measured ladder and the round's wall time)" else "off: every round verifies the whole block (MLX_SERVE_DSV41_DSPARK_POLICY=0)" });
     log.info("[turboexl3_ds41] read pool parts: {s}\n", .{if (direct_parts.on) "each demand read's parts on the file's block read straight into their rows, the rest staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0: every part staged); [direct-parts] lines at each prompt's and request's end" else "every part staged and copied (MLX_SERVE_DSV41_DIRECT_PARTS=0)"});
     if (routed_one.on()) log.info("[turboexl3_ds41] wide prompt calls' resident routed experts as one turboexl3 call (MLX_SERVE_DSV41_ROUTED_ONE: {s}); [routed-one] lines at each request's end\n", .{@tagName(routed_one.mode)});
+    {
+        var l39_buf: [512]u8 = undefined;
+        log.info("{s}", .{l39_last.loadLine(&l39_buf)});
+    }
     if (dec_prefetch.on) log.info("[turboexl3_ds41] CED decoder prefetch on (MLX_SERVE_DSV41_DEC_PREFETCH): the decoder layers' experts predicted at encoder layer {d}, {d} layers posted per prompt call, into their free rows only\n", .{ dec_prefetch.start, dec_prefetch.per_call });
     if (seed_free.on) log.info("[turboexl3_ds41] usage seed's rows free until routed (MLX_SERVE_DSV41_SEED_FREE=0: a seeded row is a resident from the load): the prompt's read-ahead and the CED decoder prefetch may take them\n", .{}) else log.info("[turboexl3_ds41] usage seed's rows residents from the load (MLX_SERVE_DSV41_SEED_FREE=0)\n", .{});
     if (prompt_io.on) log.info("[turboexl3_ds41] prompt timeline on (MLX_SERVE_DSV41_PROMPT_IO): [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end{s}\n", .{if (prompt_io.split_ra) "; the read-ahead's wait split (=2: a sync at each step)" else ""});
@@ -1578,7 +1592,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const scl = stage_copy.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len ..]);
     // MLX_SERVE_DSV41_BUFFER_MB: the [buffer-mb] line (since load; "" when the split is never raised).
     const bml = buffer_mb.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len ..]);
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len]);
+    // MLX_SERVE_DSV41_L39_LAST: the [l39-last] line ("" off).
+    const l3l = l39_last.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len + l3l.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is

@@ -195,6 +195,7 @@ test {
     _ = @import("src/markov_plan.zig");
     _ = @import("src/prompt_io.zig");
     _ = @import("src/dec_prefetch.zig");
+    _ = @import("src/l39_last.zig");
     _ = @import("src/direct_parts.zig");
     _ = @import("src/round_io.zig");
     _ = @import("src/stream_lookahead.zig");
