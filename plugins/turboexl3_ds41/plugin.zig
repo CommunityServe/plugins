@@ -203,6 +203,9 @@ pub const scratch_waves = @import("src/scratch_waves.zig");
 /// A wide prompt layer's hyper-connection stages with fewer passes over the stream (`MLX_SERVE_DSV41_HC_FUSE`,
 /// src/hc_fuse.zig, kernels/hc_mix_norm.metal and kernels/hc_expand_norm.metal), read by the copied model.
 pub const hc_fuse = @import("src/hc_fuse.zig");
+/// The wide router's logits as one launch of MLX's fused NAX GEMM body at this machine's tile
+/// (`MLX_SERVE_DSV41_GATE_GEMM`, src/gate_gemm.zig, read by the copied model's `gateLogits`).
+pub const gate_gemm = @import("src/gate_gemm.zig");
 /// A wide prompt call's DIG-X waves' 128-row GEMMs with the B stage double-buffered (`MLX_SERVE_DSV41_M1`, src/m1.zig),
 /// read by the copied quant and source.
 pub const m1 = @import("src/m1.zig");
@@ -466,6 +469,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     hc_fuse.configure(env.span(.MLX_SERVE_DSV41_HC_FUSE)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_HC_FUSE is none of 0, 1, check (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    gate_gemm.configure(env.span(.MLX_SERVE_DSV41_GATE_GEMM)) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_GATE_GEMM is none of 0, 1, check (unset: on): the load is refused\n", .{});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -1102,6 +1112,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] wide prompt layers' new streams written in place over their x1 region (MLX_SERVE_DSV41_SCRATCH_TAIL; =0: a fresh buffer a layer; with MLX_SERVE_DSV41_SCRATCH and TAIL_FUSE on): TAIL_FUSE's write-into twin, the region published as the layer's streams, no fresh buffer a layer (a call's last wide layer keeps it)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt layers' new streams over their x1 region, checked (MLX_SERVE_DSV41_SCRATCH_TAIL=check): the stock kernel's fresh streams served, the twin's compared word for word in the same routed call; a [scratch-tail] check line a wide layer\n", .{}),
     }
+    {
+        var gg_buf: [512]u8 = undefined;
+        log.info("{s}", .{gate_gemm.loadLine(&gg_buf)});
+    }
     switch (hc_fuse.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' hc stages as the stock kernels (MLX_SERVE_DSV41_HC_FUSE=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers' hc stages fused (MLX_SERVE_DSV41_HC_FUSE; =0: the stock kernels): the attention side's mixes and norm in one launch, the FFN side's expand and norm in one launch into the x1 region, the splits from the mixes after\n", .{}),
@@ -1665,7 +1679,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const bml = buffer_mb.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len ..]);
     // MLX_SERVE_DSV41_L39_LAST: the [l39-last] line ("" off).
     const l3l = l39_last.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len ..]);
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len + l3l.len]);
+    // MLX_SERVE_DSV41_GATE_GEMM: the [gate-gemm] line ("" off).
+    const ggl = gate_gemm.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len + l3l.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len + l3l.len + ggl.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is

@@ -1325,6 +1325,36 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   buffers, allocated earlier: about 48 MB over the phase change and the embedding (the row ids, the thread's copy, table
   0's read buffers, 64 more threads' stacks), at most about 45 MB more at L1's activation peak; nothing in GPU/MLX memory
   or the page cache (direct reads).
+- `MLX_SERVE_DSV41_GATE_GEMM` (src/gate_gemm.zig, src/kernels/gate_gemm_loop.metal, src/kernels/gate_gemm_nt.metal,
+  patches/turboexl3-zzzza2-gate-gemm.patch; on by default, `=0` off, `=check` checked): the wide router's f32 logits
+  (`gateLogits` past the decode width: both casts and MLX's NAX matmul, x bf16 [rows, 5120], gate_w [384, 5120], F16 on
+  the pack) as one launch of MLX's fused NAX GEMM body (steel_gemm_fused_nax.h `gemm` at nt and its gemm_loop, MLX
+  0.32.3: its statements, SK 32, the 16 x 32 x 16 MMA, k in MLX's order), reading x and gate_w in their stored types and
+  casting each element to float as it loads (the values astype makes: no cast passes), at this machine's tile (bm 64,
+  bn 128, bk 256, wm 2, wn 4, swizzle 1; MLX's own here is swizzle 2), launched in MLX's threadgroup shape (32, WN, WM),
+  only where MLX runs its regular kernel (1,707 rows and up at K 5120 and N 384; its split K below, and decode's GEMV), so
+  the same words. The tile only moves which simdgroup computes which outputs (each simdgroup's tile whole 16-row
+  fragments and N pairs, BK whole SK 32 steps): every output's k order is MLX's. The microbench (hgf3u,
+  w-hgf3u-20261103-1359, hg1 lane's src/f3_bench.zig on the M5 Max, bf16 operands; 14 tiles, words then time A B B A):
+  0 differing words at 16,383, 4,097 and 2,048 rows; the chain 2,724 us a call at 16,383 rows (its matmul alone 1,846,
+  x's cast alone 932, the route kernel 378), the launch 1,536 (1.773x; 1.731x at 4,097 and 1.525x at 2,048; the
+  pre-registered rule: at least 1.15x at 16,383, not slower at 4,097 and 2,048); the read-ahead's prediction GEMM stays
+  MLX's (no tile passed: 1.144x best). `check` serves the chain and, at every call GATE_GEMM would take, runs the launch
+  beside it and compares the two word for word (one host read a call). A `[gate-gemm] mode= calls= checks= words=
+  differ=` line at each request's end.
+- On against ctl55 (hggg2, w-pio-20261103-1626, two binaries on G_KITBM with keyed sampling, the bill pinned: a = ctl55
+  (zzzza0), dylib 066a83371f77; b = this code on zzzza0, dylib 7502e55f3caf, `=1` in the b arms; a warm server, the
+  check arm, then a1 b1 b2 a2): cold 16K a 1693.1/1692.3 -> b 1703.5/1703.9 tok/s (+0.65%), new text (slice 3)
+  1803.3/1797.9 -> 1807.2/1801.7 (+0.21%), about 63 ms of a 16,383-row cold prefill (about 3 ms a router call over 21
+  calls a 16K card: the isolated 1.18 ms and, it seems, the f32 cast's in-situ cost); 139 prompt and 169 decode rows in
+  every arm, the pin one wrote and five read at in_use 30343; each request's footprint not up (std16k and slice 92.3 GiB
+  in both, a1's slice 91.7); the guard's accounted samples 104.8 GiB in both b arms against 104.5 and 105.8 in the a
+  arms. Exact: the texts the same bytes in every arm, the check arm's too (cold 65d438d647, new-text slice 3
+  83a88208e3), and the check arm's 21 calls a request compared 132,112,512 and 120,282,624 words, none different. No
+  decode A/B: decode's rows take the router's GEMV kernel and the CED decoder's 128 rows MLX's split K, not the launch.
+  The first build (hggg, w-pio-20261103-1600) was a null run: its shape check took bf16 operands only (the microbench's
+  synthetic gate), while the pack's gate_w is F16 (as stored, `getW`), so it declined every call (calls 0 on every
+  request) and its b arms ran the chain; hggg2 reads each operand in its stored float type.
 - `MLX_SERVE_DSV41_HC_FUSE` (src/hc_fuse.zig, src/kernels/hc_mix_norm.metal, src/kernels/hc_expand_norm.metal,
   patches/turboexl3-zzz9o-hc-fuse.patch; on by default, `=0` off, `=check`): a wide prompt layer's hyper-connection
   stages with fewer passes over the stream ([L, 4, 5120] bf16, 671 MB at 16K rows). Off, the attention side's hc_mix
