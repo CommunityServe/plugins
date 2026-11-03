@@ -102,6 +102,9 @@ pub const rest_early = @import("src/rest_early.zig");
 /// A wide prompt layer's attention projections' large outputs kept past its teardown, their buffers to MLX's cache at the
 /// next wide layer's start (`MLX_SERVE_DSV41_TRANSIENT_KEEP`, src/transient_keep.zig), read by the copied model.
 pub const transient_keep = @import("src/transient_keep.zig");
+/// MLX's command-buffer split raised for prompts through the host's `HostGpu.command_buffer_limits`
+/// (`MLX_SERVE_DSV41_BUFFER_MB`, src/buffer_mb.zig), read by the copied streamed source at its phase changes.
+pub const buffer_mb = @import("src/buffer_mb.zig");
 /// A wide prompt layer followed by another wide one committed at its end, not waited for (`MLX_SERVE_DSV41_REST_ASYNC`,
 /// src/rest_async.zig), read by the copied model.
 pub const rest_async = @import("src/rest_async.zig");
@@ -284,6 +287,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     t3kit.bind(ctx.host.?);
     // The streamed bank's slot rows fit within the host's ceiling, not only the device's working set.
     bill.host_ceiling = &shims.memoryCeiling;
+    // MLX_SERVE_DSV41_BUFFER_MB: the prompt's split through the host's HostGpu.command_buffer_limits (null on a host
+    // without the entry); a user's MLX_MAX_MB_PER_BUFFER wins.
+    buffer_mb.configure(env.span(.MLX_SERVE_DSV41_BUFFER_MB), env.span(.MLX_MAX_MB_PER_BUFFER), kit.host.Host.of(ctx.host) catch null) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_BUFFER_MB is none of 0, prompt or a whole number of MB (unset: prompt, 500): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
     routed_t3.enabled = config.routedT3(env.span(.MLX_SERVE_DSV41_ROUTED)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ROUTED is neither turboexl3 nor streamer (unset: turboexl3): the load is refused\n", .{});
         out.* = switch (e) {
@@ -930,6 +942,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         .on => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, before the routing barrier waits: the routes, the next layer's predicted routes, then the shared expert and the attention state (MLX_SERVE_DSV41_WIDE_EARLY=0: after the call)\n", .{}),
         .check => log.info("[turboexl3_ds41] wide prompt calls commit what their MoE does not read behind their routes, and the shared expert is also built the old way and served, the two compared word for word (MLX_SERVE_DSV41_WIDE_EARLY=check): a [wide-early] check line a wide call\n", .{}),
     }
+    {
+        var bm_buf: [512]u8 = undefined;
+        log.info("{s}", .{buffer_mb.loadLine(&bm_buf)});
+    }
     switch (transient_keep.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' attention projections' outputs freed at the layer's teardown (MLX_SERVE_DSV41_TRANSIENT_KEEP=0)\n", .{}),
         .on => log.info("[turboexl3_ds41] wide prompt layers keep their attention projections' large outputs past the teardown, their buffers to MLX's cache at the next wide layer's start (MLX_SERVE_DSV41_TRANSIENT_KEEP=0: freed at the teardown): [transient-keep] at each request's end\n", .{}),
@@ -1543,7 +1559,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const dfl1 = if (demand_first.mode != .off) (if (dfSnap(model(mp))) |dfs| demand_first.meters(dfs, meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len ..]) else meter_buf[0..0]) else meter_buf[0..0];
     // MLX_SERVE_DSV41_STAGE_COPY: the [stage-copy] lines ("" off).
     const scl = stage_copy.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len ..]);
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len]);
+    // MLX_SERVE_DSV41_BUFFER_MB: the [buffer-mb] line (since load; "" when the split is never raised).
+    const bml = buffer_mb.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is

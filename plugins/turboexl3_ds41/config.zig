@@ -211,6 +211,7 @@ test {
     _ = @import("src/wide_early.zig");
     _ = @import("src/rest_early.zig");
     _ = @import("src/transient_keep.zig");
+    _ = @import("src/buffer_mb.zig");
     _ = @import("src/rest_async.zig");
     _ = @import("src/q_tail.zig");
     _ = @import("src/engram_twin.zig");

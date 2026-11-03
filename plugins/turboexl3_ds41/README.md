@@ -669,6 +669,32 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
     accounted peak 103.8 / 100.6 GiB in the b arms against 104.7 / 106.6 in the a arms (step footprint 91.2 / 88.1
     against 91.4 / 93.9); the encoder's other stage past layer 0 4208 / 4189 ms against 4319 / 4294. Measured on
     zzz9r; merged on (zzz9s).
+- `MLX_SERVE_DSV41_BUFFER_MB` (src/buffer_mb.zig, patches/turboexl3-zzz9w-buffer-mb.patch; on by default: unset, empty
+  or `prompt` 500 MB during prompts, `N` N MB, `0` off; decode left at MLX's split): MLX's command-buffer split (the
+  MB of bound arrays a buffer takes before MLX commits it; MLX_MAX_MB_PER_BUFFER at the device's start, 50 MB on the
+  M5 Max) raised at each phase change to a prompt and put back at the change to decode, through the host's setter.
+  Process-wide at 500 on ctl46 it lifted prefill (mb3p: cold +3.05%, new text +3.93%) and moved decode both ways
+  (mb3d: card -0.21%, greedy +0.21%), so prompts only. A user's MLX_MAX_MB_PER_BUFFER wins (the split left as they set
+  it). Only where command buffers split moves: the same words (a text gate). `[buffer-mb] mode= prompt_mb= decode_mb=
+  enters= exits=` at each request's end. The host requirement: mlx-serve's additive `HostGpu.command_buffer_limits`
+  (draft PR ddalcu/mlx-serve#1065; a setter over MLX's `Device::set_max_ops_mb_per_buffer`), which the plugin builds
+  against (G_KITBM's kit); on an older host, whose `HostGpu` stops before the member, MLX's own split in every phase
+  (the load line says so).
+  - Read as bm1p (M5 Max, w-pio-20261102-2235; one build, bm1 97107edaa896 on G_KITBM 46bbf9bd8b4e, a at `=0`, b the
+    default, with keyed sampling; a warm server, then a1 b1 b2 a2, each a cold code-ctx16384 card request then the
+    new-text 16K slice 3): cold 1623.9 1622.5 against 1669.2 1676.9 tok/s (+3.07%; pairs +2.79, +3.35), new text
+    1750.2 1693.0 against 1795.5 1789.7 (+4.12%; pairs +2.59, +5.71); the texts the same bytes in every arm (cold
+    65d438d647, new-text slice 3 83a88208e3), the bank rows 147 / 176 in every arm; `[buffer-mb] prompt_mb=500
+    decode_mb=50` with enters = exits in the b arms; the guard's accounted peak 106.5 / 104.9 GiB in the a arms
+    against 108.3 / 100.9 in the b arms (step footprint 93.7 / 92.1 against 95.7 / 88.0).
+  - Read as bm1d (M5 Max, w-20261102-2243; the same build and host, a at `=0`, b the default, with keyed sampling and
+    the standard decode config; a warm server, then a1 b1 b2 a2 b3 a3 a4 b4, each a code-ctx16384 card then greedy):
+    the texts the same bytes in every arm, the rows the same; card 48.4 48.2 48.2 48.5 against 48.1 48.4 48.2 48.6
+    tok/s (0.00%, a tie; pairs -0.62, +0.41, 0.00, +0.21), its prefill +3.33%; greedy 58.3 58.3 58.3 58.3 against 57.8
+    58.3 58.2 58.3 (-0.26%; pairs -0.86, 0.00, -0.17, 0.00); the guard's accounted peak 108.5 GiB in the b arms
+    against 108.4 in the a arms (the step footprint 95.7 GiB in both). Merged by David's ruling (2026-11-03): the
+    greedy request's prompt is cached, so its decode runs at MLX's own split in both arms, and the peak is judged per
+    request. Measured on zzz9t; merged on (zzz9w).
 - `MLX_SERVE_DSV41_REST_EARLY` (src/rest_early.zig, patches/turboexl3-zzz9e-rest-early.patch; on, `=0` off): a wide
   prompt layer's new streams (its routed call's tail kernel, the TAIL_FUSE combine and hc expand, with its inputs' small
   ops) committed at the call's end, before the layer's teardown. `=0`: `wideLayer` returns after its last group's holds,
