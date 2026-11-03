@@ -68,6 +68,13 @@ projections and a real 6-bit affine embedding, quantized from seeded float weigh
 `mlx-serve plugin check` loads it, runs a forward through both Metal kernels, and `mlx-serve plugin fixture` writes the
 same pack to a directory you can serve with `--model`.
 
+## Costs that were measured, not estimated
+
+| Quantity | Value | How |
+|---|---|---|
+| One layer's dequant tiles (prefill transient) | **92.0 MB** | allocated the seven `[N, K]` f16 tiles standalone and read MLX's own active memory; the `bill` term is the same arithmetic |
+| Concurrent prefill | 2 slots **3.0x**, 4 slots **6.0x** one stream | 225-token prompts, aggregate tok/s over the single-stream rate; per-layer `evalKeep` does not serialize slots |
+
 ## Not supported
 
 - **Layer split** across Macs (`span != null` is refused).

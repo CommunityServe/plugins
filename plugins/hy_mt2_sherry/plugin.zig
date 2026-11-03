@@ -717,14 +717,29 @@ fn runTrunk(m: *Model, f: *const abi.Forward, ops: *const abi.CacheOps, out: *ab
         const kk = try stqLinearRows(m, &g, &l.k, h, total_u32);
         const vv = try stqLinearRows(m, &g, &l.v, h, total_u32);
 
+        // One row per slot is the decode shape: `[slots, dim]` reshapes straight to `[slots, 1, heads, hd]` with no
+        // slice per projection. Above one row the projections are slot-major, so each slot is cut out whole.
+        const decode_shape = rows_u32 == 1;
+        const q_all = if (decode_shape) try g.reshape(q, &.{ slots, 1, nh, hd }) else q;
+        const k_all = if (decode_shape) try g.reshape(kk, &.{ slots, 1, nkv, hd }) else kk;
+        const v_all = if (decode_shape) try g.reshape(vv, &.{ slots, 1, nkv, hd }) else vv;
         var parts: std.ArrayList(c.mlx_array) = .empty;
         defer parts.deinit(gpa);
         for (0..slots_u32) |i| {
             const first: c_int = @intCast(i * rows_u32);
             const pos: c_int = @intCast(f.positions.slice()[i]);
-            const qi = try g.reshape(try slotRows(&g, q, first, rows, qdim), &.{ 1, rows, nh, hd });
-            const ki = try g.reshape(try slotRows(&g, kk, first, rows, kdim), &.{ 1, rows, nkv, hd });
-            const vi = try g.reshape(try slotRows(&g, vv, first, rows, kdim), &.{ 1, rows, nkv, hd });
+            const qi = if (decode_shape)
+                try g.op(c.mlx_slice, .{ q_all, &[_]c_int{ @intCast(i), 0, 0, 0 }, 4, &[_]c_int{ @intCast(i + 1), 1, nh, hd }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4 })
+            else
+                try g.reshape(try slotRows(&g, q_all, first, rows, qdim), &.{ 1, rows, nh, hd });
+            const ki = if (decode_shape)
+                try g.op(c.mlx_slice, .{ k_all, &[_]c_int{ @intCast(i), 0, 0, 0 }, 4, &[_]c_int{ @intCast(i + 1), 1, nkv, hd }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4 })
+            else
+                try g.reshape(try slotRows(&g, k_all, first, rows, kdim), &.{ 1, rows, nkv, hd });
+            const vi = if (decode_shape)
+                try g.op(c.mlx_slice, .{ v_all, &[_]c_int{ @intCast(i), 0, 0, 0 }, 4, &[_]c_int{ @intCast(i + 1), 1, nkv, hd }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4 })
+            else
+                try g.reshape(try slotRows(&g, v_all, first, rows, kdim), &.{ 1, rows, nkv, hd });
             var qh = try g.op(c.mlx_fast_rope, .{ try g.swap12(qi), hd, false, no_base, 1.0, pos, m.freqs });
             var kh = try g.op(c.mlx_fast_rope, .{ try g.swap12(ki), hd, false, no_base, 1.0, pos, m.freqs });
             const vh = try g.swap12(vi);
