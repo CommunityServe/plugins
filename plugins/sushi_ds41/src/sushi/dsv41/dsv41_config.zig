@@ -221,7 +221,8 @@ pub const Config = struct {
     /// carry the rows' growth: its slack plus one layer's old rows beside the new buffer during the copy.
     pub fn forwardCap(self: *const Config, rows: u64, seq: u64) u64 {
         const ctx = @max(seq, 1);
-        const by_rows = if (rows > verify_rows) rows *| self.dim *| cap_row_bytes_per_dim else narrow_rows * ctx * 4 * score_copies;
+        const unpacked_index_keys = ctx * self.index_head_dim * act_bytes;
+        const by_rows = if (rows > verify_rows) rows *| self.dim *| cap_row_bytes_per_dim else narrow_rows * ctx * 4 * score_copies + unpacked_index_keys;
         const growth = ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
         return (by_rows +| growth) *| 5 / 4 +| cap_slack_bytes;
     }
