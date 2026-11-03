@@ -1,8 +1,8 @@
-//! The Neural Engine test of `dsv41_ane.zig` (`SUSHI_DS41_ANE_SHARED`'s programs) against a host SwiGLU over the same int8
+//! The Neural Engine test of `src/ane_shared.zig` (`SUSHI_DS41_ANE_SHARED`'s programs) against a host SwiGLU over the same int8
 //! weights. A root of `zig build gpu-test` only (through `gpu_test.zig`); skipped where the runtime has no ANE. It needs no
 //! model: the load-time self-check (`aneSelfCheck`) compares the real pack's layer 0 with the GPU chain.
 const std = @import("std");
-const ane = @import("sushi/dsv41/dsv41_ane.zig");
+const ane = @import("ane_shared.zig");
 
 const H = 256;
 const F = 128;

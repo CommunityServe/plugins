@@ -6,7 +6,7 @@
 //! I/O is fp16 in channel-major planes: unit u reads `[hidden][rows]` of rows `u * rows ..`, and writes `[hidden][rows]`.
 
 const std = @import("std");
-const log = @import("../log.zig");
+const log = @import("sushi/log.zig");
 
 const Mlp = opaque {};
 const Bank = opaque {};

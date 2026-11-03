@@ -20,7 +20,7 @@ const model_mod = @import("../model.zig");
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("expert_usage.zig");
 const transient_peak = @import("transient_peak.zig");
-const ane_mod = @import("dsv41_ane.zig");
+const ane_mod = @import("../../ane_shared.zig");
 
 const A = sc_mod.A;
 const S = sc_mod.S;
@@ -2602,7 +2602,7 @@ fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) 
 extern "c" fn mlx_eye(res: *A, n: c_int, m: c_int, k: c_int, dtype: mlx.mlx_dtype, s: S) c_int;
 
 /// The shared expert of wide prefill chunks on the Neural Engine (`SUSHI_DS41_ANE_SHARED=1|2`, the unit count; a
-/// prototype, lossy: int8 weights, fp16 activations). See `dsv41_ane.zig`.
+/// prototype, lossy: int8 weights, fp16 activations). See `src/ane_shared.zig`.
 pub const AneState = struct {
     progs: ane_mod.Programs,
     /// Rows a chunk's programs take (`n_units * rows`); a narrower chunk is zero-padded up to it.
