@@ -21,15 +21,15 @@ pub fn build(b: *std.Build) void {
     const run = b.addRunArtifact(tests);
     b.step("claims", "Run the claim and parse tests").dependOn(&run.step);
 
-    // The Metal tests of src/attn_nax.zig, src/index_nax.zig, src/vision_key.zig and src/prefill_pipe_test.zig, linked to
+    // The Metal tests of src/index_nax.zig, src/vision_key.zig, src/ablation_test.zig and src/prefill_pipe_test.zig, linked to
     // an MLX the caller names (the server's own, so its pin), never to the dylib:
-    // `zig build gpu-test -Dmlx-lib=<dir holding libmlxc.dylib>`. The matmul2d tests skip without an M5, the pipeline
+    // `zig build gpu-test -Dmlx-lib=<dir holding libmlxc.dylib>`. The matmul2d test skips without an M5, the pipeline
     // test without `-Ddsv41-tiny=<dir>` (sushi's tiny checkpoint, tests/dump_dsv41_fixtures.py).
     // Declared before the return below, so `zig build --help` lists it without -Dmlx-lib. The run step does not pass
     // the caller's environment through, so the tiny checkpoint comes in as an option.
     const tiny = b.option([]const u8, "dsv41-tiny", "Directory of sushi's tiny DeepSeek-V4.1 checkpoint (the gpu-test pipeline test)");
     const mlx_lib = b.option([]const u8, "mlx-lib", "Directory holding the libmlxc.dylib the Metal test links") orelse return;
-    const gpu = b.createModule(.{ .root_source_file = b.path("src/attn_nax_test.zig"), .target = root.resolved_target, .optimize = root.optimize, .link_libc = true });
+    const gpu = b.createModule(.{ .root_source_file = b.path("src/gpu_test.zig"), .target = root.resolved_target, .optimize = root.optimize, .link_libc = true });
     gpu.addLibraryPath(.{ .cwd_relative = mlx_lib });
     gpu.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
     gpu.addRPath(.{ .cwd_relative = mlx_lib });
@@ -45,5 +45,5 @@ pub fn build(b: *std.Build) void {
     const gpu_run = b.addRunArtifact(b.addTest(.{ .root_module = gpu, .filters = &.{"sushi_ds41 gpu"} }));
     gpu_run.setEnvironmentVariable("SUSHI_DS41_GPU_TEST", "1");
     if (tiny) |dir| gpu_run.setEnvironmentVariable("DSV41_TINY", dir);
-    b.step("gpu-test", "Run the Metal tests (needs -Dmlx-lib; the matmul2d ones skip without an M5)").dependOn(&gpu_run.step);
+    b.step("gpu-test", "Run the Metal tests (needs -Dmlx-lib; the matmul2d one skips without an M5)").dependOn(&gpu_run.step);
 }

@@ -8,6 +8,7 @@ const model = @import("../model.zig");
 const expert_io = @import("../expert_io.zig");
 const log = @import("../log.zig");
 const vision = @import("dsv41_vision.zig");
+const exl3 = @import("sushi_exl3");
 
 pub const Parts = struct {
     /// Routed experts as stacked-at-load banks (a checkpoint small enough to hold them); streamed ones are not read here.
@@ -25,8 +26,13 @@ pub fn isVisionKey(key: []const u8) bool {
     return std.mem.endsWith(u8, key, ".bias_vl");
 }
 
+/// Key prefix of the zero pad tensors a repacked shard carries.
+pub const pad_prefix = "__pad__.";
+
 /// Does the resident load keep `key`?
 pub fn keeps(key: []const u8, parts: Parts) bool {
+    // A repacked shard's zero fill that puts the next trellis on a page; it is no weight.
+    if (std.mem.startsWith(u8, key, pad_prefix)) return false;
     // A DSpark draft is text: its stages' image routing biases are never read.
     if (std.mem.startsWith(u8, key, "mtp.")) return parts.dspark and !std.mem.endsWith(u8, key, ".bias_vl");
     if (isVisionKey(key)) return parts.vision;
@@ -35,18 +41,6 @@ pub fn keeps(key: []const u8, parts: Parts) bool {
     // An STQ pack's routed rate groups, which stream.
     if (std.mem.startsWith(u8, key, "model.layers.") and std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null) return parts.experts;
     return true;
-}
-
-/// Does this shard hold the embedding as an affine triple? Such a triple stays in the shard, and the model reads its
-/// rows from there (`dsv41_embed`); a dense `embed.weight` is loaded.
-fn embedOnSsd(header: *const expert_io.SafetensorsHeader) bool {
-    const t = header.parsed.value.object;
-    return t.contains("embed.weight") and t.contains("embed.scales") and t.contains("embed.biases");
-}
-
-fn isEmbedKey(key: []const u8) bool {
-    for ([_][]const u8{ "embed.weight", "embed.scales", "embed.biases" }) |k| if (std.mem.eql(u8, key, k)) return true;
-    return false;
 }
 
 /// The checkpoint's weight shards in name order; the caller frees each name and the list.
@@ -109,11 +103,10 @@ pub fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8,
         defer _ = std.c.close(fd);
         var header = try expert_io.SafetensorsHeader.read(allocator, fd);
         defer header.deinit();
-        const embed_ssd = embedOnSsd(&header);
         var tensors = header.parsed.value.object.iterator();
         while (tensors.next()) |entry| {
             const key = entry.key_ptr.*;
-            if (std.mem.eql(u8, key, "__metadata__") or (embed_ssd and isEmbedKey(key)) or !keep(key, ctx)) continue;
+            if (std.mem.eql(u8, key, "__metadata__") or !keep(key, ctx)) continue;
             const read = try model.readSafetensorArray(&reader, fd, &header, entry.value_ptr.*);
             const value = read.array;
             var value_owned = true;
@@ -137,6 +130,42 @@ pub fn loadWhere(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8,
     }
     log.info("[dsv41] loaded {d} resident tensors from {d} shards\n", .{ weights.count(), shards.items.len });
     return weights;
+}
+
+/// The pack's routed trellis tensors against the `order` its config names, before any weight loads: each is stored
+/// under that order's name, has that order's grid for a `hidden` x `inter` expert, and lies in a shard that stamps it.
+pub fn validateTileOrder(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, order: exl3.format.TileOrder, hidden: u32, inter: u32) !void {
+    const marker = ".mlp.switch_mlp.";
+    var shards = try shardNames(io, allocator, dir_path);
+    defer freeShardNames(allocator, &shards);
+    var seen_pack = false;
+    var seen_major = false;
+    for (shards.items) |name| {
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
+        defer allocator.free(path);
+        const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
+        defer _ = std.c.close(fd);
+        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
+        defer header.deinit();
+        var holds = false;
+        var tensors = header.parsed.value.object.iterator();
+        while (tensors.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const at = std.mem.indexOf(u8, key, marker) orelse continue;
+            const parsed = exl3.group_layout.Name.parse(key[at + marker.len ..]) catch continue;
+            if (parsed.part != 0) continue;
+            holds = true;
+            if (parsed.pair_major) seen_major = true else seen_pack = true;
+            if (seen_major and seen_pack) return error.Exl3TileOrderMixed;
+            if (parsed.tileOrder() != order) return error.Exl3TileOrderMismatch;
+            const dims = (entry.value_ptr.object.get("shape") orelse return error.InvalidSafetensorsHeader).array.items;
+            var shape: [5]u64 = undefined;
+            if (dims.len > shape.len) return error.Exl3GroupGeometry;
+            for (dims, 0..) |d, i| shape[i] = std.math.cast(u64, d.integer) orelse return error.InvalidSafetensorsHeader;
+            _ = try exl3.group_layout.trellisRate(order, shape[0..dims.len], if (parsed.projection == 2) inter else hidden, if (parsed.projection == 2) hidden else inter);
+        }
+        if (holds) try exl3.shardTileOrderAgrees(order, expert_io.metadataString(header.parsed.value.object, "tile_order"));
+    }
 }
 
 /// Bytes the resident load holds once built: the stored tensors, the head widened to f32, and each
@@ -181,11 +210,10 @@ fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, sect
         defer _ = std.c.close(fd);
         var header = try expert_io.SafetensorsHeader.read(allocator, fd);
         defer header.deinit();
-        const embed_ssd = embedOnSsd(&header);
         var tensors = header.parsed.value.object.iterator();
         while (tensors.next()) |entry| {
             const key = entry.key_ptr.*;
-            if (std.mem.eql(u8, key, "__metadata__") or (embed_ssd and isEmbedKey(key)) or !keeps(key, .{ .dspark = true, .vision = true })) continue;
+            if (std.mem.eql(u8, key, "__metadata__") or !keeps(key, .{ .dspark = true, .vision = true })) continue;
             const mine: Section = if (isVisionKey(key)) .vision else if (std.mem.startsWith(u8, key, "mtp.")) .stages else .trunk;
             if (mine != section) continue;
             const offs = (entry.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader).array.items;
@@ -235,7 +263,7 @@ fn raggedSlot(key: []const u8) ?usize {
     if (stage >= 16 or !std.mem.startsWith(u8, rest, mid)) return null;
     const tail = rest[mid.len..];
     const proj: usize = if (std.mem.startsWith(u8, tail, "gate_proj")) 0 else if (std.mem.startsWith(u8, tail, "up_proj")) 1 else if (std.mem.startsWith(u8, tail, "down_proj")) 2 else return null;
-    const part: usize = if (std.mem.endsWith(u8, tail, ".trellis")) 0 else if (std.mem.endsWith(u8, tail, ".suh")) 1 else if (std.mem.endsWith(u8, tail, ".svh")) 2 else return null;
+    const part: usize = if (std.mem.endsWith(u8, tail, ".trellis") or std.mem.endsWith(u8, tail, ".trellis_pm")) 0 else if (std.mem.endsWith(u8, tail, ".suh")) 1 else if (std.mem.endsWith(u8, tail, ".svh")) 2 else return null;
     return stage * 9 + part * 3 + proj;
 }
 
@@ -419,7 +447,7 @@ test "dsv41 source: a tensor from 1 MiB is billed page-rounded, a DSpark stage's
     try testing.expectEqual(expert_io.pageRoundUp(3 * mib + 100) + expert_io.pageRoundUp(100), try dsparkBytes(testing.io, testing.allocator, root));
 }
 
-test "dsv41 source: an affine embedding stays in its shard and leaves the trunk term, a dense one is loaded and billed" {
+test "dsv41 source: an affine embedding is loaded and billed with the trunk" {
     const mib: usize = 1 << 20;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -431,36 +459,10 @@ test "dsv41 source: an affine embedding stays in its shard and leaves the trunk 
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
-    try testing.expectEqual(@as(u64, 4000), try residentBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(expert_io.pageRoundUp(2 * mib) + 1000 + 1000 + 4000, try residentBytes(testing.io, testing.allocator, root));
     var w = try loadResident(testing.io, testing.allocator, root, .{});
     defer w.deinit();
-    try testing.expect(w.get("embed.weight") == null and w.get("embed.scales") == null and w.get("embed.biases") == null);
-    try testing.expect(w.get("norm.weight") != null);
-
-    var dense = testing.tmpDir(.{});
-    defer dense.cleanup();
-    try writeShard(dense.dir, "model-a.safetensors", &.{ .{ "embed.weight", 2 * mib }, .{ "norm.weight", 4000 } });
-    var dense_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dense_root = dense_buf[0..try dense.dir.realPath(testing.io, &dense_buf)];
-    try testing.expectEqual(expert_io.pageRoundUp(2 * mib) + 4000, try residentBytes(testing.io, testing.allocator, dense_root));
-    var dw = try loadResident(testing.io, testing.allocator, dense_root, .{});
-    defer dw.deinit();
-    try testing.expect(dw.get("embed.weight") != null);
-}
-
-test "dsv41 source: the bytes an SSD embedding frees go to the expert cache in the ssd budget ledger" {
-    const budgetLedger = @import("../expert_stream.zig").budgetLedger;
-    const table: u64 = 371_000_000;
-    const trunk: u64 = 4_780_000_000;
-    const budget: u64 = 108 << 30;
-    // 40 layers of 384 experts, 9.62 MB the largest.
-    const resident = try budgetLedger(budget, trunk, 3_920_000_000, 0, 40, 384, 6, 9_620_000, 600_000_000, .{});
-    const freed = try budgetLedger(budget, trunk - table, 3_920_000_000, 0, 40, 384, 6, 9_620_000, 600_000_000, .{});
-    try testing.expectEqual(resident.trunk_bytes - table, freed.trunk_bytes);
-    // The table is 0.96 of a slot a layer: the cache gains one slot a layer or none, never more.
-    try testing.expect(freed.slots_per_layer - resident.slots_per_layer <= 1);
-    const spare = budget - (resident.trunk_bytes + resident.mtp_bytes + resident.workspace_bytes + resident.selected_bytes + resident.bounce_bytes) - resident.cache_bytes;
-    try testing.expectEqual(freed.slots_per_layer - resident.slots_per_layer, (spare + table) / (40 * 9_620_000));
+    for ([_][]const u8{ "embed.weight", "embed.scales", "embed.biases", "norm.weight" }) |k| try testing.expect(w.get(k) != null);
 }
 
 test "dsv41 source: a router weight is billed at its stored size, in the trunk and in a DSpark stage" {
@@ -475,4 +477,20 @@ test "dsv41 source: a router weight is billed at its stored size, in the trunk a
     const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
     try testing.expectEqual(expert_io.pageRoundUp(gate), try residentBytes(testing.io, testing.allocator, root));
     try testing.expectEqual(expert_io.pageRoundUp(gate), try dsparkBytes(testing.io, testing.allocator, root));
+}
+
+test "dsv41 source: a repack's zero pad tensors are never kept, loaded or billed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeShard(tmp.dir, "model-00001-of-00002.safetensors", &.{
+        .{ "embed.weight", 1000 }, .{ "__pad__.model-00001-of-00002.0", 9000 }, .{ "mtp.0.attn.wq_a.weight", 7000 },
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    for ([_]Parts{ .{}, .{ .dspark = true }, .{ .experts = true }, .{ .vision = true } }) |p| try testing.expect(!keeps("__pad__.model-00001-of-00002.0", p));
+    try testing.expectEqual(@as(u64, 1000), try residentBytes(testing.io, testing.allocator, root));
+    try testing.expectEqual(@as(u64, 7000), try dsparkBytes(testing.io, testing.allocator, root));
+    var all = try loadResident(testing.io, testing.allocator, root, .{ .dspark = true, .vision = true });
+    defer all.deinit();
+    try testing.expectEqual(@as(usize, 2), all.count());
 }

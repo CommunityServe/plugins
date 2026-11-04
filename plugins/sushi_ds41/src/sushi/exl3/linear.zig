@@ -7,6 +7,7 @@ const mlx = @import("mlx_host").mlx;
 const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
 const kernels = @import("expert_exl3_kernels.zig");
+const project_rows = @import("project_rows.zig");
 const root = @import("root.zig");
 
 /// Tests and the trunk bench: `rows` is the served arm up to `PROJECT_ROWS_MAX`, `gemm` the sorted GEMM at any width,
@@ -41,7 +42,7 @@ pub const SHARED_MAX: usize = 4;
 /// `[S, in]` (one row per linear), `svh` `[1, out]`; linear s owns columns `cols[s]..cols[s + 1]`, each a multiple of 128.
 pub const Shared = struct { p: root.Proj, cols: [SHARED_MAX + 1]c_int, count: usize };
 
-/// `x` [rows, in] (rows <= `kernels.PROJECT_ROWS_MAX`) through every linear of `sh` in one multi-row launch: `outs[s]` is
+/// `x` [rows, in] (rows <= `project_rows.PROJECT_ROWS_MAX`) through every linear of `sh` in one multi-row launch: `outs[s]` is
 /// linear s's [rows, width] in x's dtype (the caller frees each). A row holds the bar of its own linear's launch; the
 /// sum order may differ from it, since the launch splits k for the stacked width.
 pub fn linearShared(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, outs: []mlx.mlx_array) !void {
@@ -52,7 +53,7 @@ pub fn linearShared(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.D
     const total = sh.cols[sh.count];
     var bounds: [3]c_int = @splat(total);
     for (1..sh.count) |i| bounds[i - 1] = sh.cols[i];
-    const flat = try kernels.projectRowsSegmented(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, bounds);
+    const flat = try project_rows.projectRowsSegmented(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, bounds);
     defer _ = mlx.mlx_array_free(flat);
     var made: usize = 0;
     errdefer for (outs[0..made]) |o| {
@@ -78,8 +79,8 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, grou
     const tsh = mlx.getShape(p.trellis);
     if (tsh.len != 4 or tsh[0] != groups) return error.BadExl3Shape;
     kernels.setDecodeParams(dec);
-    if ((force_arm orelse if (rows <= kernels.PROJECT_ROWS_MAX) Arm.rows else Arm.gemm) == .rows)
-        return kernels.projectRows(s, x, p.trellis, p.suh, p.svh);
+    if ((force_arm orelse if (rows <= project_rows.PROJECT_ROWS_MAX) Arm.rows else Arm.gemm) == .rows)
+        return project_rows.projectRows(s, x, p.trellis, p.suh, p.svh);
     const alloc = std.heap.page_allocator;
     const ids = try alloc.alloc(u32, groups * rows);
     defer alloc.free(ids);
@@ -99,7 +100,7 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, grou
 }
 
 /// Windows of at most `win` rows that never straddle two banks.
-fn windowTable(groups: usize, rows: usize, win: c_int) !kernels.WindowTable {
+pub fn windowTable(groups: usize, rows: usize, win: c_int) !kernels.WindowTable {
     const w: usize = @intCast(win);
     const per = (rows + w - 1) / w;
     const alloc = std.heap.page_allocator;
@@ -280,7 +281,7 @@ test "exl3 linear: one-bank and grouped trellis linears hold the f32-truth bar o
     const out: usize = 256;
     var failed: usize = 0;
     for (cases) |cs| for ([_]usize{ 1, 2, 8 }) |groups| for ([_]usize{ 1, 3, 8, 70 }) |rows| for ([_]Arm{ .rows, .gemm, .gemv }) |arm| for ([_]mlx.mlx_dtype{ .float16, .bfloat16, .float32 }) |dt| {
-        if ((arm == .gemv and rows > 3) or (arm == .rows and rows > kernels.PROJECT_ROWS_MAX)) continue;
+        if ((arm == .gemv and rows > 3) or (arm == .rows and rows > project_rows.PROJECT_ROWS_MAX)) continue;
         if (groups == 8 and rows > 8) continue;
         force_arm = arm;
         defer force_arm = null;
@@ -489,13 +490,126 @@ test "exl3 linear: the multi-row kernel gives a row the same bytes at widths 2 t
     }
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 8 at Flash-Next's trunk shapes, stacked, on the machine's own arm and on SIMD" {
+    try mlx.requireGpu();
+    // The arm follows the hardware, never the row count.
+    project_rows.rows_exact = true;
+    defer project_rows.rows_exact = false;
+    for (1..9) |rows| try std.testing.expectEqual(kernels.gemmNaxOn(), project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1).nax);
+    try exactRowsCase();
+    _ = setenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK", "1", 1);
+    defer _ = unsetenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK");
+    for (1..9) |rows| try std.testing.expect(!project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1).nax);
+    try exactRowsCase();
+}
+
+/// Rows 1 to 8 of an exact call equal the same row alone, on one bank, and on three linears stacked into one launch.
+fn exactRowsCase() !void {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    defer kernels.setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0xe4ac7);
+    const rnd = prng.random();
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    // The 12288-wide output, a deep input and a narrow one each split k differently.
+    const shapes = [_][3]usize{ .{ 2560, 12288, 48 }, .{ 2560, 12288, 96 }, .{ 2560, 10240, 64 }, .{ 2560, 6144, 64 }, .{ 6144, 2560, 48 }, .{ 2560, 640, 32 }, .{ 256, 131072, 32 } };
+    for (shapes) |sh| {
+        var h = try Host.init(alloc, rnd, 1, sh[0], sh[1], @intCast(sh[2]));
+        defer h.deinit();
+        const xb = try alloc.alloc(u16, 8 * sh[0]);
+        for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
+        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 8, @intCast(sh[0]) }, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(x);
+        var solo: [8][]const f32 = undefined;
+        var solo_arrays: [8]mlx.mlx_array = undefined;
+        var made: usize = 0;
+        defer for (solo_arrays[0..made]) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (0..8) |r| {
+            var row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(row);
+            try mlx.check(mlx.mlx_slice(&row, x, &[_]c_int{ @intCast(r), 0 }, 2, &[_]c_int{ @intCast(r + 1), @intCast(sh[0]) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            const y = try linear(s, row, h.p, dec);
+            solo_arrays[made] = mlx.mlx_array_new();
+            made += 1;
+            solo[r] = try hostF32(s, y, &solo_arrays[made - 1]);
+            _ = mlx.mlx_array_free(y);
+        }
+        for (2..9) |width| {
+            var part = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(part);
+            try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ @intCast(width), @intCast(sh[0]) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            const y = try linear(s, part, h.p, dec);
+            defer _ = mlx.mlx_array_free(y);
+            var cy = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cy);
+            const got = try hostF32(s, y, &cy);
+            for (0..width) |r| try t.expectEqualSlices(u8, std.mem.sliceAsBytes(solo[r]), std.mem.sliceAsBytes(got[r * sh[1] ..][0..sh[1]]));
+        }
+    }
+
+    // Stacked: three linears that share an input, each row of the one launch the row alone in the same launch.
+    const in: usize = 2560;
+    const widths = [3]usize{ 1280, 512, 512 };
+    var h = try Host.init(alloc, rnd, 1, in, widths[0] + widths[1] + widths[2], 48);
+    defer h.deinit();
+    var tiled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tiled);
+    try mlx.check(mlx.mlx_tile(&tiled, h.p.suh, &[_]c_int{ 3, 1 }, 2, s));
+    const stacked = Shared{ .p = .{ .trellis = h.p.trellis, .suh = tiled, .svh = h.p.svh }, .cols = .{ 0, 1280, 1792, 2304, 0 }, .count = 3 };
+    const xb = try alloc.alloc(u16, 8 * in);
+    for (xb) |*b| b.* = bf16Bits((rnd.float(f32) * 2 - 1) * 4);
+    const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 8, @intCast(in) }, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(x);
+    var want: [3][8][]const f32 = undefined;
+    var want_arrays: [24]mlx.mlx_array = undefined;
+    var wm: usize = 0;
+    defer for (want_arrays[0..wm]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (0..8) |r| {
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_slice(&row, x, &[_]c_int{ @intCast(r), 0 }, 2, &[_]c_int{ @intCast(r + 1), @intCast(in) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        var outs: [3]mlx.mlx_array = undefined;
+        try linearShared(s, row, stacked, dec, &outs);
+        for (outs, 0..) |o, i| {
+            want_arrays[wm] = mlx.mlx_array_new();
+            wm += 1;
+            want[i][r] = try hostF32(s, o, &want_arrays[wm - 1]);
+            _ = mlx.mlx_array_free(o);
+        }
+    }
+    for (2..9) |width| {
+        var part = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(part);
+        try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ @intCast(width), @intCast(in) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        var outs: [3]mlx.mlx_array = undefined;
+        try linearShared(s, part, stacked, dec, &outs);
+        for (outs, 0..) |o, i| {
+            defer _ = mlx.mlx_array_free(o);
+            var co = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(co);
+            const got = try hostF32(s, o, &co);
+            for (0..width) |r| try t.expectEqualSlices(u8, std.mem.sliceAsBytes(want[i][r]), std.mem.sliceAsBytes(got[r * widths[i] ..][0..widths[i]]));
+        }
+    }
+}
+
 test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at DeepSeek's trunk shapes, and the lm_head keeps its serial launch's" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     defer kernels.setDecodeParams(.mul1);
-    kernels.rows_exact = true;
-    defer kernels.rows_exact = false;
+    project_rows.rows_exact = true;
+    defer project_rows.rows_exact = false;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -529,8 +643,8 @@ test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 6 at 
             if (width == 1) {
                 one_row = try alloc.dupe(f32, got);
                 if (sh.out == 129280) {
-                    kernels.rows_exact = false;
-                    defer kernels.rows_exact = true;
+                    project_rows.rows_exact = false;
+                    defer project_rows.rows_exact = true;
                     const serial = try linearGrouped(s, part, h.p, dec);
                     defer _ = mlx.mlx_array_free(serial);
                     var cs = mlx.mlx_array_new();
