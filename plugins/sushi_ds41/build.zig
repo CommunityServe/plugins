@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "mlx_host", .module = gpu }},
     });
     gpu.addImport("sushi_exl3", gpu_exl3);
-    // The slice's model reaches the ANE runtime (`aneMoe`), so the Metal test binary links it too.
+    // The slice's model reaches the ANE runtime (`ane_shared.moe`), so the Metal test binary links it too.
     addAne(b, gpu);
     const gpu_run = b.addRunArtifact(b.addTest(.{ .root_module = gpu, .filters = &.{"sushi_ds41 gpu"} }));
     gpu_run.setEnvironmentVariable("SUSHI_DS41_GPU_TEST", "1");
