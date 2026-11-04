@@ -14,7 +14,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "mlx_host", .module = root }},
     });
     root.addImport("sushi_exl3", exl3);
-    addAne(b, root);
     // The kit's test step roots config.zig, which needs the vendored module; this one roots the plugin and leaves MLX
     // undefined (the tests never call it).
     const tests = b.addTest(.{ .root_module = root, .filters = &.{"sushi_ds41"} });
@@ -43,21 +42,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "mlx_host", .module = gpu }},
     });
     gpu.addImport("sushi_exl3", gpu_exl3);
-    // The slice's model reaches the ANE runtime (`ane_shared.moe`), so the Metal test binary links it too.
-    addAne(b, gpu);
+    // The slice's model reaches `ane_shared.zig`, which names the kit's `HostAne`.
+    gpu.addImport("mlx_serve", root.import_table.get("mlx_serve").?);
     const gpu_run = b.addRunArtifact(b.addTest(.{ .root_module = gpu, .filters = &.{"sushi_ds41 gpu"} }));
     gpu_run.setEnvironmentVariable("SUSHI_DS41_GPU_TEST", "1");
     if (tiny) |dir| gpu_run.setEnvironmentVariable("DSV41_TINY", dir);
     b.step("gpu-test", "Run the Metal tests (needs -Dmlx-lib; the matmul2d one skips without an M5)").dependOn(&gpu_run.step);
-}
-
-/// The Neural Engine runtime (a copy of mlx-serve's lib/ane, symbols renamed `s41_` so they never bind to the host's
-/// `msv_` copy): the shared expert's prefill programs (`SUSHI_DS41_ANE_SHARED`).
-fn addAne(b: *std.Build, m: *std.Build.Module) void {
-    const objc = &[_][]const u8{ "-O3", "-fobjc-arc", "-Wno-deprecated-declarations" };
-    m.addCSourceFile(.{ .file = b.path("src/ane/ane_bridge.m"), .flags = objc });
-    m.addCSourceFile(.{ .file = b.path("src/ane/ane_mlp.m"), .flags = objc });
-    m.addIncludePath(b.path("src/ane"));
-    m.linkFramework("Foundation", .{});
-    m.linkFramework("IOSurface", .{});
 }

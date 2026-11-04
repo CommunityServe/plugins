@@ -70,12 +70,12 @@ DSpark on or off.
 - Prefill pipeline: a prefill-width layer is submitted, not waited on, with up to 2 in flight
   (`SUSHI_DS41_PREFILL_PIPELINE`, 0 turns it off; `patches/prefill-pipeline.patch`, `pipeOn`). Same graphs, same bytes.
 - Shared expert on the Neural Engine, prefill, off by default (`SUSHI_DS41_ANE_SHARED=1|2`, the number of ANE units;
-  `src/ane_shared.zig`, `src/ane/`, `patches/shared-expert-ane.patch`): in each 2,048-row chunk, the layers below the
+  `src/ane_shared.zig`, `patches/shared-expert-ane.patch`): in each 2,048-row chunk, the layers below the
   CED split run the shared expert's SwiGLU as int8 weights and fp16 activations on the ANE while the GPU runs the
-  routed experts. Lossy. The load self-check compares one layer against the GPU chain (`cos 0.999889` on the release
-  pack), and if the ANE is missing or a program fails to build, the GPU path keeps serving (`ane shared: off (...)`).
-  The ANE is reached through Apple's private AppleNeuralEngine framework, as in mlx-serve's `lib/ane`, of which
-  `src/ane/` is a renamed copy. M5 Ultra, `=2`: cold prefill x1.037 at 25.6k and x1.042 at 60k, KL 0.0108 against the
+  routed experts. Lossy. The load self-check compares every covered layer against the GPU chain (worst `cos 0.999767`
+  on the release pack), and if the ANE is missing or a program fails to build, the GPU path keeps serving
+  (`ane shared: off (...)`). The programs are built and run by the host's Neural Engine runtime (`Host.ane`,
+  mlx-serve's `lib/ane`); a host without it serves this plugin on the GPU. M5 Ultra, `=2`: cold prefill x1.037 at 25.6k and x1.042 at 60k, KL 0.0108 against the
   GPU path, peak footprint +3 GB, API KLD to the FP8 teacher 0.1849 (unchanged).
 - Directional ablation (`Caps.ablation`, mlx-serve's `--ablation-profiles`): a request's direction is removed from
   every write to the hyper-connection stream: the embedding (text and image rows, and the DSpark stages' block input),
