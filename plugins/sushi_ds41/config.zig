@@ -14,8 +14,9 @@ const formats = [_][]const u8{"stq"};
 
 const gpa = std.heap.c_allocator;
 
-/// What `bill` and `load` read.
-pub const Private = struct { cfg: sc.Config, exl3_n: u32, exl3_rates: ?u128, dspark: bool };
+/// What `bill` and `load` read. `tile_order` is `expert_quant.tile_order`, kept for the load: the store it opens reads
+/// the order off the pack's index and refuses a geometry that does not name it, so a pair-major pack would not load.
+pub const Private = struct { cfg: sc.Config, exl3_n: u32, exl3_rates: ?u128, dspark: bool, tile_order: exl3.format.TileOrder = .pack };
 
 pub fn private(p: *const abi.Parsed) *const Private {
     return @ptrCast(@alignCast(p.private.?));
@@ -100,9 +101,12 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     errdefer gpa.destroy(priv);
     priv.cfg = sc.parse(text, o) catch return refuse("config.json is not a DeepSeek-V4.1 geometry sushi serves");
     if (priv.cfg.expert_dec == null or priv.cfg.trunk_dec == null) return refuse("an STQ pack names both expert_quant and trunk_quant");
-    const experts = exl3.parseQuantBlock(o.get("expert_quant").?) catch return refuse("expert_quant does not parse");
+    // parseExpertQuant, not parseQuantBlock: the block parser is shared with `trunk_quant` and never reads
+    // `tile_order`, so a pair-major pack would reach the store without its order named and be refused.
+    const experts = exl3.parseExpertQuant(o) catch return refuse("expert_quant does not parse");
     priv.exl3_n = experts.rate.n;
     priv.exl3_rates = experts.rates;
+    priv.tile_order = experts.tile_order;
     priv.dspark = priv.cfg.dspark.block > 0 and priv.cfg.n_mtp > 0 and mtpAllowed(settings_json.slice()) and shipsStages(dir);
     const c = &priv.cfg;
     var p: abi.Parsed = .{
@@ -178,6 +182,39 @@ test "sushi_ds41 parses the STQ pack's geometry" {
     }
     // The mini pack names no stage tensors in its (absent) index: no native drafter.
     try testing.expectEqual(@as(u32, 0), p.spec.native_stages);
+}
+
+test "sushi_ds41 keeps expert_quant.tile_order for the load's geometry" {
+    // A pack that names no order is the pack order: the fixture is the release's own layout.
+    const plain: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = stq }} };
+    const plain_dir = plain.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(parse(&plain_dir, abi.Str.of(stq), .{}, null, true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expectEqual(exl3.format.TileOrder.pack, private(&p).tile_order);
+
+    // A revision 2.0 pack names pair_major, and the load must be told: the store derives the same order from the
+    // index and refuses the geometry when the two disagree (Exl3TileOrderMismatch).
+    const pair_json = try std.mem.replaceOwned(u8, testing.allocator, stq,
+        "\"codebook_digest\": \"c089b4eb\"",
+        "\"codebook_digest\": \"c089b4eb\", \"tile_order\": \"pair_major\"");
+    defer testing.allocator.free(pair_json);
+    const pair: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = pair_json }} };
+    const pair_dir = pair.packDir();
+    var q: abi.Parsed = .{};
+    try testing.expect(parse(&pair_dir, abi.Str.of(pair_json), .{}, null, true, &q).isOk());
+    defer freeParsed(&q);
+    try testing.expectEqual(exl3.format.TileOrder.pair_major, private(&q).tile_order);
+
+    // An order this build cannot read is refused where it is parsed, before any weight is read.
+    const bogus_json = try std.mem.replaceOwned(u8, testing.allocator, stq,
+        "\"codebook_digest\": \"c089b4eb\"",
+        "\"codebook_digest\": \"c089b4eb\", \"tile_order\": \"swizzle\"");
+    defer testing.allocator.free(bogus_json);
+    const bogus: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = bogus_json }} };
+    const bogus_dir = bogus.packDir();
+    var r: abi.Parsed = .{};
+    try testing.expect(!parse(&bogus_dir, abi.Str.of(bogus_json), .{}, null, true, &r).isOk());
 }
 
 test "sushi_ds41 arms its native drafter only for a pack that ships the stages and a model that allows them" {
