@@ -109,10 +109,12 @@ fn build(m: *dsv.Model, ane: *const HostAne, n_units: usize) !*AneState {
     for (0..layers) |li| {
         var sc = Scope.init(m.gpa, m.s);
         defer sc.deinit();
+        var arena = std.heap.ArenaAllocator.init(m.gpa);
+        defer arena.deinit();
         const sh = &m.layers[li].shared;
-        const g = try int8Rows(&sc, m, &sh[0], d);
-        const u = try int8Rows(&sc, m, &sh[1], d);
-        const dn = try int8Rows(&sc, m, &sh[2], ffn);
+        const g = try int8Rows(&sc, arena.allocator(), m, &sh[0], d);
+        const u = try int8Rows(&sc, arena.allocator(), m, &sh[1], d);
+        const dn = try int8Rows(&sc, arena.allocator(), m, &sh[2], ffn);
         for (banks[0..n_units]) |b| {
             const proc = ane.bank_add_swiglu(ane.ctx, b.?, d, ffn, unit_rows, g.q, g.s, u.q, u.s, dn.q, dn.s, m.cfg.swiglu_limit, &err, err.len);
             if (proc != @as(i32, @intCast(li))) return aneError("program", &err);
@@ -144,18 +146,22 @@ const Int8 = struct { q: [*]const i8, s: [*]const f32 };
 
 extern "c" fn mlx_eye(res: *A, n: c_int, m: c_int, k: c_int, dtype: mlx.mlx_dtype, s: sc_mod.S) c_int;
 
-fn int8Rows(sc: *Scope, m: *const dsv.Model, lin: *const dsv.Lin, in: u32) !Int8 {
+fn int8Rows(sc: *Scope, a: std.mem.Allocator, m: *const dsv.Model, lin: *const dsv.Lin, in: u32) !Int8 {
     var eye = mlx.mlx_array_new();
     const identity = try sc.res(mlx_eye(&eye, ci(in), ci(in), 0, m.act, m.s), &eye);
-    const w = try sc.astype(try sc.t2(try lin.apply(sc, identity)), .float32);
-    const amax = try sc.maximum(try sc.max(try sc.op1(mlx.mlx_abs, w), 1, true), try sc.f(1e-30));
-    const scale = try sc.div(amax, try sc.f(127));
-    var r = mlx.mlx_array_new();
-    const rounded = try sc.res(mlx.mlx_round(&r, try sc.div(w, scale), 0, sc.s), &r);
-    const q = try sc.contiguous(try sc.astype(rounded, .int8));
-    try mlx.check(mlx.mlx_array_eval(q));
-    const s = try sc_mod.hostF32(try sc.contiguous(try sc.reshape(scale, &.{-1})));
-    return .{ .q = @ptrCast(mlx.mlx_array_data_uint8(q) orelse return error.HostRead), .s = s.ptr };
+    const w = try sc_mod.hostF32(try sc.contiguous(try sc.astype(try sc.t2(try lin.apply(sc, identity)), .float32)));
+    const rows = w.len / in;
+    const q = try a.alloc(i8, w.len);
+    const s = try a.alloc(f32, rows);
+    for (0..rows) |r| {
+        const row = w[r * in ..][0..in];
+        var amax: f32 = 0;
+        for (row) |v| amax = @max(amax, @abs(v));
+        s[r] = if (amax > 0) amax / 127.0 else 1.0;
+        const inv = 1.0 / s[r];
+        for (row, q[r * in ..][0..in]) |v, *o| o.* = @intFromFloat(std.math.clamp(@round(v * inv), -127, 127));
+    }
+    return .{ .q = q.ptr, .s = s.ptr };
 }
 
 fn noFree(_: ?*anyopaque) callconv(.c) void {}
