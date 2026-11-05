@@ -14,6 +14,7 @@ const Scope = sc_mod.Scope;
 const Config = cfg_mod.Config;
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("expert_usage.zig");
+const PrefetchCredit = @import("../prefetch_plan.zig").PrefetchCredit;
 
 pub fn geometry(cfg: *const Config) stream.Geometry {
     return .{
@@ -38,15 +39,35 @@ pub const Stream = struct {
     act: mlx.mlx_dtype,
     /// The slabs of the layer in flight, between `lease` and `release`.
     held: ?stream.Prepared = null,
+    /// Every expert of one layer, resident until `unpin`: its leases read no SSD.
+    pinned: ?Pinned = null,
+    pinned_leases: u64 = 0,
+
+    const Pinned = struct { layer: usize, prepared: stream.Prepared };
+
+    /// Reads all of `layer`'s experts once; a layer-major batch runs every window against them.
+    pub fn pin(self: *Stream, layer: usize) !void {
+        self.unpin();
+        const gpa = self.engine.allocator;
+        const all = try gpa.alloc(u16, self.cfg.experts);
+        defer gpa.free(all);
+        for (all, 0..) |*id, i| id.* = @intCast(i);
+        self.pinned = .{ .layer = layer, .prepared = try self.engine.prepareHost(@intCast(layer), all) };
+    }
+
+    pub fn unpin(self: *Stream) void {
+        if (self.pinned) |*p| p.prepared.deinit();
+        self.pinned = null;
+    }
 
     pub fn hook(self: *Stream) model.Experts.Hook {
         return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque };
     }
 
-    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?A) anyerror!A {
+    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?model.SharedOp) anyerror!A {
         const self: *Stream = @ptrCast(@alignCast(ctx));
         const y = try self.apply(sc, layer, x, idx, wts);
-        return if (shared) |sy| sc.add(y, try sc.astype(sy, .float32)) else y;
+        return if (shared) |op| sc.add(y, try sc.astype(try op.value(sc, x), .float32)) else y;
     }
 
     fn leaseOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, idx: A) anyerror!model.Experts.Lease {
@@ -71,15 +92,20 @@ pub const Stream = struct {
             if (id < 0 or id >= self.cfg.experts) return error.ExpertOutOfRange;
             h.* = @intCast(id);
         }
-        var fresh = try self.engine.prepareHost(@intCast(layer), host);
-        errdefer {
+        const pin_hit = if (self.pinned) |*p| p.layer == layer else false;
+        var fresh: ?stream.Prepared = if (pin_hit) null else try self.engine.prepareHost(@intCast(layer), host);
+        errdefer if (fresh) |*p| {
             _ = mlx.mlx_synchronize(sc.s);
-            fresh.deinit();
-        }
-        const prepared: *const stream.Prepared = &fresh;
+            p.deinit();
+        };
+        const prepared: *const stream.Prepared = if (fresh) |*p| p else &self.pinned.?.prepared;
         const slots = try gpa.alloc(i32, host.len);
         defer gpa.free(slots);
-        for (slots, prepared.remapped) |*s, r| s.* = r;
+        if (pin_hit) {
+            // `remapped` of a pinned layer is indexed by expert id.
+            for (slots, host) |*s, id| s.* = prepared.remapped[id];
+            self.pinned_leases += 1;
+        } else for (slots, prepared.remapped) |*s, r| s.* = r;
         const local = try sc.ints(slots, mlx.getShape(idx));
         const C = stream.quant.Component;
         const bank = struct {
@@ -113,15 +139,37 @@ pub const Stream = struct {
     }
 };
 
+/// `n` elements of `list`'s storage, grown when short and never shrunk; the contents are undefined.
+fn scratch(comptime T: type, list: *std.ArrayList(T), gpa: std.mem.Allocator, n: usize) ![]T {
+    list.clearRetainingCapacity();
+    try list.ensureTotalCapacity(gpa, n);
+    list.items.len = n;
+    return list.items;
+}
+
 /// The routed experts of an STQ pack (`expert_quant`) over the shared expert cache, built with `layout = .exl3_k4`:
 /// each layer's rate groups are slot pools, and the picks run on the grouped trellis chain with the clamped SwiGLU.
 pub const StqStream = struct {
     engine: *stream.Engine,
     cfg: *const Config,
     settles: u64 = 0,
+    /// A wide chunk starts each rate group's GEMMs as its experts land (`Engine.fillStaged`); false reads the whole fill
+    /// first (the byte-identity test's reference).
+    overlap: bool = true,
+    /// A settle's picks as expert ids, and the slots they resolved to: kept between settles.
+    picks: std.ArrayList(u16) = .empty,
+    slots: std.ArrayList(i32) = .empty,
+    /// The flat positions of a settle's picks that left the slot the queued chain read.
+    bad: std.ArrayList(u32) = .empty,
+
+    pub fn deinit(self: *StqStream) void {
+        self.picks.deinit(self.engine.allocator);
+        self.slots.deinit(self.engine.allocator);
+        self.bad.deinit(self.engine.allocator);
+    }
 
     pub fn hook(self: *StqStream) model.Experts.Hook {
-        return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque, .host_ns = hostNsOpaque, .prefetch = prefetchOpaque, .spec = .{
+        return .{ .ctx = self, .apply = applyOpaque, .lease = leaseOpaque, .release = releaseOpaque, .host_ns = hostNsOpaque, .prefetch = prefetchOpaque, .can_prefetch = canPrefetchOpaque, .spec = .{
             .can = canQueue,
             .queue = queueOpaque,
             .settle = settleOpaque,
@@ -146,33 +194,32 @@ pub const StqStream = struct {
     }
 
     /// The chain over the slots the layer's GPU map holds for the picks, which the host checks in `settle`.
-    fn queueOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp) anyerror!model.Experts.Queued {
+    fn queueOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp, ride: ?[]const A) anyerror!model.Experts.Queued {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         const spec = try self.engine.specGrouped(@intCast(layer)) orelse return error.Dsv41StqLayerNotGrouped;
         const idx32 = try sc.astype(idx, .int32);
         // Submitted before the chain, so the host's read of the picks waits for the router only, not for the chain.
-        const ids = mlx.mlx_vector_array_new_data(&[_]A{idx32}, 1);
-        defer _ = mlx.mlx_vector_array_free(ids);
-        try mlx.check(mlx.mlx_async_eval(ids));
+        if (ride) |r| try model.submitWith(idx32, r);
         const local = try sc.take(spec.slots, idx32, 0);
-        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), spec.bank, x, local, wts, shared);
-        return .{ .out = out, .idx = idx32, .map = spec.host };
+        var kept: exl3.rate_groups.Kept = .{};
+        errdefer kept.deinit();
+        const out = try model.stqRoutedKept(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), spec.bank, x, local, wts, shared, &kept);
+        return .{ .out = out, .idx = idx32, .map = spec.host, .kept = kept };
     }
 
     /// Reads the picks and resolves them in the cache: null when each sat in the slot `map` gave the queued chain, else
     /// the chain over the slots they now hold. The cache is touched here only, so a discarded successor never moves it.
-    fn settleOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp, map: []const i32) anyerror!?A {
+    fn settleOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: model.SharedOp, map: []const i32, kept: exl3.rate_groups.Kept) anyerror!?A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         const gpa = self.engine.allocator;
         var clock = stream.Clock.init();
         const ids = try sc_mod.hostI32(idx);
         if (self.engine.prefetcher) |pf| {
             self.settles +%= 1;
-            if (self.settles % 4096 == 0) log.info("[expert-stream] prefetch: {d} jobs, {d} experts read in {d:.1} ms, the host waited {d:.1} ms for them\n", .{ pf.jobs_run.load(.monotonic), pf.experts_read.load(.monotonic), @as(f64, @floatFromInt(pf.job_ns.load(.monotonic))) / 1e6, @as(f64, @floatFromInt(pf.host_wait_ns.load(.monotonic))) / 1e6 });
+            if (self.settles % 4096 == 0) log.info("[expert-stream] prefetch: {d} jobs queued, {d} read {d} experts ({d} skipped for lack of credit) in {d:.1} ms, the host waited {d:.1} ms for them\n", .{ pf.jobs_queued.load(.monotonic), pf.jobs_run.load(.monotonic), pf.experts_read.load(.monotonic), pf.experts_skipped.load(.monotonic), @as(f64, @floatFromInt(pf.job_ns.load(.monotonic))) / 1e6, @as(f64, @floatFromInt(pf.host_wait_ns.load(.monotonic))) / 1e6 });
         }
         self.engine.noteRoute(@intCast(layer), false, .{ .ids_wait_ns = clock.lap() });
-        const host = try gpa.alloc(u16, ids.len);
-        defer gpa.free(host);
+        const host = try scratch(u16, &self.picks, gpa, ids.len);
         for (host, ids) |*h, id| {
             if (id < 0 or id >= self.cfg.experts) return error.ExpertOutOfRange;
             h.* = @intCast(id);
@@ -182,19 +229,41 @@ pub const StqStream = struct {
         errdefer _ = mlx.mlx_synchronize(sc.s);
         if (stream.specMatches(map, host, prepared.remapped, prepared.workspace)) return null;
         const rb = prepared.ragged orelse return error.Dsv41StqLayerNotGrouped;
-        const slots = try gpa.alloc(i32, host.len);
-        defer gpa.free(slots);
+        const slots = try scratch(i32, &self.slots, gpa, host.len);
         for (slots, prepared.remapped) |*o, r| o.* = r;
         const local = try sc.ints(slots, mlx.getShape(idx));
         _ = clock.lap();
+        model.spec_rebuilt_picks += host.len;
+        // The picks that held keep the planes the queued chain made; only the ones that moved run again.
+        const bad = try scratch(u32, &self.bad, gpa, host.len);
+        var n_bad: usize = 0;
+        for (host, prepared.remapped, 0..) |expert, slot, i| {
+            if (stream.specPickHeld(map, expert, slot)) continue;
+            bad[n_bad] = @intCast(i);
+            n_bad += 1;
+        }
+        if (!prepared.workspace and n_bad < host.len) {
+            if (try model.stqRoutedRedo(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, prepared.remapped, wts, shared, kept, bad[0..n_bad])) |out| {
+                model.spec_redone += 1;
+                model.spec_redo_picks += n_bad;
+                self.engine.noteExpertCompute(@intCast(layer), clock.lap());
+                return out;
+            }
+        }
+        model.spec_redo_picks += host.len;
         const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared);
         self.engine.noteExpertCompute(@intCast(layer), clock.lap());
         return out;
     }
 
-    fn prefetchOpaque(ctx: *anyopaque, layer: usize, cand: []const u16, rows: usize, n: usize, m: usize) void {
+    fn prefetchOpaque(ctx: *anyopaque, layer: usize, cand: []const u16, score: []const f32, rows: usize, n: usize, m: usize) void {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
-        self.engine.prefetch(@intCast(layer), cand, rows, n, m);
+        self.engine.prefetch(@intCast(layer), cand, score, rows, n, m);
+    }
+
+    fn canPrefetchOpaque(ctx: *anyopaque, layer: usize) bool {
+        const self: *StqStream = @ptrCast(@alignCast(ctx));
+        return layer < self.engine.layers.len and self.engine.canPrefetch(@intCast(layer));
     }
 
     fn hostNsOpaque(ctx: *anyopaque) u64 {
@@ -202,7 +271,7 @@ pub const StqStream = struct {
         return self.engine.fill_ns_total + self.engine.copy_ns_total;
     }
 
-    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?A) anyerror!A {
+    fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: ?model.SharedOp) anyerror!A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         return self.applyScored(sc, layer, x, idx, wts, logits, shared orelse return error.Dsv41StqNeedsSharedExpert);
     }
@@ -216,16 +285,16 @@ pub const StqStream = struct {
 
     /// The routed sum plus the shared expert's `shared`, f32 `[L, dim]`.
     pub fn apply(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A) !A {
-        return self.applyScored(sc, layer, x, idx, wts, .{ .ctx = null }, shared);
+        return self.applyScored(sc, layer, x, idx, wts, .{ .ctx = null }, .{ .array = shared });
     }
 
     /// `apply` with the router's `logits`, which a decode-width route's lossy pick (`stream.pick_tolerance`) reads.
-    pub fn applyScored(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: A) !A {
+    pub fn applyScored(self: *StqStream, sc: *Scope, layer: usize, x: A, idx: A, wts: A, logits: A, shared: model.SharedOp) !A {
         if (!mlx.streamIsGpu(sc.s)) return error.Dsv41StreamRequiresGpu;
         // A resident layer maps the picks to slots on the GPU: no host read, so the forward is never stalled on one.
         if (self.engine.residentRoute(@intCast(layer))) |rr| {
             const local = try sc.take(rr.map, try sc.astype(idx, .int32), 0);
-            return model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rr.bank, x, local, wts, .{ .array = shared });
+            return model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rr.bank, x, local, wts, shared);
         }
         const gpa = self.engine.allocator;
         var clock = stream.Clock.init();
@@ -250,7 +319,8 @@ pub const StqStream = struct {
             h.* = @intCast(id);
         }
         if (scores) |sv| _ = try self.engine.swapGroupedMisses(@intCast(layer), host, try sc_mod.hostF32(sv), tolerance, @intCast(mlx.getShape(idx)[1]));
-        var prepared = try if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host);
+        const staged = wide and self.overlap;
+        var prepared = try if (staged) self.engine.prepareHostStaged(@intCast(layer), host) else if (wide) self.engine.prepareHostWide(@intCast(layer), host) else self.engine.prepareHost(@intCast(layer), host);
         defer prepared.deinit();
         errdefer _ = mlx.mlx_synchronize(sc.s);
         const rb = prepared.ragged orelse return error.Dsv41StqLayerNotGrouped;
@@ -259,12 +329,28 @@ pub const StqStream = struct {
         for (slots, prepared.remapped) |*o, r| o.* = r;
         const local = try sc.ints(slots, mlx.getShape(idx));
         _ = clock.lap();
+        const fill_before = self.engine.layers[@intCast(layer)].stats.fill_ns;
+        var early: exl3.rate_groups.EarlyPlanes = .{};
+        defer early.deinit();
         // The caller only submits the sum (at decode widths, and at prefill widths when the layers pipeline), so no wait
         // here guards the slabs. A later layer's refill still comes after it: that layer's picks, read above before any
         // slab write, need this sum. Across a chunk boundary nothing orders the next chunk's first refill after this
         // chunk's last layers, so `extendState` drains before it returns when the experts stream.
-        const out = try model.stqRouted(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, .{ .array = shared });
-        self.engine.noteExpertCompute(@intCast(layer), clock.lap());
+        const out = try model.stqRoutedEarly(sc, self.cfg.expert_dec.?, @intFromFloat(self.cfg.swiglu_limit), rb, x, local, wts, shared, if (staged) &early else null, null);
+        if (staged) {
+            const Start = struct {
+                early: *const exl3.rate_groups.EarlyPlanes,
+                rb: *const exl3.Ragged,
+                fn ready(ctx: *anyopaque, group: usize) anyerror!void {
+                    const st: *@This() = @ptrCast(@alignCast(ctx));
+                    try st.early.start(st.rb, group);
+                }
+            };
+            var start = Start{ .early = &early, .rb = rb };
+            try self.engine.fillStaged(&prepared, &start, Start.ready);
+        }
+        // The staged fill runs inside this span; fill_ms already reports it.
+        self.engine.noteExpertCompute(@intCast(layer), clock.lap() -| (self.engine.layers[@intCast(layer)].stats.fill_ns - fill_before));
         return out;
     }
 };
@@ -460,6 +546,7 @@ const StqServed = struct {
 
     fn deinit(self: *StqServed) void {
         self.m.deinit();
+        self.hook.deinit();
         self.engine.deinit();
     }
 };
@@ -838,7 +925,7 @@ test "dsv41 stq: the served STQ pack (trunk banks, affine embedding, streamed ra
         defer served.deinit();
         try scaleRouters(&sc, served.m);
         try testing.expect(served.m.layers[0].wq_b.stq != null and served.m.layers[0].wo_a.stq != null and served.m.head.stq != null);
-        try testing.expect(served.m.embed.ssd != null);
+        try testing.expect(served.m.embed.scales.ctx != null);
         served.m.fused = false;
         var tr: model.Trace = .{ .gpa = testing.allocator };
         defer tr.deinit();
@@ -965,6 +1052,39 @@ fn argmax(row: []const f32) usize {
 
 test "dsv41 stq: greedy DSpark rounds over the STQ pack emit the serial greedy tokens (DSV41_STQ_TINY)" {
     try dsparkMatchesSerial(null);
+}
+
+test "dsv41 stq: a wide chunk whose fill is staged per rate group gives the unstaged chunk's bytes, through misses and the union (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    try testing.expect(ids.len > 2 * (exl3.kernels.DECODE_ROWS_MAX + 1));
+    for ([_]u64{ 8, 3 }) |slots| {
+        var plain: StqServed = undefined;
+        try plain.init(dir, .bfloat16, true, false, slots, s);
+        defer plain.deinit();
+        plain.hook.overlap = false;
+        var staged: StqServed = undefined;
+        try staged.init(dir, .bfloat16, true, false, slots, s);
+        defer staged.deinit();
+        const half = ids.len / 2;
+        for ([_][]const u32{ ids[0..half], ids[half..] }) |chunk| {
+            const a = try model.extend(plain.m, chunk, .all);
+            defer _ = mlx.mlx_array_free(a);
+            const b = try model.extend(staged.m, chunk, .all);
+            defer _ = mlx.mlx_array_free(b);
+            try expectSameBits(&sc, a, b);
+        }
+        try testing.expectEqual(@as(u64, 0), plain.engine.staged_routes);
+        // A resident pool serves every route on the GPU, with no fill to stage.
+        try testing.expectEqual(!staged.engine.plan.resident, staged.engine.staged_routes > 0);
+    }
 }
 
 test "dsv41 drop: greedy DSpark rounds over the STQ pack with experts dropped emit the serial greedy tokens of the same mask (DSV41_STQ_TINY)" {
@@ -1108,6 +1228,55 @@ test "dsv41 stq: verify rows that decode each distinct expert once give the per-
     }
 }
 
+test "dsv41 stq: a wide chunk's shared expert riding the routed prefill launches gives the separate chain's logits and state, byte for byte (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var packs: [2]StqServed = undefined;
+    var rows: [2][]f32 = undefined;
+    var slots: [2][]model.Slot = undefined;
+    var folded: [2]usize = undefined;
+    var built: usize = 0;
+    defer for (0..built) |i| {
+        testing.allocator.free(rows[i]);
+        for (slots[i]) |*sl| model.freeSlot(sl);
+        testing.allocator.free(slots[i]);
+        packs[i].deinit();
+    };
+    for ([_]bool{ false, true }, 0..) |fold, i| {
+        try packs[i].init(dir, .bfloat16, true, false, 8, s);
+        packs[i].m.shared_fold = fold;
+        built += 1;
+        const before = exl3.rate_groups.prefillFoldedCount();
+        var all: std.ArrayList(f32) = .empty;
+        defer all.deinit(testing.allocator);
+        // Both chunks are wider than a decode row group.
+        for ([_][]const u32{ ids[0..20], ids[20..] }) |chunk| {
+            const lg = try model.extend(packs[i].m, chunk, .all);
+            defer _ = mlx.mlx_array_free(lg);
+            const h = try model.hostRows(&sc, lg);
+            defer testing.allocator.free(h);
+            try all.appendSlice(testing.allocator, h);
+        }
+        folded[i] = exl3.rate_groups.prefillFoldedCount() - before;
+        rows[i] = try all.toOwnedSlice(testing.allocator);
+        slots[i] = try testing.allocator.alloc(model.Slot, model.slotCount(packs[i].m));
+        @memset(slots[i], model.nil_slot);
+        try model.captureState(packs[i].m, slots[i]);
+    }
+    try testing.expect(ids.len - 20 > exl3.kernels.DECODE_ROWS_MAX);
+    try testing.expectEqual(@as(usize, 0), folded[0]);
+    try testing.expect(folded[1] > 0);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(rows[0]), std.mem.sliceAsBytes(rows[1]));
+    try model.expectSlotsBits(&sc, slots[0], slots[1]);
+}
+
 test "dsv41 stq: tile-major pools give the pack-order pools' bytes, through hits, misses, the union and prefill rows (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = try stqDir();
@@ -1215,8 +1384,10 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
     defer sc.deinit();
     const ids = try model.tokens(&sc, &fx);
     defer testing.allocator.free(ids);
-    // 8 holds every expert (resident: nothing to queue), the others stream through hits and misses.
-    for ([_]u64{ 8, 4, 3 }) |slots| {
+    // The prepared chain is the pack's geometry (5120/2304) in serving: it keeps the planes a settle reuses.
+    defer exl3.rate_groups.prepared_force = null;
+    for ([_]?bool{ null, true }) |prepared| for ([_]u64{ 8, 4, 3 }) |slots| {
+        exl3.rate_groups.prepared_force = prepared;
         var drained: StqServed = undefined;
         try drained.init(dir, .bfloat16, true, false, slots, s);
         defer drained.deinit();
@@ -1235,6 +1406,10 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
         eager.m.route_spec_rebuilds = std.math.maxInt(u32);
         const kept0 = model.spec_kept;
         const rebuilt0 = model.spec_rebuilt;
+        const folded0 = model.expands_folded;
+        const redone0 = model.spec_redone;
+        const redo_picks0 = model.spec_redo_picks;
+        const rebuilt_picks0 = model.spec_rebuilt_picks;
         var at: usize = 0;
         for ([_]usize{ 20, 1, 1, 5, 1, 3, 1, 16, 1, 1, 1, 1, 2, 1, 1 }) |n| {
             const take = @min(n, ids.len - at);
@@ -1254,14 +1429,127 @@ test "dsv41 stq: queueing the routed chains from the cache map gives the drained
         }
         const kept = model.spec_kept - kept0;
         const rebuilt = model.spec_rebuilt - rebuilt0;
-        if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 stq route-spec slots {d}: {d} layers kept, {d} rebuilt\n", .{ slots, kept, rebuilt });
+        const redone = model.spec_redone - redone0;
+        if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 stq route-spec prepared {?} slots {d}: {d} layers kept, {d} rebuilt, {d} of them recomputing only the missed picks ({d} of {d} picks)\n", .{ prepared, slots, kept, rebuilt, redone, model.spec_redo_picks - redo_picks0, model.spec_rebuilt_picks - rebuilt_picks0 });
+        // The queued and eager packs' decode layers write their stream in the reduce; the drained pack's expand is the kernel.
+        try testing.expectEqual(slots != 8, model.expands_folded > folded0);
         if (slots == 8) {
             try testing.expectEqual(@as(u64, 0), kept + rebuilt);
         } else if (slots <= 3) {
             try testing.expect(kept > 0);
             try testing.expect(rebuilt > 0);
+            if (prepared != null) try testing.expect(redone > 0) else try testing.expectEqual(@as(u64, 0), redone);
         }
-    }
+    };
+}
+
+test "dsv41 stq: a settle that recomputes only the picks off the map gives the whole chain's bytes, 1 to 16 rows, one, two and every pick off (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    exl3.rate_groups.prepared_force = true;
+    defer exl3.rate_groups.prepared_force = null;
+    const s = mlx.gpuStream();
+    var pack: StqServed = undefined;
+    try pack.init(dir, .bfloat16, true, false, 4, s);
+    defer pack.deinit();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const h = &pack.hook;
+    const layer: usize = 3;
+    try testing.expect(StqStream.canQueue(h, layer));
+    const k = pack.m.layers[layer].top_k;
+    const dim_h: usize = pack.m.cfg.dim;
+    var prng = std.Random.DefaultPrng.init(0x5e771e);
+    const rnd = prng.random();
+    const shared: model.SharedOp = .{ .layer = .{ .m = pack.m, .li = layer } };
+    var redone: u64 = 0;
+    for ([_]usize{ 1, 2, 4, 16 }) |rows| for ([_]usize{ 1, 2, 0 }) |off| {
+        const picks = try testing.allocator.alloc(i32, rows * k);
+        defer testing.allocator.free(picks);
+        for (0..rows) |r| for (0..k) |j| {
+            picks[r * k + j] = @intCast((r + j * 2) % 4);
+        };
+        const xs = try testing.allocator.alloc(f32, rows * dim_h);
+        defer testing.allocator.free(xs);
+        for (xs) |*v| v.* = (rnd.float(f32) * 2 - 1) * 4;
+        const ws = try testing.allocator.alloc(f32, rows * k);
+        defer testing.allocator.free(ws);
+        for (ws) |*v| v.* = 0.05 + rnd.float(f32) * 0.3;
+        const x = try sc.astype(try sc.floats(xs, &.{ @intCast(rows), @intCast(dim_h) }), .bfloat16);
+        const idx = try sc.ints(picks, &.{ @intCast(rows), @intCast(k) });
+        const wts = try sc.floats(ws, &.{ @intCast(rows), @intCast(k) });
+        // The first settle fills the pool; the second queues from the map it left.
+        const none_map = try testing.allocator.alloc(i32, pack.m.cfg.experts);
+        defer testing.allocator.free(none_map);
+        @memset(none_map, -1);
+        _ = try StqStream.settleOpaque(h, &sc, layer, x, idx, wts, shared, none_map, .{});
+        var q = try StqStream.queueOpaque(h, &sc, layer, x, idx, wts, shared, null);
+        defer q.kept.deinit();
+        try mlx.check(mlx.mlx_array_eval(q.out));
+        // The picks the chain read from the map, taken off it: the settle sees them move.
+        const forced = try testing.allocator.dupe(i32, q.map);
+        defer testing.allocator.free(forced);
+        const n_off = if (off == 0) rows * k else off;
+        for (picks[0..n_off]) |e| forced[@intCast(e)] = -1;
+        const redone0 = model.spec_redone;
+        const part = (try StqStream.settleOpaque(h, &sc, layer, x, q.idx, wts, shared, forced, q.kept)) orelse return error.TestUnexpectedResult;
+        const whole = (try StqStream.settleOpaque(h, &sc, layer, x, q.idx, wts, shared, forced, .{})) orelse return error.TestUnexpectedResult;
+        try expectSameBits(&sc, part, whole);
+        // Every pick that shares an expert with a forced one is off the map as well.
+        redone += model.spec_redone - redone0;
+    };
+    try testing.expect(redone > 0);
+}
+
+test "dsv41 stq: a queued decode layer is one command buffer, two where a prefetch prediction rides its picks (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    // 8 holds every expert (the picks are read before the chain is built), 4 queues the chains from the cache map.
+    for ([_]u64{ 8, 4 }) |slots| for ([_]bool{ false, true }) |dspark| for ([_]bool{ false, true }) |prefetch| {
+        var pack: StqServed = undefined;
+        try pack.init(dir, .bfloat16, true, dspark, slots, s);
+        defer pack.deinit();
+        if (prefetch) try enablePrefetch(&pack, 2, 8, 2);
+        // Every layer of a pass may be rebuilt, so each build is a queued one.
+        pack.m.route_spec_rebuilds = std.math.maxInt(u32);
+        const layers = pack.m.cfg.layers;
+        const prefill = try model.extend(pack.m, ids[0..20], .last);
+        _ = mlx.mlx_array_free(prefill);
+        var at: usize = 20;
+        // The DSpark stage rings' commit goes out once per step.
+        const flush: u64 = @intFromBool(dspark);
+        const predicted_all = model.prefetch_predicted;
+        for ([_]usize{ 1, 1, 3, 1, 4, 1, 2, 1, 1, 3 }) |n| {
+            const q0 = model.async_evals;
+            const rebuilt0 = model.spec_rebuilt;
+            const predicted0 = model.prefetch_predicted;
+            const lg = try model.extend(pack.m, ids[at..][0..n], .all);
+            _ = mlx.mlx_array_free(lg);
+            at += n;
+            const submits = model.async_evals - q0;
+            const rebuilt = model.spec_rebuilt - rebuilt0;
+            const predicted = model.prefetch_predicted - predicted0;
+            if (slots == 8) {
+                // The picks with the hc split, the shared expert, then the layer's graph with the routed chain.
+                try testing.expectEqual(3 * layers + flush, submits);
+                continue;
+            }
+            // A queued build is one buffer, with the picks, the hc split and the routed chain in it; its prefetch
+            // prediction (`predicted`) goes out ahead with the picks as a second. A rollback adds a build and one buffer
+            // for the exact stream, a queued head one; a last-layer miss has no rollback.
+            const with_all = (layers + rebuilt) + predicted + rebuilt + 1 + flush;
+            const last_missed = with_all - 2;
+            try testing.expect(submits == with_all or submits == last_missed);
+        }
+        if (prefetch and slots == 4) try testing.expect(model.prefetch_predicted > predicted_all);
+    };
 }
 
 test "dsv41 stq: queued routed chains leave a verify round's kept rows, the DSpark windows and the open groups as the drained schedule does (DSV41_STQ_TINY)" {
@@ -1322,10 +1610,95 @@ test "dsv41 stq: queued routed chains leave a verify round's kept rows, the DSpa
 }
 
 fn enablePrefetch(served: *StqServed, lead_rows: u8, n: u8, m: u8) !void {
-    try served.engine.startPrefetch();
+    try served.engine.startPrefetch(PrefetchCredit.unmetered);
     served.m.prefetch_lead_rows = lead_rows;
     served.m.prefetch_n = n;
     served.m.prefetch_m = m;
+}
+
+/// Every pool of a layer: recency, residency and the tick.
+fn poolState(layer: anytype) ![]stream.GroupCache {
+    const gl = layer.grouped.?;
+    const out = try testing.allocator.alloc(stream.GroupCache, gl.groups.count);
+    for (out, gl.caches[0..gl.groups.count]) |*o, c| {
+        o.* = c;
+        o.expert_to_slot = try testing.allocator.dupe(i32, c.expert_to_slot);
+        o.slot_to_expert = try testing.allocator.dupe(u16, c.slot_to_expert);
+        o.ages = try testing.allocator.dupe(u64, c.ages);
+        o.ready = try testing.allocator.dupe(bool, c.ready);
+    }
+    return out;
+}
+
+fn freePoolState(pools: []stream.GroupCache) void {
+    for (pools) |c| {
+        testing.allocator.free(c.expert_to_slot);
+        testing.allocator.free(c.slot_to_expert);
+        testing.allocator.free(c.ages);
+        testing.allocator.free(c.ready);
+    }
+    testing.allocator.free(pools);
+}
+
+fn expectPoolsAre(want: []const stream.GroupCache, layer: anytype) !void {
+    const gl = layer.grouped.?;
+    for (want, gl.caches[0..gl.groups.count]) |w, c| {
+        try testing.expectEqualSlices(i32, w.expert_to_slot, c.expert_to_slot);
+        try testing.expectEqualSlices(u16, w.slot_to_expert, c.slot_to_expert);
+        try testing.expectEqualSlices(u64, w.ages, c.ages);
+        try testing.expectEqualSlices(bool, w.ready, c.ready);
+        try testing.expectEqual(w.tick, c.tick);
+    }
+}
+
+test "dsv41 stq: a route whose experts all hit copies no pool, and a route that fails leaves every pool's recency and residency as it was (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var pack: StqServed = undefined;
+    try pack.init(dir, .bfloat16, true, false, 8, mlx.gpuStream());
+    defer pack.deinit();
+    const e = &pack.engine;
+    const layer: u16 = 3;
+    const state = &e.layers[layer];
+    const routed = [_]u16{ 5, 1, 6, 1 };
+    {
+        var warm = try e.prepareHost(layer, &routed);
+        warm.deinit();
+    }
+    const copies = e.cache_snapshots;
+    {
+        var hit = try e.prepareHost(layer, &routed);
+        hit.deinit();
+    }
+    try testing.expectEqual(copies, e.cache_snapshots);
+
+    // A slab still filling fails the route after its experts resolved.
+    const slab = state.slabs[0].slab.?;
+    const before_hit = try poolState(state);
+    defer freePoolState(before_hit);
+    e.drainPendingReaders();
+    _ = try slab.tryBeginFill();
+    try testing.expectError(error.SlabFilling, e.prepareHost(layer, &routed));
+    try testing.expectEqual(copies, e.cache_snapshots);
+    try expectPoolsAre(before_hit, state);
+    _ = try slab.publish();
+    try slab.retire();
+
+    // An expert whose slot is not ready is a miss: its pool is copied before the route moves it, and put back.
+    const gl = state.grouped.?;
+    const g = gl.groups.groupOf(1);
+    gl.caches[g].ready[@intCast(gl.caches[g].expert_to_slot[1 - gl.groups.base[g]])] = false;
+    const before_miss = try poolState(state);
+    defer freePoolState(before_miss);
+    _ = try slab.tryBeginFill();
+    try testing.expectError(error.SlabFilling, e.prepareHost(layer, &routed));
+    try testing.expect(e.cache_snapshots > copies);
+    try expectPoolsAre(before_miss, state);
+    _ = try slab.publish();
+    try slab.retire();
+
+    var again = try e.prepareHost(layer, &routed);
+    again.deinit();
 }
 
 test "dsv41 prefetch: experts read ahead leave the pool, the map and the slab bytes as a route to them does, and the route then hits (DSV41_STQ_TINY)" {
@@ -1335,17 +1708,18 @@ test "dsv41 prefetch: experts read ahead leave the pool, the map and the slab by
     var ahead: StqServed = undefined;
     try ahead.init(dir, .bfloat16, true, false, 4, s);
     defer ahead.deinit();
-    try ahead.engine.startPrefetch();
+    try ahead.engine.startPrefetch(PrefetchCredit.unmetered);
     var routed: StqServed = undefined;
     try routed.init(dir, .bfloat16, true, false, 4, s);
     defer routed.deinit();
     const layer: u16 = 3;
-    // Two rows of three ranked candidates; each asks for its first two: the experts 5, 1 and 6.
+    // Two rows of three ranked candidates; each asks for its first two: the experts 1 (both rows), 5 and 6.
     const cand = [_]u16{ 5, 1, 7, 1, 6, 2 };
-    ahead.engine.prefetch(layer, &cand, 2, 3, 2);
+    const ranked_scores = [_]f32{ 6, 5, 4, 3, 2, 1 };
+    ahead.engine.prefetch(layer, &cand, &ranked_scores, 2, 3, 2);
     ahead.engine.prefetchWait(layer);
     {
-        var p = try routed.engine.prepareHost(layer, &.{ 5, 1, 6 });
+        var p = try routed.engine.prepareHost(layer, &.{ 1, 5, 6 });
         p.deinit();
     }
     const a = &ahead.engine.layers[layer];
@@ -1364,7 +1738,7 @@ test "dsv41 prefetch: experts read ahead leave the pool, the map and the slab by
     try testing.expectEqual(filled, ahead.engine.fill_experts_total);
     try testing.expectEqual(@as(u64, 3), ahead.engine.prefetcher.?.experts_read.load(.monotonic));
     // Experts the pool holds are not read again.
-    ahead.engine.prefetch(layer, &cand, 2, 3, 2);
+    ahead.engine.prefetch(layer, &cand, &ranked_scores, 2, 3, 2);
     ahead.engine.prefetchWait(layer);
     try testing.expectEqual(@as(u64, 3), ahead.engine.prefetcher.?.experts_read.load(.monotonic));
 }
@@ -1392,9 +1766,15 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
         try narrow.init(dir, .bfloat16, true, true, slots, s);
         defer narrow.deinit();
         try enablePrefetch(&narrow, 2, 3, 1);
+        // A credit of one expert a job, so most of what the rows want goes unread.
+        var metered: StqServed = undefined;
+        try metered.init(dir, .bfloat16, true, true, slots, s);
+        defer metered.deinit();
+        try enablePrefetch(&metered, 2, 8, 2);
+        metered.engine.prefetcher.?.credit = oneExpertAJob(&metered.engine);
         const pa = try model.extend(plain.m, ids[0..20], .last);
         _ = mlx.mlx_array_free(pa);
-        for ([_]*StqServed{ &wide, &narrow }) |served| {
+        for ([_]*StqServed{ &wide, &narrow, &metered }) |served| {
             const pb = try model.extend(served.m, ids[0..20], .last);
             _ = mlx.mlx_array_free(pb);
         }
@@ -1403,7 +1783,7 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
         for ([_][2]usize{ .{ 0, 0 }, .{ 5, 2 }, .{ 0, 0 }, .{ 0, 0 }, .{ 6, 0 }, .{ 4, 3 }, .{ 0, 0 }, .{ 3, 1 }, .{ 0, 0 }, .{ 0, 0 }, .{ 2, 1 }, .{ 0, 0 } }) |round| {
             const a = if (round[0] == 0) try model.extend(plain.m, ids[at..][0..1], .all) else try model.verify(plain.m, ids[at..][0..round[0]]);
             defer _ = mlx.mlx_array_free(a);
-            for ([_]*StqServed{ &wide, &narrow }) |served| {
+            for ([_]*StqServed{ &wide, &narrow, &metered }) |served| {
                 const c = if (round[0] == 0) try model.extend(served.m, ids[at..][0..1], .all) else try model.verify(served.m, ids[at..][0..round[0]]);
                 defer _ = mlx.mlx_array_free(c);
                 try expectSameBits(&sc, a, c);
@@ -1414,12 +1794,52 @@ test "dsv41 prefetch: decode steps and verify rounds with the pools read ahead g
                 try model.finishVerify(plain.m, round[1]);
                 try model.finishVerify(wide.m, round[1]);
                 try model.finishVerify(narrow.m, round[1]);
+                try model.finishVerify(metered.m, round[1]);
                 at += round[1] + 1;
             }
         }
         try testing.expect(wide.engine.prefetcher.?.experts_read.load(.monotonic) > 0);
         try testing.expect(narrow.engine.prefetcher.?.experts_read.load(.monotonic) > 0);
+        const meter = metered.engine.prefetcher.?;
+        try testing.expect(meter.experts_read.load(.monotonic) > 0);
+        try testing.expect(meter.experts_skipped.load(.monotonic) > 0);
     }
+}
+
+/// A credit that grants every job the bytes of the layer's largest expert, however many jobs ran before it.
+fn oneExpertAJob(engine: *const stream.Engine) PrefetchCredit {
+    var widest: u64 = 0;
+    for (0..engine.geometry.experts) |e| widest = @max(widest, engine.expertReadBytes(3, @intCast(e)));
+    return .{ .pct = 0, .max_bps = 0, .target_layers = 1, .credit = std.math.inf(f64), .share = @floatFromInt(widest) };
+}
+
+test "dsv41 prefetch: the read-rate probe leaves the caches and the engine's counters as a load without it (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    const s = mlx.gpuStream();
+    var plain: StqServed = undefined;
+    try plain.init(dir, .bfloat16, true, false, 4, s);
+    defer plain.deinit();
+    var probed: StqServed = undefined;
+    try probed.init(dir, .bfloat16, true, false, 4, s);
+    defer probed.deinit();
+    try plain.engine.warmCache();
+    const reading = try probed.engine.probeReadRate();
+    try testing.expect(reading.max_bps > 0);
+    try probed.engine.warmCache();
+    for (plain.engine.layers, probed.engine.layers) |a, b| {
+        const ga = a.grouped orelse continue;
+        for (ga.caches[0..ga.groups.count], b.grouped.?.caches[0..ga.groups.count]) |ca, cb| {
+            try testing.expectEqualSlices(i32, ca.expert_to_slot, cb.expert_to_slot);
+            try testing.expectEqualSlices(u16, ca.slot_to_expert, cb.slot_to_expert);
+            try testing.expectEqualSlices(bool, ca.ready, cb.ready);
+            try testing.expectEqualSlices(u64, ca.ages, cb.ages);
+            try testing.expectEqual(ca.tick, cb.tick);
+        }
+        try testing.expectEqual(a.stats.fill_bytes, b.stats.fill_bytes);
+    }
+    try testing.expectEqual(plain.engine.fill_experts_total, probed.engine.fill_experts_total);
+    try testing.expectEqual(plain.engine.fill_bytes_total, probed.engine.fill_bytes_total);
 }
 
 test "dsv41 prefetch: one-row decode steps ask for nothing and keep the bytes (DSV41_STQ_TINY)" {
@@ -1449,6 +1869,146 @@ test "dsv41 prefetch: one-row decode steps ask for nothing and keep the bytes (D
         at += n;
     }
     try testing.expectEqual(@as(u64, 0), armed.engine.prefetcher.?.jobs_queued.load(.monotonic));
+}
+
+test "dsv41 prefetch: candidates the pool already holds queue no job, the rest queue one (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    const s = mlx.gpuStream();
+    var served: StqServed = undefined;
+    try served.init(dir, .bfloat16, true, false, 4, s);
+    defer served.deinit();
+    try served.engine.startPrefetch(PrefetchCredit.unmetered);
+    const pf = served.engine.prefetcher.?;
+    const layer: u16 = 3;
+    served.engine.prefetch(layer, &.{ 5, 1, 1, 6 }, &.{ 4, 3, 2, 1 }, 2, 2, 2);
+    served.engine.prefetchWait(layer);
+    try testing.expectEqual(@as(u64, 1), pf.jobs_queued.load(.monotonic));
+    const waited = pf.host_wait_ns.load(.monotonic);
+    // The pool holds every candidate the rows ask for.
+    served.engine.prefetch(layer, &.{ 5, 1, 1, 6 }, &.{ 4, 3, 2, 1 }, 2, 2, 2);
+    try testing.expectEqual(@as(u32, 0), pf.live.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), pf.jobs_queued.load(.monotonic));
+    served.engine.prefetchWait(layer);
+    try testing.expectEqual(waited, pf.host_wait_ns.load(.monotonic));
+    // Row 0 now lacks 7.
+    served.engine.prefetch(layer, &.{ 5, 7, 1, 6 }, &.{ 4, 3, 2, 1 }, 2, 2, 2);
+    served.engine.prefetchWait(layer);
+    try testing.expectEqual(@as(u64, 2), pf.jobs_queued.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), pf.jobs_run.load(.monotonic));
+}
+
+test "dsv41 prefetch: a layer that cannot be prefetched is not predicted, and the bytes stay (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var plain: StqServed = undefined;
+    try plain.init(dir, .bfloat16, true, true, 3, s);
+    defer plain.deinit();
+    var armed: StqServed = undefined;
+    try armed.init(dir, .bfloat16, true, true, 3, s);
+    defer armed.deinit();
+    try enablePrefetch(&armed, 2, 8, 2);
+    armed.engine.borrow_from = 2;
+    for (2..armed.m.cfg.layers) |li| _ = try armed.engine.borrowLayer(@intCast(li));
+    const before = model.prefetch_predicted;
+    const a = try model.extend(plain.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try model.extend(armed.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(b);
+    try expectSameBits(&sc, a, b);
+    for ([_]usize{ 5, 3 }) |rows| {
+        const x = try model.verify(plain.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(x);
+        const y = try model.verify(armed.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(y);
+        try expectSameBits(&sc, x, y);
+        try model.finishVerify(plain.m, 1);
+        try model.finishVerify(armed.m, 1);
+    }
+    try testing.expectEqual(before, model.prefetch_predicted);
+}
+
+test "dsv41 prefetch: with no credit for one whole expert a round predicts nothing and queues nothing, and the bytes stay (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var plain: StqServed = undefined;
+    try plain.init(dir, .bfloat16, true, true, 3, s);
+    defer plain.deinit();
+    var starved: StqServed = undefined;
+    try starved.init(dir, .bfloat16, true, true, 3, s);
+    defer starved.deinit();
+    try enablePrefetch(&starved, 2, 8, 2);
+    // Demand alone fills the budget: the grant of every round is 0.
+    starved.engine.prefetcher.?.credit = PrefetchCredit.init(65, 1e9, 4);
+    starved.engine.prefetcher.?.credit.refill(std.time.ns_per_s, 1 << 40);
+    const before = model.prefetch_predicted;
+    const a = try model.extend(plain.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try model.extend(starved.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(b);
+    try expectSameBits(&sc, a, b);
+    for ([_]usize{ 5, 3 }) |rows| {
+        const x = try model.verify(plain.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(x);
+        const y = try model.verify(starved.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(y);
+        try expectSameBits(&sc, x, y);
+        try model.finishVerify(plain.m, 1);
+        try model.finishVerify(starved.m, 1);
+    }
+    try testing.expectEqual(before, model.prefetch_predicted);
+    try testing.expectEqual(@as(u64, 0), starved.engine.prefetcher.?.jobs_queued.load(.monotonic));
+}
+
+test "dsv41 prefetch: a model that never started it predicts and queues nothing in verify rounds and gives the bytes of one that did (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var off: StqServed = undefined;
+    try off.init(dir, .bfloat16, true, true, 3, s);
+    defer off.deinit();
+    var on: StqServed = undefined;
+    try on.init(dir, .bfloat16, true, true, 3, s);
+    defer on.deinit();
+    try enablePrefetch(&on, 2, 8, 2);
+    const a = try model.extend(off.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try model.extend(on.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(b);
+    try expectSameBits(&sc, a, b);
+    for ([_]usize{ 5, 3 }) |rows| {
+        const before = model.prefetch_predicted;
+        const x = try model.verify(off.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(x);
+        try testing.expectEqual(before, model.prefetch_predicted);
+        const y = try model.verify(on.m, ids[20..][0..rows]);
+        defer _ = mlx.mlx_array_free(y);
+        try testing.expect(model.prefetch_predicted > before);
+        try expectSameBits(&sc, x, y);
+        try model.finishVerify(off.m, 1);
+        try model.finishVerify(on.m, 1);
+    }
+    try testing.expect(off.engine.prefetcher == null);
 }
 
 test "dsv41 drop: the STQ pack with experts dropped gives the logits of the full pools under the same router mask, bit for bit, and never reads or caches a dropped expert (DSV41_STQ_TINY)" {
@@ -1548,7 +2108,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try stqDir();
     const model_mod = @import("../model.zig");
-    const scheduler_mod = @import("../scheduler.zig");
+    const model_load = @import("../model_load.zig");
     const Transformer = @import("../transformer.zig").Transformer;
     var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -1569,14 +2129,14 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     config.drop_expert = 3;
     try testing.expectEqual(@as(u32, 5), config.keptExperts());
     // The plan counts the dropped experts out of the union workspace and of the budget's fixed bill.
-    const full_plan = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &plain, root, 2 << 30, false, 0);
-    const cut_plan = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, root, 2 << 30, false, 0);
+    const full_plan = try model_load.planExpertStreamingWith(io, testing.allocator, &plain, root, 2 << 30, false, 0);
+    const cut_plan = try model_load.planExpertStreamingWith(io, testing.allocator, &config, root, 2 << 30, false, 0);
     // The tiny pack fits the budget whole, so the bill is the resident one: every kept expert and its meta table.
     try testing.expect(full_plan.cache.resident and cut_plan.cache.resident);
     try testing.expect(cut_plan.cache.cache_bytes < full_plan.cache.cache_bytes);
     try testing.expect(cut_plan.resolved.ledger.?.cache_bytes < full_plan.resolved.ledger.?.cache_bytes);
     // A pack without the list refuses before any weight loads.
-    try testing.expectError(error.ExpertDropRefused, scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, dir, 2 << 30, false, 0));
+    try testing.expectError(error.ExpertDropRefused, model_load.planExpertStreamingWith(io, testing.allocator, &config, dir, 2 << 30, false, 0));
 
     config.expert_streaming = true;
     config.expert_cache_bytes = 64 << 20;
@@ -1615,7 +2175,7 @@ test "dsv41 drop: a real STQ pack's headers and its usage file plan a drop of 8 
     const pack = std.mem.span(std.c.getenv("SUSHI_DSV41_REAL_PACK") orelse return error.SkipZigTest);
     const usage = std.mem.span(std.c.getenv("SUSHI_DSV41_REAL_USAGE") orelse return error.SkipZigTest);
     const model_mod = @import("../model.zig");
-    const scheduler_mod = @import("../scheduler.zig");
+    const model_load = @import("../model_load.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try linkPack(&tmp, pack);
@@ -1625,10 +2185,10 @@ test "dsv41 drop: a real STQ pack's headers and its usage file plan a drop of 8 
     defer testing.allocator.free(root);
     var config = try model_mod.parseConfig(io, testing.allocator, pack);
     defer config.deinit(testing.allocator);
-    const whole = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
+    const whole = try model_load.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
     for ([_]u16{ 8, 16 }) |n| {
         config.drop_expert = n;
-        const cut = try scheduler_mod.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
+        const cut = try model_load.planExpertStreamingWith(io, testing.allocator, &config, root, 116 << 30, false, 0);
         const freed = if (whole.cache.resident) whole.cache.cache_bytes - cut.cache.cache_bytes else whole.cache.workspace_bytes - cut.cache.workspace_bytes;
         if (std.c.getenv("SUSHI_DSV41_STQ_REPORT") != null) std.debug.print("dsv41 drop {d}: resident {} -> {}, union workspace {d:.3} -> {d:.3} GB, expert cache {d:.3} -> {d:.3} GB, {d} -> {d} slots/layer\n", .{
             n,
@@ -2274,5 +2834,286 @@ test "dsv41 DSpark exact: a one-row round gives the bytes of row 0 of a wider ve
         try model.finishVerify(wide.m, 0);
         t = @intCast(argmax(ra[0..V]));
         at += 1;
+    }
+}
+
+test "dsv41 stq: a settle's scratch grows once and then serves every smaller or equal size without allocating" {
+    var list: std.ArrayList(u16) = .empty;
+    defer list.deinit(testing.allocator);
+    _ = try scratch(u16, &list, testing.allocator, 6);
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    for ([_]usize{ 6, 3, 6, 0, 5 }) |n| {
+        const got = try scratch(u16, &list, failing.allocator(), n);
+        try testing.expectEqual(n, got.len);
+    }
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+const pm_pack = @import("../pair_major_pack_test.zig");
+const io_mod = @import("../expert_io.zig");
+
+const PmDir = struct {
+    tmp: testing.TmpDir,
+    path: []u8,
+
+    fn make(src: []const u8, fault: pm_pack.Fault) !PmDir {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &buf);
+        const path = try testing.allocator.dupe(u8, buf[0..n]);
+        errdefer testing.allocator.free(path);
+        try pm_pack.write(testing.allocator, src, path, fault);
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn makeAligned(src: []const u8) !PmDir {
+        return makeAlignedExcept(src, "");
+    }
+
+    fn makeAlignedExcept(src: []const u8, off_page: []const u8) !PmDir {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &buf);
+        const path = try testing.allocator.dupe(u8, buf[0..n]);
+        errdefer testing.allocator.free(path);
+        try pm_pack.writeAlignedExcept(testing.allocator, src, path, io_mod.pageSize(), off_page);
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *PmDir) void {
+        testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
+/// `direct_bytes`: at least this many fill bytes of the resident load (every expert read once) skip the bounce buffer.
+fn expectPmParity(dir: []const u8, pm_path: []const u8, direct_bytes: u64, budgets: []const u64) !void {
+    try mlx.requireGpu();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    for (budgets) |slots| {
+        var legacy: StqServed = undefined;
+        try legacy.init(dir, .bfloat16, true, true, slots, s);
+        defer legacy.deinit();
+        var major: StqServed = undefined;
+        try major.init(pm_path, .bfloat16, true, true, slots, s);
+        defer major.deinit();
+        var at: usize = 0;
+        for ([_]usize{ 20, 2, 5, 3, 4, 6, 1, 1, 9 }) |n| {
+            const take = @min(n, ids.len - at);
+            if (take == 0) break;
+            const a = try model.extend(legacy.m, ids[at..][0..take], .all);
+            defer _ = mlx.mlx_array_free(a);
+            const b = try model.extend(major.m, ids[at..][0..take], .all);
+            defer _ = mlx.mlx_array_free(b);
+            at += take;
+            const ga = try model.hostRows(&sc, a);
+            defer testing.allocator.free(ga);
+            const gb = try model.hostRows(&sc, b);
+            defer testing.allocator.free(gb);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ga), std.mem.sliceAsBytes(gb));
+        }
+        var da = try model.draft(legacy.m, ids[0], true);
+        defer da.deinit();
+        var db = try model.draft(major.m, ids[0], true);
+        defer db.deinit();
+        try testing.expectEqualSlices(u32, da.ids, db.ids);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(da.logits), std.mem.sliceAsBytes(db.logits));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(da.conf), std.mem.sliceAsBytes(db.conf));
+        const old = legacy.engine.fillStats();
+        const new = major.engine.fillStats();
+        try testing.expect(old.bytes_reshuffled > 0);
+        try testing.expectEqual(@as(u64, 0), new.bytes_reshuffled);
+        try testing.expect(new.bytes_read > 0);
+        if (slots == 8) try testing.expect(new.bytes_read - new.bytes_bounced >= direct_bytes);
+    }
+}
+
+/// The repacker's own copy of the tiny pack, beside it as `<DSV41_STQ_TINY>-pm`, when it exists.
+fn siblingPm(buf: []u8, dir: []const u8) ?[]const u8 {
+    const path = std.fmt.bufPrint(buf, "{s}-pm", .{dir}) catch return null;
+    var d = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return null;
+    d.close(std.Io.Threaded.global_single_threaded.io());
+    return path;
+}
+
+test "dsv41 pair-major: a pair-major STQ pack serves the pack-order pack's bytes over prefill, decode, verify rows and the DSpark draft, its fills reshuffling no tile (DSV41_STQ_TINY)" {
+    const dir = try stqDir();
+    var pm = try PmDir.make(dir, .none);
+    defer pm.deinit();
+    try expectPmParity(dir, pm.path, 0, &.{ 8, 6 });
+}
+
+test "dsv41 pair-major: a page-aligned pair-major pack reads the experts whose spans and pools lie on pages directly, and serves the pack-order pack's bytes (DSV41_STQ_TINY)" {
+    if (io_mod.pageSize() != 16384) return error.SkipZigTest;
+    const dir = try stqDir();
+    var pm = try PmDir.makeAligned(dir);
+    defer pm.deinit();
+    // Down group 2 holds two experts at n = 64, one page each, in each of the 8 layers.
+    try expectPmParity(dir, pm.path, 8 * 2 * 16384, &.{ 8, 6 });
+}
+
+test "dsv41 pair-major: a pair-major pack with one trellis off its page still pads its pools and reads the down experts that fill a page directly (DSV41_STQ_TINY)" {
+    if (io_mod.pageSize() != 16384) return error.SkipZigTest;
+    const dir = try stqDir();
+    var pm = try PmDir.makeAlignedExcept(dir, ".up_proj.g0.");
+    defer pm.deinit();
+    try expectPmParity(dir, pm.path, 8 * 2 * 16384, &.{ 8, 6 });
+}
+
+test "dsv41 pair-major: the resident bill and load of a padded pair-major pack equal the pack-order pack's (DSV41_STQ_TINY)" {
+    if (io_mod.pageSize() != 16384) return error.SkipZigTest;
+    const dir = try stqDir();
+    var pm = try PmDir.makeAligned(dir);
+    defer pm.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const source = @import("dsv41_source.zig");
+    try testing.expectEqual(try source.residentBytes(io, testing.allocator, dir), try source.residentBytes(io, testing.allocator, pm.path));
+    try testing.expectEqual(try source.dsparkBytes(io, testing.allocator, dir), try source.dsparkBytes(io, testing.allocator, pm.path));
+}
+
+test "dsv41 pair-major: the repacker's pair-major copy of the tiny pack gives the same bytes (DSV41_STQ_TINY, its -pm sibling)" {
+    const dir = try stqDir();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try expectPmParity(dir, siblingPm(&buf, dir) orelse return error.SkipZigTest, 0, &.{ 8, 6 });
+}
+
+test "dsv41 pair-major: `sushi repack` of a copy of the tiny pack gives a pack that serves the pack-order pack's bytes (DSV41_STQ_TINY)" {
+    const dir = try stqDir();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const copy = buf[0..n];
+    var src = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
+    defer src.close(io);
+    var it = src.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const bytes = try src.readFileAlloc(io, entry.name, testing.allocator, .limited(64 << 20));
+        defer testing.allocator.free(bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = entry.name, .data = bytes });
+    }
+    try testing.expectEqual(@import("repack.zig").Outcome.repacked, try @import("repack.zig").repackPack(testing.allocator, io, copy, .{ .workers = 2 }));
+    try expectPmParity(dir, copy, 0, &.{ 8, 6 });
+}
+
+test "dsv41 pair-major: a pack-order pool cannot take pair-major tiles, and a uniform layer cannot be pair-major (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var pm = try PmDir.make(dir, .none);
+    defer pm.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try @import("../model.zig").parseConfig(io, testing.allocator, pm.path);
+    defer config.deinit(testing.allocator);
+    try testing.expectEqual(exl3.format.TileOrder.pair_major, config.expert_tile_order);
+    try testing.expectError(error.Exl3TileOrderNeedsTileMajor, stream.Engine.initWithOptions(testing.allocator, pm.path, config.expertGeometry(), 1 << 30, mlx.gpuStream(), .{ .layout = .exl3_k4, .tile_major = false }));
+}
+
+test "dsv41 pair-major: a pack whose order the config, the index, the shapes or the shard stamps disagree on is refused by name before a weight loads (DSV41_STQ_TINY)" {
+    const dir = try stqDir();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const model_mod = @import("../model.zig");
+    const source = @import("dsv41_source.zig");
+    const Case = struct {
+        fault: pm_pack.Fault,
+        config: ?anyerror = null,
+        validate: ?anyerror = null,
+    };
+    const cases = [_]Case{
+        .{ .fault = .none },
+        .{ .fault = .bad_order_value, .config = error.Exl3TileOrderUnsupported },
+        .{ .fault = .mixed_keys, .config = error.Exl3TileOrderMixed },
+        .{ .fault = .config_without_keys, .config = error.Exl3TileOrderMismatch },
+        .{ .fault = .shape_mismatch, .validate = error.Exl3GroupGeometry },
+        .{ .fault = .stamp_missing, .validate = error.Exl3ShardStampMismatch },
+        .{ .fault = .stamp_on_legacy, .validate = error.Exl3ShardStampMismatch },
+    };
+    for (cases) |c| {
+        var pm = try PmDir.make(dir, c.fault);
+        defer pm.deinit();
+        if (c.config) |want| {
+            try testing.expectError(want, model_mod.parseConfig(io, testing.allocator, pm.path));
+            continue;
+        }
+        var config = try model_mod.parseConfig(io, testing.allocator, pm.path);
+        defer config.deinit(testing.allocator);
+        const got = source.validateTileOrder(io, testing.allocator, pm.path, config.expert_tile_order, config.hidden_size, config.moe_intermediate_size);
+        if (c.validate) |want| try testing.expectError(want, got) else try got;
+    }
+}
+
+test "dsv41 pair-major: the expert store refuses a swapped grid and an unstamped shard itself, so a caller that skips the loader's check still never reads garbage (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]struct { fault: pm_pack.Fault, want: anyerror }{
+        .{ .fault = .shape_mismatch, .want = error.Exl3GroupGeometry },
+        .{ .fault = .stamp_missing, .want = error.Exl3ShardStampMismatch },
+        .{ .fault = .stamp_on_legacy, .want = error.Exl3ShardStampMismatch },
+    }) |c| {
+        var pm = try PmDir.make(dir, c.fault);
+        defer pm.deinit();
+        var config = try @import("../model.zig").parseConfig(io, testing.allocator, pm.path);
+        defer config.deinit(testing.allocator);
+        try testing.expectError(c.want, stream.Engine.initWithOptions(testing.allocator, pm.path, config.expertGeometry(), 1 << 30, mlx.gpuStream(), .{ .layout = .exl3_k4, .tile_major = true }));
+    }
+}
+
+test "dsv41 pair-major: the transformer loads a pair-major pack through the one loader and serves the pack-order pack's logits (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try stqDir();
+    var pm = try PmDir.make(dir, .none);
+    defer pm.deinit();
+    const model_mod = @import("../model.zig");
+    const Transformer = @import("../transformer.zig").Transformer;
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+
+    var config = try model_mod.parseConfig(io, testing.allocator, pm.path);
+    defer config.deinit(testing.allocator);
+    try testing.expectEqual(exl3.format.TileOrder.pair_major, config.expert_tile_order);
+    config.expert_streaming = true;
+    config.expert_cache_bytes = 64 << 20;
+    config.expert_source_dir = try testing.allocator.dupe(u8, pm.path);
+
+    var served: StqServed = undefined;
+    try served.init(dir, .bfloat16, true, config.dsparkOn(), 8, s);
+    defer served.deinit();
+    var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, pm.path, &config, false);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, testing.allocator, config, &weights);
+    defer xfm.deinit();
+
+    var at: usize = 0;
+    for ([_]usize{ 25, 1, 1, 7, 1 }) |n| {
+        const take = @min(n, ids.len - at);
+        const chunk = try sc.ints(@as([]const i32, @ptrCast(ids[at .. at + take])), &.{ 1, @intCast(take) });
+        const logits = try xfm.forward(chunk);
+        defer _ = mlx.mlx_array_free(logits);
+        const want = try model.extend(served.m, ids[at .. at + take], .last);
+        defer _ = mlx.mlx_array_free(want);
+        at += take;
+        const got = try model.hostRows(&sc, logits);
+        defer testing.allocator.free(got);
+        const exp = try model.hostRows(&sc, want);
+        defer testing.allocator.free(exp);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(exp), std.mem.sliceAsBytes(got));
     }
 }

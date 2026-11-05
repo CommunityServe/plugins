@@ -27,5 +27,5 @@ src/mlx_steel/mlx/ holds four of MLX's steel headers (defines.h, utils/type_trai
 gemm/nax.h) from the commit in src/mlx_steel/MLX_COMMIT.
 
 --------------------------------------------------------------------------------
-tests/fixtures/k2.json to k5.json are the config.json files of OpensourceWTF/Qwen3.8-Flash-Next-EXL3-{2.05,3.05,4.05,
-5.05}-mlx-serve (license qwen-community-1.0), unchanged.
+tests/fixtures/k2.json to k5.json are the config.json files of the 2.05bpw, 3.05bpw, 4.05bpw and 5.05bpw branches of
+OpensourceWTF/Qwen3.8-Flash-Next-exl3 (license qwen-community-1.0), unchanged.

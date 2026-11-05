@@ -8,7 +8,7 @@ const std = @import("std");
 const mlx = @import("sushi/mlx.zig");
 const sc_mod = @import("sushi/dsv41/dsv41_scope.zig");
 const kernels = @import("sushi/dsv41/dsv41_kernels.zig");
-const attn_nax = @import("attn_nax.zig");
+const nax_gate = @import("sushi/nax_gate.zig");
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -98,7 +98,7 @@ const SOURCE =
     \\}
 ;
 
-var def = kernels.Def{ .name = "sushi_ds41_index_nax", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = SOURCE, .header = attn_nax.HEADER };
+var def = kernels.Def{ .name = "sushi_ds41_index_nax", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = SOURCE, .header = kernels.ATTN_NAX_HEADER };
 
 /// Measured on the M5 Ultra at a 256-row span over 23,680 keys: R 4 / 8 / 16 with KT 64 / 64 / 32 took 0.771 / 0.716 /
 /// 0.703 ms against `indexScoresTile`'s 2.323.
@@ -111,7 +111,7 @@ const nsg = 8;
 pub fn fits(ih: usize, ihd: usize, dt: mlx.mlx_dtype) bool {
     if (dt != .bfloat16 and dt != .float16) return false;
     if (ih != 32 or ihd % 16 != 0 or kt * ihd * 2 + r * 32 * 4 > 32768) return false;
-    return attn_nax.naxAvailable();
+    return nax_gate.verifyQmmNaxAvailable();
 }
 
 /// `indexScoresTile`'s scores `[L, nb]` (f32, -inf past what a row sees) of `q` `[L, 32, IHD]` against `keys`

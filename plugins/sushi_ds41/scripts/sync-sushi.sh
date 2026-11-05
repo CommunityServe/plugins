@@ -2,15 +2,17 @@
 # Copies the DeepSeek-V4.1 slice of sushi into src/sushi/ in sushi's own folders (src/dsv41/, src/glm5/, src/exl3/), then
 # applies this repo's edits to it (patches/*.patch). Usage: scripts/sync-sushi.sh <sushi checkout>
 # The cut edges are ours and never overwritten: src/sushi/{model,transformer,status,scheduler,test_models,tokenizer,
-# dflash}.zig and src/sushi/dsv41/transient_peak.zig (the host's MLX has no transient-peak counters).
+# dflash,model_load,pair_major_pack_test}.zig, src/sushi/dsv41/transient_peak.zig (the host's MLX has no transient-peak counters)
+# and src/sushi/dsv41/repack.zig (only sushi's tests, filtered out here, import model_load, pair_major_pack_test and repack).
 # scripts/sync-sushi.sh --check <sushi checkout> <ref>: does <ref> (a release tag or commit) change the slice since
 # SUSHI_COMMIT? Exit 0 when the pin holds, 1 with the changed files when a sync is due.
 set -euo pipefail
 plugin="$(cd "$(dirname "$0")/.." && pwd -P)"
 dst="$plugin/src/sushi"
-dsv41="dsv41_borrow dsv41_config dsv41_embed dsv41_engram dsv41_kernels dsv41_model dsv41_owned dsv41_qat dsv41_scope dsv41_source dsv41_stream dsv41_vision dspark_rows expert_usage"
-shared="vision_common dflash_policy spec_cost_gate mtp_depth_bounds expert_bf16_kernels expert_io expert_quant expert_stream io_util log mlx mlx_kernel_keys test_expect"
-cut="model transformer status scheduler test_models tokenizer dflash"
+dsv41="dsv41_borrow dsv41_config dsv41_engram dsv41_kernels dsv41_model dsv41_owned dsv41_qat dsv41_scope dsv41_source dsv41_stream dsv41_vision dspark_rows expert_usage"
+shared="vision_common dflash_policy spec_cost_gate mtp_depth_bounds expert_bf16_kernels expert_io expert_quant expert_stream io_util log metal_minify mlx mlx_kernel_keys nax_gate prefetch_plan test_expect"
+cut="model transformer status scheduler test_models tokenizer dflash model_load pair_major_pack_test"
+dsv41_cut="transient_peak repack"
 
 slice_paths() {
   local p
@@ -38,7 +40,9 @@ src="${1:?sushi checkout}/src"
 keep=()
 for f in $cut; do keep+=(! -name "$f.zig"); done
 find "$dst" -maxdepth 1 -type f -name '*.zig' "${keep[@]}" -delete
-find "$dst/dsv41" -type f ! -name transient_peak.zig -delete
+keep41=()
+for f in $dsv41_cut; do keep41+=(! -name "$f.zig"); done
+find "$dst/dsv41" -type f "${keep41[@]}" -delete
 rm -rf "$dst/glm5" "$dst/exl3" "$dst/fixtures"
 mkdir -p "$dst/glm5" "$dst/exl3" "$dst/fixtures"
 for f in $dsv41; do cp "$src/dsv41/$f.zig" "$dst/dsv41/$f.zig"; done
