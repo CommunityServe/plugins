@@ -1,18 +1,18 @@
 diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
-@@ -107,6 +107,9 @@
- const stail = @import("../../../scratch_tail.zig");
- /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
- const one_plan = @import("../../../one_plan.zig");
+@@ -65,6 +65,9 @@
+ /// turboexl3_ds41 (the plugin's src/gate_gemm.zig): the wide router's logits as one launch of MLX's fused NAX GEMM body
+ /// at this machine's tile.
+ const ggemm = @import("../../../gate_gemm.zig");
 +/// turboexl3_ds41's indexer span groups (src/idx_group.zig): a wide index layer's spans evaluated a group at a time past
 +/// the bound.
 +const igroup = @import("../../../idx_group.zig");
- /// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
+ /// turboexl3_ds41's fused Markov chain (src/markov.zig): the draft's chain in B + 1 launches.
  const markov = @import("../../../markov.zig");
- /// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DECODE, the plugin's src/engram_decode.zig): a round's bonus token's Engram
-@@ -5047,6 +5050,11 @@
-     // MLX_SERVE_DSV41_WOA_JOIN: the layer's `wo_a` W_hat, decoded at its first joined run, dropped at its end.
+ /// turboexl3_ds41 (the plugin's src/engram_decode.zig): a round's bonus token's Engram
+@@ -4734,6 +4737,11 @@
+     // src/woa_join.zig: the layer's `wo_a` W_hat, decoded at its first joined run, dropped at its end.
      var woa_hats: woaj.Hats = .{};
      defer woa_hats.deinit();
 +    // turboexl3_ds41 (src/idx_group.zig): an index layer's span picks evaluated a group at a time once the layer's indexer
@@ -20,10 +20,10 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
 +    const ig_r = m.ratio(li);
 +    const ig_g: usize = if (ly.idx != null and ig_r > 0) igroup.groupSpans(n_spans, sp.span, (sp.p0 + sp.L) / ig_r) else n_spans;
 +    var ig_start: usize = 0;
-     // MLX_SERVE_DSV41_SCRATCH_HEADS (phase B): a full run's grouped heads straight into a run region (`[rows, og, in]`),
-     // its `wo_a` reading the region: no join, no transpose (with the ring on and an EXL3 `wo_a`).
-     const heads_b = run > 1 and try sat.headsLayerBegin(sat.heads_mode != .off and sat.mode == .on and ly.wo_a.x3 != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
-@@ -5102,6 +5110,16 @@
+     // src/scratch_attn.zig: a full run's grouped heads straight into a run region (`[rows, og, in]`), its `wo_a` reading
+     // the region: no join, no transpose (with an EXL3 `wo_a`).
+     const heads_b = run > 1 and try sat.headsLayerBegin(ly.wo_a.x3 != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
+@@ -4781,6 +4789,16 @@
          }
          hold(&sp.topks[k], sh.topk);
          hold(&sp.cands[k], sh.cand);
@@ -38,5 +38,5 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
 +            ig_start = k + 1;
 +        }
      }
-     if (woa.mode == .check and run > 1) woa.report(li, woa_check.runs, woa_check.equal, woa_check.differ, woa_check.max_abs);
-     if (woaj.mode == .check and woaj.tally.runs > 0) woaj.report(li);
+     const y = try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
+     // src/scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE

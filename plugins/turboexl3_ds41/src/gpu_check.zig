@@ -1,24 +1,22 @@
 //! sx4's GPU check (`zig build gpu-check -Dgpu-check-mlx=<host tree>/lib/mlx`, an executable over the kit's `mlx` and
-//! that tree's staged MLX; run only inside a GPU window): the two in-place kernels `MLX_SERVE_DSV41_SCRATCH_TAIL` serves,
+//! that tree's staged MLX; run only inside a GPU window): the two in-place kernels the wide layers' tails serve,
 //! compiled on the GPU at the served template arguments (K 6, D 5120, HC 4, bf16 streams, sources and shared rows, 24
 //! source slots; rows 16,383 by default, then 4,097) and their words checked against the stock kernels' over synthetic
 //! inputs:
 //! - tail: TAIL_FUSE's stock kernel's new streams (a fresh output) against its write-into twin's over a second copy of
-//!   the streams, in place: every word equal (and the copy's words changed: the twin wrote it, not a temporary); then
-//!   `check`'s path (`expandIntoChecked`: the stock, then the twin over a third copy, compared in the one call) with the
-//!   stock's words served.
+//!   the streams, in place: every word equal (and the copy's words changed: the twin wrote it, not a temporary).
 //! - hc: SCRATCH's hc expand into a region (kernels/hc_expand_into.metal) out of place, against the same kernel over a
 //!   second copy of the streams in place (its streams the region itself, as the layer after a twin reads them): every word
 //!   equal (and the copy's words changed).
-//! - hc-fuse (o1a2, `MLX_SERVE_DSV41_HC_FUSE`, src/hc_fuse.zig): the three fused hc kernels compiled on the GPU as the
+//! - hc-fuse (o1a2, the fused hc kernels, src/hc_fuse.zig): the three fused hc kernels compiled on the GPU as the
 //!   copied model builds and launches them (HC_TG 1,024 threads, hc_mix's 4-row by 6-mix tile, HC 4, 20 Sinkhorn
-//!   iterations, bf16 streams) at 1, 2, 4,097 and 16,383 rows (one row binds `post` and `cpre`, 4 words each, in
-//!   MLX's constant space; two rows in the device space), every output checked word for word against the stock chain's
-//!   (the copied model's own kernel files): hc_mix_norm (with and without the read-ahead's second norm) against hc_mix and
+//!   iterations, bf16 streams) at 1, 2, 4,097 and 16,383 rows (one row binds `post` and `cpre`, 4 words each, in MLX's
+//!   constant space; two rows in the device space), every output checked word for word against the stock chain's (the
+//!   copied model's own kernel files): hc_mix_norm (with and without the read-ahead's second norm) against hc_mix and
 //!   hc_norm (twice), its split by hc_split against hc_norm's; hc_expand_norm (a fresh new stream) and
 //!   hc_expand_norm_into (into a region of its own, and into the stream's own buffer in place) against SCRATCH's expand
 //!   into a region then hc_mix and hc_norm over it, the fused stream's split by hc_mix and hc_split against hc_norm's.
-//! Lines `GPUCHECK start`, `GPUCHECK tail`, `GPUCHECK tail-check`, `GPUCHECK hc`, `GPUCHECK hc-fuse` (or `... error=` and
+//! Lines `GPUCHECK start`, `GPUCHECK tail`, `GPUCHECK hc`, `GPUCHECK hc-fuse` (or `... error=` and
 //! `GPUCHECK mlx-error` with MLX's message, a kernel that does not compile among them), `GPUCHECK DONE rc=` (0: every
 //! check passed).
 
@@ -111,19 +109,10 @@ fn tailCheck(s: mlx.mlx_stream, n: usize) !bool {
     const t = try words(s, res2, fresh);
     const changed = try words(s, res2, res);
     std.debug.print("GPUCHECK tail rows={d} copy_differ={d} words={d} differ={d} changed={d}\n", .{ n, copy0.differ, t.words, t.differ, changed.differ });
-    var ok = copy0.differ == 0 and t.words > 0 and t.differ == 0 and changed.differ > 0;
+    const ok = copy0.differ == 0 and t.words > 0 and t.differ == 0 and changed.differ > 0;
     drop(&carrier);
     drop(&res2);
     _ = mlx.mlx_clear_cache();
-    // `check`'s path over a third copy: the stock kernel's words served, the twin's compared with them in the call.
-    var res3 = try normal(s, &.{ rows, HC, D }, .bfloat16, 203, 1.0);
-    defer drop(&res3);
-    const r = try tail_fuse.expandIntoChecked(s, &srcs, loc, w, sh, res3, pc);
-    var served = r.fresh;
-    defer drop(&served);
-    const t2 = try words(s, served, fresh);
-    std.debug.print("GPUCHECK tail-check rows={d} words={d} differ={d} served_words={d} served_differ={d}\n", .{ n, r.words, r.differ, t2.words, t2.differ });
-    ok = ok and r.words > 0 and r.differ == 0 and t2.differ == 0;
     return ok;
 }
 
@@ -161,7 +150,7 @@ fn hcCheck(s: mlx.mlx_stream, n: usize) !bool {
     return t.words > 0 and t.differ == 0 and changed.differ > 0;
 }
 
-// ── hc-fuse (MLX_SERVE_DSV41_HC_FUSE) ───────────────────────────────────────────────────────────────────────────────
+// ── hc-fuse (the fused hc kernels) ───────────────────────────────────────────────────────────────────────────────────
 /// The copied model's stock hc kernels (deepseek_v41.zig's HC_MIX_SOURCE, HC_NORM_SOURCE and HC_SPLIT_SOURCE: the same
 /// files) and its served launch values: HC_TG threads (the load's probe halves none on the M5 Max), hc_mix's tile of
 /// `hc_mix_rows` rows by the first of 6, 4, 3, 2, 1 mixes dividing 24, the pack's 20 Sinkhorn iterations.

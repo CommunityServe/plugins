@@ -26,110 +26,11 @@ pub const Switches = struct {
     /// MLX_SERVE_DSV41_DSPARK_FIXED_GREEDY (aw1): the fixed policy cuts and backs off a greedy request's rounds too; off,
     /// it stands aside on them (the whole block). Off unless set (aw1s: the cut lost on the same greedy text).
     fixed_greedy: bool = false,
-    /// MLX_SERVE_DSV41_DSPARK_WIDTH (a diagnostic setting): a greedy round's verify width forced (`Width`).
-    width: Width = .off,
-};
-
-/// `MLX_SERVE_DSV41_DSPARK_WIDTH` (a diagnostic setting, never served): a greedy stage round's verify width forced, so a
-/// batch-invariant trunk's text can be checked at every width (the same bytes as the 1-row decode's) and each width's
-/// verify timed (the ladder V(w)). Off; `w` (rows 1..8: the stages' drafts cut to w - 1, or past the block the drafts
-/// again from the first, filler the trunk's argmax rejects but its rows still run); `random:S[:M]` (a width 1..M, M 8
-/// unless given, a round, keyed by S and the state's position, so the same each run); `sweep[:M]` (1..M in turn by the
-/// request's stage rounds).
-pub const Width = union(enum) {
-    off,
-    fixed: usize,
-    random: struct { seed: u64, max: usize = MAX_ROWS },
-    sweep: usize,
-
-    pub const MAX_ROWS: usize = 8;
-    pub const Error = error{DsparkWidthSetting};
-
-    fn maxOf(v: []const u8) Error!usize {
-        const m = std.fmt.parseInt(usize, v, 10) catch return error.DsparkWidthSetting;
-        if (m < 1 or m > MAX_ROWS) return error.DsparkWidthSetting;
-        return m;
-    }
-
-    pub fn parse(value: ?[]const u8) Error!Width {
-        const v = value orelse return .off;
-        if (v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return .off;
-        if (std.mem.eql(u8, v, "sweep")) return .{ .sweep = MAX_ROWS };
-        if (std.mem.startsWith(u8, v, "sweep:")) return .{ .sweep = try maxOf(v[6..]) };
-        if (std.mem.startsWith(u8, v, "random:")) {
-            var it = std.mem.splitScalar(u8, v[7..], ':');
-            const sv = it.next() orelse return error.DsparkWidthSetting;
-            const seed = std.fmt.parseInt(u64, sv, 10) catch return error.DsparkWidthSetting;
-            const mx = if (it.next()) |m| try maxOf(m) else MAX_ROWS;
-            if (it.next() != null) return error.DsparkWidthSetting;
-            return .{ .random = .{ .seed = seed, .max = mx } };
-        }
-        return .{ .fixed = try maxOf(v) };
-    }
-
-    /// The rows the request's stage round `round` at the state's position `n` verifies; null off.
-    pub fn rows(self: Width, n: usize, round: u64) ?usize {
-        return switch (self) {
-            .off => null,
-            .fixed => |w| w,
-            .random => |r| 1 + @as(usize, @intCast(splitmix(r.seed ^ (@as(u64, @intCast(n)) *% 0x9E3779B97F4A7C15)) % r.max)),
-            .sweep => |m| 1 + @as(usize, @intCast(round % m)),
-        };
-    }
-
-    pub fn describe(self: Width, buf: []u8) []const u8 {
-        return switch (self) {
-            .off => "off",
-            .fixed => |w| std.fmt.bufPrint(buf, "{d} rows", .{w}) catch "fixed",
-            .random => |r| std.fmt.bufPrint(buf, "random:{d}:{d}", .{ r.seed, r.max }) catch "random",
-            .sweep => |m| std.fmt.bufPrint(buf, "sweep:{d}", .{m}) catch "sweep",
-        };
-    }
-};
-
-fn splitmix(v: u64) u64 {
-    var x = v +% 0x9E3779B97F4A7C15;
-    x = (x ^ (x >> 30)) *% 0xBF58476D1CE4E5B9;
-    x = (x ^ (x >> 27)) *% 0x94D049BB133111EB;
-    return x ^ (x >> 31);
-}
-
-/// `Width`'s per-width counters over a request: each width's rounds, verify ms (sum and samples, for the median) and
-/// drafts kept.
-pub const WidthStats = struct {
-    pub const SAMPLES = 512;
-    rounds: [Width.MAX_ROWS + 1]u32 = @splat(0),
-    verify_ms: [Width.MAX_ROWS + 1]f64 = @splat(0),
-    accepted: [Width.MAX_ROWS + 1]u64 = @splat(0),
-    samples: [Width.MAX_ROWS + 1][SAMPLES]f32 = undefined,
-
-    pub fn record(self: *WidthStats, rows: usize, verify_ms: f32, accepted: u32) void {
-        if (rows == 0 or rows > Width.MAX_ROWS) return;
-        const k = self.rounds[rows];
-        if (k < SAMPLES) self.samples[rows][k] = verify_ms;
-        self.rounds[rows] = k + 1;
-        self.verify_ms[rows] += verify_ms;
-        self.accepted[rows] += accepted;
-    }
-
-    /// `[dspark-width]`: per width with rounds, `rows:rounds,mean,median,kept-a-round`.
-    pub fn format(self: *WidthStats, buf: []u8) []const u8 {
-        var w = std.Io.Writer.fixed(buf);
-        for (1..Width.MAX_ROWS + 1) |r| {
-            const n = self.rounds[r];
-            if (n == 0) continue;
-            const m = @min(n, SAMPLES);
-            std.mem.sort(f32, self.samples[r][0..m], {}, std.sort.asc(f32));
-            const med = self.samples[r][(m - 1) / 2];
-            w.print(" {d}:{d},{d:.2},{d:.2},{d:.2}", .{ r, n, self.verify_ms[r] / @as(f64, @floatFromInt(n)), med, @as(f64, @floatFromInt(self.accepted[r])) / @as(f64, @floatFromInt(n)) }) catch break;
-        }
-        return w.buffered();
-    }
 };
 
 /// The fixed policy's tables when `MLX_SERVE_DSV41_DSPARK_COSTS` gives none: fitted on the M5 Max on the a4k canonical pack
 /// (lad2, w-lad2-20261102-1707: every bucket by one rule, machine timings only, kept apart from every benchmark prompt:
-/// aw1k's MLX_SERVE_DSV41_DSPARK_WIDTH=sweep:6 forcing a greedy round's verify width 1..6 in turn on the warm
+/// a diagnostic build forcing a greedy round's verify width 1..6 in turn on the warm
 /// request, a card first on the same prompt, at about 1K (the 2048 table), 4K (the 8192 table) and 16K (the unbounded
 /// table) prompt tokens of two prompts of their own (Python's asyncio and email sources, a task tail of their own): row w
 /// the two prompts' median verify ms at w rows plus the bucket's per-round overhead (the median round less its verify,
@@ -471,8 +372,6 @@ pub const Request = struct {
     alone_rounds: u64 = 0,
     /// Rounds that verified what a stale ladder cell wanted (`Ladder.due`) instead of the policy's choice.
     refreshes: u64 = 0,
-    /// `Width`'s counters (MLX_SERVE_DSV41_DSPARK_WIDTH set).
-    widths: WidthStats = .{},
 };
 
 /// The drafter's state beside its model: the model's history and ladder, the policy of the request it serves.
@@ -529,7 +428,7 @@ pub const Drafter = struct {
         return .stage;
     }
 
-    /// MLX_SERVE_DSV41_DRAFT_AHEAD (src/draft_ahead.zig): whether `plan` would return `.stage` for these arguments now,
+    /// turboexl3_ds41 (the plugin's aheadLaunch): whether `plan` would return `.stage` for these arguments now,
     /// without its effects: the copy check as `plan` makes it, and the stages' block only where `plan` gives it without
     /// the ladder or the backoff (the policy off, or the fixed policy standing aside on a greedy round).
     pub fn wouldStage(self: *const Drafter, n: usize, t1: u32, max: usize, remaining: u32, block: usize) bool {
@@ -567,7 +466,6 @@ pub const Drafter = struct {
         defer self.refreshing = false;
         const q = &self.req;
         self.ladder.sample(drafts + 1, verify_ms);
-        if (self.on.width != .off and kind == .stage) q.widths.record(drafts + 1, verify_ms, accepted);
         switch (kind) {
             .copy => {
                 q.copy_rounds += 1;
@@ -611,7 +509,6 @@ pub const Drafter = struct {
             q.copy_accepted = 0;
             q.alone_rounds = 0;
             q.refreshes = 0;
-            q.widths = .{};
         }
         if (q.stage_rounds + q.copy_rounds + q.alone_rounds == 0) return &.{};
         var w = std.Io.Writer.fixed(buf);
@@ -628,11 +525,6 @@ pub const Drafter = struct {
         w.print("[spec-stats] dspark policy: skipped={d} probes={d} refreshes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s} ladder_ms={s}\n", .{
             q.drafting.skipped, q.drafting.probes, q.refreshes, self.ladder.costs()[1], q.stats.formatAcc(&acc), q.stats.formatRows(&rows), self.ladder.formatCells(&cells),
         }) catch {};
-        if (self.on.width != .off) {
-            var wb: [32]u8 = undefined;
-            var cb: [512]u8 = undefined;
-            w.print("[dspark-width] {s}: rows:rounds,verify mean ms,median ms,kept a round{s}\n", .{ self.on.width.describe(&wb), q.widths.format(&cb) }) catch {};
-        }
         return w.buffered();
     }
 };
@@ -644,31 +536,6 @@ fn onOff(on: bool) []const u8 {
 // ── tests ──
 
 const testing = std.testing;
-
-test "dspark width: the setting and its rows" {
-    try testing.expectEqual(@as(Width, .off), try Width.parse(null));
-    try testing.expectEqual(@as(Width, .off), try Width.parse("0"));
-    try testing.expectEqual(Width{ .fixed = 8 }, try Width.parse("8"));
-    try testing.expectEqual(Width{ .sweep = 8 }, try Width.parse("sweep"));
-    try testing.expectEqual(Width{ .sweep = 6 }, try Width.parse("sweep:6"));
-    try testing.expectEqual(Width{ .random = .{ .seed = 7, .max = 8 } }, try Width.parse("random:7"));
-    try testing.expectEqual(Width{ .random = .{ .seed = 7, .max = 6 } }, try Width.parse("random:7:6"));
-    for ([_][]const u8{ "9", "x", "random:", "random:a", "-1", "sweep:9", "sweep:0", "random:1:9", "random:1:6:2" }) |v| try testing.expectError(error.DsparkWidthSetting, Width.parse(v));
-    // every width 1..max comes up, the same each run, keyed by the position
-    for ([_]usize{ 6, 8 }) |mx| {
-        var seen: [Width.MAX_ROWS + 1]bool = @splat(false);
-        for (0..512) |n| {
-            const w: Width = .{ .random = .{ .seed = 1, .max = mx } };
-            const r = w.rows(16384 + n, 0).?;
-            try testing.expect(r >= 1 and r <= mx);
-            try testing.expectEqual(r, w.rows(16384 + n, 99).?);
-            seen[r] = true;
-        }
-        for (seen[1 .. mx + 1]) |b| try testing.expect(b);
-    }
-    for (0..16) |k| try testing.expectEqual(1 + k % 6, (Width{ .sweep = 6 }).rows(0, k).?);
-    try testing.expectEqual(@as(?usize, null), @as(Width, .off).rows(5, 5));
-}
 
 /// A 30-token passage `p` and a prompt quoting its first `quoted` tokens again after a 3-token break.
 const Quote = struct {

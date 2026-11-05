@@ -5,43 +5,118 @@ diff -ruN -x .generated a/env.zig b/env.zig
      pub const MLXSERVE_DEVICE: Var = .{ .kind = .public, .type = .text, .default = "the GPU", .owner = "mlx", .since = "26.7.2", .doc = "iOS: `cpu` forces the CPU device" };
      pub const MLXSERVE_LOWMEM: Var = .{ .kind = .public, .type = .flag, .default = "by total RAM", .owner = "host/media_jobs", .since = "26.7.2", .doc = "low-memory media mode (1 on, 0 off)" };
      pub const MLX_ENABLE_TF32: Var = .{ .kind = .public, .type = .flag, .default = "on", .owner = "plugins/qwen4_exp/qsa", .since = "26.9.3", .doc = "MLX's own TF32 switch; the QSA score follows it" };
-+    pub const MLX_MAX_MB_PER_BUFFER: Var = .{ .kind = .public, .type = .int, .default = "the chip's (50 on the M5 Max)", .owner = "mlx", .since = "26.11.1", .doc = "MLX's command buffer split, MB of bound arrays: read once by MLX's Metal device at the server's start, process-wide; set, turboexl3_ds41's MLX_SERVE_DSV41_BUFFER_MB yields to it" };
++    pub const MLX_MAX_MB_PER_BUFFER: Var = .{ .kind = .public, .type = .int, .default = "the chip's (50 on the M5 Max)", .owner = "mlx", .since = "26.11.1", .doc = "MLX's command buffer split, MB of bound arrays: read once by MLX's Metal device at the server's start, process-wide; set, turboexl3_ds41 leaves the split as set in every phase" };
      pub const MLX_PTX_CACHE_DIR: Var = .{ .kind = .public, .type = .text, .default = "$TMPDIR/mlx/<mlx stamp>/ptx", .owner = "mlx", .since = "26.10.3", .doc = "MLX's CUDA PTX cache; exported per MLX build when unset" };
      pub const MLX_SERVE_ANE_CACHE_CAP_GB: Var = .{ .kind = .public, .type = .int, .default = "40", .owner = "engines/ane", .since = "26.10.3", .doc = "ANE compile cache cap, GB (read by lib/ane)" };
      pub const MLX_SERVE_ANE_CACHE_DIR: Var = .{ .kind = .public, .type = .text, .default = "~/.mlx-serve/ane-cache", .owner = "engines/ane", .since = "26.10.3", .doc = "ANE compile cache root (read by lib/ane)" };
-@@ -268,6 +269,7 @@
-     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
-     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
-     pub const MLX_SERVE_DSV41_BANK_POOL: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's one pool (turboexl3_ds41, needs the host's HostGpu.alias; a host without it serves with the pool off, a [bank-pool] off line at load): the prompt's transient windows and the wave sets' regions, then decode's window 0 and whole ext arrays over the same bytes, so a phase change re-partitions it instead of freeing and freshly allocating; each pooled array its own buffer; neither phase holds more; the same bytes served (unset, empty or 1: on; 0: off; check: on, every range that changes hands filled with 0xFF first, [bank-pool] check lines); a [bank-pool] plan line at load" };
-+    pub const MLX_SERVE_DSV41_BUFFER_MB: Var = .{ .kind = .kill, .type = .text, .default = "prompt (500)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompts' MLX command-buffer split (turboexl3_ds41, through the host's HostGpu.command_buffer_limits): unset, empty or prompt, 500 MB from each phase change to a prompt, MLX's own split put back at the change to decode; N: N MB; 0: off; a user's MLX_MAX_MB_PER_BUFFER wins; a host without the entry keeps MLX's split; the same words" };
-     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
-     pub const MLX_SERVE_DSV41_COMPILE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 compiled decode stretches (=0: every op eager)" };
-     pub const MLX_SERVE_DSV41_DECODE_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "split where its curves fit the pack, else flat", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode slot rows (turboexl3_ds41): unset, the flat bill's decode bytes split across the layers by its development corpus's misses-a-row curves, each layer between its prompt rows and 256, where the curves fit the pack (flat rows where they do not); flat: flat rows; split: the split required (refused by name, rows flat, where it does not fit)" };
 diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
-@@ -60,6 +60,9 @@
- /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_STOP, the plugin's src/decode_stop.zig): MLX's cache capped at decode, the
- /// prompt's cap restored for the next prompt.
+@@ -42,6 +42,8 @@
+ /// turboexl3_ds41 (the plugin's src/decode_stop.zig): MLX's cache capped at decode, the prompt's cap restored for the
+ /// next prompt.
  const decode_stop = @import("mlx_host").decode_stop;
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_BUFFER_MB, the plugin's src/buffer_mb.zig): MLX's command-buffer split raised for a
-+/// prompt, put back at decode.
++/// turboexl3_ds41 (the plugin's src/buffer_mb.zig): MLX's command-buffer split raised for a prompt, put back at decode.
 +const buffer_mb = @import("mlx_host").buffer_mb;
- /// `MLX_SERVE_DSV41_SEED_FREE` (the plugin's src/seed_free.zig): the usage seed's rows free until a route uses them.
- const seed_free = @import("mlx_host").seed_free;
- /// `MLX_SERVE_DSV41_JOINLESS` (the plugin's src/joinless.zig): a wide prompt call's routed sum and the layer's shared
-@@ -736,10 +739,14 @@
-                         try h.grow(&self.g, self.decode_rows);
-                         // MLX_SERVE_DSV41_DECODE_STOP: decode's cache capped where the bill took the stop's bytes back.
-                         decode_stop.enterDecode();
-+                        // MLX_SERVE_DSV41_BUFFER_MB: MLX's own split back for decode (the prompt's work done above).
-+                        buffer_mb.enterDecode();
-                     },
-                     .prompt => {
-                         // MLX_SERVE_DSV41_DECODE_STOP: the prompt's cache cap back before decode's rows go.
-                         decode_stop.enterPrompt();
-+                        // MLX_SERVE_DSV41_BUFFER_MB: the prompt's split, before its first op.
-+                        buffer_mb.enterPrompt();
-                         if (prompt_io.on) prompt_io.reset();
-                         direct_parts.promptStart(self.source.stats());
-                         self.stream.directPartsLive(true);
+ /// turboexl3_ds41 (the plugin's src/decode_window.zig): decode's window 0 rows, the bill's decode term and the stream's
+ /// grow.
+ const dwin = @import("mlx_host").decode_window;
+@@ -465,56 +467,48 @@
+         if (p == self.phase) return;
+         // Next-layer staging: a prediction no call read is let go.
+         self.source.dropNext();
+-        switch (self.hook) {
+-            inline else => |*h| {
+-                try h.flush();
+-                switch (p) {
+-                    .decode => {
+-                        // DEC_PREFETCH: no route of the prompt is left to land a fill.
+-                        try self.stream.landFills();
+-                        dec_prefetch.reset();
+-                        if (prompt_io.on) prompt_io.report(self.pioCounters());
+-                        self.stream.tallyStaging();
+-                        stage_votes.report(prompt_io.on);
+-                        direct_parts.promptEnd(self.source.stats());
+-                        // MLX_SERVE_DSV41_DIRECT_PARTS is the prompt's: decode's reads (the grow's fills, its misses)
+-                        // stage and copy, as without it.
+-                        self.stream.directPartsLive(false);
+-                        // MLX_SERVE_DSV41_GU_SPLIT is decode's: its reads (the grow's fills, its misses) split from here.
+-                        self.stream.guSplit(gu_split.poolMode());
+-                        // MLX_SERVE_DSV41_DEMAND_FIRST is decode's: its lookahead behind its demand from here.
+-                        self.stream.demandFirst(demand_first.poolMode());
+-                        // MLX_SERVE_DSV41_SCRATCH_WAVES: the prompt's regions let go (MLX keeps a buffer while a command uses it).
+-                        scratch_waves.releaseAll();
+-                        self.released = (try h.releaseTransient()) > 0;
+-                        _ = mlx.mlx_synchronize(self.g.s);
+-                        self.g.clearCache();
+-                        try h.grow(&self.g, self.decode_rows);
+-                        // MLX_SERVE_DSV41_DECODE_STOP: decode's cache capped where the bill took the stop's bytes back.
+-                        decode_stop.enterDecode();
+-                    },
+-                    .prompt => {
+-                        // MLX_SERVE_DSV41_DECODE_STOP: the prompt's cache cap back before decode's rows go.
+-                        decode_stop.enterPrompt();
+-                        if (prompt_io.on) prompt_io.reset();
+-                        direct_parts.promptStart(self.source.stats());
+-                        self.stream.directPartsLive(true);
+-                        // MLX_SERVE_DSV41_GU_SPLIT: the prompt's reads whole, as without it.
+-                        self.stream.guSplit(0);
+-                        // MLX_SERVE_DSV41_DEMAND_FIRST: the prompt's pool as without it.
+-                        self.stream.demandFirst(0);
+-                        dec_prefetch.reset();
+-                        // `shrink` frees the grown rows and checks MLX's active bytes dropped by them, so no command may
+-                        // still hold them (the grow's own fills, a decode's last eval): a phase change right after the
+-                        // load's grow otherwise fails at random with GrownRowsStillReferenced and leaves the stream failed.
+-                        _ = mlx.mlx_synchronize(self.g.s);
+-                        _ = try h.shrink(self.prompt_rows, .keep);
+-                        _ = mlx.mlx_synchronize(self.g.s);
+-                        self.g.clearCache();
+-                        _ = try h.regrowTransient(&self.g, self.released);
+-                    },
+-                }
+-            },
++        {
++            const h = &self.hook;
++            try h.flush();
++            switch (p) {
++                .decode => {
++                    // The PARTS route is the prompt's: decode's reads (the grow's fills, its misses) stage and copy.
++                    self.stream.directPartsLive(false);
++                    // The gate/up split is decode's: its reads (the grow's fills, its misses) split from here.
++                    self.stream.guSplit(1);
++                    // Decode's lookahead behind its demand from here, a claimed record's untaken pieces read by the demand.
++                    self.stream.demandFirst(2);
++                    // The scratch waves: the prompt's regions let go (MLX keeps a buffer while a command uses it).
++                    scratch_waves.releaseAll();
++                    self.released = (try h.releaseTransient()) > 0;
++                    _ = mlx.mlx_synchronize(self.g.s);
++                    self.g.clearCache();
++                    try h.grow(&self.g, self.decode_rows);
++                    // The decode stop: decode's cache capped where the bill took the stop's bytes back.
++                    decode_stop.enterDecode();
++                    // The prompt command-buffer split: MLX's own split back for decode (the prompt's work done above).
++                    buffer_mb.enterDecode();
++                },
++                .prompt => {
++                    // The decode stop: the prompt's cache cap back before decode's rows go.
++                    decode_stop.enterPrompt();
++                    // The prompt command-buffer split: the prompt's split, before its first op.
++                    buffer_mb.enterPrompt();
++                    self.stream.directPartsLive(true);
++                    // The prompt's reads whole.
++                    self.stream.guSplit(0);
++                    // Demand first: off for the prompt's pool.
++                    self.stream.demandFirst(0);
++                    // `shrink` frees the grown rows and checks MLX's active bytes dropped by them, so no command may
++                    // still hold them (the grow's own fills, a decode's last eval): a phase change right after the
++                    // load's grow otherwise fails at random with GrownRowsStillReferenced and leaves the stream failed.
++                    _ = mlx.mlx_synchronize(self.g.s);
++                    _ = try h.shrink(self.prompt_rows, .keep);
++                    _ = mlx.mlx_synchronize(self.g.s);
++                    self.g.clearCache();
++                    _ = try h.regrowTransient(&self.g, self.released);
++                },
++            }
+         }
+         self.phase = p;
+     }

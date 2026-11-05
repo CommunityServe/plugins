@@ -1,14 +1,3 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -294,6 +294,7 @@
-     pub const MLX_SERVE_DSV41_LATE_GEMV: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode lookahead's next-layer scores as a product in the router weights' half type (turboexl3_ds41): MLX's wide GEMV, one weight pass for a verify's rows; the read-ahead's ranking only, served bytes unchanged (=0: the f32 product)" };
-     pub const MLX_SERVE_DSV41_LOOKAHEAD: Var = .{ .kind = .kill, .type = .text, .default = "2 (records read ahead a layer call; idle rule 0)", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's expert lookahead (turboexl3_ds41): <budget>[:<idle>], the records read ahead a layer call 0 to 4 (0: the predictor off) and the idle rule 0 or 1; the served bytes are the same at every setting" };
-     pub const MLX_SERVE_DSV41_LOOKAHEAD_WIDE: Var = .{ .kind = .kill, .type = .text, .default = "10", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode lookahead widened (turboexl3_ds41, with MLX_SERVE_DSV41_LOOKAHEAD's predictor on): N, 1 to 64: about N records a round read ahead past each layer call's budget (a credit of N over the layers, at most 2 more a call), the stream sized for the lookahead's widest budget (eight staging slots); reads only, the same bytes (unset: 10; 0: off; on or off, a [lookahead] line at each request's end with the DSpark profile)" };
-+    pub const MLX_SERVE_DSV41_M1: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' DIG-X waves (turboexl3_ds41): the 128-row routed GEMMs (K3 and K2, gate|up and down) with the B stage double-buffered, the next stage decoded while this one's MMA runs, one barrier a stage; the same A fragments, decoded B values and MMA sequence per output, so served bytes unchanged; self-checked at load against the 128-row texts (unset, empty or 1: the double-buffered texts, SCRATCH_WAVES' twins derived from them (zzz9k); 0: the 128-row texts; check: the 128-row texts served, the double-buffered ones beside them on every wave's inputs, every z word compared, the waves off the scratch regions, [m1] lines)" };
-     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
-     pub const MLX_SERVE_DSV41_PG2: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' dense EXL3 linears (turboexl3_ds41): turboexl3's matmul path (MLX's f16 matmul, then the finish) as one launch at the tile the pg2u probe measured per (K, N) on this machine: MLX's fused NAX kernel body and loop with the finish's statements as its epilogue, in MLX's own threadgroup shape, where MLX runs that kernel unsplit; the same words, z never in memory (unset or 1: on; 0: the chain; check: the chain served, pg2's launch run beside every call it takes and compared word for word, [pg2] lines)" };
-     pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end, and a [prompt-io] wide line a wide layer; =2 also splits the read-ahead's wait by a sync at each step" };
 diff -ruN -x .generated a/sdk/quant/exl3/stream/kernels/exl3/dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128d.metal b/sdk/quant/exl3/stream/kernels/exl3/dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128d.metal
 --- a/sdk/quant/exl3/stream/kernels/exl3/dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128d.metal
 +++ b/sdk/quant/exl3/stream/kernels/exl3/dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128d.metal
@@ -577,7 +566,7 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/kernels.zig b/sdk/quant/exl3/str
      dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1,
      q3_exl3_dig_decmat_5120x2304_mul1hk2,
      q3_exl3_dig_decmat_2304x5120_mul1hk2,
-+    // M1 (11-02, turboexl3_ds41's MLX_SERVE_DSV41_M1, mlx-serve native): the 128-row DIG-X GEMMs, K3 and K2, with the B
++    // M1 (11-02, turboexl3_ds41's, mlx-serve native): the 128-row DIG-X GEMMs, K3 and K2, with the B
 +    // stage double-buffered (stage s + 1 decoded while stage s's MMA runs, one barrier a stage); every output's A
 +    // fragments, decoded B values and tile_matmad_nax sequence are the 128-row text's (twin check: its words)
 +    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128d,
@@ -590,16 +579,7 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/kernels.zig b/sdk/quant/exl3/str
 diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/stream/quant.zig
 --- a/sdk/quant/exl3/stream/quant.zig
 +++ b/sdk/quant/exl3/stream/quant.zig
-@@ -14,6 +14,8 @@
- /// turboexl3_ds41 (MLX_SERVE_DSV41_SCRATCH_WAVES): the waves' per-prompt regions and their twins' text derivation (the
- /// plugin's src/scratch_waves.zig, src/wave_twins.zig).
- const sw = @import("mlx_host").scratch_waves;
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_M1): the double-buffered 128-row GEMMs' mode and their check (the plugin's src/m1.zig).
-+const m1 = @import("mlx_host").m1;
- const kset = @import("../../../weights/streamed/sdk_ext/kernel_set.zig");
- const mtl = @import("../../../weights/streamed/sdk_ext/metal_launch.zig");
- const mlx = @import("sdk").mlx;
-@@ -100,6 +102,10 @@
+@@ -100,6 +100,10 @@
      .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1,
      .q3_exl3_dig_decmat_5120x2304_mul1hk2,
      .q3_exl3_dig_decmat_2304x5120_mul1hk2,
@@ -610,55 +590,53 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/strea
  };
  /// The routed decode forms (`DSV41_CELL_ROUTED_FORMS`): each independently selectable, chosen at construction.
  pub const Forms = struct { down_pair: bool = false, gu_one: bool = false };
-@@ -220,6 +226,8 @@
+@@ -220,6 +224,8 @@
          waves: []DigXPrefill(G) = &.{},
          /// the waves' down stage is the fused down GEMM (`routeFusedDown`)
          fused_down: bool = false,
-+        /// M1 (`routeM1`): the waves' 128-row GEMMs' mode (off: the stock texts)
-+        m1_mode: m1.Mode = .off,
++        /// M1 (`routeM1`): the waves' 128-row GEMMs double-buffered (false: the stock texts)
++        m1_on: bool = false,
          /// kv16-opt: the waves' expert outputs in bf16 (`routeExpertBf16`)
          expert_bf16: bool = false,
          /// the decode GEMVs' routed forms (`routeForms`); all false: the stock mul1h texts
-@@ -286,6 +294,18 @@
+@@ -286,6 +292,16 @@
              for (self.waves) |*w| w.installDown(.fused);
              self.fused_down = true;
          }
-+        /// M1 (MLX_SERVE_DSV41_M1), at construction (before any prefill and before `routeScratchWaves`, whose twins derive
-+        /// from the GEMM texts it selects): on or check, the double-buffered 128-row GEMMs' self-checks (compile,
-+        /// composition, twin: every z word the 128-row text's) on `set`, the accepting set, join the report, then every
-+        /// layer's waves run their GEMMs in `mode` (`DigX.m1_mode`; check also keeps the waves off the regions, so every
-+        /// GEMM is compared). A failed check refuses the load by name (SelfCheckFailed, `diag`).
-+        pub fn routeM1(self: *Self, set: *const ks.Set, mode: m1.Mode, diag: *Diag) !void {
-+            if (mode == .off) return;
++        /// M1, at construction (before any prefill and before `routeScratchWaves`, whose twins derive from the GEMM texts
++        /// it selects): the double-buffered 128-row GEMMs' self-checks (compile, composition, twin: every z word the
++        /// 128-row text's) on `set`, the accepting set, join the report, then every layer's waves run their GEMMs on them
++        /// (`DigX.m1_on`). A failed check refuses the load by name (SelfCheckFailed, `diag`).
++        pub fn routeM1(self: *Self, set: *const ks.Set, diag: *Diag) !void {
 +            if (self.into != null) return error.M1AfterScratchWaves;
 +            try set.selfCheck(self.a, &m1_texts, .full, &self.report, diag);
-+            for (self.waves) |*w| w.dig.m1_mode = mode;
-+            self.m1_mode = mode;
++            for (self.waves) |*w| w.dig.m1_on = true;
++            self.m1_on = true;
 +        }
          /// The decode route texts (the forms', the banked route's) compiled at construction with the rest of the set
          /// (`.compile`: compile, bind, one launch), so no route text compiles at its first decode launch.
          pub fn compileTexts(self: *Self, set: *const ks.Set, texts: []const Kernel, diag: *Diag) !void {
-@@ -311,7 +331,7 @@
+@@ -311,7 +327,7 @@
              if (self.into != null or self.waves.len == 0) return intoRefuse(diag, error.ScratchWavesTwin, "exl3 scratch waves: routed twice or no waves", .{});
              const tw = try self.a.create(IntoTwins);
              errdefer self.a.destroy(tw);
 -            tw.* = try IntoTwins.init(self.a, self.reg, diag);
-+            tw.* = try IntoTwins.init(self.a, self.reg, self.m1_mode == .on, diag);
++            tw.* = try IntoTwins.init(self.a, self.reg, self.m1_on, diag);
              errdefer tw.deinit();
              try tw.compileAll(g.s, self.waves[0].tiles_gu, self.waves[0].tiles_dn, diag);
              self.into = tw;
-@@ -367,6 +387,10 @@
+@@ -367,6 +383,10 @@
  pub const w1_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1 };
  /// The table-codebook gate|up GEMM: registered, not routed (its 0b smoke checks it by name).
  const lut_texts = [_]Kernel{.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut};
-+/// M1 (MLX_SERVE_DSV41_M1): the 128-row GEMMs with the B stage double-buffered, a construction-time arm
-+/// (`Accepted.routeM1` self-checks them, then the waves launch them and SCRATCH_WAVES' twins derive from them); the
++/// M1: the 128-row GEMMs with the B stage double-buffered, a construction-time arm
++/// (`Accepted.routeM1` self-checks them, then the waves launch them and the scratch waves' twins derive from them); the
 +/// stock accept neither routes nor checks them.
 +pub const m1_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128d, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128d, .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128d, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128d };
  /// The routed decode forms: installed at construction by `Accepted.routeForms` (their twins are registry checks, run in
  /// a check window and by kbench v9); the stock accept neither routes nor checks them.
  pub const form_texts = [_]Kernel{ .dsv41_exl3_pair_k3_5120, .dsv41_exl3_guone_k3_2304, .dsv41_exl3_pair_k2_5120, .dsv41_exl3_guone_k2_2304 };
-@@ -378,9 +402,10 @@
+@@ -378,9 +398,10 @@
      .dsv41_exl3_b3_mul1h_k2_2304,     .dsv41_exl3_b3_mul1h_k2_5120,  .dsv41_exl3_b3_pair_k2_5120, .dsv41_exl3_b3_guone_k2_2304,
  };
  pub const checked_at_accept = blk: {
@@ -671,22 +649,21 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/strea
          out[n] = k;
          n += 1;
      };
-@@ -826,6 +851,14 @@
+@@ -826,6 +847,13 @@
          gemm_gu128_k2: *const Entry,
          gemm_dn128_k2: *const Entry,
          gemm_dn_w1_k2: *const Entry,
-+        /// M1 (`Accepted.routeM1`, MLX_SERVE_DSV41_M1): the 128-row GEMMs with the B stage double-buffered (K3, K2; the
-+        /// same words), and the mode the waves' GEMMs run in: off the 128-row texts; on these in their place; check the
-+        /// 128-row texts served and these launched beside them on the same inputs, every z word compared (`m1.compare`)
++        /// M1 (`Accepted.routeM1`): the 128-row GEMMs with the B stage double-buffered (K3, K2; the same words), and
++        /// whether the waves' GEMMs run on them in the 128-row texts' place
 +        gemm_gu128d: *const Entry,
 +        gemm_dn128d: *const Entry,
 +        gemm_gu128d_k2: *const Entry,
 +        gemm_dn128d_k2: *const Entry,
-+        m1_mode: m1.Mode = .off,
++        m1_on: bool = false,
          pub fn init(reg: *const xk.Registry) Self {
              return .{
                  .gemm_gu = reg.get(.q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3),
-@@ -843,6 +876,10 @@
+@@ -843,6 +871,10 @@
                  .gemm_gu128_k2 = reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128),
                  .gemm_dn128_k2 = reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128),
                  .gemm_dn_w1_k2 = reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1),
@@ -697,47 +674,37 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/strea
              };
          }
          /// The routed GEMMs' M tile rows: their wave tables count ceil(rows / m_tile) tiles per expert (`digTableBm`).
-@@ -857,8 +894,16 @@
+@@ -857,8 +889,11 @@
          pub fn gemmGateUp(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32) ![2]G.T {
              var vars = rowsVars(rowsOf(G, g, x0, 0));
              vars.set(.tgs, tgs);
 +            const k2 = kIndexOf(G, g, code_g) == 1;
-+            // M1: the double-buffered text in the 128-row text's place (on), or beside it (check)
++            // M1: the double-buffered text in the 128-row text's place
 +            const dbuf = if (k2) self.gemm_gu128d_k2 else self.gemm_gu128d;
              var out: [2]G.T = undefined;
 -            try launchRule(G, g, if (kIndexOf(G, g, code_g) == 1) self.gemm_gu128_k2 else self.gemm_gu128, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
-+            try launchRule(G, g, if (self.m1_mode == .on) dbuf else if (k2) self.gemm_gu128_k2 else self.gemm_gu128, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
-+            if (comptime G.T == mlx.mlx_array) if (self.m1_mode == .check) {
-+                var alt: [2]G.T = undefined;
-+                try launchRule(G, g, dbuf, &vars, &.{ x0, x1, code_g, code_u, tbl }, &alt);
-+                try m1.compare(g.s, .gate_up, &alt, &out);
-+            };
++            try launchRule(G, g, if (self.m1_on) dbuf else if (k2) self.gemm_gu128_k2 else self.gemm_gu128, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
              return out;
          }
          /// `gemmGateUp` through the table-codebook text: the same inputs and words.
-@@ -887,8 +932,16 @@
+@@ -887,8 +922,11 @@
          pub fn gemmDown(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32) !G.T {
              var vars = rowsVars(rowsOf(G, g, x, 0));
              vars.set(.tgs, tgs);
 +            const k2 = kIndexOf(G, g, code_d) == 1;
-+            // M1: the double-buffered text in the 128-row text's place (on), or beside it (check)
++            // M1: the double-buffered text in the 128-row text's place
 +            const dbuf = if (k2) self.gemm_dn128d_k2 else self.gemm_dn128d;
              var out: [1]G.T = undefined;
 -            try launchRule(G, g, if (kIndexOf(G, g, code_d) == 1) self.gemm_dn128_k2 else self.gemm_dn128, &vars, &.{ x, code_d, tbl }, &out);
-+            try launchRule(G, g, if (self.m1_mode == .on) dbuf else if (k2) self.gemm_dn128_k2 else self.gemm_dn128, &vars, &.{ x, code_d, tbl }, &out);
-+            if (comptime G.T == mlx.mlx_array) if (self.m1_mode == .check) {
-+                var alt: [1]G.T = undefined;
-+                try launchRule(G, g, dbuf, &vars, &.{ x, code_d, tbl }, &alt);
-+                try m1.compare(g.s, .down, &alt, &out);
-+            };
++            try launchRule(G, g, if (self.m1_on) dbuf else if (k2) self.gemm_dn128_k2 else self.gemm_dn128, &vars, &.{ x, code_d, tbl }, &out);
              return out[0];
          }
          /// act [A, 5120] bf16 rows ridx [rows] i32, rhs [rows] u32 (expert per row), slots = a
-@@ -990,6 +1043,19 @@
+@@ -990,6 +1028,19 @@
      .widen1 = .{ .k = .dsv41_prefill_dig_rot_widen1_5120_obf16, .pragma = .first, .dep_only = true },
  });
  pub const IntoError = error{ ScratchWavesTwin, ScratchWavesNeedsBf16Chain, ScratchWavesNeedsMlx };
-+/// Each twin's stock text: into_specs', or with M1 on (MLX_SERVE_DSV41_M1=1) the double-buffered 128-row GEMMs in the
++/// Each twin's stock text: into_specs', or with M1 routed (`Accepted.routeM1`) the double-buffered 128-row GEMMs in the
 +/// GEMM twins' place (the same words; the derivation's anchors hold for both texts: no pragma, no name a twin adds).
 +fn intoKernels(m1_on: bool) std.enums.EnumArray(IntoTwin, Kernel) {
 +    var out: std.enums.EnumArray(IntoTwin, Kernel) = undefined;
@@ -753,7 +720,7 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/strea
  fn intoRefuse(diag: ?*Diag, err: IntoError, comptime fmt: []const u8, args: anytype) IntoError {
      if (diag) |d| d.set(fmt, args);
      return err;
-@@ -1002,12 +1068,15 @@
+@@ -1002,12 +1053,15 @@
  pub const IntoTwins = struct {
      reg: *const xk.Registry,
      kernels: std.enums.EnumArray(IntoTwin, mlx.mlx_fast_metal_kernel) = .initFill(.{ .ctx = null }),
@@ -762,7 +729,7 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/strea
  
 -    pub fn init(a: Allocator, reg: *const xk.Registry, diag: ?*Diag) (IntoError || error{OutOfMemory})!IntoTwins {
 -        var self: IntoTwins = .{ .reg = reg };
-+    /// `m1_on` (MLX_SERVE_DSV41_M1=1): the GEMM twins derive from the double-buffered 128-row texts (the same words).
++    /// `m1_on` (M1 routed): the GEMM twins derive from the double-buffered 128-row texts (the same words).
 +    pub fn init(a: Allocator, reg: *const xk.Registry, m1_on: bool, diag: ?*Diag) (IntoError || error{OutOfMemory})!IntoTwins {
 +        var self: IntoTwins = .{ .reg = reg, .ks = intoKernels(m1_on) };
          errdefer self.deinit();
@@ -772,7 +739,7 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/strea
              const e = reg.get(spec.k);
              const hdr = reg.header(e);
              if (e.outputs.len == 0 or (spec.dep_only and e.outputs.len != 1) or e.inputs.len + e.outputs.len + 1 > xk.max_inputs)
-@@ -1061,10 +1130,16 @@
+@@ -1061,10 +1115,16 @@
              self.kernels.set(t, .{ .ctx = null });
          }
      }
@@ -790,7 +757,7 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/strea
          const e = self.reg.get(spec.k);
          const cfg = xk.launchFor(e, vars, null) catch unreachable;
          const one = [_]c_int{1};
-@@ -1089,7 +1164,7 @@
+@@ -1089,7 +1149,7 @@
          const gu = digTableBm(&one_expert, tiles_gu, 128);
          const dn = digTableBm(&one_expert, tiles_dn, 128);
          for (std.enums.values(IntoTwin)) |t| {
@@ -799,15 +766,16 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/quant.zig b/sdk/quant/exl3/strea
              const e = self.reg.get(spec.k);
              const tbl = switch (t) {
                  .gemm_dn_k3, .gemm_dn_k2, .widen1 => &dn,
-@@ -1267,7 +1342,7 @@
+@@ -1265,8 +1325,7 @@
+                 try self.parts.ensureUnusedCapacity(a, 1);
+                 try self.flight.ensureUnusedCapacity(a, 1);
                  const m = g.mark();
-                 // MLX_SERVE_DSV41_SCRATCH_WAVES: an uncarried call's wave (not solo) on the regions, the stock words (in check
-                 // the stock wave served, every launch compared).
--                if (comptime G.T == mlx.mlx_array) if (self.into) |tw| if (!carried and !solo) {
-+                if (comptime G.T == mlx.mlx_array) if (self.into) |tw| if (!carried and !solo and self.dig.m1_mode != .check) {
+-                // MLX_SERVE_DSV41_SCRATCH_WAVES: an uncarried call's wave (not solo) on the regions, the stock words (in check
+-                // the stock wave served, every launch compared).
++                // The scratch waves: an uncarried call's wave (not solo) on the regions, the stock words.
+                 if (comptime G.T == mlx.mlx_array) if (self.into) |tw| if (!carried and !solo) {
                      if (try self.submitArena(g, tw, act, bank, ex[0 .. i - first], self.ridx.items[r0..off], self.rhs.items[r0..off])) |ya| {
                          self.parts.appendAssumeCapacity(g.keep(ya));
-                         try g.asyncEval(&.{ya});
 diff -ruN -x .generated a/sdk/quant/exl3/stream/selfcheck.zig b/sdk/quant/exl3/stream/selfcheck.zig
 --- a/sdk/quant/exl3/stream/selfcheck.zig
 +++ b/sdk/quant/exl3/stream/selfcheck.zig
@@ -836,7 +804,7 @@ diff -ruN -x .generated a/sdk/quant/exl3/stream/selfcheck.zig b/sdk/quant/exl3/s
 diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
-@@ -80,6 +80,9 @@
+@@ -62,6 +62,9 @@
  /// `MLX_SERVE_DSV41_STAGE_VOTES` (the plugin's src/stage_votes.zig): staging's vote floor over the prediction's votes
  /// (`readAhead`); the prompt's staged records by their votes (`[stage-votes]` with PROMPT_IO).
  const stage_votes = @import("mlx_host").stage_votes;
@@ -846,13 +814,24 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
  const dsv41_routes = @import("../../quant/exl3/stream/kernel_routes.zig");
  const Combine = dsv41_routes.JoinlessCombine(G);
  pub const Gate = Hook.Gate;
-@@ -251,6 +254,9 @@
+@@ -219,14 +222,12 @@
          try self.q.routeBanked(&self.g);
-         // MLX_SERVE_DSV41_SCRATCH_WAVES: the waves' write-into twins derived from the pinned stock texts and compiled now,
+         // The scratch waves: the waves' write-into twins derived from the pinned stock texts and compiled now,
          // every layer's uncarried waves on them; a twin that does not derive or compile refuses the load by name.
-+        // MLX_SERVE_DSV41_M1: the waves' 128-row GEMMs double-buffered (on) or both compared (check), self-checked now;
+-        if (scratch_waves.on()) try self.q.routeScratchWaves(&self.g, &diag);
+-        // JOINLESS (MLX_SERVE_DSV41_JOINLESS): the combine on the set the quant accepted, its bf16 text compiled and launched
+-        // once now; ROUTED_ONE's wide calls end on their own path, so the pair is refused by name.
+-        if (joinless.mode != .off) {
+-            if (routed_one.on()) {
+-                std.log.err("streamed exl3: MLX_SERVE_DSV41_JOINLESS needs MLX_SERVE_DSV41_ROUTED_ONE off (its wide calls end on their own path)", .{});
+-                return error.JoinlessRoutedOne;
+-            }
++        // M1: the waves' 128-row GEMMs double-buffered, self-checked now (a failed check refuses the load by name);
 +        // before the scratch twins, which derive from the GEMM texts it selects.
-+        try self.q.routeM1(self.set, m1.mode, &diag);
-         if (scratch_waves.on()) try self.q.routeScratchWaves(&self.g, &diag);
-         // JOINLESS (MLX_SERVE_DSV41_JOINLESS): the combine on the set the quant accepted, its bf16 text compiled and launched
-         // once now; ROUTED_ONE's wide calls end on their own path, so the pair is refused by name.
++        try self.q.routeM1(self.set, &diag);
++        try self.q.routeScratchWaves(&self.g, &diag);
++        // JOINLESS: the combine on the set the quant accepted, its bf16 text compiled and launched once now.
++        {
+             var jgeo = dsv41_routes.PrefillGeometry.derived;
+             jgeo.hidden = geo.hidden_size;
+             jgeo.n_experts_per_tok = geo.n_experts_per_tok;

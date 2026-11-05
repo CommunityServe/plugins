@@ -1,24 +1,13 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -273,6 +273,7 @@
-     pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
-     pub const MLX_SERVE_DSV41_DIRECT_PARTS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 read pool parts (turboexl3_ds41): each demand read's parts whose file offset, length and row lie on the file's block read straight into their rows (the gate's code on this pack: a third of a record no longer copied), the others staged and copied, the same bytes; [direct-parts] lines at each prompt's and request's end (=0: every part staged and copied)" };
-     pub const MLX_SERVE_DSV41_DRAFT_AHEAD: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 greedy round's next DSpark draft (turboexl3_ds41): launched at the end of the round before it, from its next token once its state is committed, when the next plan is the stages' block, and taken by the next round when it fits (the same token, position and state); the same ops, served bytes unchanged (unset or 1: on; 0: off; check: on, the next round makes its own draft too, compares the ids and confidences word for word and serves its own, [draft-ahead] lines)" };
-+    pub const MLX_SERVE_DSV41_DECODE_STOP: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode stop (turboexl3_ds41): the decode phase's budget takes 1.0e9 B of the 2.0e9 B stop under the ceiling back for its slot rows (two more on the M5 Max at 16K), MLX's cache capped at 1 GiB from the phase change to decode and the prompt's cap restored at the change back; the prompt's budget and rows unchanged; the same bytes (unset or 1: on; 0: off; check: as 1, [decode-stop] lines)" };
-     pub const MLX_SERVE_DSV41_DECODE_WINDOW: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode window 0 (turboexl3_ds41): 4 rows, not the widest decode route's 48, a decode plan admitting its declined misses past them over the lowest-ranked residents it does not use, the freed bytes billed to the decode slot rows (taken where every layer keeps 96 decode rows or more); the same bytes served (unset or 1: on; 0: off; check: on, the plans left past the window counted), [bank-bill] at load and [mem-decode] at each request's end" };
-     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
-     pub const MLX_SERVE_DSV41_DSPARK_COSTS: Var = .{ .kind = .kill, .type = .text, .default = "unset", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark fixed verify policy's tables (turboexl3_ds41; with MLX_SERVE_DSV41_DSPARK_POLICY unset or =fixed only, refused beside =0 or =1; sampled requests only, a greedy request's rounds verify the whole block; unset: the built-in tables fitted on an M5 Max, src/rounds.zig DEFAULT_COSTS): v1,v2,...,vN/d, the verify ms by rows from one to N (2..16) then the ms a stage draft takes, or such tables by context U1:t1+U2:t2+...+tK (the bounds ascending positions, the last table unbounded, at most 8; a round reads the first table whose bound exceeds its position), fitted once per box and pack; the cut and the drafting backoff read it instead of the measured ladder and the round's wall time, so a request's text is the same run to run; refused by name when malformed" };
 diff -ruN -x .generated a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/bill.zig
 --- a/plugins/deepseek_v41/bill.zig
 +++ b/plugins/deepseek_v41/bill.zig
 @@ -29,6 +29,10 @@
- /// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DECODE, the plugin's src/engram_decode.zig): the Engram LRU's bytes, set at the
- /// load before the bank opens (0 off), billed beside `stream_host_bytes`.
+ /// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_LRU_MB, the plugin's src/engram_decode.zig): the Engram LRU's bytes, set at the
+ /// load before the bank opens, billed beside `stream_host_bytes`.
  pub var engram_store_bytes: u64 = 0;
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_STOP, the plugin's src/decode_stop.zig): the bytes of `stream_host_bytes`'s stop
-+/// under the ceiling the decode phase's budget takes back (MLX's cache capped at decode instead), set at the load before
-+/// the bank opens; 0 off. The prompt phase's budget keeps the whole stop.
++/// turboexl3_ds41 (the plugin's src/decode_stop.zig): the bytes of `stream_host_bytes`'s stop under the ceiling the
++/// decode phase's budget takes back (MLX's cache capped at decode instead), set at the load before the bank opens; 0
++/// off. The prompt phase's budget keeps the whole stop.
 +pub var decode_stop_cut: u64 = 0;
  /// The bytes a streamed bank's slot rows may take in each phase: the GPU working set less `wired_margin` (the host's
  /// `--wired-margin-gib`) and `stream_host_bytes`, the memory in use now (the residents loaded, every other process)
@@ -33,9 +22,9 @@ diff -ruN -x .generated a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/b
  }
  /// The bytes the host lets the plugin still allocate on the GPU (set by the plugin's load); null in mlx-serve itself.
 @@ -48,7 +52,7 @@
- /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_WINDOW's `[bank-bill]` line): `streamBudget`'s terms at `context`, read as it
- /// reads them (MLX's recommended working set, the host's ceiling (0: none), the margin, the host's and the Engram LRU's
- /// bytes, the memory in use, and each phase's working set).
+ /// turboexl3_ds41 (the `[bank-bill]` load line): `streamBudget`'s terms at `context`, read as it reads them
+ /// (MLX's recommended working set, the host's ceiling (0: none), the margin, the host's and the Engram LRU's bytes, the
+ /// memory in use, and each phase's working set).
 -pub const BudgetTerms = struct { recommended: u64, ceiling: u64, wired_margin: u64, host: u64, store: u64, in_use: u64, ws_prompt: u64, ws_decode: u64 };
 +pub const BudgetTerms = struct { recommended: u64, ceiling: u64, wired_margin: u64, host: u64, store: u64, in_use: u64, ws_prompt: u64, ws_decode: u64, decode_cut: u64 = 0 };
  pub fn streamBudgetTerms(config: *const cfg_mod.Config, context: u64, wired_margin: u64) BudgetTerms {
@@ -52,8 +41,8 @@ diff -ruN -x .generated a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/b
 diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41/plugin.zig
 --- a/plugins/deepseek_v41/plugin.zig
 +++ b/plugins/deepseek_v41/plugin.zig
-@@ -281,7 +281,7 @@
-     if (dwin.on()) {
+@@ -277,7 +277,7 @@
+     {
          const t = bill_mod.streamBudgetTerms(c, context, wired_margin);
          const bl = b.bill;
 -        std.log.info("deepseek_v41: [bank-bill] context={d} recommended_mb={d} ceiling_mb={d} margin_mb={d} host_mb={d} store_mb={d} in_use_mb={d} ws_prompt_mb={d} ws_decode_mb={d} budget_prompt_mb={d} budget_decode_mb={d} row_b={d} prompt_windows_mb={d} decode_windows_mb={d} staging_mb={d} rows_prompt={d} rows_decode={d} rem_prompt_mb={d} rem_decode_mb={d}", .{
@@ -61,7 +50,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41
              context,
              t.recommended >> 20,
              t.ceiling >> 20,
-@@ -291,6 +291,7 @@
+@@ -287,6 +287,7 @@
              t.in_use >> 20,
              t.ws_prompt >> 20,
              t.ws_decode >> 20,
@@ -70,19 +59,19 @@ diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41
              budget.decode >> 20,
              bl.row_bytes,
 diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
---- a/sdk/weights/streamed/exl3_source.zig	2026-11-01 17:29:06
-+++ b/sdk/weights/streamed/exl3_source.zig	2026-11-01 19:13:58
-@@ -50,6 +50,9 @@
- const dec_prefetch = @import("mlx_host").dec_prefetch;
- /// `MLX_SERVE_DSV41_TAIL_FUSE` (the plugin's src/tail_fuse.zig): the combine and the model's hc expand in one kernel.
+--- a/sdk/weights/streamed/exl3_source.zig
++++ b/sdk/weights/streamed/exl3_source.zig
+@@ -37,6 +37,9 @@
+ const HookT3 = xp.ExpertsWith(G, xp.StreamSource, MathT3, .{ .prefill = true, .lookahead = true, .gated = true });
+ /// The plugin's src/tail_fuse.zig: the combine and the model's hc expand in one kernel.
  const tail_fuse = @import("mlx_host").tail_fuse;
 +/// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_STOP, the plugin's src/decode_stop.zig): MLX's cache capped at decode, the
 +/// prompt's cap restored for the next prompt.
 +const decode_stop = @import("mlx_host").decode_stop;
- /// `MLX_SERVE_DSV41_SEED_FREE` (the plugin's src/seed_free.zig): the usage seed's rows free until a route uses them.
- const seed_free = @import("mlx_host").seed_free;
- /// `MLX_SERVE_DSV41_JOINLESS` (the plugin's src/joinless.zig): a wide prompt call's routed sum and the layer's shared
-@@ -631,8 +634,12 @@
+ /// turboexl3_ds41 (the plugin's src/decode_window.zig): decode's window 0 rows, the bill's decode term and the stream's
+ /// grow.
+ const dwin = @import("mlx_host").decode_window;
+@@ -513,8 +516,12 @@
                          _ = mlx.mlx_synchronize(self.g.s);
                          self.g.clearCache();
                          try h.grow(&self.g, self.decode_rows);

@@ -63,18 +63,8 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     return v;
 }
 
-/// `MLX_SERVE_DSV41_ROUTED` (the server's environment: mlx-serve hands a plugin's load only the settings it knows): the
-/// streamed bank's experts run their decode on turboexl3 (src/routed_t3.zig) unless it names `streamer`, the streamer's
-/// own EXL3 kernels throughout. Unset, empty or `turboexl3`: turboexl3; anything else is refused by name.
-pub fn routedT3(value: ?[]const u8) error{RoutedSetting}!bool {
-    const v = value orelse return true;
-    if (v.len == 0 or std.mem.eql(u8, v, "turboexl3")) return true;
-    if (std.mem.eql(u8, v, "streamer")) return false;
-    return error.RoutedSetting;
-}
-
-/// `MLX_SERVE_DSV41_DSPARK_COPY` (the server's environment, as `routedT3`): the drafter's copy rounds (src/rounds.zig),
-/// on unless the value starts with `0`.
+/// `MLX_SERVE_DSV41_DSPARK_COPY` (the server's environment: mlx-serve hands a plugin's load only the settings it
+/// knows): the drafter's copy rounds (src/rounds.zig), on unless the value starts with `0`.
 pub fn switchOn(value: ?[]const u8) bool {
     const v = value orelse return true;
     return v.len == 0 or v[0] != '0';
@@ -172,12 +162,6 @@ test "turboexl3_ds41 refuses by name the pack before its repack and a codebook i
     }
 }
 
-test "turboexl3_ds41 runs the routed experts' decode on turboexl3 unless MLX_SERVE_DSV41_ROUTED names the streamer" {
-    for ([_]?[]const u8{ null, "", "turboexl3" }) |v| try testing.expect(try routedT3(v));
-    try testing.expect(!try routedT3("streamer"));
-    for ([_][]const u8{ "0", "1", "turboexl3 ", "Streamer", "t3" }) |v| try testing.expectError(error.RoutedSetting, routedT3(v));
-}
-
 test "turboexl3_ds41 keeps its DSpark copy rounds on unless the setting starts with 0" {
     for ([_]?[]const u8{ null, "", "1", "on" }) |v| try testing.expect(switchOn(v));
     for ([_][]const u8{ "0", "00", "0n" }) |v| try testing.expect(!switchOn(v));
@@ -190,74 +174,29 @@ test "turboexl3_ds41 keeps its DSpark verify policy off unless the setting is gi
 
 test {
     _ = @import("src/rounds.zig");
-    _ = @import("src/stage_prof.zig");
-    _ = @import("src/one_plan.zig");
     _ = @import("src/markov_plan.zig");
-    _ = @import("src/prompt_io.zig");
-    _ = @import("src/dec_prefetch.zig");
-    _ = @import("src/l39_last.zig");
     _ = @import("src/gate_gemm.zig");
-    _ = @import("src/direct_parts.zig");
-    _ = @import("src/round_io.zig");
-    _ = @import("src/stream_lookahead.zig");
     _ = @import("src/la_wide.zig");
     _ = @import("src/expert_usage_cfg.zig");
-    _ = @import("src/route_rec.zig");
     _ = @import("src/decode_rows.zig");
-    _ = @import("src/seed_free.zig");
-    _ = @import("src/ra_fused.zig");
     _ = @import("src/woa_rows.zig");
-    _ = @import("src/joinless.zig");
     _ = @import("src/tail_fuse.zig");
-    _ = @import("src/decode_fuse.zig");
     _ = @import("src/wide_early.zig");
-    _ = @import("src/rest_early.zig");
-    _ = @import("src/transient_keep.zig");
     _ = @import("src/buffer_mb.zig");
-    _ = @import("src/bill_pin.zig");
-    _ = @import("src/decode_cache.zig");
     _ = @import("src/decode_floor.zig");
-    _ = @import("src/rest_async.zig");
-    _ = @import("src/q_tail.zig");
-    _ = @import("src/engram_twin.zig");
-    _ = @import("src/dec_invariant.zig");
     _ = @import("src/gemv_twin.zig");
-    _ = @import("src/prompt_tl.zig");
-    _ = @import("src/whole_stream.zig");
     _ = @import("src/stage.zig");
-    _ = @import("src/stage_trim.zig");
-    _ = @import("src/stage_copy.zig");
-    _ = @import("src/stage_next.zig");
     _ = @import("src/stage_votes.zig");
-    _ = @import("src/gu_split.zig");
-    _ = @import("src/demand_first.zig");
-    _ = @import("src/demand_split.zig");
-    _ = @import("src/cold_start.zig");
-    _ = @import("src/scratch_x1.zig");
     _ = @import("src/engram_direct.zig");
-    _ = @import("src/engram_first.zig");
     _ = @import("src/engram_decode.zig");
-    _ = @import("src/draft_ahead.zig");
-    _ = @import("src/decode_window.zig");
     _ = @import("src/decode_stop.zig");
-    _ = @import("src/shfin.zig");
     _ = @import("src/shfin_t3.zig");
-    _ = @import("src/scratch.zig");
     _ = @import("src/scratch_waves.zig");
-    _ = @import("src/m1.zig");
     _ = @import("src/wave_twins.zig");
     _ = @import("src/scratch_attn.zig");
     _ = @import("src/attn_twins.zig");
     _ = @import("src/attn_core.zig");
-    _ = @import("src/verify_tl.zig");
-    _ = @import("src/late_gemv.zig");
-    _ = @import("src/shared_hoist.zig");
-    _ = @import("src/t3_group.zig");
-    _ = @import("src/hw4b.zig");
-    _ = @import("src/hw2.zig");
     _ = @import("src/embed_pread.zig");
-    _ = @import("src/vision_lazy.zig");
     _ = @import("src/hc_fuse.zig");
-    _ = @import("src/scratch_tail.zig");
     _ = @import("src/bank_pool.zig");
 }

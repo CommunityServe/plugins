@@ -1,6 +1,4 @@
-//! `MLX_SERVE_DSV41_BANK_POOL` (read at load; unset, empty or `1`: on; `0`: off; `check`: on, and every pooled range
-//! that changes hands filled with 0xFF at its install, a `[bank-pool] check` line each; anything else is refused by
-//! name): one buffer both phases' slot rows carve (the copied stream's `BankPool`), so a phase change re-partitions it
+//! One buffer both phases' slot rows carve (the copied stream's `BankPool`), so a phase change re-partitions it
 //! instead of freeing one phase's rows and freshly allocating the other's (o2a1's split: 176-191 ms prompt to decode and
 //! 94-101 ms back, about 13-15 ms a GiB of fresh MLX allocation).
 //!
@@ -15,31 +13,12 @@
 //! source's synchronize. A host whose table has no `HostGpu.alias` (an mlx-serve without host-alias.patch: its HostGpu 96
 //! bytes) serves with the pool off, a load line naming the missing entry (`hostHasAlias`).
 //!
-//! This file: the switch and the plan (MLX-free; `zig build test` runs its test as a step of its own).
+//! This file: the plan (MLX-free).
 
 const std = @import("std");
 
-pub const Mode = enum { off, on, check };
-pub var mode: Mode = .on;
-
-pub const Error = error{BankPoolSetting};
-
-pub fn configure(value: ?[]const u8) Error!void {
-    mode = try parse(value);
-}
-
-/// `value`: null, empty or `1` on; `0` off; `check`; anything else refused by name.
-pub fn parse(value: ?[]const u8) Error!Mode {
-    const v = value orelse return .on;
-    if (v.len == 0 or std.mem.eql(u8, v, "1")) return .on;
-    if (std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "check")) return .check;
-    return error.BankPoolSetting;
-}
-
-pub fn on() bool {
-    return mode != .off;
-}
+/// The pool on: set off at load on a host whose table has no `HostGpu.alias` (`hostHasAlias`).
+pub var on: bool = true;
 
 /// `HostGpu.alias` in the host's table (mlx-serve's additive ABI entry, appended after `buffer_addresses` at byte 88):
 /// bytes 96 to 104. The plugin's kit predates it (its HostGpu 96 bytes): src/host_shims.zig reads the entry at this
@@ -123,15 +102,6 @@ pub fn plan(prompt: []Item, window: []Item, ext: []Item, page: u64, order: []u32
 }
 
 /// The `[bank-pool] plan` line (MiB for bytes, KiB for the decode layout's slack under the pool).
-pub fn planLine(p: Plan, transient: u64, spare: u64, window: u64, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "[bank-pool] plan mode={t} pool_mb={d} prompt_transient_mb={d} prompt_spare_mb={d} decode_window_mb={d} decode_pooled={d} decode_pooled_mb={d} decode_fresh={d} decode_fresh_mb={d} decode_slack_kb={d}\n", .{ mode, p.bytes >> 20, transient >> 20, spare >> 20, window >> 20, p.pooled, p.pooled_bytes >> 20, p.fresh, p.fresh_bytes >> 20, (p.bytes - p.decode_end) >> 10 }) catch buf[0..0];
-}
-
-/// The `[bank-pool] check` line: the install's layout and the bytes it filled with 0xFF, and every install's so far.
-pub fn checkLine(to_decode: bool, filled: u64, total: u64, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "[bank-pool] check to={s} filled_mb={d} total_filled_mb={d}\n", .{ if (to_decode) "decode" else "prompt", filled >> 20, total >> 20 }) catch buf[0..0];
-}
-
 const testing = std.testing;
 
 fn disjoint(items: []const Item, page: u64) !void {
@@ -153,15 +123,6 @@ test "bank_pool: a host's HostGpu of 96 bytes has no alias entry; one of 104 (ho
     try testing.expect(!hostHasAlias(103));
     try testing.expect(hostHasAlias(104));
     try testing.expect(hostHasAlias(112));
-}
-
-test "bank_pool: the setting's values" {
-    try testing.expectEqual(Mode.on, try parse(null));
-    try testing.expectEqual(Mode.on, try parse(""));
-    try testing.expectEqual(Mode.off, try parse("0"));
-    try testing.expectEqual(Mode.on, try parse("1"));
-    try testing.expectEqual(Mode.check, try parse("check"));
-    try testing.expectError(error.BankPoolSetting, parse("2"));
 }
 
 test "bank_pool: each layout's items are page-aligned and disjoint, decode's within the prompt's bytes, largest first" {

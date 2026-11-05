@@ -1,14 +1,3 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -287,6 +287,7 @@
-     pub const MLX_SERVE_DSV41_ENGRAM_DECODE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram rows kept across a conversation's turns (turboexl3_ds41): an LRU of rows over the tables (MLX_SERVE_DSV41_ENGRAM_LRU_MB, billed at load) that a prompt grid's distinct rows and every row a decode read reads go into, a decode read taking the rows it holds and reading the others on a 64-thread pool, a round's bonus token's rows read while its draft runs; the same bytes (unset or 1: on; 0: off; check: on, every row of a decode read read again and the held ones compared, the read bytes served, [engram-decode] lines)" };
-     pub const MLX_SERVE_DSV41_ENGRAM_LRU_MB: Var = .{ .kind = .kill, .type = .text, .default = "256", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram LRU's size in MiB with MLX_SERVE_DSV41_ENGRAM_DECODE on (turboexl3_ds41): its rows and their index, 1 to 16384, billed at load beside the host's bytes" };
-     pub const MLX_SERVE_DSV41_ENGRAM_DIRECT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram tables (turboexl3_ds41): a prompt's rows read once a table (its spans' ids made distinct) and past the page cache, each row's bytes from the file system blocks that hold them, on up to 64 threads; the same bytes (=0: span by span through the page cache)" };
-+    pub const MLX_SERVE_DSV41_GU_SPLIT: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's demand reads (turboexl3_ds41, dq1b): 1 reads each missed record's gate/up range as two range jobs side by side (split at the part boundary nearest its middle), check also reads each split range again whole and compares it with the rows ([gu-split] mismatch); unset or 1 on (zzz9h), 0 off; the served bytes are the same at every setting" };
-     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
-     pub const MLX_SERVE_DSV41_JOINLESS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' routed sum and shared expert (turboexl3_ds41): on, one kernel combines them reading each routed row where its wave wrote it, no joins of the waves' outputs, the same f32 words; 0: the joins and the op chain; check: both, compared word for word, the op chain's served ([joinless] lines)" };
-     pub const MLX_SERVE_DSV41_LATE_GEMV: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode lookahead's next-layer scores as a product in the router weights' half type (turboexl3_ds41): MLX's wide GEMV, one weight pass for a verify's rows; the read-ahead's ranking only, served bytes unchanged (=0: the f32 product)" };
 diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4.h b/sdk/weights/streamed/csrc/q3_lookahead4.h
 --- a/sdk/weights/streamed/csrc/q3_lookahead4.h
 +++ b/sdk/weights/streamed/csrc/q3_lookahead4.h
@@ -29,7 +18,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4.h b/sdk/weight
  int q3ld_spec_config(int32_t nthreads, const uint64_t *bufs, int32_t nslots, int64_t slot_bytes, int64_t rec_len,
                       int64_t chunk, int64_t *counters);
  int q3ld_spec_streams(int32_t idle_busy);   /* stopped pool, after spec_config: 0 or 1; 0 or -1 */
-+int q3ld_gu_split(int32_t mode);           /* dq1b: any time: 0 off, 1 the gate/up ranges in two jobs, 2 and checked; 0 or -1 */
++int q3ld_gu_split(int32_t mode);           /* dq1b: any time: 0 off, 1 the gate/up ranges in two jobs; 0 or -1 */
  int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t psize,
                 int64_t *res_arr, int64_t n_tickets, int64_t *log_arr, int64_t n_log, int64_t *gauge_arr);
  /* One job of n <= MAX_ITEMS records on tickets first .. first + 2n - 1: GU(0..n-1) then DOWN(0..n-1); claims the
@@ -45,7 +34,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4.h b/sdk/weight
 diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
 --- a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
 +++ b/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
-@@ -113,6 +113,25 @@
+@@ -113,6 +113,23 @@
   *   needed before the drive reached them (P7 early_whole_trim: the read-ahead jobs still queued when the prompt call's
   *   plans exist).  It never touches the speculative class (no claim is released; the prompt pass issues none).
   *   Inject event kind 11 (withdrawn).
@@ -60,9 +49,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
 + *   the whole range takes it whole, unsplit).  The ticket's status words are the halves' (status the first half's when it
 + *   failed, else the second's; preadv calls, bytes and payload summed; errno the first nonzero; t_start the earlier,
 + *   t_end the later; worker the first half's; the lookahead flags or-ed, their chunk counts summed; the wait the longer),
-+ *   written and published once, by the worker that finishes the second half.  Mode 2 (check): before that publish the
-+ *   worker reads the whole range again (plain preadv into its staging, the stock loop's steps) and compares it with the
-+ *   rows the halves wrote (SC_SPLIT_CHECKED, SC_SPLIT_MISMATCH).  Exact: the same bytes into the same rows; only the
++ *   written and published once, by the worker that finishes the second half.  Exact: the same bytes into the same rows; only the
 + *   preadv calls covering a range change.  WITHDRAW takes a split submit's jobs with it, all or none.  Not with the
 + *   DIRECT route (it reads every range whole).  Counters SC_SPLIT_*.
 + *   dq1a's measurement rides along (RES_W 10): word 8 the range's lookahead flags (bit 0: an unclaimed speculative chunk
@@ -71,7 +58,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
   */
  #include <errno.h>
  #include <mach/mach_time.h>
-@@ -125,7 +144,9 @@
+@@ -125,7 +142,9 @@
  #include <time.h>
  #include <unistd.h>
  
@@ -82,7 +69,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  #define MAX_WORKERS 8
  #define MAX_COMP 6
  #define MAX_ITEMS 8
-@@ -212,6 +233,16 @@
+@@ -212,6 +231,14 @@
      SC_PARTS_DIRECT,      /* range parts read straight into their rows (offset, length and row on the block) */
      SC_PARTS_DIRECT_BYTES,
      SC_PARTS_STAGED_BYTES, /* bytes of the other parts of those ranges (the staging loop + the copy) */
@@ -94,12 +81,10 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
 +    SC_SPLIT_PRE_ISSUED,  /* half pre-ranges queued */
 +    SC_SPLIT_SPAN_NS,     /* the split tickets' spans: the earlier half's start to the later half's end */
 +    SC_SPLIT_OVERLAP_NS,  /* the time both halves of a ticket were in flight at once */
-+    SC_SPLIT_CHECKED,     /* mode 2: tickets read again whole and compared with their rows */
-+    SC_SPLIT_MISMATCH,    /* ... whose rows differed from the whole read (or whose check read failed) */
      SC_N
  };
  
-@@ -249,6 +280,7 @@
+@@ -249,6 +276,7 @@
      int64_t file_size;
      int64_t deadline;
      int64_t ticket;     /* the job's one range */
@@ -107,7 +92,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  } job_t;
  
  typedef struct {
-@@ -293,6 +325,13 @@
+@@ -293,6 +321,13 @@
  static int nspec = 0, nspec_threads = 0, nspec_started = 0, spec_inflight = 0, spec_configured = 0;
  static int64_t spec_slot_bytes = 0, spec_rec_len = 0, spec_chunk = 0;
  static int spec_idle_busy = SPEC_MAX_DEMAND_BUSY;   /* the queue rule's demand-busy limit for threads >= 1 */
@@ -121,21 +106,20 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  static uint64_t spec_order = 0;
  static int64_t *sc = 0;
  
-@@ -323,6 +362,13 @@
+@@ -323,6 +358,12 @@
  static uint64_t pre_order = 0;
  static int32_t *pre_of = 0;   /* per ticket: 1 + the pre-range bound to that range at submit, 0 = none */
  static int32_t *sub_len = 0;  /* WITHDRAW: per ticket, the range jobs of the submit it starts (0: it starts none) */
-+/* GU SPLIT (dq1b): 0 off, 1 on, 2 on with the check (q3ld_gu_split); per ticket the halves still to finish (0: not
-+ * split), whether its check runs, both halves' status words (2 x RES_W), and the pre-range bound to its second half */
++/* GU SPLIT (dq1b): 0 off, 1 on (q3ld_gu_split); per ticket the halves still to finish (0: not split), both halves'
++ * status words (2 x RES_W), and the pre-range bound to its second half */
 +static int gu_split = 0;
 +static int32_t *split_left = 0;
-+static int32_t *split_chk = 0;
 +static int64_t *split_words = 0;
 +static int32_t *pre_of_b = 0;
  
  /* ---- the event-gate class (lookahead4) */
  #define MAX_GATES 512         /* the live gates of every route a stream holds: 6 routes x (48 parts + 1) <= 512 */
-@@ -848,11 +894,13 @@
+@@ -848,11 +889,13 @@
      p->state = PR_INFLIGHT;
      busy += 1;
      sc[SC_PRE_STARTED] += 1;
@@ -150,7 +134,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      pthread_mutex_unlock(&mu);
      RANGE_DELAY();
      int64_t out[RES_W] = { 0 };
-@@ -867,6 +915,8 @@
+@@ -867,6 +910,8 @@
      } else {
          for (int k = 1; k < RES_W; k++) p->words[k] = out[k];
          p->words[7] = w;
@@ -159,7 +143,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
          p->words[0] = status;
          p->state = PR_DONE;
      }
-@@ -972,6 +1022,7 @@
+@@ -972,6 +1017,7 @@
      out[4] = 0;
      out[5] = t_start;
      out[6] = q3ld_monotonic_ns();
@@ -167,7 +151,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      return ST_OK;
  }
  
-@@ -979,7 +1030,7 @@
+@@ -979,7 +1025,7 @@
  static void claim_ranges(int fd, int64_t first, int32_t count) {
      int woke = 0;
      for (int32_t i = 0; i < count; i++) {
@@ -176,7 +160,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
          const range_t *rg = &ranges[first + i];
          int k = spec_containing(fd, rg->offset, range_total(rg));
          if (k < 0) continue;
-@@ -1068,6 +1119,92 @@
+@@ -1068,6 +1114,58 @@
      pthread_mutex_unlock(&sig_mu);
  }
  
@@ -231,45 +215,11 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
 +    sc[SC_SPLIT_SPAN_NS] += m[6] > m[5] ? m[6] - m[5] : 0;
 +}
 +
-+/* GU SPLIT check (mode 2): the whole range read again with plain preadv into `stage` (the stock loop's steps) and
-+ * compared with the rows the halves wrote.  1 equal; 0 a byte differs, or the read failed or came back short. */
-+static int split_check(const job_t *job, const range_t *rg, char *stage) {
-+    const int64_t total = range_total(rg);
-+    int64_t done = 0, d_off = 0;
-+    int32_t d = 0;
-+    while (d < rg->ndst && rg->len[d] == 0) d++;
-+    while (done < total) {
-+        const int64_t off = rg->offset + done;
-+        const int64_t aligned = off / page_size * page_size, skip = off - aligned;
-+        const int64_t want = total - done;
-+        const int64_t end = (off + want + page_size - 1) / page_size * page_size;
-+        int64_t phys = staging_bytes;
-+        if (end - aligned < phys) phys = end - aligned;
-+        if (job->file_size - aligned < phys) phys = job->file_size - aligned;
-+        if (phys <= 0) return 0;
-+        struct iovec iov = { stage, (size_t)phys };
-+        const ssize_t r = preadv(job->fd, &iov, 1, (off_t)aligned);
-+        if (r <= skip) return 0;
-+        int64_t got = (int64_t)r - skip;
-+        if (got > want) got = want;
-+        const char *src = stage + skip;
-+        int64_t left = got;
-+        while (left > 0 && d < rg->ndst) {
-+            const int64_t room = rg->len[d] - d_off;
-+            const int64_t n = left < room ? left : room;
-+            if (memcmp((const char *)(uintptr_t)rg->dst[d] + d_off, src, (size_t)n) != 0) return 0;
-+            src += n; left -= n; d_off += n;
-+            if (d_off == rg->len[d]) { d++; d_off = 0; while (d < rg->ndst && rg->len[d] == 0) d++; }
-+        }
-+        done += got;
-+    }
-+    return 1;
-+}
 +
  static void publish(int64_t t) {
      /* caller holds mu; res[t] already written */
      logbuf[seq % (uint64_t)logn] = t;
-@@ -1094,12 +1231,26 @@
+@@ -1094,12 +1192,26 @@
          __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);
          EV(2, job.ticket);
          busy += 1;
@@ -297,7 +247,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
          if (pb) {                                      /* PRE: the bound pre-range's result */
              pre_t *p = &pre[pb - 1];
              pthread_mutex_lock(&mu);
-@@ -1107,31 +1258,63 @@
+@@ -1107,31 +1219,56 @@
                  int64_t tw = q3ld_monotonic_ns();
                  sc[SC_PRE_WAITS] += 1;
                  while (p->state != PR_DONE) pthread_cond_wait(&pre_cv, &mu);
@@ -347,13 +297,6 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
 +            if (done) {
 +                int64_t m[RES_W];
 +                split_join(t, m);
-+                if (split_chk[t] && m[0] == ST_OK) {   /* mode 2: the whole range again, against the rows */
-+                    pthread_mutex_unlock(&mu);
-+                    const int same = split_check(&job, &ranges[t], stage);
-+                    pthread_mutex_lock(&mu);
-+                    sc[SC_SPLIT_CHECKED] += 1;
-+                    if (!same) sc[SC_SPLIT_MISMATCH] += 1;
-+                }
 +                out = res + t * RES_W;
 +                for (int k = 1; k < RES_W; k++) out[k] = m[k];
 +                status = (int)m[0];
@@ -369,7 +312,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
          pthread_mutex_lock(&mu);
          busy -= 1;
          pthread_cond_broadcast(&done_cv);
-@@ -1284,6 +1467,8 @@
+@@ -1284,6 +1421,8 @@
              char *dst = s->buf + s->got;
              int fd = s->fd;
              off_t off = (off_t)(s->aligned + s->got);
@@ -378,7 +321,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
              pthread_mutex_unlock(&mu);
              SPEC_DELAY();
              int64_t done = 0;
-@@ -1296,6 +1481,7 @@
+@@ -1296,6 +1435,7 @@
                  done += r;
              }
              pthread_mutex_lock(&mu);
@@ -386,7 +329,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
              sc[SC_SPEC_CHUNKS] += 1;
              sc[SC_SPEC_BYTES] += done;
              if (err) { s->landed = 0; sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); break; }
-@@ -1340,6 +1526,8 @@
+@@ -1340,6 +1480,8 @@
      }
      spec_order = 0;
      spec_inflight = 0;
@@ -395,7 +338,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      spec_configured = 1;
      pthread_mutex_unlock(&mu);
      return 0;
-@@ -1367,13 +1555,19 @@
+@@ -1367,13 +1509,18 @@
          if (((uintptr_t)spec[i].buf) % (uintptr_t)psize) { pthread_mutex_unlock(&mu); return -1; }
      }
      ranges = (range_t *)calloc((size_t)n_tickets, sizeof(range_t));
@@ -406,18 +349,17 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      gate_of = (int64_t *)calloc((size_t)n_tickets, sizeof(int64_t));
 -    if (!ranges || !queue || !pre_of || !sub_len || !gate_of) {
 +    split_left = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));     /* GU SPLIT */
-+    split_chk = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
 +    split_words = (int64_t *)calloc((size_t)n_tickets * 2 * RES_W, sizeof(int64_t));
 +    pre_of_b = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
-+    if (!ranges || !queue || !pre_of || !sub_len || !gate_of || !split_left || !split_chk || !split_words || !pre_of_b) {
++    if (!ranges || !queue || !pre_of || !sub_len || !gate_of || !split_left || !split_words || !pre_of_b) {
          free(ranges); free(queue); free(pre_of); free(sub_len); free(gate_of);
-+        free(split_left); free(split_chk); free(split_words); free(pre_of_b);
++        free(split_left); free(split_words); free(pre_of_b);
          ranges = 0; queue = 0; pre_of = 0; sub_len = 0; gate_of = 0;
-+        split_left = 0; split_chk = 0; split_words = 0; pre_of_b = 0;
++        split_left = 0; split_words = 0; pre_of_b = 0;
          pthread_mutex_unlock(&mu);
          return -ENOMEM;
      }
-@@ -1382,7 +1576,8 @@
+@@ -1382,7 +1529,8 @@
      memset(gates, 0, sizeof(gates));                  /* EVENT: armed later by q3ld_ev_config */
      g_head = g_tail = 0; ev_hi = ev_target = ev_sent = 0; ev_target_t = 0; ev_kind = EVK_OFF; ev_obj = 0;
      wd_stop = 0; wd_running = 0;
@@ -427,7 +369,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      res = res_arr; nt = n_tickets; logbuf = log_arr; logn = n_log; gauge = gauge_arr;
      staging_bytes = sbytes; page_size = psize;
      __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0;
-@@ -1411,7 +1606,7 @@
+@@ -1411,7 +1559,7 @@
      int status = ST_OK;
      out[4] = 0;
      for (int32_t d = 0; d < rg->ndst && status == ST_OK; d++) {
@@ -436,7 +378,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
          range_t one = { 0 };
          one.offset = rg->offs[d];
          one.ndst = 1;
-@@ -1432,7 +1627,8 @@
+@@ -1432,7 +1580,8 @@
  }
  
  /* One job (a stock fill unit) -- q3_nativeissue.c's q3ni_submit, plus the claim of the speculative records
@@ -446,7 +388,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int32_t ngu, int32_t ndown,
                  const int64_t *offsets, const uint64_t *const *rows, const int64_t *lens, int64_t first) {
      if (n < 1 || n > MAX_ITEMS || ngu < 1 || ndown < 1 || ngu > MAX_COMP || ndown > MAX_COMP) return -1;
-@@ -1443,7 +1639,9 @@
+@@ -1443,7 +1592,9 @@
      for (int32_t i = 0; i < count; i++) {
          if (res[(first + i) * RES_W] == ST_PENDING) { pthread_mutex_unlock(&mu); return -2; }
      }
@@ -457,17 +399,16 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      for (int32_t i = 0; i < count; i++) {
          int down = i >= n;
          int32_t item = down ? i - n : i;
-@@ -1460,6 +1658,9 @@
+@@ -1460,6 +1611,8 @@
          for (int k = 1; k < RES_W; k++) out[k] = 0;
          out[0] = ST_PENDING;
          pre_of[first + i] = 0;
 +        pre_of_b[first + i] = 0;
 +        split_left[first + i] = h && !down ? 2 : 0;
-+        split_chk[first + i] = 0;
          sub_len[first + i] = i == 0 ? count : 0;       /* WITHDRAW: the submit's range jobs, on its first ticket */
          gate_of[first + i] = 0;                        /* EVENT: a gate maps a ticket only after this submit */
      }
-@@ -1468,27 +1669,60 @@
+@@ -1468,27 +1621,57 @@
          for (int32_t i = 0; i < count; i++) {
              range_t *rg = &ranges[first + i];
              int p = pre_find(fd, rg);
@@ -526,10 +467,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
 -        job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->ticket = first + i;
 -        __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
 +        const int32_t parts = split_left[first + i] ? 2 : 1;   /* GU SPLIT: a split range's halves side by side */
-+        if (parts == 2) {
-+            split_chk[first + i] = gu_split == 2;
-+            sc[SC_SPLIT_TICKETS] += 1;
-+        }
++        if (parts == 2) sc[SC_SPLIT_TICKETS] += 1;
 +        for (int32_t k = 0; k < parts; k++) {
 +            job_t *job = &queue[(qhead + qlen) % qcap];
 +            job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->ticket = first + i;
@@ -542,13 +480,12 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      EV(1, first);
      pthread_cond_broadcast(&work_cv);
      pthread_mutex_unlock(&mu);
-@@ -1528,12 +1762,16 @@
+@@ -1528,12 +1711,15 @@
          for (int k = 1; k < RES_W; k++) out[k] = 0;
          out[0] = ST_PENDING;
          pre_of[first + i] = 0;
 +        pre_of_b[first + i] = 0;
 +        split_left[first + i] = 0;
-+        split_chk[first + i] = 0;
          sub_len[first + i] = i == 0 ? count : 0;
          gate_of[first + i] = 0;
      }
@@ -559,7 +496,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
          __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
      }
      EV(1, first);
-@@ -1543,37 +1781,44 @@
+@@ -1543,37 +1729,44 @@
  }
  
  /* WITHDRAW: take the submit whose first ticket is `first` back out of the FIFO while no worker has started it: its
@@ -622,16 +559,16 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      }
      EV(11, first);
      pthread_cond_broadcast(&spec_cv);          /* the demand queue got shallower: the speculative queue rule may pass */
-@@ -1857,6 +2102,8 @@
+@@ -1857,6 +2050,8 @@
      parts_live = 1;
      run_range = run_range_staged;
      free(ranges); free(queue); free(pre_of); free(sub_len); ranges = 0; queue = 0; pre_of = 0; sub_len = 0;
-+    free(split_left); free(split_chk); free(split_words); free(pre_of_b);
-+    split_left = 0; split_chk = 0; split_words = 0; pre_of_b = 0; gu_split = 0;
++    free(split_left); free(split_words); free(pre_of_b);
++    split_left = 0; split_words = 0; pre_of_b = 0; gu_split = 0;
      for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
      pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
      res = 0; logbuf = 0; gauge = 0; sc = 0;
-@@ -1891,10 +2138,8 @@
+@@ -1891,10 +2086,8 @@
      return 0;
  }
  
@@ -644,7 +581,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      int64_t total = 0;
      for (int32_t c = 0; c < nd; c++) total += lens[c];
      int64_t a0 = offset / page_size * page_size;
-@@ -1924,6 +2169,12 @@
+@@ -1924,6 +2117,12 @@
      return 1;
  }
  
@@ -657,7 +594,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  /* One layer-call's pre-read (PyDLL: GIL held, never blocks beyond the pool mutex), right after the router barrier
   * returns: bases = the call's certain-miss record offsets (route order), tag = the clock value of this call's settle.
   * Expires unbound pre-ranges of older calls; claims the live speculative records containing a base (a QUEUED one is
-@@ -1968,7 +2219,18 @@
+@@ -1968,7 +2167,18 @@
          }
          if (nt < 2 * MAX_PRE) todo[nt++] = b;
      }
@@ -677,15 +614,15 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      for (int32_t k = 0; k < nt; k++) queued += pre_issue(fd, file_size, tag, todo[k] + gu_total, 1, lens_all);
      if (n) sc[SC_PRE_CALLS] += 1;
      if (queued) pthread_cond_broadcast(&work_cv);
-@@ -2182,7 +2444,17 @@
+@@ -2182,7 +2392,17 @@
  }
  #endif
  
 -int32_t q3ld_abi(void) { return 2026110101; }              /* PARTS route; 2026102401 SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
 +/* GU SPLIT (dq1b): the gate/up split for the submits and pre-reads from here on (any time; the stream's phase change):
-+ * 0 off, 1 split, 2 split and check.  Returns 0, -1 for another mode. */
++ * 0 off, 1 split.  Returns 0, -1 for another mode. */
 +int q3ld_gu_split(int32_t mode) {
-+    if (mode < 0 || mode > 2) return -1;
++    if (mode < 0 || mode > 1) return -1;
 +    pthread_mutex_lock(&mu);
 +    gu_split = mode;
 +    pthread_mutex_unlock(&mu);
@@ -699,7 +636,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
 diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
-@@ -69,6 +69,9 @@
+@@ -51,6 +51,9 @@
  /// `MLX_SERVE_DSV41_DIRECT_PARTS` (the plugin's src/direct_parts.zig): the read pool's demand ranges part by part, the
  /// block-aligned parts read straight into their rows.
  const direct_parts = @import("mlx_host").direct_parts;
@@ -709,7 +646,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
  /// `MLX_SERVE_DSV41_STAGE_NEXT` (the plugin's src/stage_next.zig): the next routed layer's read-ahead and staging during
  /// the current layer's call (`nextAhead`, `Stream.readAheadNext`, `Stream.stageNext`).
  const stage_next = @import("mlx_host").stage_next;
-@@ -652,6 +655,8 @@
+@@ -528,6 +531,8 @@
                          // MLX_SERVE_DSV41_DIRECT_PARTS is the prompt's: decode's reads (the grow's fills, its misses)
                          // stage and copy, as without it.
                          self.stream.directPartsLive(false);
@@ -718,7 +655,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
                          // MLX_SERVE_DSV41_SCRATCH_WAVES: the prompt's regions let go (MLX keeps a buffer while a command uses it).
                          scratch_waves.releaseAll();
                          self.released = (try h.releaseTransient()) > 0;
-@@ -667,6 +672,8 @@
+@@ -543,6 +548,8 @@
                          if (prompt_io.on) prompt_io.reset();
                          direct_parts.promptStart(self.source.stats());
                          self.stream.directPartsLive(true);
@@ -732,7 +669,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streame
 +++ b/sdk/weights/streamed/experts.zig
 @@ -26,6 +26,9 @@
  const env = @import("mlx_host").env;
- /// turboexl3_ds41 (its src/stage.zig, `MLX_SERVE_DSV41_STAGE`): a wide call's groups around the stream's staged windows.
+ /// turboexl3_ds41 (its src/stage.zig): a wide call's groups around the stream's staged windows.
  const stage_cfg = @import("mlx_host").stage;
 +/// turboexl3_ds41 (dq1b's `[cold-start]`, the plugin's src/cold_start.zig): the decode's first calls of each layer against
 +/// the layer's last prompt call (reads only).
@@ -740,34 +677,16 @@ diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streame
  const mlx = @import("sdk").mlx;
  const ops = @import("ops.zig");
  const expert_bank = @import("expert/bank.zig");
-@@ -1453,6 +1456,10 @@
-                 scores = try g.hostF32(s, score_buf[0 .. n * self.n_experts]);
-             };
-             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
-+            // turboexl3_ds41 (dq1b's [cold-start]): a decode-width prompt call's ids (the layer's last call stands); a
-+            // decode call's are read with its waves below.
-+            const cs_decoding = if (comptime @hasDecl(S, "decoding")) self.source.decoding() else false;
-+            if (cold_start.on and !cs_decoding) cold_start.prompt(layer, ids, n, k);
-             tt = dt.charge(.barrier, tt);
-             const t_barrier = tt;
-             if (comptime timeline.enabled) timeline.point(layer, .barrier, 0, false);
-@@ -1472,6 +1479,7 @@
-             var released = false;
-             errdefer if (!released) self.source.release(call);
-             const sv = self.source.served(call);
-+            if (cold_start.on and cs_decoding) cold_start.decode(layer, ids, sv.waves);
-             var acc: Acc = .{};
-             if (dev) |d| {
-                 // DEVROUTE: every pair's row from the device wave; the miss parts' rows follow and replace theirs in the join.
-@@ -1733,6 +1741,8 @@
+@@ -1727,7 +1730,8 @@
              var tp = wide_profile.now();
              _ = try g.hostIds(indices, w.ids.items);
              wide_profile.charge(.barrier, tp);
+-            // MLX_SERVE_DSV41_STAGE_NEXT: the next wide layer's held prediction starts on the GPU behind this barrier.
 +            // turboexl3_ds41 (dq1b's [cold-start]): the prompt call's routed ids (the layer's last call stands).
-+            if (cold_start.on) cold_start.prompt(layer, w.ids.items, n, k);
-             // MLX_SERVE_DSV41_STAGE_NEXT: the next wide layer's held prediction starts on the GPU behind this barrier.
++            // Next-layer staging: the next wide layer's held prediction starts on the GPU behind this barrier.
              if (comptime @hasDecl(S, "nextStart")) try self.source.nextStart(layer);
              // A0 (profile builds): the prompt's last rows' experts.
+             if (comptime first_cycle.enabled) first_cycle.tailRecord(layer, w.ids.items, n, k);
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weights/streamed/sdk_ext/expert/io.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/io.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/io.zig
@@ -816,13 +735,13 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  };
  /// The pool's counter words (q3_lookahead4_exl3.c `SC_*`), written under its
  /// mutex; the h_* entries are the first of four horizon classes.
-@@ -163,8 +172,20 @@
+@@ -163,8 +172,18 @@
      parts_direct = 72,
      parts_direct_bytes = 73,
      parts_staged_bytes = 74,
 +    /// dq1b (`Pool.guSplit`): gate/up tickets read as two range jobs; their halves read, adopted out of a lookahead
 +    /// record and served by a pre-range of their own; half pre-ranges queued; the split tickets' spans and the time
-+    /// both halves were in flight (ns); in check mode the tickets read again whole and those whose rows differed.
++    /// both halves were in flight (ns).
 +    split_tickets = 75,
 +    split_read = 76,
 +    split_adopted = 77,
@@ -830,22 +749,19 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
 +    split_pre_issued = 79,
 +    split_span_ns = 80,
 +    split_overlap_ns = 81,
-+    split_checked = 82,
-+    split_mismatch = 83,
  };
 -pub const counters_n = 75;
-+pub const counters_n = 84;
++pub const counters_n = 82;
  /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
  /// read by `threads` threads in `chunk_bytes` preadv steps.
  pub const Spec = struct {
-@@ -366,6 +387,14 @@
+@@ -360,6 +379,13 @@
          _ = self;
          _ = c.q3ld_parts_live(@intFromBool(on));
      }
 +    /// dq1b's gate/up split for the submits and pre-reads from here on (`q3ld_gu_split`), at any time: 0 off (every
 +    /// range read whole), 1 each deadline-free submit's gate/up ranges as two range jobs (the component boundary nearest
-+    /// the byte midpoint), 2 the same with each split ticket read again whole and compared with its rows before its
-+    /// publish. Either way the rows get the file's bytes.
++    /// the byte midpoint). Either way the rows get the file's bytes.
 +    pub fn guSplit(self: *Pool, mode: u32) void {
 +        _ = self;
 +        _ = c.q3ld_gu_split(@intCast(mode));
@@ -853,7 +769,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
      /// After the owned consumers settle: expire unbound reads and wait for the pool's activity to stop.
      /// Ready speculative records and their tags stay intact. A timeout refuses the phase change.
      pub fn quiesce(self: *Pool, timeout_ns: i64) error{ InvalidTimeout, Timeout }!void {
-@@ -465,7 +494,7 @@
+@@ -459,7 +485,7 @@
      }
      pub fn result(self: *const Pool, ticket: u32) Result {
          const w = self.res[@as(usize, ticket) * res_w ..][0..res_w];
@@ -878,32 +794,20 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io_stub.zig b/sdk/
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
-@@ -12,6 +12,9 @@
+@@ -12,7 +12,7 @@
  const expert_routes = @import("routes.zig");
- /// turboexl3_ds41 (its src/stage.zig, `MLX_SERVE_DSV41_STAGE`): a wide prompt call's staging layout (`Stream.stageGroups`).
+ /// turboexl3_ds41 (its src/stage.zig): a wide prompt call's staging layout (`Stream.stageGroups`).
  const stage_cfg = @import("mlx_host").stage;
-+/// turboexl3_ds41 (dq1a's, with dq1b; the plugin's src/demand_split.zig): a decode route's demand ranges by class at their
-+/// settle, with [round-io].
-+const dsplit = @import("mlx_host").demand_split;
- /// turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL, the plugin's src/bank_pool.zig): the pool's plan (`BankPool`).
+-/// turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL, the plugin's src/bank_pool.zig): the pool's plan (`BankPool`).
++/// turboexl3_ds41 (the plugin's src/bank_pool.zig): the pool's plan (`BankPool`).
  const pool_plan = @import("mlx_host").bank_pool;
- /// turboexl3_ds41 (its src/stage_votes.zig, `MLX_SERVE_DSV41_STAGE_VOTES`): staging's vote floor and every staged record's
-@@ -2153,6 +2156,10 @@
-                         self.counters.expert_bytes_read += @intCast(@max(res.payload, 0));
-                         self.counters.preadv_calls += @intCast(@max(res.preadv_calls, 0));
-                         self.noteRead(res);
-+                        // turboexl3_ds41 (dq1a's [demand-split]): a decode route's demand range by record size, part and how
-+                        // it was served (a split gate/up ticket: its halves' span).
-+                        if (dsplit.on and self.phase == .decode and res.status == .ok)
-+                            dsplit.note(self.bank.layers[r.layer].logical_bytes, k >= p.n_reads, res.preadv_calls == 0 and res.payload > 0, res.lookahead, @intCast(@max(res.payload, 0)), @intCast(@max(res.t_end_ns - res.t_start_ns, 0)), @intCast(@max(res.wait_ns, 0)));
-                     }
-                 }
-                 p.settled = true;
-@@ -3760,6 +3767,11 @@
+ /// turboexl3_ds41 (its src/stage_votes.zig): staging's vote floor (`stage_votes.plan` in `stageGroups` and `stageNext`).
+ const stage_votes = @import("mlx_host").stage_votes;
+@@ -3468,6 +3468,11 @@
              pub fn directPartsLive(self: *Stream, on: bool) void {
                  self.pool.partsLive(on);
              }
-+            /// turboexl3_ds41 (dq1b, MLX_SERVE_DSV41_GU_SPLIT: the source's decode phase on, its prompt phase off): the read
++            /// turboexl3_ds41 (dq1b, the gate/up split: the source's decode phase on, its prompt phase off): the read
 +            /// pool's gate/up split for the reads from here on (`expert_io.Pool.guSplit`).
 +            pub fn guSplit(self: *Stream, mode: u32) void {
 +                self.pool.guSplit(mode);
@@ -911,27 +815,26 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              pub fn stats(self: *Stream) Stats {
                  var s = self.counters;
                  s.expert_read_seconds = @as(f64, @floatFromInt(self.read_ns)) / 1e9;
-@@ -3775,6 +3787,11 @@
+@@ -3483,6 +3488,10 @@
                      .{ "spec_cancelled", .cancelled_by_demand }, .{ "direct_ranges", .direct_ranges },
                      .{ "parts_direct", .parts_direct }, .{ "parts_direct_bytes", .parts_direct_bytes },
                      .{ "parts_staged_bytes", .parts_staged_bytes },
 +                    .{ "split_tickets", .split_tickets },       .{ "split_read", .split_read },
 +                    .{ "split_adopted", .split_adopted },       .{ "split_pre", .split_pre },
 +                    .{ "split_pre_issued", .split_pre_issued }, .{ "split_span_ns", .split_span_ns },
-+                    .{ "split_overlap_ns", .split_overlap_ns }, .{ "split_checked", .split_checked },
-+                    .{ "split_mismatch", .split_mismatch },
++                    .{ "split_overlap_ns", .split_overlap_ns },
                      .{ "spec_claimed_inflight", .claimed_inflight }, .{ "spec_abandoned_bytes", .abandoned_bytes },
                  };
                  inline for (pairs) |pr| @field(s, pr[0]) = @intCast(@max(p.counter(pr[1]), 0));
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert.zig b/sdk/weights/streamed/sdk_ext/expert.zig
 --- a/sdk/weights/streamed/sdk_ext/expert.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert.zig
-@@ -124,6 +124,17 @@
+@@ -124,6 +124,15 @@
      parts_direct: u64 = 0,
      parts_direct_bytes: u64 = 0,
      parts_staged_bytes: u64 = 0,
 +    /// dq1b (`io.Pool.guSplit`): gate/up tickets split, their halves read / adopted / served by their pre-ranges, half
-+    /// pre-ranges queued, the split tickets' spans and both halves' overlap (ns), check-mode tickets and mismatches.
++    /// pre-ranges queued, the split tickets' spans and both halves' overlap (ns).
 +    split_tickets: u64 = 0,
 +    split_read: u64 = 0,
 +    split_adopted: u64 = 0,
@@ -939,8 +842,6 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert.zig b/sdk/weights/
 +    split_pre_issued: u64 = 0,
 +    split_span_ns: u64 = 0,
 +    split_overlap_ns: u64 = 0,
-+    split_checked: u64 = 0,
-+    split_mismatch: u64 = 0,
      adopt_ranges: u64 = 0,
      adopt_bytes: u64 = 0,
      /// Pre-read ranges queued, served to a demand read, dropped unbound.

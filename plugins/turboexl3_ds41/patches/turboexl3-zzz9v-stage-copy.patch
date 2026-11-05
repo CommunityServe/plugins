@@ -1,89 +1,47 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -278,6 +278,7 @@
-     pub const MLX_SERVE_DSV41_DRAFT_AHEAD: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 greedy round's next DSpark draft (turboexl3_ds41): launched at the end of the round before it, from its next token once its state is committed, when the next plan is the stages' block, and taken by the next round when it fits (the same token, position and state); the same ops, served bytes unchanged (unset or 1: on; 0: off; check: on, the next round makes its own draft too, compares the ids and confidences word for word and serves its own, [draft-ahead] lines)" };
-     pub const MLX_SERVE_DSV41_DECODE_STOP: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode stop (turboexl3_ds41): the decode phase's budget takes 1.0e9 B of the 2.0e9 B stop under the ceiling back for its slot rows (two more on the M5 Max at 16K), MLX's cache capped at 1 GiB from the phase change to decode and the prompt's cap restored at the change back; the prompt's budget and rows unchanged; the same bytes (unset or 1: on; 0: off; check: as 1, [decode-stop] lines)" };
-     pub const MLX_SERVE_DSV41_STAGE_TRIM: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt call's staging trimmed at its routes (turboexl3_ds41, with MLX_SERVE_DSV41_STAGE): the staged windows' parts posted hottest first, and once the call's routes are known each staged part holding none of its experts that no read has started taken back out of the read pool unread, its rows let go; reads only, the same bytes (unset or 1: on; 0: off; check: as 1, each withdrawn ticket's status read back, [stage-trim] lines)" };
-+    pub const MLX_SERVE_DSV41_STAGE_COPY: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' persistent loads (turboexl3_ds41, with MLX_SERVE_DSV41_STAGE): unset, empty or 1, a persistent load whose record a staged window row holds (staged, landed or still reading) is filled by copying that row into its persistent row at its part's wait, not read again from the file; the same plans, slots and bytes (0: off, every persistent load read from the file; check: as 1, each copied record read again from the file into a scratch row and compared byte for byte, [stage-copy] check lines)" };
-     pub const MLX_SERVE_DSV41_DECODE_FUSE: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode call's tail in one kernel (turboexl3_ds41, with MLX_SERVE_DSV41_SHARED_HOIST): a decode-lane routed call's joined rows read in place through their (source, row) table by TAIL_FUSE's kernel, weighted and folded in the column reduce's order, the shared expert (committed behind the call's waves) added, rounded and hc-expanded into the layer's new streams, not the take, weight, sum and ffn_post_shared stretch; the same words (unset or 1: on, zzz9l; 0: off; check: the chain served, the kernel compared word for word, [decode-fuse] lines)" };
-     pub const MLX_SERVE_DSV41_DECODE_WINDOW: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode window 0 (turboexl3_ds41): 4 rows, not the widest decode route's 48, a decode plan admitting its declined misses past them over the lowest-ranked residents it does not use, the freed bytes billed to the decode slot rows (taken where every layer keeps 96 decode rows or more); the same bytes served (unset or 1: on; 0: off; check: on, the plans left past the window counted), [bank-bill] at load and [mem-decode] at each request's end" };
-     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
-@@ -23,6 +23,10 @@
- /// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_TRIM, the plugin's src/stage_trim.zig): a wide call's staged parts its routes
- /// do not take withdrawn before the drive reaches them, the staged windows' parts in rank order.
+@@ -19,8 +19,8 @@
+ /// turboexl3_ds41 (the plugin's src/stage_trim.zig): a wide call's staged parts its routes do not take withdrawn before
+ /// the drive reaches them, the staged windows' parts in rank order.
  const strim = @import("mlx_host").stage_trim;
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_COPY, the plugin's src/stage_copy.zig): a wide call's persistent load whose record a
-+/// staged window row holds filled by copying that row at its part's wait (`planCopies`, `copyLoads`), not read again; the
-+/// call's in-call evictions counted (`countEvictions`).
-+const scopy = @import("mlx_host").stage_copy;
- /// turboexl3_ds41 (MLX_SERVE_DSV41_LOOKAHEAD_WIDE, the plugin's src/la_wide.zig): the decode lookahead's credit of records
- /// past each layer call's base (`Stream.laCount`) and its histogram by top-k position (`Stream.lookaheadHist`).
+-/// turboexl3_ds41 (MLX_SERVE_DSV41_LOOKAHEAD_WIDE, the plugin's src/la_wide.zig): the decode lookahead's credit of records
+-/// past each layer call's base (`Stream.laCount`) and its histogram by top-k position (`Stream.lookaheadHist`).
++/// turboexl3_ds41 (the plugin's src/la_wide.zig): the decode lookahead's credit of records past each layer call's base
++/// (`Stream.laCount`).
  const la_wide = @import("mlx_host").la_wide;
-@@ -847,6 +851,11 @@
+ const log = @import("sdk").log;
+ /// The route recorder (`expert.routes`) is a diagnostic: its hooks compile into profile builds (`sdk.plugin_profile`) and
+@@ -811,6 +811,11 @@
              gates: ?Gates = null,
              /// Its record in the route recorder (`Stream.recorder`).
              rec: u32 = expert_routes.none,
-+            /// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_COPY): per load (plan order), the transient row + 1 whose staged record
-+            /// fills its persistent row at its part's wait (`Stream.copyLoads`), 0 none (set by `planCopies`, read only while
-+            /// `n_copy` > 0); `n_copy`: those still to fill.
++            /// turboexl3_ds41 (staged-row copies): per load (plan order), the transient row + 1 whose staged record
++            /// fills its persistent row at its part's wait (`Stream.copyLoads`), 0 none (set by `planCopies`, read only
++            /// while `n_copy` > 0); `n_copy`: those still to fill.
 +            copy_src: [max_route_ids]u16 = undefined,
 +            n_copy: u8 = 0,
              pub fn partsOf(r: *const Route) []const Part {
                  return r.parts[0..r.n_parts];
              }
-@@ -1020,6 +1029,13 @@
-             /// MLX_SERVE_DSV41_STAGE_VOTES: `next_lay`'s records' votes, row for row.
-             next_vlay: stage_cfg.Layout = .{},
-             next_posted: [max_wide_depth]bool = @splat(false),
-+            /// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_COPY): the layer whose seeded prompt call is open (`seedPrefill`; a route
-+            /// of another layer closes it), the experts its routes have routed and those their plans evicted
-+            /// (`countEvictions`); `check`'s scratch row, one record's components (page memory, the widest layer's).
-+            sc_call_layer: ?u32 = null,
-+            sc_routed: std.DynamicBitSetUnmanaged = .{},
-+            sc_evicted: std.DynamicBitSetUnmanaged = .{},
-+            sc_scratch: ?[n_components][]u8 = null,
-             /// P1's read-ahead of one layer: `loads[0..n]` (expert, slot) in file order, `reads[i]` false when the
-             /// slot still held the record; its pool jobs `parts[0..n_parts]` over them (a Route's tickets).
-             const Ahead = struct {
-@@ -1378,6 +1394,9 @@
-                 a.free(self.fill_loads);
-                 a.free(self.fill_reads);
-                 a.free(self.fill_parts);
-+                self.sc_routed.deinit(a);
-+                self.sc_evicted.deinit(a);
-+                if (self.sc_scratch) |bufs| for (bufs) |b| std.heap.page_allocator.free(b);
+@@ -1277,10 +1282,6 @@
+                 a.free(self.ahead.landed);
+                 if (self.p7_rows.len > 0) a.free(self.p7_rows);
+                 if (self.ahead_job.len > 0) a.free(self.ahead_job);
+-                a.free(self.fills);
+-                a.free(self.fill_loads);
+-                a.free(self.fill_reads);
+-                a.free(self.fill_parts);
                  a.destroy(self);
              }
              fn fail(self: *Stream, err: Error) Error {
-@@ -1732,6 +1751,8 @@
-                 if (self.prompt_reads == .stock and ah.live and ah.layer == layer) try self.awaitReadAhead(layer);
-                 const policy = &self.layers[layer].policy;
-                 policy.prepareSeed(ids);
-+                // MLX_SERVE_DSV41_STAGE_COPY: the call's in-call evictions counted from its first route on.
-+                if (scopy.on()) try self.openCall(layer);
-                 // P1's engagement, once at the layer's barrier: the records read ahead that its call routes, and its seed's
-                 // records not read ahead (the seed's misses, loaded on demand).
-                 if (ah.layer != layer or ah.n == 0 or ah.tallied) return;
-@@ -1817,6 +1838,8 @@
-                 var held_rows: [max_route_ids]u16 = undefined;
-                 if (staging) self.windowRows(layer, window, held_rows[0..self.max_route_ids]);
-                 ls.policy.planWith(ids, self.phase, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held_set.items, .held_rows = if (staging) held_rows[0..self.max_route_ids] else &.{} });
-+                // MLX_SERVE_DSV41_STAGE_COPY: the plan's evictions in its seeded call counted.
-+                if (scopy.on() and self.phase == .prefill) self.countEvictions(layer, &r.plan);
-                 if (staging and r.plan.n_loads > r.plan.n_persistent) try self.landWindow(window);
-                 // A persistent load may take a row a promotion of this layer still writes.
-                 if (r.plan.n_persistent > 0 and self.copier.thread != null) self.copier.waitFor(self.copier.layer_seq.items[layer]);
-@@ -1825,13 +1848,18 @@
+@@ -1726,13 +1727,18 @@
                      s.* = ls.policy.slotOf(e).?;
                      self.locate(layer, s.*).meta.pins += 1;
                  }
-+                // MLX_SERVE_DSV41_STAGE_COPY: a persistent load whose record a window row holds is filled from that row at
-+                // its part's wait (no read); a pending copy whose row this route's transient reads overwrite is filled first.
-+                if (scopy.on() and staging) try self.planCopies(r);
++                // turboexl3_ds41: a persistent load whose record a window row holds is filled from that row at its part's
++                // wait (no read); a pending copy whose row this route's transient reads overwrite is filled first.
++                if (staging) try self.planCopies(r);
                  var skipped: u64 = 0;
                  for (plan.loadsOf(), 0..) |l, i| {
                      const m = self.locate(layer, l.slot).meta;
@@ -91,45 +49,45 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
                      const held = m.state == .ready and m.layer == layer and m.expert == l.expert;
 -                    r.reads[i] = !held;
-+                    // MLX_SERVE_DSV41_STAGE_COPY: a load its staged row fills reads nothing (the row loading until its copy).
++                    // Staged-row copies: a load its staged row fills reads nothing (the row loading until its copy).
 +                    const copy = r.n_copy > 0 and r.copy_src[i] != 0;
 +                    r.reads[i] = !held and !copy;
                      skipped += @intFromBool(held);
                      if (staging and !l.persistent) self.noteStaged(layer, window, l.slot - ls.policy.capacity - @as(u32, window) * self.max_route_ids, l.expert, held);
                      if (!held) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
-@@ -1997,6 +2025,8 @@
+@@ -1891,6 +1897,8 @@
              /// tickets). Null when nothing is read.
              pub fn gate(self: *Stream, r: *Route) Error!?Gates {
                  std.debug.assert(self.gated and r.state == .live and r.gates == null);
-+                // MLX_SERVE_DSV41_STAGE_COPY: a gated route's kernels wait on its tickets only: its copies filled now.
++                // Staged-row copies: a gated route's kernels wait on its tickets only: its copies filled now.
 +                if (r.n_copy > 0) try self.copyAll(r);
                  const n = r.n_parts;
                  if (n == 0) return null;
                  const lo = self.gate_value;
-@@ -2128,6 +2158,8 @@
+@@ -2022,6 +2030,8 @@
              /// still be reading): the gate/up kernels of its records can run.
              pub fn waitGu(self: *Stream, r: *Route, part: u32) Error!void {
                  const p = &r.parts[part];
-+                // MLX_SERVE_DSV41_STAGE_COPY: the part's loads its staged rows fill, filled first.
++                // Staged-row copies: the part's loads its staged rows fill, filled first.
 +                if (r.n_copy > 0) try self.copyPart(r, p);
                  if (p.settled) return;
                  self.waitReads(p.ticket, p.n_reads) catch |e| return self.fail(e);
                  for (0..p.n_reads) |i| {
-@@ -2145,6 +2177,8 @@
+@@ -2039,6 +2049,8 @@
                  return self.settle(r, &r.parts[part]);
              }
              fn settle(self: *Stream, r: *Route, p: *Part) Error!void {
-+                // MLX_SERVE_DSV41_STAGE_COPY: the part's loads its staged rows fill, filled first.
++                // Staged-row copies: the part's loads its staged rows fill, filled first.
 +                if (r.n_copy > 0) try self.copyPart(r, p);
                  if (p.settled) return;
                  const count = 2 * p.n_reads;
                  const waited = self.waitReads(p.ticket, count);
-@@ -2416,6 +2450,12 @@
+@@ -2299,6 +2311,12 @@
                  const mn = minisOf(&self.bank.layers[layer]);
                  const lens = &self.layers[layer].lens;
                  const n = experts.len;
-+                // MLX_SERVE_DSV41_STAGE_COPY: a pending copy from a row this post overwrites, filled first.
-+                if (scopy.on()) {
++                // A pending copy from a row this post overwrites, filled first.
++                {
 +                    var hot: [max_wide_depth * max_route_ids]bool = @splat(false);
 +                    for (0..n) |r| hot[w * width + r] = true;
 +                    try self.copyGuard(&hot, null);
@@ -137,48 +95,14 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  for (experts, 0..) |e, r| {
                      const m = self.locate(layer, pol.capacity + @as(u32, @intCast(w * width + r))).meta;
                      const held = m.state == .ready and m.layer == layer and m.expert == e;
-@@ -2608,6 +2648,312 @@
-                     st.adopted[w][r] = true;
-                 }
+@@ -2476,7 +2494,215 @@
+                 self.counters.stage_adopted += @intFromBool(adopted);
                  st.rows[w][r] = expert_policy.no_expert;
-+            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: layer `layer`'s seeded prompt call opened (`seedPrefill`): no expert routed or
-+            /// evicted yet (`countEvictions`).
-+            fn openCall(self: *Stream, layer: u32) !void {
-+                const n = self.layers[layer].policy.n_experts;
-+                if (self.sc_routed.bit_length < n) {
-+                    try self.sc_routed.resize(self.allocator, n, false);
-+                    try self.sc_evicted.resize(self.allocator, n, false);
-+                }
-+                self.sc_routed.unsetAll();
-+                self.sc_evicted.unsetAll();
-+                self.sc_call_layer = layer;
-+            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: a prefill plan of `layer` inside its open seeded call (a route of another layer
-+            /// closes it): its misses of experts an earlier route of the call evicted (their records read again), and its
-+            /// evictions, by a seed admission or not, of experts the call routes in a later route (its counts name them and
-+            /// no route of it has routed them yet).
-+            fn countEvictions(self: *Stream, layer: u32, plan: *const Plan) void {
-+                const cl = self.sc_call_layer orelse return;
-+                if (cl != layer) {
-+                    self.sc_call_layer = null;
-+                    return;
-+                }
-+                const pol = &self.layers[layer].policy;
-+                const mn = minisOf(&self.bank.layers[layer]);
-+                var record: u64 = 0;
-+                for (self.layers[layer].lens) |len| record += len * mn;
-+                for (plan.missesOf()) |e| if (self.sc_evicted.isSet(e)) scopy.noteRemiss(record);
-+                for (plan.evictionsOf()) |ev| {
-+                    scopy.noteEviction(pol.protected.isSet(ev.next), pol.call_counts[ev.previous] > 0 and !self.sc_routed.isSet(ev.previous));
-+                    self.sc_evicted.set(ev.previous);
-+                }
-+                for (plan.hitsOf()) |e| self.sc_routed.set(e);
-+                for (plan.missesOf()) |e| self.sc_routed.set(e);
-+            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: per transient row of the windows (window x width + row), the expert whose record of
-+            /// `layer` it holds or is reading: a row of the layer's pending staging, the expert it names; else a row whose
-+            /// record of the layer is ready, its expert; `no_expert` otherwise. Returns the rows covered.
+             }
+-            /// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_TRIM): layer `layer`'s call has its routes (`used`: its distinct experts)
++            /// Staged-row copies: per transient row of the windows (window x width + row), the expert whose record of
++            /// `layer` it holds or is reading: a row of the layer's pending staging, the expert it names; else a row
++            /// whose record of the layer is ready, its expert; `no_expert` otherwise. Returns the rows covered.
 +            fn stagedRows(self: *Stream, layer: u32, out: *[max_wide_depth * max_route_ids]u16) usize {
 +                const st = &self.stage;
 +                const cap = self.layers[layer].policy.capacity;
@@ -197,10 +121,10 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                }
 +                return self.wide_depth * width;
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: route `r`'s persistent loads (a prefill route with staging, after its plan) whose
-+            /// row does not hold the record and whose record a transient row of the layer holds (`stagedRows`): each one
-+            /// filled from that row at its part's wait (`copyLoads`), reading nothing, its staged row adopted. Then a pending
-+            /// copy from a row this route's transient reads overwrite is filled first (`copyGuard`).
++            /// Staged-row copies: route `r`'s persistent loads (a prefill route with staging, after its plan) whose row
++            /// does not hold the record and whose record a transient row of the layer holds (`stagedRows`): each one
++            /// filled from that row at its part's wait (`copyLoads`), reading nothing, its staged row adopted. Then a
++            /// pending copy from a row this route's transient reads overwrite is filled first (`copyGuard`).
 +            fn planCopies(self: *Stream, r: *Route) Error!void {
 +                const layer = r.layer;
 +                const plan = &r.plan;
@@ -232,7 +156,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                }
 +                if (any) try self.copyGuard(&hot, r);
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: transient row `t`'s staged record of `e` taken by a copy: adopted, as `noteStaged`
++            /// Staged-row copies: transient row `t`'s staged record of `e` taken by a copy: adopted, as `noteStaged`
 +            /// adopts a transient load's (a row of the layer's staging that still names it).
 +            fn adoptStaged(self: *Stream, layer: u32, t: u32, e: u16) void {
 +                const st = &self.stage;
@@ -241,11 +165,9 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                const row = t % width;
 +                if (st.layer != layer or w >= max_wide_depth or row >= st.n[w] or st.rows[w][row] != e) return;
 +                self.counters.stage_adopted += 1;
-+                stage_votes.noteAdopted(st.votes[w][row]);
-+                st.adopted[w][row] = true;
 +                st.rows[w][row] = expert_policy.no_expert;
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: the pending copies (of the routes not free, and `extra`) whose rows `hot` marks,
++            /// Staged-row copies: the pending copies (of the routes not free, and `extra`) whose rows `hot` marks,
 +            /// filled now: a route's transient reads or a staging's post are about to overwrite those rows.
 +            fn copyGuard(self: *Stream, hot: *const [max_wide_depth * max_route_ids]bool, extra: ?*Route) Error!void {
 +                for (&self.routes) |*o| {
@@ -262,7 +184,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                    try self.copyLoads(o, lis[0..n]);
 +                }
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: route `r`'s pending copies among part `p`'s loads, filled (`copyLoads`).
++            /// Staged-row copies: route `r`'s pending copies among part `p`'s loads, filled (`copyLoads`).
 +            fn copyPart(self: *Stream, r: *Route, p: *const Part) Error!void {
 +                var lis: [max_route_ids]u8 = undefined;
 +                var n: usize = 0;
@@ -273,7 +195,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                }
 +                try self.copyLoads(r, lis[0..n]);
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: every pending copy of route `r`, filled (`copyLoads`).
++            /// Staged-row copies: every pending copy of route `r`, filled (`copyLoads`).
 +            fn copyAll(self: *Stream, r: *Route) Error!void {
 +                var lis: [max_route_ids]u8 = undefined;
 +                var n: usize = 0;
@@ -284,11 +206,10 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                }
 +                try self.copyLoads(r, lis[0..n]);
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: route `r`'s loads `lis` (pending copies) filled from their rows: a row's staged
-+            /// part waited for if it is still reading (`copySource`), the rows' records copied into the loads' persistent
-+            /// rows in one run of the copy threads (`copyParallel`), each persistent row then ready. A row found holding
-+            /// another record (never expected) has the load's record read from the file instead. `check`: each copied
-+            /// record read again from the file into the scratch row and compared (`checkCopy`).
++            /// Staged-row copies: route `r`'s loads `lis` (pending copies) filled from their rows: a row's staged part
++            /// waited for if it is still reading (`copySource`), the rows' records copied into the loads' persistent
++            /// rows in one run of the copy threads (`copyParallel`), each persistent row then ready. A row found
++            /// holding another record (never expected) has the load's record read from the file instead.
 +            fn copyLoads(self: *Stream, r: *Route, lis: []const u8) Error!void {
 +                if (lis.len == 0) return;
 +                const layer = r.layer;
@@ -311,29 +232,18 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                        total += nb;
 +                    }
 +                }
-+                const t0 = expert_io.Pool.nowNs();
 +                copyParallel(copies[0..nc], total);
-+                scopy.copy_ns += @intCast(@max(expert_io.Pool.nowNs() - t0, 0));
-+                scopy.bytes += total;
 +                for (lis, held[0..lis.len]) |li, h| {
 +                    const l = r.plan.loads[li];
 +                    r.copy_src[li] = 0;
 +                    r.n_copy -= 1;
-+                    if (h) {
-+                        scopy.copied += 1;
-+                    } else {
-+                        scopy.lost += 1;
-+                        try self.readRecord(layer, l.slot, l.expert);
-+                    }
++                    if (!h) try self.readRecord(layer, l.slot, l.expert);
 +                    const m = self.locate(layer, l.slot).meta;
 +                    const pins = m.pins;
 +                    m.* = .{ .pins = pins, .state = .ready, .layer = @intCast(layer), .expert = l.expert };
 +                }
-+                if (scopy.mode == .check) for (lis, held[0..lis.len]) |li, h| {
-+                    if (h) try self.checkCopy(layer, r.plan.loads[li]);
-+                };
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: whether transient row `t` holds `e`'s record of `layer` once its staged part has
++            /// Staged-row copies: whether transient row `t` holds `e`'s record of `layer` once its staged part has
 +            /// landed: ready there, or reading in a part of the layer's pending staging (that part waited for now, the
 +            /// window left pending: `landWindow` marks its rows).
 +            fn copySource(self: *Stream, layer: u32, t: u32, e: u16) Error!bool {
@@ -349,17 +259,12 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                for (st.parts[w][0..st.n_parts[w]]) |*p| {
 +                    if (std.mem.indexOfScalar(u8, st.order[w][p.first..][0..p.n], @intCast(row)) == null) continue;
 +                    if (p.withdrawn) return false;
-+                    if (!p.settled) {
-+                        const t0 = expert_io.Pool.nowNs();
-+                        defer scopy.wait_ns += @intCast(@max(expert_io.Pool.nowNs() - t0, 0));
-+                        scopy.waited += 1;
-+                        try self.settleStaged(p);
-+                    }
++                    if (!p.settled) try self.settleStaged(p);
 +                    return true;
 +                }
 +                return false;
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: one staged part's reads waited for and counted, as `landWindowOf` lands a part (its
++            /// Staged-row copies: one staged part's reads waited for and counted, as `landWindowOf` lands a part (its
 +            /// rows marked when the window lands); a failed read fails the stream.
 +            fn settleStaged(self: *Stream, p: *Part) Error!void {
 +                p.settled = true;
@@ -377,7 +282,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                };
 +                if (!ok) return self.fail(if (waited) |_| error.ReadFailed else |err| err);
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: `e`'s record of `layer` read from the file into `slot`'s row now (a copy whose row
++            /// Staged-row copies: `e`'s record of `layer` read from the file into `slot`'s row now (a copy whose row
 +            /// held another record), its bytes counted as a load's.
 +            fn readRecord(self: *Stream, layer: u32, slot: u32, e: u16) Error!void {
 +                var rows: [expert_io.max_items][n_components]u64 = undefined;
@@ -385,11 +290,11 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                var down: [expert_io.max_items]u64 = undefined;
 +                var ids: [expert_io.max_items]u16 = undefined;
 +                const nr = self.entries(layer, slot, e, &rows, &gu, &down, &ids, 0);
-+                try self.readNow(layer, rows[0..nr], gu[0..nr], down[0..nr], ids[0..nr], true);
++                try self.readNow(layer, rows[0..nr], gu[0..nr], down[0..nr], ids[0..nr]);
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY: one pool job over entries (`entries`' form) submitted and waited for; `count`, its
-+            /// bytes in the stream's read counters. A failed read fails the stream.
-+            fn readNow(self: *Stream, layer: u32, rows: []const [n_components]u64, gu: []const u64, down: []const u64, ids: []const u16, count: bool) Error!void {
++            /// turboexl3_ds41: one pool job over entries (`entries`' form) submitted and waited for, its bytes in the
++            /// stream's read counters. A failed read fails the stream.
++            fn readNow(self: *Stream, layer: u32, rows: []const [n_components]u64, gu: []const u64, down: []const u64, ids: []const u16) Error!void {
 +                const ticket = try self.submit(layer, ids, gu, down, rows, &self.layers[layer].lens);
 +                const n: u32 = @intCast(2 * ids.len);
 +                const waited = self.waitReads(ticket, n);
@@ -397,56 +302,13 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                if (ok) for (0..n) |k| {
 +                    const res = self.pool.result(ticket + @as(u32, @intCast(k)));
 +                    if (res.status != .ok) ok = false;
-+                    if (!count) continue;
 +                    self.counters.expert_bytes_read += @intCast(@max(res.payload, 0));
 +                    self.counters.preadv_calls += @intCast(@max(res.preadv_calls, 0));
 +                    self.noteRead(res);
 +                };
 +                if (!ok) return self.fail(if (waited) |_| error.ReadFailed else |err| err);
 +            }
-+            /// MLX_SERVE_DSV41_STAGE_COPY=check: load `l`'s record (just copied into its persistent row) read again from the
-+            /// file into the scratch row (page memory, allocated once at the widest layer's components) and compared with
-+            /// the persistent row byte for byte: `scopy.checked`, and the differing bytes in `scopy.differ`.
-+            fn checkCopy(self: *Stream, layer: u32, l: expert_policy.Load) Error!void {
-+                const geom = &self.bank.layers[layer];
-+                const mn = minisOf(geom);
-+                if (self.sc_scratch == null) {
-+                    var bufs: [n_components][]u8 = undefined;
-+                    for (&bufs, 0..) |*b, c| {
-+                        var widest: u64 = 0;
-+                        for (self.layers, self.bank.layers) |*x, *g| widest = @max(widest, x.lens[c] * minisOf(g));
-+                        b.* = std.heap.page_allocator.alloc(u8, @intCast(widest)) catch {
-+                            for (bufs[0..c]) |y| std.heap.page_allocator.free(y);
-+                            return self.fail(error.ReadFailed);
-+                        };
-+                    }
-+                    self.sc_scratch = bufs;
-+                }
-+                const scratch = self.sc_scratch.?;
-+                var rows: [expert_io.max_items][n_components]u64 = undefined;
-+                var gu: [expert_io.max_items]u64 = undefined;
-+                var down: [expert_io.max_items]u64 = undefined;
-+                var ids: [expert_io.max_items]u16 = undefined;
-+                const sp = self.bank.spans(layer, l.expert);
-+                const stride = miniStride(geom);
-+                for (0..mn) |mi| {
-+                    const m: u64 = @intCast(mi);
-+                    for (&rows[mi], scratch, geom.segments) |*d, b, sg| d.* = @intFromPtr(b.ptr) + m * sg.length;
-+                    gu[mi] = sp.gu_offset + m * stride;
-+                    down[mi] = sp.down_offset + m * stride;
-+                    ids[mi] = l.expert;
-+                }
-+                try self.readNow(layer, rows[0..mn], gu[0..mn], down[0..mn], ids[0..mn], false);
-+                var d: u64 = 0;
-+                for (self.layers[layer].lens, 0..) |len, c| {
-+                    const nb: usize = @intCast(len * mn);
-+                    const a = self.slotRow(layer, l.slot, @enumFromInt(c))[0..nb];
-+                    const b = scratch[c][0..nb];
-+                    if (std.mem.eql(u8, a, b)) continue;
-+                    for (a, b) |x, y| d += @intFromBool(x != y);
-+                }
-+                scopy.checked += 1;
-+                scopy.differ += d;
-             }
-             /// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_TRIM): layer `layer`'s call has its routes (`used`: its distinct experts)
++            /// turboexl3_ds41: layer `layer`'s call has its routes (`used`: its distinct experts)
              /// and has taken its staged groups: each staged part of the layer's pending windows that holds none of them and that
+             /// no read worker has started is withdrawn from the read pool (`Pool.withdraw`: its tickets published unread, no
+             /// row written), its rows let go (a reading row emptied, every row unpinned) and named no longer (`windowRows`

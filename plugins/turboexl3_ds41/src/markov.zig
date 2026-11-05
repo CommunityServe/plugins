@@ -1,5 +1,5 @@
-//! The DSpark draft's Markov chain in B + 1 launches (`MLX_SERVE_DSV41_MARKOV`, read at load; the plan is MLX-free in
-//! src/markov_plan.zig). The copied model's draftRows (patches/turboexl3-z-markov.patch) hands `chain` the head's logits;
+//! The DSpark draft's Markov chain in B + 1 launches (the plan is MLX-free in src/markov_plan.zig). The copied model's
+//! draftRows (patches/turboexl3-z-markov.patch) hands `chain` the head's logits;
 //! without it every draft position is five dependent op groups (a take, a [1, rank] x [rank, vocab] matmul in the
 //! activation dtype, its cast, the add to the logits row, an argmax and its cast) and the confidence head's dot.
 //!
@@ -12,10 +12,10 @@
 //! (where every product of its dot is exact: `plan.confFused`). No host sync in between; the draft's one eval reads them.
 //!
 //! The bytes are the op chain's: the same products (exact: two 8- or 11-bit significands), sums in the same order, the
-//! same roundings. `check` runs both and compares tokens, confidence logits and every biased row bit for bit.
+//! same roundings.
 //!
-//! An odd position reads the rows from the far end (zig-zag, not with `flat`): the rows the position before read last
-//! are the ones the system cache may still hold. Which rows a threadgroup sums does not change a row's bytes.
+//! An odd position reads the rows from the far end (zig-zag): the rows the position before read last are the ones the
+//! system cache may still hold. Which rows a threadgroup sums does not change a row's bytes.
 
 const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
@@ -23,19 +23,6 @@ const log = @import("mlx_serve/sdk/util/log.zig");
 const plan = @import("markov_plan.zig");
 
 const A = mlx.mlx_array;
-
-pub const Mode = plan.Mode;
-pub const modeOf = plan.modeOf;
-
-/// Set at load from `MLX_SERVE_DSV41_MARKOV`.
-pub var mode: Mode = .off;
-
-pub fn on() bool {
-    return mode != .off;
-}
-
-/// Since the last request's end (`meters`).
-pub var tally: plan.Tally = .{};
 
 const header = @embedFile("kernels/markov_header.metal");
 const step_source = @embedFile("kernels/markov_step.metal");
@@ -62,7 +49,7 @@ pub const In = struct {
     /// f32 [1, dim + rank]: the confidence head
     cw: A,
     want_conf: bool,
-    /// the biased rows too (the sampled path's, `check`'s)
+    /// the biased rows too (the sampled path's)
     keep: bool,
 };
 
@@ -146,9 +133,7 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
         .dim = dimOf(in.hout, 1),
         .block = dimOf(in.logits, 0),
     };
-    tally.drafts += 1;
     if (plan.refusal(sh)) |r| {
-        tally.refused += 1;
         if (!refusal_said) log.info("[turboexl3_ds41] Markov chain: the draft keeps the op chain ({s})\n", .{@tagName(r)});
         refusal_said = true;
         return null;
@@ -159,7 +144,6 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
     const B = sh.block;
     const V = sh.vocab;
     const nt = plan.step_groups;
-    const zz: c_int = if (mode == .flat) 0 else 1;
     const act = mlx.mlx_array_dtype(in.mh);
     const edt = mlx.mlx_array_dtype(in.emb);
     // position 0's pin, never read: 8 elements, so MLX binds it in the device address space as every later pin
@@ -185,7 +169,7 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", ci(p)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NT", ci(nt)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KEEP", if (in.keep) 1 else 0));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ZZ", zz));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ZZ", 1));
         var o: [2]A = undefined;
         try apply(k.step, cfg, &.{ in.logits, in.emb, in.mh, in.t1, pin }, s, &o);
         _ = mlx.mlx_array_free(pin);
@@ -226,16 +210,14 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
         };
         out.rows = r;
     }
-    tally.fused += 1;
     return out;
 }
 
 /// MLX builds a custom kernel's library at its first launch, one per template instance (B step kernels and the last
 /// one: a few tens of ms each). At load, one chain over zero logits builds the ones `m`'s drafts run, so the first draft
-/// runs at speed; the tally starts after it.
+/// runs at speed.
 pub fn warm(s: mlx.mlx_stream, emb: A, mh: A, cw: A, hout_dtype: mlx.mlx_dtype, block: usize, dim: usize, want_conf: bool) !void {
-    defer tally = .{};
-    if (mode == .off or block == 0) return;
+    if (block == 0) return;
     var lg = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(lg);
     try mlx.check(mlx.mlx_zeros(&lg, &[_]c_int{ ci(block), ci(dimOf(mh, 0)) }, 2, .float32, s));
@@ -245,7 +227,7 @@ pub fn warm(s: mlx.mlx_stream, emb: A, mh: A, cw: A, hout_dtype: mlx.mlx_dtype, 
     const zero: i32 = 0;
     const t1 = mlx.mlx_array_new_data(&zero, &[_]c_int{1}, 1, .int32);
     defer _ = mlx.mlx_array_free(t1);
-    const o = (try chain(s, .{ .logits = lg, .hout = hout, .t1 = t1, .emb = emb, .mh = mh, .cw = cw, .want_conf = want_conf, .keep = mode == .check })) orelse return;
+    const o = (try chain(s, .{ .logits = lg, .hout = hout, .t1 = t1, .emb = emb, .mh = mh, .cw = cw, .want_conf = want_conf, .keep = false })) orelse return;
     defer {
         _ = mlx.mlx_array_free(o.toks);
         if (o.conf) |x| _ = mlx.mlx_array_free(x);
@@ -255,63 +237,4 @@ pub fn warm(s: mlx.mlx_stream, emb: A, mh: A, cw: A, hout_dtype: mlx.mlx_dtype, 
     const vec = mlx.mlx_vector_array_new_data(&ev, ev.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_eval(vec));
-}
-
-/// `check`: the fused draft against the op chain's (evaluated), bit for bit; the tally counts what differs, and the
-/// first few differences are logged.
-pub fn compare(f: Out, toks: A, conf: ?A, rows: ?A) !void {
-    var ev: [3]A = undefined;
-    var n: usize = 0;
-    ev[n] = f.toks;
-    n += 1;
-    if (f.conf) |x| {
-        ev[n] = x;
-        n += 1;
-    }
-    if (f.rows) |x| {
-        ev[n] = x;
-        n += 1;
-    }
-    const vec = mlx.mlx_vector_array_new_data(&ev, n);
-    defer _ = mlx.mlx_vector_array_free(vec);
-    try mlx.check(mlx.mlx_eval(vec));
-    tally.checked += 1;
-    const B = mlx.mlx_array_size(f.toks);
-    const ft = mlx.mlx_array_data_int32(f.toks) orelse return error.NoData;
-    const ot = mlx.mlx_array_data_int32(toks) orelse return error.NoData;
-    if (!std.mem.eql(i32, ft[0..B], ot[0..B])) {
-        tally.token_drafts += 1;
-        if (tally.token_drafts <= 4) log.info("[markov] check: tokens differ: fused {any}, op chain {any}\n", .{ ft[0..B], ot[0..B] });
-    }
-    if (f.conf != null and conf != null) {
-        const fc = mlx.mlx_array_data_float32(f.conf.?) orelse return error.NoData;
-        const oc = mlx.mlx_array_data_float32(conf.?) orelse return error.NoData;
-        if (!std.mem.eql(u32, @as([*]const u32, @ptrCast(fc))[0..B], @as([*]const u32, @ptrCast(oc))[0..B])) {
-            tally.conf_drafts += 1;
-            if (tally.conf_drafts <= 4) log.info("[markov] check: confidence differs: fused {any}, op chain {any}\n", .{ fc[0..B], oc[0..B] });
-        }
-    }
-    if (f.rows != null and rows != null) {
-        const len = mlx.mlx_array_size(f.rows.?);
-        if (len != mlx.mlx_array_size(rows.?)) return error.MarkovShape;
-        const fr: [*]const u32 = @ptrCast(mlx.mlx_array_data_float32(f.rows.?) orelse return error.NoData);
-        const or_: [*]const u32 = @ptrCast(mlx.mlx_array_data_float32(rows.?) orelse return error.NoData);
-        var d: u64 = 0;
-        var first: ?usize = null;
-        for (0..len) |i| if (fr[i] != or_[i]) {
-            d += 1;
-            if (first == null) first = i;
-        };
-        tally.elems += len;
-        tally.row_elems += d;
-        if (d > 0 and tally.row_elems == d) log.info("[markov] check: {d} of {d} biased row elements differ, the first at {d}: fused 0x{x:0>8}, op chain 0x{x:0>8}\n", .{ d, len, first.?, fr[first.?], or_[first.?] });
-    }
-}
-
-/// `[markov]` at a request's end when the setting is on; the tally starts again.
-pub fn meters(buf: []u8) []const u8 {
-    if (mode == .off) return buf[0..0];
-    const l = tally.line(mode, buf);
-    tally = .{};
-    return l;
 }

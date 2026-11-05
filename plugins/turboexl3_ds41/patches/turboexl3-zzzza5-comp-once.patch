@@ -1,7 +1,7 @@
 diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
-@@ -2742,6 +2742,9 @@
+@@ -2615,6 +2615,9 @@
      floor: ?usize = null,
      /// Set by `attention` when it handed back the heads grouped and inverse-roped (`attnGather`'s `grouped`).
      grouped: bool = false,
@@ -11,16 +11,16 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  };
  /// `x` normed attention input `[L, dim]` at positions [p0, p0 + L). With `pre` (the rows' projections,
  /// made over the whole chunk by `wideLayer`) the heads `[L, H, hd]` come back before `attnOut`.
-@@ -2778,7 +2781,7 @@
+@@ -2650,7 +2653,7 @@
      if (ly.ratio > 0) {
          const r: usize = ly.ratio;
          const clen = (p0 + L) / r;
 -        if (ly.comp) |*cw| if (sh.floor == null) {
 +        if (ly.comp) |*cw| if (sh.floor == null and !sh.compressed) {
              try compress(sc, m, st, li, cw, x, p0);
-             try prof.mark(.compressor, &.{ if (ls.comp) |rw| rw.buf else none, if (ls.idx_k) |rw| rw.buf else none, ls.pend_kv, ls.pend_gate });
          };
-@@ -5055,6 +5058,20 @@
+         if (ly.idx) |*iw| {
+@@ -4742,6 +4745,18 @@
      const ig_r = m.ratio(li);
      const ig_g: usize = if (ly.idx != null and ig_r > 0) igroup.groupSpans(n_spans, sp.span, (sp.p0 + sp.L) / ig_r) else n_spans;
      var ig_start: usize = 0;
@@ -34,14 +34,12 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
 +        const lo, const hi = sp.bounds(k);
 +        var csc = Scope.init(gpa, m.s);
 +        defer csc.deinit();
-+        const ls = &st.layers[li];
 +        try compress(&csc, m, st, li, &ly.comp.?, try csc.slice(pa.h, 0, lo, hi), sp.p0 + lo);
-+        try prof.mark(.compressor, &.{ if (ls.comp) |rw| rw.buf else none, if (ls.idx_k) |rw| rw.buf else none, ls.pend_kv, ls.pend_gate });
 +    };
-     // MLX_SERVE_DSV41_SCRATCH_HEADS (phase B): a full run's grouped heads straight into a run region (`[rows, og, in]`),
-     // its `wo_a` reading the region: no join, no transpose (with the ring on and an EXL3 `wo_a`).
-     const heads_b = run > 1 and try sat.headsLayerBegin(sat.heads_mode != .off and sat.mode == .on and ly.wo_a.x3 != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
-@@ -5064,7 +5081,7 @@
+     // src/scratch_attn.zig: a full run's grouped heads straight into a run region (`[rows, og, in]`), its `wo_a` reading
+     // the region: no join, no transpose (with an EXL3 `wo_a`).
+     const heads_b = run > 1 and try sat.headsLayerBegin(ly.wo_a.x3 != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
+@@ -4751,7 +4766,7 @@
          // A span's core intermediates are dropped once built, as in the per-span path.
          var ssc = Scope.init(gpa, m.s);
          defer ssc.deinit();
@@ -49,4 +47,4 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
 +        var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .compressed = comp_first };
          var span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
          if (pj.qt.ctx != null) span_pj.qt = try ssc.slice(pj.qt, 0, lo, hi);
-         if (pj.qh.ctx != null) span_pj.qh = try ssc.slice(pj.qh, 0, lo, hi);
+         // Whether this span's run takes a region (its `run` spans all of `sp.span` rows).

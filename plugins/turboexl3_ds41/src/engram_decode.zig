@@ -1,11 +1,10 @@
-//! `MLX_SERVE_DSV41_ENGRAM_DECODE` (read at load; unset, empty or `1`: on; `0`: off; `check`: on and checked; anything
-//! else is refused by name) and `MLX_SERVE_DSV41_ENGRAM_LRU_MB` (its size in MiB, 1 to 16384; unset: 256): Engram rows
-//! kept across a conversation's turns in an LRU, a decode read's misses read at high parallelism.
+//! Engram rows kept across a conversation's turns in an LRU (`MLX_SERVE_DSV41_ENGRAM_LRU_MB`, read at load: its size in
+//! MiB, 1 to 16384; unset: 256), a decode read's misses read at high parallelism.
 //!
-//! A DSpark verify's 6 rows read 24 n-gram ids a table, past the page cache (MLX_SERVE_DSV41_ENGRAM_DIRECT; a pread a
+//! A DSpark verify's 6 rows read 24 n-gram ids a table, past the page cache (the direct Engram reads; a pread a
 //! half-row in oMLX's layout, one a record in a repacked table), on a prefetch thread from the forward's start, a row a
 //! GCD work item (about 9-10 reads in flight); the first Engram layer waits for the first table's: ~2.0 ms a round, the
-//! GPU idle ~1.0 ms of it (tp1, w-20261101-1811: 0.98 ms median at layer 1's entry, the verify's largest gap). On:
+//! GPU idle ~1.0 ms of it (tp1, w-20261101-1811: 0.98 ms median at layer 1's entry, the verify's largest gap). Instead:
 //! - one LRU of rows over the tables (keyed by table and id, `lru_mb` MiB with its index), kept across requests: a
 //!   prompt grid's distinct rows go in as the whole-table read hands its spans over (ENGRAM_DIRECT; 310,174 rows over
 //!   the two tables for a 16K-token prompt), and so does every row a decode read reads;
@@ -13,18 +12,12 @@
 //!   read (a repacked table's record, else a row's codes or its scales) a work item;
 //! - a round's bonus token (`t1`, the verify's first row, known before its draft runs) has its rows read when the round
 //!   starts, on a GCD worker, into the LRU, where the verify after the draft finds them.
-//! `check` reads every row of a decode read and compares the ones the LRU held with them (`compare`; the gate: 0 differ),
-//! the read ones served. The LRU's bytes are billed at the load beside the host's own (`bill.engram_store_bytes`): fewer
-//! slot rows where they do not fit beside them; the load line says how many. Exact: a row's bytes are the table's
-//! whichever way they come.
+//! The LRU's bytes are billed at the load beside the host's own (`bill.engram_store_bytes`): fewer slot rows where they
+//! do not fit beside them; the load line says how many. Exact: a row's bytes are the table's whichever way they come.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const Mode = enum { off, on, check };
-
-/// Set at load (`parse`: on unless `0`); off until then.
-pub var mode: Mode = .off;
 /// The LRU's bytes in MiB (`MLX_SERVE_DSV41_ENGRAM_LRU_MB`), set at load.
 pub var lru_mb: u32 = default_mb;
 pub const default_mb: u32 = 256;
@@ -37,16 +30,7 @@ pub const max_tables = 4;
 /// The longest row part (codes, scales or biases) an early read holds.
 pub const max_part = 512;
 
-pub const Error = error{ EngramDecodeSetting, EngramLruSetting };
-
-/// `value`: null, empty or `1` on; `0` off; `check`; anything else refused by name.
-pub fn parse(value: ?[]const u8) Error!Mode {
-    const v = value orelse return .on;
-    if (v.len == 0 or std.mem.eql(u8, v, "1")) return .on;
-    if (std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "check")) return .check;
-    return error.EngramDecodeSetting;
-}
+pub const Error = error{EngramLruSetting};
 
 /// `value`: null or empty `default_mb`; a whole number of MiB in [1, `max_mb`]; anything else refused by name.
 pub fn parseMb(value: ?[]const u8) Error!u32 {
@@ -57,13 +41,9 @@ pub fn parseMb(value: ?[]const u8) Error!u32 {
     return n;
 }
 
-pub fn on() bool {
-    return mode != .off;
-}
-
-/// What the load bills for the LRU (`bill.engram_store_bytes`): its bytes on, 0 off.
+/// What the load bills for the LRU (`bill.engram_store_bytes`): its bytes.
 pub fn billBytes() u64 {
-    return if (on()) @as(u64, lru_mb) << 20 else 0;
+    return @as(u64, lru_mb) << 20;
 }
 
 /// A pthread mutex: the LRU's users are the prefetch threads, GCD workers and the model's thread, with no `Io` among them.
@@ -199,7 +179,6 @@ const Lru = struct {
             x = l.tail;
             l.unlinkList(x);
             l.unlinkHash(x);
-            _ = evictions.fetchAdd(1, .monotonic);
         }
         l.keys[x] = key;
         const bk = l.bucketOf(key);
@@ -210,7 +189,6 @@ const Lru = struct {
         @memcpy(d[0..l.wlen], w);
         @memcpy(d[l.wlen..][0..l.slen], s);
         @memcpy(d[l.wlen + l.slen ..][0..l.blen], b);
-        _ = inserted.fetchAdd(1, .monotonic);
     }
 
     /// Row `key`'s bytes copied out when held (it made the most recent).
@@ -244,56 +222,33 @@ fn lruFor(wlen: usize, slen: usize, blen: usize) ?*Lru {
     return if (lru.fits(wlen, slen, blen)) &lru else null;
 }
 
-/// Counters since the load: ids a decode read took from the LRU and ids it read; rows put in (a prompt grid's and the
-/// reads') and those that gave way; rows read early, early reads skipped with one in flight or failed; rows compared
-/// under `check` and those that differ.
-pub var hits: std.atomic.Value(u64) = .init(0);
-pub var misses: std.atomic.Value(u64) = .init(0);
-pub var inserted: std.atomic.Value(u64) = .init(0);
-pub var evictions: std.atomic.Value(u64) = .init(0);
-pub var prompt_rows: std.atomic.Value(u64) = .init(0);
-pub var early_rows: std.atomic.Value(u64) = .init(0);
-pub var early_busy: std.atomic.Value(u64) = .init(0);
-pub var early_failed: std.atomic.Value(u64) = .init(0);
-pub var checked: std.atomic.Value(u64) = .init(0);
-pub var differ: std.atomic.Value(u64) = .init(0);
-
 /// A prompt grid's table read whole: its distinct ids and their rows (`w`, `s`, `b` in the ids' order) into the LRU.
 pub fn keep(fd: c_int, wlen: usize, slen: usize, blen: usize, ids: []const u32, w: []const u8, s: []const u8, b: []const u8) void {
-    if (!on() or ids.len == 0) return;
+    if (ids.len == 0) return;
     mutex.lock();
     defer mutex.unlock();
     const l = lruFor(wlen, slen, blen) orelse return;
     for (ids, 0..) |id, i| l.put(keyOf(fd, id), w[i * wlen ..][0..wlen], s[i * slen ..][0..slen], b[i * blen ..][0..blen]);
-    _ = prompt_rows.fetchAdd(ids.len, .monotonic);
 }
 
 /// A decode read of table `fd`'s `ids`: each one the LRU holds copied into its place in `w`, `s` and `b` (rows of `wlen`,
-/// `slen`, `blen` B), `held` saying which; the count held. Counts the hits and misses.
+/// `slen`, `blen` B), `held` saying which; the count held.
 pub fn take(fd: c_int, ids: []const u32, wlen: usize, slen: usize, blen: usize, w: []u8, s: []u8, b: []u8, held: []bool) usize {
     @memset(held, false);
     mutex.lock();
     defer mutex.unlock();
-    const l = lruFor(wlen, slen, blen) orelse return miss(ids.len);
+    const l = lruFor(wlen, slen, blen) orelse return 0;
     var n: usize = 0;
     for (ids, 0..) |id, i| {
         if (!l.get(keyOf(fd, id), w[i * wlen ..][0..wlen], s[i * slen ..][0..slen], b[i * blen ..][0..blen])) continue;
         held[i] = true;
         n += 1;
     }
-    _ = hits.fetchAdd(n, .monotonic);
-    _ = misses.fetchAdd(ids.len - n, .monotonic);
     return n;
-}
-
-fn miss(n: usize) usize {
-    _ = misses.fetchAdd(n, .monotonic);
-    return 0;
 }
 
 /// The rows a decode read read (those `held` does not mark) into the LRU.
 pub fn putMisses(fd: c_int, ids: []const u32, held: []const bool, wlen: usize, slen: usize, blen: usize, w: []const u8, s: []const u8, b: []const u8) void {
-    if (!on()) return;
     mutex.lock();
     defer mutex.unlock();
     const l = lruFor(wlen, slen, blen) orelse return;
@@ -301,21 +256,6 @@ pub fn putMisses(fd: c_int, ids: []const u32, held: []const bool, wlen: usize, s
         if (i < held.len and held[i]) continue;
         l.put(keyOf(fd, id), w[i * wlen ..][0..wlen], s[i * slen ..][0..slen], b[i * blen ..][0..blen]);
     }
-}
-
-/// `check`: each held row's bytes from the LRU (`kw`, `ks`, `kb`) compared with the ones read (`w`, `s`, `b`).
-pub fn compare(held: []const bool, wlen: usize, slen: usize, blen: usize, w: []const u8, s: []const u8, b: []const u8, kw: []const u8, ks: []const u8, kb: []const u8) void {
-    var n: u64 = 0;
-    var bad: u64 = 0;
-    for (held, 0..) |h, i| {
-        if (!h) continue;
-        n += 1;
-        if (!std.mem.eql(u8, w[i * wlen ..][0..wlen], kw[i * wlen ..][0..wlen]) or
-            !std.mem.eql(u8, s[i * slen ..][0..slen], ks[i * slen ..][0..slen]) or
-            !std.mem.eql(u8, b[i * blen ..][0..blen], kb[i * blen ..][0..blen])) bad += 1;
-    }
-    _ = checked.fetchAdd(n, .monotonic);
-    _ = differ.fetchAdd(bad, .monotonic);
 }
 
 // ── the decode reads' pool ──
@@ -425,12 +365,8 @@ const Early = struct {
         const w = e.w[0 .. n * e.wlen];
         const s = e.s[0 .. n * e.slen];
         const b = e.b[0 .. n * e.blen];
-        if (!e.read(e.ctx, e.ids[0..n], w, s, b)) {
-            _ = early_failed.fetchAdd(1, .monotonic);
-            return;
-        }
+        if (!e.read(e.ctx, e.ids[0..n], w, s, b)) return;
         putMisses(e.fd, e.ids[0..n], &.{}, e.wlen, e.slen, e.blen, w, s, b);
-        _ = early_rows.fetchAdd(n, .monotonic);
     }
 };
 var early_jobs: [max_tables]Early = @splat(.{});
@@ -443,12 +379,9 @@ extern "c" fn dispatch_async_f(queue: ?*anyopaque, context: ?*anyopaque, work: *
 /// hold read now on a GCD worker into it; returns at once. Skipped while the table's last one is still in flight.
 pub fn early(slot: usize, ctx: *const anyopaque, read: ReadFn, fd: c_int, wlen: usize, slen: usize, blen: usize, ids: []const u32) void {
     if (comptime !builtin.os.tag.isDarwin()) return;
-    if (!on() or slot >= max_tables or ids.len == 0 or ids.len > max_early or wlen > max_part or slen > max_part or blen > max_part) return;
+    if (slot >= max_tables or ids.len == 0 or ids.len > max_early or wlen > max_part or slen > max_part or blen > max_part) return;
     const e = &early_jobs[slot];
-    if (e.busy.swap(true, .acquire)) {
-        _ = early_busy.fetchAdd(1, .monotonic);
-        return;
-    }
+    if (e.busy.swap(true, .acquire)) return;
     var n: usize = 0;
     {
         mutex.lock();
@@ -492,62 +425,6 @@ pub fn size() struct { rows: u64, cap: u64, bytes: u64 } {
     return .{ .rows = lru.used, .cap = lru.cap, .bytes = if (lru.ready) lru.bytes() else 0 };
 }
 
-pub const Snap = struct {
-    hits: u64 = 0,
-    misses: u64 = 0,
-    inserted: u64 = 0,
-    evictions: u64 = 0,
-    prompt: u64 = 0,
-    early: u64 = 0,
-    early_busy: u64 = 0,
-    early_failed: u64 = 0,
-    checked: u64 = 0,
-    differ: u64 = 0,
-
-    pub fn sub(b: Snap, a: Snap) Snap {
-        var d: Snap = .{};
-        inline for (@typeInfo(Snap).@"struct".field_names) |f| @field(d, f) = @field(b, f) -| @field(a, f);
-        return d;
-    }
-};
-
-pub fn snap() Snap {
-    return .{
-        .hits = hits.load(.monotonic),
-        .misses = misses.load(.monotonic),
-        .inserted = inserted.load(.monotonic),
-        .evictions = evictions.load(.monotonic),
-        .prompt = prompt_rows.load(.monotonic),
-        .early = early_rows.load(.monotonic),
-        .early_busy = early_busy.load(.monotonic),
-        .early_failed = early_failed.load(.monotonic),
-        .checked = checked.load(.monotonic),
-        .differ = differ.load(.monotonic),
-    };
-}
-
-/// The counters at the last request's end (or the load).
-var last: Snap = .{};
-
-pub fn start() void {
-    last = snap();
-}
-
-/// At a request's end: `[engram-decode]` with the request's counts and the LRU's rows now; nothing off.
-pub fn meters(buf: []u8) []const u8 {
-    if (!on()) return buf[0..0];
-    const now = snap();
-    const d = now.sub(last);
-    last = now;
-    const z = size();
-    var w = std.Io.Writer.fixed(buf);
-    w.print("[engram-decode] mode={s} lru_mb={d} lru_rows={d} lru_cap={d} prompt_rows={d} inserted={d} evictions={d} hits={d} misses={d} early={d} early_busy={d} early_failed={d} checked={d} differ={d} pool={d}\n", .{
-        @tagName(mode), lru_mb,  z.rows,       z.cap,     d.prompt,  d.inserted, d.evictions, d.hits, d.misses, d.early,
-        d.early_busy,   d.early_failed, d.checked, d.differ, pool.width,
-    }) catch {};
-    return w.buffered();
-}
-
 // ── tests ──
 
 const testing = std.testing;
@@ -556,36 +433,24 @@ fn resetForTest() void {
     if (lru.ready) _ = lru.drop();
 }
 
-test "engram decode settings: the switch (unset, empty or 1 on; 0 off; check) and the LRU's MiB (unset 256; 1 to 16384), anything else refused by name" {
-    for ([_]?[]const u8{ null, "", "1" }) |v| try testing.expectEqual(Mode.on, try parse(v));
-    try testing.expectEqual(Mode.off, try parse("0"));
-    try testing.expectEqual(Mode.check, try parse("check"));
-    for ([_][]const u8{ "on", "2", "Check", "1 ", "true" }) |v| try testing.expectError(error.EngramDecodeSetting, parse(v));
+test "engram decode setting: the LRU's MiB (unset 256; 1 to 16384), anything else refused by name" {
     try testing.expectEqual(@as(u32, 256), try parseMb(null));
     try testing.expectEqual(@as(u32, 256), try parseMb(""));
     try testing.expectEqual(@as(u32, 1), try parseMb("1"));
     try testing.expectEqual(@as(u32, 16384), try parseMb("16384"));
     for ([_][]const u8{ "0", "16385", "-1", "256M", " 256", "1.5" }) |v| try testing.expectError(error.EngramLruSetting, parseMb(v));
-    const saved = .{ mode, lru_mb };
-    defer {
-        mode = saved[0];
-        lru_mb = saved[1];
-    }
-    mode = .off;
-    try testing.expectEqual(@as(u64, 0), billBytes());
-    mode = .check;
+    const saved = lru_mb;
+    defer lru_mb = saved;
     lru_mb = 300;
     try testing.expectEqual(@as(u64, 300 << 20), billBytes());
 }
 
 test "engram decode LRU: a grid's rows taken by id across tables, the least recently used giving way, a used row kept" {
-    const saved = .{ mode, lru_mb };
+    const saved = lru_mb;
     defer {
-        mode = saved[0];
-        lru_mb = saved[1];
+        lru_mb = saved;
         resetForTest();
     }
-    mode = .on;
     lru_mb = 1;
     resetForTest();
     // 1 MiB at 8 + 4 B rows (40 B with the index): 26,214 slots
@@ -621,7 +486,6 @@ test "engram decode LRU: a grid's rows taken by id across tables, the least rece
     // a grid of cap - 1 new rows: three of the four held give way in order of use, table a's 3 (used just now) stays
     const cap: usize = @intCast(size().cap);
     try testing.expectEqual(@as(usize, 1), take(a, &.{3}, 8, 4, 0, w[0..8], s[0..4], &.{}, held[0..1]));
-    const e0 = evictions.load(.monotonic);
     const ids = try testing.allocator.alloc(u32, cap - 1);
     defer testing.allocator.free(ids);
     for (ids, 0..) |*x, i| x.* = @intCast(1000 + i);
@@ -633,7 +497,6 @@ test "engram decode LRU: a grid's rows taken by id across tables, the least rece
     @memset(sb, 7);
     keep(a, 8, 4, 0, ids, wb, sb, &.{});
     try testing.expectEqual(@as(u64, cap), size().rows);
-    try testing.expectEqual(e0 + 3, evictions.load(.monotonic));
     // given way: z's 7, a's 7 and 5 (used before a's 3); a's 3 and the grid's rows held
     try testing.expectEqual(@as(usize, 0), take(z, &.{7}, 8, 4, 0, w[0..8], s[0..4], &.{}, held[0..1]));
     try testing.expectEqual(@as(usize, 0), take(a, &.{ 7, 5 }, 8, 4, 0, w[0..16], s[0..8], &.{}, held[0..2]));
@@ -643,19 +506,6 @@ test "engram decode LRU: a grid's rows taken by id across tables, the least rece
     // dropped at a table's close
     forget(a);
     try testing.expectEqual(@as(u64, 0), size().rows);
-}
-
-test "engram decode check: a held row read back differently is counted" {
-    const w: [16]u8 = @splat(1);
-    var kw = w;
-    kw[12] = 2;
-    const s: [2]u8 = @splat(3);
-    const c0 = checked.load(.monotonic);
-    const d0 = differ.load(.monotonic);
-    compare(&.{ true, true }, 8, 1, 0, &w, &s, &.{}, &kw, &s, &.{});
-    compare(&.{ false, false }, 8, 1, 0, &w, &s, &.{}, &kw, &s, &.{});
-    try testing.expectEqual(c0 + 2, checked.load(.monotonic));
-    try testing.expectEqual(d0 + 1, differ.load(.monotonic));
 }
 
 test "engram decode pool: every item once, on the pool's threads and the caller's, job after job" {
@@ -677,13 +527,11 @@ test "engram decode pool: every item once, on the pool's threads and the caller'
 
 test "engram decode early read: the ids the LRU does not hold read on a GCD worker into it" {
     if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
-    const saved = .{ mode, lru_mb };
+    const saved = lru_mb;
     defer {
-        mode = saved[0];
-        lru_mb = saved[1];
+        lru_mb = saved;
         resetForTest();
     }
-    mode = .on;
     lru_mb = 1;
     resetForTest();
     const fd: c_int = 4444;

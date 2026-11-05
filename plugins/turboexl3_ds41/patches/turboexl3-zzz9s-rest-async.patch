@@ -1,34 +1,14 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -308,6 +308,7 @@
-     pub const MLX_SERVE_DSV41_Q_TAIL: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layer query heads (turboexl3_ds41): wq_b's output kept as the unroped heads and only their last channels roped apart, both read by the gather's scores; the same scores, one head-sized copy fewer a layer (=0: the whole roped copy; check: the copy served, the tail and the scores compared word for word, [q-tail] check lines)" };
-     pub const MLX_SERVE_DSV41_RA_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' read-ahead prediction on the fused hc kernels (turboexl3_ds41): the attention-side mix first, the prediction from one more pass of its norm kernel under the FFN's norm; served bytes unchanged (=0: the op chain)" };
-     pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
-+    pub const MLX_SERVE_DSV41_REST_ASYNC: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers (turboexl3_ds41): on, a wide layer followed by another wide one has its last eval committed, not waited for, so the next layer's start runs while the GPU finishes this one's tail; the same kernels in the same order (0: each wide layer waited for)" };
-     pub const MLX_SERVE_DSV41_REST_EARLY: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers (turboexl3_ds41): on, a layer's new streams (its routed call's tail kernel with its inputs' small ops) committed at the call's end, before the layer's teardown, so the GPU runs them while the host frees the layer; the same kernels and words; 0: off (the layer's last eval after the teardown)" };
-     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "turboexl3", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' decode (turboexl3, the default: turboexl3_ds41's banked decode; streamer: the streamer's own EXL3 kernels)" };
-     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
 diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
-@@ -67,6 +67,9 @@
- /// A wide layer's attention projections' large outputs kept past its teardown, for the next wide layer's to take their
- /// buffers back from MLX's cache (turboexl3_ds41's src/transient_keep.zig, `MLX_SERVE_DSV41_TRANSIENT_KEEP`).
- const tkeep = @import("../../../transient_keep.zig");
-+/// A wide layer with a wide one after it committed at its end, not waited for (turboexl3_ds41's src/rest_async.zig,
-+/// `MLX_SERVE_DSV41_REST_ASYNC`).
-+const rasync = @import("../../../rest_async.zig");
- /// A wide layer's heads left unroped, their roped last channels apart, read together by the gather's scores
- /// (turboexl3_ds41's src/q_tail.zig, `MLX_SERVE_DSV41_Q_TAIL`).
- const qtail = @import("../../../q_tail.zig");
-@@ -4705,6 +4708,14 @@
+@@ -4472,7 +4472,14 @@
+             defer ev.deinit(gpa);
              for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
              try appendLayerState(gpa, &ev, &st.layers[li]);
-             try prof.mark(.rest, ev.items);
-+            // turboexl3_ds41 (MLX_SERVE_DSV41_REST_ASYNC): a wide layer with a wide one after it is committed, not waited
-+            // for: the next layer's start (its graph, its read-ahead's first buffers) runs under this one's tail.
-+            if (rasync.on and wide and li + 1 < hi) {
+-            try prof.mark(.rest, ev.items);
++            // turboexl3_ds41: a wide layer with a wide one after it is committed, not waited for: the next layer's start
++            // (its graph, its read-ahead's first buffers) runs under this one's tail.
++            if (wide and li + 1 < hi) {
 +                const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
 +                defer _ = mlx.mlx_vector_array_free(vec);
 +                try mlx.check(mlx.mlx_async_eval(vec));

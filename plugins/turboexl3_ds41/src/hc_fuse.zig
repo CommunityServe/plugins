@@ -1,41 +1,20 @@
-//! `MLX_SERVE_DSV41_HC_FUSE` (read at load; unset, empty or `1`: on; `0`: off; `check`; any other value is refused by
-//! name): a wide prompt layer's hyper-connection stages with fewer passes over the stream (`[L, hc, D]`, 671 MB of bf16
-//! at 16K rows).
+//! A wide prompt layer's hyper-connection stages with fewer passes over the stream (`[L, hc, D]`, 671 MB of bf16 at 16K
+//! rows).
 //!
-//! Off (`0`), the copied model runs each side's stage as separate kernels. The attention side: hc_mix (the 24 mixes of every
-//! row) reads the stream, then hc_norm (the split, and the collapse of the stream with the previous mix rms-normed) reads
-//! it again (and RA_FUSED's read-ahead norm a third time). The FFN side: the hc expand writes the new stream x1 (the x1
-//! region), hc_mix reads it, hc_norm reads it again. On (the default): the attention side's mixes and norm (and the read-ahead's
-//! norm) are one launch, `kernels/hc_mix_norm.metal`, its mix threadgroups hc_mix's statements and each row group's norm
-//! threadgroup hc_norm's (it runs beside the row group's mix threadgroups, which read the same rows); the FFN side's
-//! expand and norm are one launch, `kernels/hc_expand_norm.metal` (one threadgroup a row: each thread expands its columns
-//! of every copy with the expand's fmas and collapses them from its registers), hc_mix then reads the new stream; both
-//! sides take the split from the mixes after (hc_split, the decode stage's own kernel: hc_norm's split statements). The
-//! same reductions: every sum over the same threads (`hc_tg`), the same simd sums, the same partials in the same order;
-//! a GPU that runs a fused kernel at fewer threads than `hc_tg` refuses it by name at load (the stock kernels serve).
-//! `check`: the stock kernels served, the fused launches run beside them and every output compared word for word (the
-//! mixes, the split, the normed rows, the new stream): a `[hc-fuse] check` line a side a wide layer.
+//! Unfused, the copied model runs each side's stage as separate kernels. The attention side: hc_mix (the 24 mixes of
+//! every row) reads the stream, then hc_norm (the split, and the collapse of the stream with the previous mix
+//! rms-normed) reads it again (and RA_FUSED's read-ahead norm a third time). The FFN side: the hc expand writes the new
+//! stream x1 (the x1 region), hc_mix reads it, hc_norm reads it again. Fused: the attention side's mixes and norm (and
+//! the read-ahead's norm) are one launch, `kernels/hc_mix_norm.metal`, its mix threadgroups hc_mix's statements and
+//! each row group's norm threadgroup hc_norm's (it runs beside the row group's mix threadgroups, which read the same
+//! rows); the FFN side's expand and norm are one launch, `kernels/hc_expand_norm.metal` (one threadgroup a row: each
+//! thread expands its columns of every copy with the expand's fmas and collapses them from its registers), hc_mix then
+//! reads the new stream; both sides take the split from the mixes after (hc_split, the decode stage's own kernel:
+//! hc_norm's split statements). The same reductions: every sum over the same threads (`hc_tg`), the same simd sums, the
+//! same partials in the same order; a GPU that runs a fused kernel at fewer threads than `hc_tg` refuses it by name at
+//! load (the stock kernels serve).
 
 const std = @import("std");
-
-pub const Mode = enum { off, on, check };
-
-/// The switch (`configure`, at load; the model sets it off when it refuses the kernels).
-pub var mode: Mode = .on;
-
-pub const Error = error{HcFuseSetting};
-
-pub fn configure(value: ?[]const u8) Error!void {
-    mode = try parse(value);
-}
-
-pub fn parse(value: ?[]const u8) Error!Mode {
-    const v = value orelse return .on;
-    if (v.len == 0 or std.mem.eql(u8, v, "1")) return .on;
-    if (std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "check")) return .check;
-    return error.HcFuseSetting;
-}
 
 /// The attention side's launch (hc_mix's threadgroups, then each row group's hc_norm threadgroup).
 pub const mix_norm_source = @embedFile("kernels/hc_mix_norm.metal");
@@ -43,20 +22,6 @@ pub const mix_norm_source = @embedFile("kernels/hc_mix_norm.metal");
 pub const expand_norm_source = @embedFile("kernels/hc_expand_norm.metal");
 pub const expand_norm_fresh_header = "#define CARRIER_INIT\n#define X1_AT(i) x1[i]\n";
 pub const expand_norm_into_header = "#define CARRIER_INIT if (tid == 0 && l == 0) carrier[0] = 0;\n#define X1_AT(i) ((device T*)dst)[i]\n";
-
-/// One side's `check` of one wide layer: the words compared and those that differ.
-pub fn report(layer: usize, side: []const u8, words: u64, differ: u64) void {
-    std.debug.print("[hc-fuse] check layer={d} side={s} words={d} differ={d}\n", .{ layer, side, words, differ });
-}
-
-test "hc_fuse setting: on unset, empty or 1; 0 off; check; anything else refused by name" {
-    try std.testing.expectEqual(Mode.on, try parse(null));
-    try std.testing.expectEqual(Mode.on, try parse(""));
-    try std.testing.expectEqual(Mode.off, try parse("0"));
-    try std.testing.expectEqual(Mode.on, try parse("1"));
-    try std.testing.expectEqual(Mode.check, try parse("check"));
-    for ([_][]const u8{ "on", "2", "01", "true", "fuse", "CHECK" }) |v| try std.testing.expectError(error.HcFuseSetting, parse(v));
-}
 
 test "hc_fuse kernel texts name no address space for an input's pointer" {
     // MLX binds an input of fewer than 8 elements (`post`, `cpre` and `eps` at one row) as `const constant T*`, a larger

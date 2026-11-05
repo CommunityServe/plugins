@@ -1,6 +1,6 @@
 diff -ruN -x .generated a/sdk/weights/streamed/expert/stream.zig b/sdk/weights/streamed/expert/stream.zig
---- a/sdk/weights/streamed/expert/stream.zig	2026-10-31 22:48:16
-+++ b/sdk/weights/streamed/expert/stream.zig	2026-10-31 22:48:16
+--- a/sdk/weights/streamed/expert/stream.zig
++++ b/sdk/weights/streamed/expert/stream.zig
 @@ -173,6 +173,10 @@
      pub fn waitDown(self: *StreamSource, call: *Call, part: u32) Error!void {
          return self.stream.waitDown(call.route.?, part);
@@ -13,11 +13,11 @@ diff -ruN -x .generated a/sdk/weights/streamed/expert/stream.zig b/sdk/weights/s
          self.stream.release(call.route.?);
      }
 diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streamed/experts.zig
---- a/sdk/weights/streamed/experts.zig	2026-10-31 22:48:16
-+++ b/sdk/weights/streamed/experts.zig	2026-10-31 22:48:16
-@@ -1415,10 +1415,14 @@
+--- a/sdk/weights/streamed/experts.zig
++++ b/sdk/weights/streamed/experts.zig
+@@ -1409,10 +1409,14 @@
              // The installed decode-only predictor follows the source's phase; the last layer predicts nothing.
-             const predict = (if (comptime routes.lookahead and predictor_decode_only) self.source.decoding() else routes.lookahead) and lookaheadPredicts();
+             const predict = (if (comptime routes.lookahead and predictor_decode_only) self.source.decoding() else routes.lookahead);
              const sc: ?T = if (if (predict) self.predictorGate(layer) else null) |gate| try self.scoresOf(g, xf, gate) else null;
 -            // The barrier's arrays: the ids, then the scores when there are any.
 +            // turboexl3_ds41: a source that takes its read-ahead step after the waves (`speculateLate`) keeps the next
@@ -32,7 +32,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streame
                  bar[n_bar] = v;
                  n_bar += 1;
              };
-@@ -1426,12 +1430,15 @@
+@@ -1420,12 +1424,15 @@
              const dev: ?T = if (comptime @hasDecl(S, "decoding")) (if (self.devroute and self.source.decoding()) try self.devWave(g, layer, xf, indices, n, k) else null) else null;
              if (dev) |d| {
                  try g.asyncEval(bar[0..n_bar]);
@@ -50,7 +50,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streame
              const ids = try g.hostIds(indices, id_buf[0..n_ids]);
              tt = dt.charge(.barrier, tt);
              const t_barrier = tt;
-@@ -1484,6 +1491,10 @@
+@@ -1478,6 +1485,10 @@
                  _ = dt.charge(.read_wait, tt);
                  try g.asyncEval(try self.down_wave(self, g, layer, &wave, &acc, null));
              }
@@ -62,9 +62,9 @@ diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streame
              released = true;
              // DEVROUTE: the layer's next call reads the policy after this route (the other LUT of the pair).
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
---- a/sdk/weights/streamed/sdk_ext/expert/stream.zig	2026-10-31 22:48:16
-+++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig	2026-10-31 22:48:16
-@@ -1554,6 +1554,13 @@
+--- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+@@ -1527,6 +1527,13 @@
                  _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
                      return self.fail(error.SpecRefused);
              }

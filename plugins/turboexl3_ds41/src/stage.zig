@@ -1,14 +1,14 @@
-//! `MLX_SERVE_DSV41_STAGE` (read at load; on by default, `0` turns it off; any other value is refused by name): a wide
-//! prompt call's predicted transient loads read while its layer's attention runs, into the transient windows its routes
-//! will plan them into.
+//! Staging: a wide prompt call's predicted transient loads read while its layer's attention runs, into the transient
+//! windows its routes will plan them into.
 //!
-//! `0`: P1's read-ahead reads the layer's predicted experts into its persistent rows only (about 50 a layer at 16K
-//! rows: the rows the usage seed and the prediction leave free); the call's stream groups (its experts past the seed
-//! ranks, about 240 a layer, every one a transient miss once the seed holds every persistent row) are read by their own
-//! routes, each group's while the groups before it compute, so the call waits on the drive (1.5 s of host waits over a
-//! 16K prompt's encoder) while the drive idles under the attention (the prompt timeline, w-pio-20261101-0650).
+//! Without it, P1's read-ahead reads the layer's predicted experts into its persistent rows only (about 50 a layer at
+//! 16K rows: the rows the usage seed and the prediction leave free); the call's stream groups (its experts past the
+//! seed ranks, about 240 a layer, every one a transient miss once the seed holds every persistent row) are read by
+//! their own routes, each group's while the groups before it compute, so the call waits on the drive (1.5 s of host
+//! waits over a 16K prompt's encoder) while the drive idles under the attention (the prompt timeline,
+//! w-pio-20261101-0650).
 //!
-//! On, after P1 the copied stream reads the prediction's stream misses (past the predicted seed ranks, not resident),
+//! After P1 the copied stream reads the prediction's stream misses (past the predicted seed ranks, not resident),
 //! hottest first, into the windows the call's first stream groups take (`layout`: group g of a call takes window g mod
 //! depth, the seed groups first). The stream's ticket ring doubles (2048) so the staged reads' tickets stay unclaimed
 //! beside P1's and every ticket the call's routes take before they land. The call adopts them (`adopt`, `Bounds`): each
@@ -19,29 +19,13 @@
 //! that uses it routes. Exact: a record is the same bytes in any row, and a wave's rows and the combine's fold do not
 //! depend on the groups' composition.
 //!
-//! Read on the M5 Max (st1, w-pio-20261101-0821: a throwaway warm server, then 0 / on / on / 0, each a cold
-//! code-ctx16384 card request and a new-text 16K one): cold prefill 1136.0 and 1120.5 tok/s at 0, 1171.4 and 1178.4 on
-//! (+4.1%); new text 1119.1 and 1136.1 at 0, 1204.2 and 1202.6 on (+6.7%). Over the cold request's encoder the moe
+//! Read on the M5 Max (st1, w-pio-20261101-0821: a throwaway warm server, then off / on / on / off, each a cold
+//! code-ctx16384 card request and a new-text 16K one): cold prefill 1136.0 and 1120.5 tok/s off, 1171.4 and 1178.4 on
+//! (+4.1%); new text 1119.1 and 1136.1 off, 1204.2 and 1202.6 on (+6.7%). Over the cold request's encoder the moe
 //! stage took 4470 and 4484 ms against 5476 and 5590, the host's waits on bytes 666 and 679 against 1516 and 1650; 4722
 //! records staged, 4079 adopted (86%). The texts are the same in every arm (the cold one md5 efeb6f4ecd).
 
 const std = @import("std");
-
-/// The switch (`configure`, at load).
-pub var on: bool = true;
-
-pub const Error = error{StageSetting};
-
-pub fn configure(value: ?[]const u8) Error!void {
-    on = try parse(value);
-}
-
-pub fn parse(value: ?[]const u8) Error!bool {
-    const v = value orelse return true;
-    if (v.len == 0) return true;
-    if (std.mem.eql(u8, v, "0")) return false;
-    return error.StageSetting;
-}
 
 /// A row that holds no staged record.
 pub const no_expert: u16 = std.math.maxInt(u16);
@@ -167,13 +151,6 @@ pub const Bounds = struct {
 };
 
 const testing = std.testing;
-
-test "stage setting: on unset or empty, 0 off; anything else refused by name" {
-    try testing.expect(try parse(null));
-    try testing.expect(try parse(""));
-    try testing.expect(!try parse("0"));
-    for ([_][]const u8{ "1", "on", "2", "01", "true" }) |v| try testing.expectError(error.StageSetting, parse(v));
-}
 
 test "stage layout: stream group j in window (sg + j) mod depth from its first row, at most depth groups" {
     var l: Layout = undefined;

@@ -1,40 +1,14 @@
-//! `MLX_SERVE_DSV41_SCRATCH` (read at load; unset, empty or `1`: on; `0`: off; `check`: the fresh array served and the
-//! region's compared with it word for word; anything else is refused by name): a wide prompt layer's streams after its
-//! attention (`x1`, [rows, 4, 5120] f32, 1.34 GB at 16K rows) written into one per-prompt region (src/scratch.zig), not
-//! a fresh MLX allocation each layer.
+//! A wide prompt layer's streams after its attention (`x1`, [rows, 4, 5120] f32, 1.34 GB at 16K rows) written into one
+//! per-prompt region (src/scratch.zig), not a fresh MLX allocation each layer.
 //!
 //! The writer is glm5_next's hc expand writing its words into the region (kernels/hc_expand_into.metal: the same loads,
 //! fmas and stores) behind the region's last reader (the layer before's MoE output, bound and unread); the norms and the
 //! MoE tail read the region's published alias (`Region.publish`). Let go at the decode phase change and with the model.
 
-const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
 const scratch = @import("scratch.zig");
 
 const A = mlx.mlx_array;
-
-/// The switch (`configure`, at load).
-pub var mode: scratch.Mode = .on;
-
-pub fn configure(value: ?[]const u8) scratch.Error!void {
-    mode = try parse(value);
-}
-
-/// On unless the setting says otherwise (src/scratch.zig's `parse` is off by default, for its other levers).
-pub fn parse(value: ?[]const u8) scratch.Error!scratch.Mode {
-    const v = value orelse return .on;
-    if (v.len == 0 or std.mem.eql(u8, v, "1")) return .on;
-    if (std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "check")) return .check;
-    return error.ScratchSetting;
-}
-
-test "scratch_x1 setting: on unset, empty or 1; 0 off; check; anything else refused by name" {
-    for ([_]?[]const u8{ null, "", "1" }) |v| try std.testing.expectEqual(scratch.Mode.on, try parse(v));
-    try std.testing.expectEqual(scratch.Mode.off, try parse("0"));
-    try std.testing.expectEqual(scratch.Mode.check, try parse("check"));
-    for ([_][]const u8{ "on", "2", "Check", " 1" }) |v| try std.testing.expectError(error.ScratchSetting, parse(v));
-}
 
 /// The region.
 pub var x1: scratch.Region = .{};

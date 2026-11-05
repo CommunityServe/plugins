@@ -1,37 +1,26 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -274,6 +274,7 @@
-     pub const MLX_SERVE_DSV41_DIRECT_PARTS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 read pool parts (turboexl3_ds41): each demand read's parts whose file offset, length and row lie on the file's block read straight into their rows (the gate's code on this pack: a third of a record no longer copied), the others staged and copied, the same bytes; [direct-parts] lines at each prompt's and request's end (=0: every part staged and copied)" };
-     pub const MLX_SERVE_DSV41_DRAFT_AHEAD: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 greedy round's next DSpark draft (turboexl3_ds41): launched at the end of the round before it, from its next token once its state is committed, when the next plan is the stages' block, and taken by the next round when it fits (the same token, position and state); the same ops, served bytes unchanged (unset or 1: on; 0: off; check: on, the next round makes its own draft too, compares the ids and confidences word for word and serves its own, [draft-ahead] lines)" };
-     pub const MLX_SERVE_DSV41_DECODE_STOP: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode stop (turboexl3_ds41): the decode phase's budget takes 1.0e9 B of the 2.0e9 B stop under the ceiling back for its slot rows (two more on the M5 Max at 16K), MLX's cache capped at 1 GiB from the phase change to decode and the prompt's cap restored at the change back; the prompt's budget and rows unchanged; the same bytes (unset or 1: on; 0: off; check: as 1, [decode-stop] lines)" };
-+    pub const MLX_SERVE_DSV41_STAGE_TRIM: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt call's staging trimmed at its routes (turboexl3_ds41, with MLX_SERVE_DSV41_STAGE): the staged windows' parts posted hottest first, and once the call's routes are known each staged part holding none of its experts that no read has started taken back out of the read pool unread, its rows let go; reads only, the same bytes (unset or 1: on; 0: off; check: as 1, each withdrawn ticket's status read back, [stage-trim] lines)" };
-     pub const MLX_SERVE_DSV41_DECODE_WINDOW: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode window 0 (turboexl3_ds41): 4 rows, not the widest decode route's 48, a decode plan admitting its declined misses past them over the lowest-ranked residents it does not use, the freed bytes billed to the decode slot rows (taken where every layer keeps 96 decode rows or more); the same bytes served (unset or 1: on; 0: off; check: on, the plans left past the window counted), [bank-bill] at load and [mem-decode] at each request's end" };
-     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
-     pub const MLX_SERVE_DSV41_DSPARK_COSTS: Var = .{ .kind = .kill, .type = .text, .default = "unset", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark fixed verify policy's tables (turboexl3_ds41; with MLX_SERVE_DSV41_DSPARK_POLICY unset or =fixed only, refused beside =0 or =1; sampled requests only, a greedy request's rounds verify the whole block; unset: the built-in tables fitted on an M5 Max, src/rounds.zig DEFAULT_COSTS): v1,v2,...,vN/d, the verify ms by rows from one to N (2..16) then the ms a stage draft takes, or such tables by context U1:t1+U2:t2+...+tK (the bounds ascending positions, the last table unbounded, at most 8; a round reads the first table whose bound exceeds its position), fitted once per box and pack; the cut and the drafting backoff read it instead of the measured ladder and the round's wall time, so a request's text is the same run to run; refused by name when malformed" };
 diff -ruN -x .generated a/sdk/weights/streamed/expert/stream.zig b/sdk/weights/streamed/expert/stream.zig
 --- a/sdk/weights/streamed/expert/stream.zig
 +++ b/sdk/weights/streamed/expert/stream.zig
-@@ -289,6 +289,11 @@
+@@ -282,6 +282,11 @@
      pub fn postNextWindows(self: *StreamSource, block: bool) !void {
          try self.stream.postNextWindows(block);
      }
-+    /// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_TRIM): the layer's staged parts its call's routes (`used`) do not take,
-+    /// withdrawn where no read has started (`Stream.trimStaged`).
++    /// turboexl3_ds41 (the staging trim): the layer's staged parts its call's routes (`used`) do not take, withdrawn
++    /// where no read has started (`Stream.trimStaged`).
 +    pub fn trimStaged(self: *StreamSource, layer: u32, used: []const u16) !void {
 +        return self.stream.trimStaged(layer, used);
 +    }
-     /// MLX_SERVE_DSV41_STAGE: the layer's staged groups, once, per window (`Stream.stagedWindows`).
+     /// Staging: the layer's staged groups, once, per window (`Stream.stagedWindows`).
      pub fn stagedWindows(self: *StreamSource, layer: u32, depth: usize, out: *[max_wide_depth][]const u16) bool {
          return self.stream.stagedWindows(layer, depth, out);
 diff -ruN -x .generated a/sdk/weights/streamed/experts.zig b/sdk/weights/streamed/experts.zig
 --- a/sdk/weights/streamed/experts.zig
 +++ b/sdk/weights/streamed/experts.zig
-@@ -1807,6 +1807,8 @@
+@@ -1801,6 +1801,8 @@
                      for (in_call[0..depth], 0..) |*o, j| o.* = wins[stage_cfg.windowOf(seed_groups, depth, j)];
                      try w.adopt.resize(a, n_distinct - sa);
                      n_staged = stage_cfg.adopt(w.distinct.items[sa..], w.first.items, sa, in_call[0..depth], max_route_ids, w.adopt.items, &staged_ends);
-+                    // turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_TRIM): the staged parts these routes take none of, let go unread.
++                    // turboexl3_ds41 (the staging trim): the staged parts these routes take none of, let go unread.
 +                    if (comptime @hasDecl(S, "trimStaged")) try self.source.trimStaged(layer, w.distinct.items);
                  }
              };
@@ -41,38 +30,40 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
 @@ -12,6 +12,9 @@
  const expert_routes = @import("routes.zig");
- /// turboexl3_ds41 (its src/stage.zig, `MLX_SERVE_DSV41_STAGE`): a wide prompt call's staging layout (`Stream.stageGroups`).
+ /// turboexl3_ds41 (its src/stage.zig): a wide prompt call's staging layout (`Stream.stageGroups`).
  const stage_cfg = @import("mlx_host").stage;
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_TRIM, the plugin's src/stage_trim.zig): a wide call's staged parts its routes
-+/// do not take withdrawn before the drive reaches them, the staged windows' parts in rank order.
++/// turboexl3_ds41 (the plugin's src/stage_trim.zig): a wide call's staged parts its routes do not take withdrawn before
++/// the drive reaches them, the staged windows' parts in rank order.
 +const strim = @import("mlx_host").stage_trim;
  const log = @import("sdk").log;
- /// The route recorder (`expert.routes`) is a diagnostic: its hooks compile into profile builds (`sdk.plugin_profile`), the
- /// tests and turboexl3_ds41's route-recording builds (`zig build -Droute-rec=true`: its root's `route_recording`) only; a
-@@ -580,6 +583,9 @@
+ /// The route recorder (`expert.routes`) is a diagnostic: its hooks compile into profile builds (`sdk.plugin_profile`) and
+ /// the tests only; a served build has no recorder branch on any route.
+@@ -573,6 +576,9 @@
              ticket: u32 = 0,
              n_reads: u32 = 0,
              settled: bool = false,
-+            /// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_TRIM): taken back out of the read pool unread (`Stream.trimStaged`): its
++            /// turboexl3_ds41 (the staging trim): taken back out of the read pool unread (`Stream.trimStaged`): its
 +            /// rows let go there, nothing to land.
 +            withdrawn: bool = false,
          };
          pub const Route = struct {
              layer: u32 = 0,
-@@ -2122,8 +2128,10 @@
+@@ -2064,12 +2070,8 @@
                      st.order[w][r] = @intCast(r);
                  }
                  st.n[w] = @intCast(n);
 -                // File order: a layer's records ascend with the expert.
 -                std.sort.insertion(u8, st.order[w][0..n], @as([]const u16, st.groups[w][0..n]), struct {
-+                // File order: a layer's records ascend with the expert. MLX_SERVE_DSV41_STAGE_TRIM: rank order (the layout's,
-+                // hottest first), so the parts the call's routes are likeliest to leave are the last posted and the likeliest
-+                // still queued when the call's routes are known (`trimStaged`).
-+                if (!strim.on()) std.sort.insertion(u8, st.order[w][0..n], @as([]const u16, st.groups[w][0..n]), struct {
-                     fn less(g: []const u16, x: u8, y: u8) bool {
-                         return g[x] < g[y];
-                     }
-@@ -2295,6 +2303,54 @@
+-                    fn less(g: []const u16, x: u8, y: u8) bool {
+-                        return g[x] < g[y];
+-                    }
+-                }.less);
++                // Rank order (the layout's, hottest first), so the parts the call's routes are likeliest to leave are the
++                // last posted and the likeliest still queued when the call's routes are known (`trimStaged`).
+                 st.pending[w] = true;
+                 var start: u32 = 0;
+                 while (start < n) {
+@@ -2238,6 +2240,45 @@
                  self.counters.stage_adopted += @intFromBool(held and st.rows[w][r] == e);
                  st.rows[w][r] = expert_policy.no_expert;
              }
@@ -80,10 +71,10 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +            /// and has taken its staged groups: each staged part of the layer's pending windows that holds none of them and that
 +            /// no read worker has started is withdrawn from the read pool (`Pool.withdraw`: its tickets published unread, no
 +            /// row written), its rows let go (a reading row emptied, every row unpinned) and named no longer (`windowRows`
-+            /// sees them empty); a part a worker has started reads as posted. `check` reads each withdrawn ticket's status back
-+            /// (`withdrawn`, nothing read). Exact: only reads no route of the call takes are dropped.
++            /// sees them empty); a part a worker has started reads as posted. Exact: only reads no route of the call takes
++            /// are dropped.
 +            pub fn trimStaged(self: *Stream, layer: u32, used: []const u16) Error!void {
-+                if (!strim.on() or self.failed or self.phase != .prefill) return;
++                if (self.failed or self.phase != .prefill) return;
 +                const st = &self.stage;
 +                if (st.layer != layer or layer >= self.layers.len) return;
 +                const pol = &self.layers[layer].policy;
@@ -92,7 +83,6 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                for (used) |e| if (e < in_call.len) {
 +                    in_call[e] = true;
 +                };
-+                const mn = minisOf(&self.bank.layers[layer]);
 +                const cap = pol.capacity;
 +                for (0..max_wide_depth) |w| {
 +                    if (!st.pending[w]) continue;
@@ -104,13 +94,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                        } else false;
 +                        if (any) continue;
 +                        const gone = self.pool.withdraw(p.ticket) catch return self.fail(error.SubmitRefused);
-+                        if (!gone) {
-+                            strim.started += 1;
-+                            continue;
-+                        }
-+                        if (strim.mode == .check) for (0..2 * p.n_reads) |k| {
-+                            if (self.pool.result(p.ticket + @as(u32, @intCast(k))).status == .withdrawn) strim.verified += 1 else strim.bad += 1;
-+                        };
++                        if (!gone) continue;
 +                        p.withdrawn = true;
 +                        p.settled = true;
 +                        for (st.order[w][p.first..][0..p.n]) |r| {
@@ -119,19 +103,17 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                            st.rows[w][r] = expert_policy.no_expert;
 +                            st.groups[w][r] = expert_policy.no_expert;
 +                        }
-+                        strim.parts += 1;
-+                        strim.records += p.n_reads / mn;
 +                    }
 +                }
 +            }
              /// MLX_SERVE_DSV41_STAGE: window `w`'s staged reads landed, once: each job waited (its bytes counted), its rows'
              /// states set, every staged row unpinned; a failed read fails the stream.
              fn landWindow(self: *Stream, w: usize) Error!void {
-@@ -2307,6 +2363,8 @@
+@@ -2250,6 +2291,8 @@
                  const cap = self.layers[st.layer].policy.capacity;
                  var failure: ?Error = null;
                  for (st.parts[w][0..st.n_parts[w]]) |*p| {
-+                    // MLX_SERVE_DSV41_STAGE_TRIM: a withdrawn part's rows were let go when it was taken back.
++                    // The staging trim: a withdrawn part's rows were let go when it was taken back.
 +                    if (p.withdrawn) continue;
                      var ok = true;
                      if (!p.settled) {

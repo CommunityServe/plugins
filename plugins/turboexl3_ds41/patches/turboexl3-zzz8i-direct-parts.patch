@@ -1,14 +1,3 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -271,6 +271,7 @@
-     pub const MLX_SERVE_DSV41_COMPILE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 compiled decode stretches (=0: every op eager)" };
-     pub const MLX_SERVE_DSV41_DECODE_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "split where its curves fit the pack, else flat", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode slot rows (turboexl3_ds41): unset, the flat bill's decode bytes split across the layers by its development corpus's misses-a-row curves, each layer between its prompt rows and 256, where the curves fit the pack (flat rows where they do not); flat: flat rows; split: the split required (refused by name, rows flat, where it does not fit)" };
-     pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
-+    pub const MLX_SERVE_DSV41_DIRECT_PARTS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 read pool parts (turboexl3_ds41): each demand read's parts whose file offset, length and row lie on the file's block read straight into their rows (the gate's code on this pack: a third of a record no longer copied), the others staged and copied, the same bytes; [direct-parts] lines at each prompt's and request's end (=0: every part staged and copied)" };
-     pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
-     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
-     pub const MLX_SERVE_DSV41_EMBED_PREAD: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 token embedding table read from the pack by pread at each lookup, not resident (turboexl3_ds41): its 1.3 GB become streamed slot rows; the rows are the table's bytes, served bytes unchanged (=0: resident)" };
 diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4.h b/sdk/weights/streamed/csrc/q3_lookahead4.h
 --- a/sdk/weights/streamed/csrc/q3_lookahead4.h
 +++ b/sdk/weights/streamed/csrc/q3_lookahead4.h
@@ -213,7 +202,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
 diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
-@@ -56,6 +56,9 @@
+@@ -43,6 +43,9 @@
  /// `MLX_SERVE_DSV41_STAGE` (the plugin's src/stage.zig): a wide prompt call's predicted transient loads staged in its windows
  /// after P1's read-ahead (`Stream.stageGroups`).
  const stage = @import("mlx_host").stage;
@@ -223,7 +212,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
  const dsv41_routes = @import("../../quant/exl3/stream/kernel_routes.zig");
  const Combine = dsv41_routes.JoinlessCombine(G);
  pub const Gate = Hook.Gate;
-@@ -235,6 +238,7 @@
+@@ -213,6 +216,7 @@
              .fill_reserve = fillReserve(self.prompt_rows),
              // MLX_SERVE_DSV41_STAGE: the staged records' tickets stay unclaimed beside every call's own (`Stream.stageGroups`).
              .pool = .{ .tickets = if (stage.on) 2048 else 1024 },
@@ -231,7 +220,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
          });
          errdefer self.stream.deinit();
          self.stream.prompt_stage = stage.on;
-@@ -561,6 +565,10 @@
+@@ -473,6 +477,10 @@
                          try self.stream.landFills();
                          dec_prefetch.reset();
                          if (prompt_io.on) prompt_io.report(self.pioCounters());
@@ -242,7 +231,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
                          self.released = (try h.releaseTransient()) > 0;
                          _ = mlx.mlx_synchronize(self.g.s);
                          self.g.clearCache();
-@@ -568,6 +576,8 @@
+@@ -480,6 +488,8 @@
                      },
                      .prompt => {
                          if (prompt_io.on) prompt_io.reset();
@@ -291,7 +280,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
  /// read by `threads` threads in `chunk_bytes` preadv steps.
  pub const Spec = struct {
-@@ -186,6 +193,10 @@
+@@ -182,6 +189,10 @@
      /// range: the owner proves the alignment once at construction (`checkDirectBlock` + the stream's
      /// `checkDirectReads`), so the uncached preadv takes the drive's direct path.
      direct: bool = false,
@@ -302,7 +291,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
      spec: ?Spec = null,
  };
  /// A speculative staging slot: the page-rounded record plus two pages.
-@@ -332,12 +343,20 @@
+@@ -327,12 +338,20 @@
              return error.PoolUnavailable;
          if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
          if (c.q3ld_direct_config(@intFromBool(opt.direct)) != 0) return error.PoolUnavailable;
@@ -342,7 +331,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io_stub.zig b/sdk/
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
-@@ -413,6 +413,9 @@
+@@ -408,6 +408,9 @@
              /// Decode misses per completion part (a down wave and its gate).
              records_per_part: u32 = 3,
              pool: expert_io.Options = .{ .tickets = 1024 },
@@ -352,7 +341,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The pool's staging buffers sized from the bank (`stagingBytes`: its widest gate/up or down span,
              /// page-rounded, plus a page of alignment) in place of `pool.staging_bytes`. A pre-read range must fit one
              /// buffer, so a bank whose spans exceed the pool's default needs it.
-@@ -867,6 +870,13 @@
+@@ -842,6 +845,13 @@
                      try expert_io.checkDirectBlock(direct_block, std.heap.pageSize());
                      try checkDirectReads(bank, direct_block);
                  }
@@ -366,19 +355,19 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
                  if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
                  errdefer if (selector) |*sel| sel.deinit(a);
-@@ -3129,6 +3139,11 @@
+@@ -2980,6 +2990,11 @@
                  self.read_ns += ns;
                  if (res.preadv_calls == 0 and res.payload > 0) self.copy_only_ns += ns;
              }
-+            /// The PARTS route for the reads from here on (`expert_io.Pool.partsLive`; MLX_SERVE_DSV41_DIRECT_PARTS: the
-+            /// source's prompt phase on, its decode phase off). A no-op without the route.
++            /// The PARTS route for the reads from here on (`expert_io.Pool.partsLive`; direct parts: the source's
++            /// prompt phase on, its decode phase off). A no-op without the route.
 +            pub fn directPartsLive(self: *Stream, on: bool) void {
 +                self.pool.partsLive(on);
 +            }
              pub fn stats(self: *Stream) Stats {
                  var s = self.counters;
                  s.expert_read_seconds = @as(f64, @floatFromInt(self.read_ns)) / 1e9;
-@@ -3142,6 +3157,8 @@
+@@ -2993,6 +3008,8 @@
                      .{ "gates", .ev_gates },            .{ "gates_forced", .ev_wd_forced },
                      .{ "spec_expired", .expired },      .{ "spec_abandoned", .abandoned }, .{ "spec_discarded", .discarded },
                      .{ "spec_cancelled", .cancelled_by_demand }, .{ "direct_ranges", .direct_ranges },

@@ -1,12 +1,12 @@
 diff -ruN -x .generated a/sdk/weights/streamed/expert/a4k.zig b/sdk/weights/streamed/expert/a4k.zig
---- a/sdk/weights/streamed/expert/a4k.zig	1969-12-31 18:00:00
-+++ b/sdk/weights/streamed/expert/a4k.zig	2026-11-01 08:24:05
+--- a/sdk/weights/streamed/expert/a4k.zig
++++ b/sdk/weights/streamed/expert/a4k.zig
 @@ -0,0 +1,103 @@
 +//! The a4k record layout of an EXL3 v2 expert bank (`sidecar.layout` "a4k" in expert-manifest-v2.json; turboexl3_ds41's
 +//! zzzzt): each record's nine segments at offsets that put every code on a 4 KiB block, so the read pool's PARTS route
-+//! (MLX_SERVE_DSV41_DIRECT_PARTS) reads all three codes straight into their slot rows (the classic layout puts only the
-+//! gate's code on the block: the up and down codes sit 2,560 and 1,024 B off it). On disk: a zero lead of (-(the gate/up
-+//! span's scales)) mod 4096, the gate/up span [gate.rout gate.rin up.rout up.rin gate.code up.code], then the down span
++//! (direct parts) reads all three codes straight into their slot rows (the classic layout puts only the gate's code on
++//! the block: the up and down codes sit 2,560 and 1,024 B off it). On disk: a zero lead of (-(the gate/up span's
++//! scales)) mod 4096, the gate/up span [gate.rout gate.rin up.rout up.rin gate.code up.code], then the down span
 +//! [down.code down.rout down.rin], the record padded to 4096. Each span stays contiguous and the down span follows the
 +//! gate/up span, as the pool reads a span (its parts back to back) and pre-reads (the down range at the gate/up range's
 +//! end). The segments' lengths, dtypes and shapes are the classic layout's; only the offsets and the order on disk
@@ -106,8 +106,8 @@ diff -ruN -x .generated a/sdk/weights/streamed/expert/a4k.zig b/sdk/weights/stre
 +    }
 +}
 diff -ruN -x .generated a/sdk/weights/streamed/expert/bank.zig b/sdk/weights/streamed/expert/bank.zig
---- a/sdk/weights/streamed/expert/bank.zig	2026-11-01 08:24:05
-+++ b/sdk/weights/streamed/expert/bank.zig	2026-11-01 08:24:05
+--- a/sdk/weights/streamed/expert/bank.zig
++++ b/sdk/weights/streamed/expert/bank.zig
 @@ -11,8 +11,14 @@
  const expert_io = @import("../sdk_ext.zig").expert.io;
  const bank_file = @import("../sdk_ext.zig").expert.bank_file;
@@ -251,9 +251,9 @@ diff -ruN -x .generated a/sdk/weights/streamed/expert/bank.zig b/sdk/weights/str
      layer: u64,
      expert: u64,
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weights/streamed/sdk_ext/expert/io.zig
---- a/sdk/weights/streamed/sdk_ext/expert/io.zig	2026-11-01 08:24:04
-+++ b/sdk/weights/streamed/sdk_ext/expert/io.zig	2026-11-01 08:24:05
-@@ -198,7 +198,13 @@
+--- a/sdk/weights/streamed/sdk_ext/expert/io.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/io.zig
+@@ -194,7 +194,13 @@
      /// the others staged and copied. 0 (the default): off. `direct` wins when both are set.
      parts_block: u64 = 0,
      spec: ?Spec = null,
@@ -267,7 +267,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  /// A speculative staging slot: the page-rounded record plus two pages.
  pub fn slotBytes(record_bytes: u64, page: u64) u64 {
      return std.mem.alignForward(u64, record_bytes, page) + 2 * page;
-@@ -297,6 +303,8 @@
+@@ -293,6 +299,8 @@
      /// Demand's tickets end here.
      demand_tickets: u32 = 0,
      record_bytes: u64 = 0,
@@ -276,16 +276,17 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
      /// Starts the process's pool (the speculative class, when given, is
      /// configured first). Staging, status words, counters and the log live
      /// here and stay put until `stop`.
-@@ -323,7 +331,7 @@
+@@ -317,8 +325,7 @@
+         @memset(res, 0);
          @memset(log_arr, 0);
          @memset(published, false);
-         const demand: u32 = opt.tickets - opt.reserve;
+-        const demand: u32 = opt.tickets - opt.reserve;
 -        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand };
-+        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand, .disk_order = opt.disk_order };
++        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = opt.tickets, .disk_order = opt.disk_order };
          var bufs: [max_spec]u64 = undefined;
          var threads: i32 = 0;
          var slot_bytes: u64 = 0;
-@@ -505,6 +513,14 @@
+@@ -500,6 +507,14 @@
      return struct {
          /// One record's destinations, a row address per component.
          pub const Rows = [components]u64;
@@ -300,7 +301,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
          /// One submit: `rows.len` records, every gate/up span (`gu_offsets`, `gate_up` parts) then every down span, each
          /// part `lens[c]` bytes into `rows[i][c]`, each span a job of its own (idle workers read them side by side, each
          /// its own status). Returns the first of its 2n tickets.
-@@ -548,13 +564,15 @@
+@@ -538,13 +553,15 @@
              const first = pool.claimTickets(lo, hi, next, count);
              var offsets: [2 * max_items]i64 = undefined;
              var row_ptrs: [max_items][*]const u64 = undefined;
@@ -318,7 +319,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
              try submitted(pool, first, count, c.q3ld_submit(fd.fd, @intCast(fd.size), no_deadline, @intCast(n), gate_up, components - gate_up, &offsets, &row_ptrs, &lens_i, first), next);
              return first;
          }
-@@ -571,17 +589,15 @@
+@@ -561,17 +578,15 @@
          /// Arms the pre-read class with one geometry's component lengths (needs the speculative class). The pool
          /// binds a demand range to a pre-range only at this topology and these lengths.
          pub fn armPreRead(pool: *Pool, lens: *const Rows) !void {
@@ -339,9 +340,9 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
              if (rc < 0) return error.PreReadRefused;
              return @intCast(rc);
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
---- a/sdk/weights/streamed/sdk_ext/expert/stream.zig	2026-11-01 08:24:04
-+++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig	2026-11-01 08:24:05
-@@ -43,10 +43,24 @@
+--- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
++++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
+@@ -38,10 +38,24 @@
          pub fn miniStride(l: *const Layer) u64 {
              return if (comptime @hasField(Layer, "minis")) l.record_bytes else 0;
          }
@@ -368,7 +369,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          /// The most records a routed id may have (a read job holds `expert_io.max_items` records).
          pub const max_minis = expert_io.max_items;
          /// The most records any layer's routed id has.
-@@ -868,7 +882,7 @@
+@@ -843,7 +857,7 @@
                      if (la.preread) for (bank.layers) |l| {
                          var gu: u64 = 0;
                          for (l.segments[0..gu_components]) |sg| gu += sg.length;
@@ -377,20 +378,34 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                          if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
                      };
                  }
-@@ -982,6 +996,12 @@
-                     const ne: usize = bank.n_experts;
-                     fl.* = .{ .loads = fill_loads[i * ne ..][0..ne], .reads = fill_reads[i * ne ..][0..ne], .parts = fill_parts[i * fill_parts_n ..][0..fill_parts_n] };
-                 }
-+                // A bank whose parts lie in their own order on disk (an a4k bank): the pool reads each range's parts in it.
-+                if (comptime @hasDecl(B.Bank, "diskOrder")) if (bank.diskOrder()) |d| {
-+                    var order: [expert_io.max_disk_components]u8 = @splat(0);
-+                    @memcpy(order[0..d.len], &d);
-+                    pool_opt.disk_order = order;
-+                };
+@@ -937,26 +951,6 @@
+                 const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts) else &.{};
+                 errdefer if (ahead_job.len > 0) a.free(ahead_job);
+                 @memset(ahead_job, no_job);
+-                // DEC_PREFETCH's fills: the reserved tickets past demand's, and per layer a fill's record (P1's sizes).
+-                if (opt.fill_reserve > 0) {
+-                    if (multi_bank or scatter) return error.InvalidOptions;
+-                    pool_opt.tickets += opt.fill_reserve;
+-                    pool_opt.reserve = opt.fill_reserve;
+-                }
+-                const n_fills: usize = if (opt.fill_reserve > 0) n_layers else 0;
+-                const fill_parts_n: usize = (std.math.divCeil(u32, bank.n_experts, expert_io.max_items / minis) catch unreachable) + 1;
+-                const fill_loads = try a.alloc(LayerPolicy.ReadAhead, n_fills * bank.n_experts);
+-                errdefer a.free(fill_loads);
+-                const fill_reads = try a.alloc(bool, n_fills * bank.n_experts);
+-                errdefer a.free(fill_reads);
+-                const fill_parts = try a.alloc(Part, n_fills * fill_parts_n);
+-                errdefer a.free(fill_parts);
+-                const fills = try a.alloc(Fill, n_fills);
+-                errdefer a.free(fills);
+-                for (fills, 0..) |*fl, i| {
+-                    const ne: usize = bank.n_experts;
+-                    fl.* = .{ .loads = fill_loads[i * ne ..][0..ne], .reads = fill_reads[i * ne ..][0..ne], .parts = fill_parts[i * fill_parts_n ..][0..fill_parts_n] };
+-                }
                  const pool = try expert_io.Pool.start(a, pool_opt);
                  errdefer pool.stop();
                  if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);
-@@ -1563,7 +1583,7 @@
+@@ -1531,7 +1525,7 @@
                  var bases: [expert_lookahead.max_candidates * max_minis]i64 = undefined;
                  var n: usize = 0;
                  for (misses) |e| for (0..minisOf(geom)) |m| {

@@ -1,4 +1,4 @@
-diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
 @@ -21,10 +21,11 @@
@@ -7,8 +7,8 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
  const Hook = xp.ExpertsWith(G, xp.StreamSource, Math, .{ .prefill = true, .lookahead = true, .gated = true });
 -/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the plugin's src/routed_t3.zig): the same schedule, turboexl3's math, neither
 -/// banked waves nor the device route (both are the streamer's own kernels').
-+/// `MLX_SERVE_DSV41_ROUTED=turboexl3` (the plugin's src/routed_t3.zig): the same schedule, the decode waves banked and
-+/// DEVROUTE's device wave on turboexl3's banked decode, as the streamer's own kernels run them; the prompt calls on the
++/// The plugin's src/routed_t3.zig: the same schedule, the decode waves banked and DEVROUTE's device wave on turboexl3's
++/// banked decode, as the streamer's own kernels run them; the prompt calls on the
 +/// streamer's own math (`Math`, the bounded DIG-X lane the prompt bill covers).
  const routed_t3 = @import("mlx_host").routed_t3;
 -const MathT3 = routed_t3.Math(G, xp.ProjOf(T), xp.BankArraysOf(T), sdk_ext.quant.PrefillRows);
@@ -22,22 +22,13 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
              for (self.gates_t3, gates) |*o, gt| o.* = .{ .w = gt.w, .bias = gt.bias };
 -            self.hook = .{ .t3 = try HookT3.initWith(a, &self.g, &self.source, .{ .state = &self.t3_state }, geo, .{ .gates = self.gates_t3, .event = event, .wide = wide, .hoist_first = true }) };
 -            std.log.info("streamed exl3: the routed experts run on turboexl3 (MLX_SERVE_DSV41_ROUTED)", .{});
-+            self.hook = .{ .t3 = try HookT3.initWith(a, &self.g, &self.source, .{ .state = &self.t3_state, .stock = Math.init(self.q, geo) }, geo, .{ .gates = self.gates_t3, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true }) };
-+            std.log.info("streamed exl3: the routed experts' decode runs on turboexl3, its waves banked and the device route on its banked decode; the prompt calls stay on the streamer's own lane (MLX_SERVE_DSV41_ROUTED)", .{});
-+            errdefer self.hook.t3.deinit();
++            self.hook = try HookT3.initWith(a, &self.g, &self.source, .{ .state = &self.t3_state, .stock = Math.init(self.q, geo) }, geo, .{ .gates = self.gates_t3, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true });
++            std.log.info("streamed exl3: the routed experts' decode runs on turboexl3, its waves banked and the device route on its banked decode; the prompt calls stay on the streamer's own lane", .{});
++            errdefer self.hook.deinit();
 +            // The banked decode's kernels compiled now, not at a request's first launch of each pair count (src/routed_t3.zig
 +            // `warm`).
-+            const w = try self.hook.t3.math.warm(&self.g, self.hook.t3.banks, @intCast(geo.hidden_size), .bfloat16);
++            const w = try self.hook.math.warm(&self.g, self.hook.banks, @intCast(geo.hidden_size), .bfloat16);
 +            std.log.info("streamed exl3: turboexl3's routed kernels compiled at load: {d} calls in {d} ms", .{ w.calls, w.ms });
          } else self.hook = .{ .stream = try Hook.initWith(a, &self.g, &self.source, Math.init(self.q, geo), geo, .{ .gates = self.gates, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true }) };
          return self;
      }
-@@ -202,6 +208,8 @@
-     /// Model layer `layer`'s routed sum `[n, hidden]` f32 for the normed MoE input `x` `[n, hidden]`, the routes `idx`
-     /// `[n, k]` and their weights `wts`.
-     pub fn rows(self: *Source, layer: u32, x: T, idx: T, wts: T) !T {
-+        // a layer call: the turboexl3 route's counters (src/routed_t3.zig) close the last one
-+        self.t3_state.begin();
-         const g = &self.g;
-         defer g.reset();
-         const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);

@@ -1,18 +1,7 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -307,6 +307,7 @@
-     pub const MLX_SERVE_DSV41_ROUTES: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode route recorder (turboexl3_ds41's route-recording builds only, zig build -Droute-rec=true): an absolute directory; each request's decode routes (expert.routes' file) and its rounds' tokens written there at its end" };
-     pub const MLX_SERVE_DSV41_STAGE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' staging (turboexl3_ds41): on, the prediction's stream misses read into the transient windows the call's first stream groups take while the layer's attention runs, the call adopting them (its first stream groups the staged ones it routes, each filled from the rest), the same records and a reorder of the groups; 0: each stream group read by its own route" };
-     pub const MLX_SERVE_DSV41_STAGE_NEXT: Var = .{ .kind = .kill, .type = .text, .default = "only", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 next wide prompt layer's staging (turboexl3_ds41, with MLX_SERVE_DSV41_STAGE): predicted from this layer's FFN rows, its read-ahead and its predicted transient loads read during this layer's call, into its persistent rows and the windows the call's groups let go, the next layer then running no read-ahead of its own; reads only, the same words (=own: its own read-ahead too; =0: at the layer's start)" };
-+    pub const MLX_SERVE_DSV41_STAGE_VOTES: Var = .{ .kind = .kill, .type = .text, .default = "8", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' staging vote floor (turboexl3_ds41, with MLX_SERVE_DSV41_STAGE): N, 1 to 65535: only the predicted stream misses at least N rows of the prediction name are staged, the read-ahead into the persistent rows keeping the whole ranking; the same bytes (unset: 8; 0: off; on or off, a [stage-votes] line of the staged records by their votes at the end of each prompt that staged, with MLX_SERVE_DSV41_PROMPT_IO)" };
-     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
-     pub const MLX_SERVE_DSV41_T3_GROUP: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode hit wave on turboexl3's grouped banked decode (turboexl3_ds41, with MLX_SERVE_DSV41_ROUTED=turboexl3): its GEMVs share one weight decode among up to four row-slots of one expert, and the device route's pairs whose expert no bank holds run no expert in it (their rows come from the miss parts, as before); served bytes unchanged (=0: the banked texts, a miss pair computed from base row 0)" };
-     pub const MLX_SERVE_DSV41_TAIL_FUSE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layer tail (turboexl3_ds41): the joinless combine and the hc expand as one kernel, the same words, no f32 sum or rounded copy in memory (=0: the chain; check: the chain served, the kernel compared over each wide call's first and last rows, [tail-fuse] check lines); with MLX_SERVE_DSV41_JOINLESS on" };
 diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
-@@ -70,6 +70,9 @@
+@@ -52,6 +52,9 @@
  /// `MLX_SERVE_DSV41_STAGE_NEXT` (the plugin's src/stage_next.zig): the next routed layer's read-ahead and staging during
  /// the current layer's call (`nextAhead`, `Stream.readAheadNext`, `Stream.stageNext`).
  const stage_next = @import("mlx_host").stage_next;
@@ -22,20 +11,20 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
  const dsv41_routes = @import("../../quant/exl3/stream/kernel_routes.zig");
  const Combine = dsv41_routes.JoinlessCombine(G);
  pub const Gate = Hook.Gate;
-@@ -605,9 +608,9 @@
+@@ -487,9 +490,9 @@
          for (ids) |e| counts[e] += 1;
          const ranked = try self.a.alloc(u16, n);
          defer self.a.free(ranked);
 -        switch (self.hook) {
 -            inline else => |*h| try h.at(layer).readAheadSeed(sdk_ext.expert.policy.rankHottest(counts, ranked)),
 -        }
-+        // MLX_SERVE_DSV41_STAGE_VOTES: the staging after the read-ahead sees each expert's votes (the hooks' readAheadSeed
-+        // is this source's).
++        // The staging floor: the staging after the read-ahead sees each expert's votes (the hooks' readAheadSeed is
++        // this source's).
 +        try self.source.readAheadSeedVotes(layer, sdk_ext.expert.policy.rankHottest(counts, ranked), counts);
      }
      /// The rows of `p`: decode grows the slot banks once the prompt's windows are freed; a prompt shrinks them back,
      /// keeping the residents decode left.
-@@ -624,6 +627,8 @@
+@@ -506,6 +509,8 @@
                          try self.stream.landFills();
                          dec_prefetch.reset();
                          if (prompt_io.on) prompt_io.report(self.pioCounters());
@@ -47,95 +36,78 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
 diff -ruN -x .generated a/sdk/weights/streamed/expert/stream.zig b/sdk/weights/streamed/expert/stream.zig
 --- a/sdk/weights/streamed/expert/stream.zig
 +++ b/sdk/weights/streamed/expert/stream.zig
-@@ -219,8 +219,13 @@
-     /// P1: the layer's predicted seed read ahead of its routes (`Stream.readAheadSeed`), then (MLX_SERVE_DSV41_STAGE) the
-     /// rest of the prediction its call's first stream groups will load staged in their windows (`Stream.stageGroups`).
+@@ -216,8 +216,13 @@
+     /// P1: the layer's predicted seed read ahead of its routes (`Stream.readAheadSeed`), then (staging) the rest of the
+     /// prediction its call's first stream groups will load staged in their windows (`Stream.stageGroups`).
      pub fn readAheadSeed(self: *StreamSource, layer: u32, experts: []const u16) !void {
 +        return self.readAheadSeedVotes(layer, experts, &.{});
 +    }
 +    /// `readAheadSeed` with each expert's votes in the prediction (`votes`, by expert), for the staging's vote floor and
-+    /// its records' votes (MLX_SERVE_DSV41_STAGE_VOTES).
++    /// its records' votes (the staging floor).
 +    pub fn readAheadSeedVotes(self: *StreamSource, layer: u32, experts: []const u16, votes: []const u32) !void {
          try self.stream.readAheadSeed(layer, experts);
 -        try self.stream.stageGroups(layer, experts);
 +        try self.stream.stageGroups(layer, experts, votes);
      }
-     /// MLX_SERVE_DSV41_STAGE_NEXT: `layer`'s predicted routes `ids` (an unevaluated uint32 or int32 [rows, k] array: the
-     /// routing kernel's ids, row-contiguous), held for the call before it with how it reads ahead (`cap`, `fill`,
-@@ -254,7 +259,8 @@
-     /// MLX_SERVE_DSV41_STAGE_NEXT: `layer`'s call has made its last route: the next layer's held prediction read back once
+     /// Next-layer staging: `layer`'s predicted routes `ids` (an unevaluated uint32 or int32 [rows, k] array: the
+     /// routing kernel's ids, row-contiguous), held for the call before it; a held one not read yet is dropped.
+@@ -246,8 +251,9 @@
+     }
+     /// Next-layer staging: `layer`'s call has made its last route: the next layer's held prediction read back once
      /// (each expert's votes, hottest first: the read-ahead's ranking) and read ahead (`Stream.readAheadNext`, the whole
-     /// ranking so the row choice sees every named expert), with `windows` its stream misses planned into the windows the
+-    /// ranking so the row choice sees every named expert), with `windows` its stream misses planned into the windows the
 -    /// call lets go (`Stream.stageNext`, which posts the ones no route holds now).
-+    /// call lets go (`Stream.stageNext`, which posts the ones no route holds now; with each expert's votes, for
-+    /// MLX_SERVE_DSV41_STAGE_VOTES).
++    /// ranking so the row choice sees every named expert), with `windows` its stream misses planned into the windows
++    /// the call lets go (`Stream.stageNext`, which posts the ones no route holds now; with each expert's votes, for the
++    /// staging floor).
      pub fn postNext(self: *StreamSource, layer: u32) !void {
          if (self.next_ids.ctx == null or self.next_layer != layer + 1) return;
          defer self.dropNext();
-@@ -281,7 +287,7 @@
+@@ -273,8 +279,8 @@
+         const ranked_buf = try a.alloc(u16, n_experts);
          defer a.free(ranked_buf);
          const ranked = expert_policy.rankHottest(counts, ranked_buf);
-         try self.stream.readAheadNext(layer + 1, ranked, self.next_cap, self.next_fill);
+-        try self.stream.readAheadNext(layer + 1, ranked, self.next_cap, self.next_fill);
 -        if (self.next_windows) try self.stream.stageNext(layer + 1, ranked);
-+        if (self.next_windows) try self.stream.stageNext(layer + 1, ranked, counts);
++        try self.stream.readAheadNext(layer + 1, ranked);
++        try self.stream.stageNext(layer + 1, ranked, counts);
      }
-     /// MLX_SERVE_DSV41_STAGE_NEXT: a release after the call's last route (`block` false: a window the copier still reads
-     /// waits for a later one), or the call's end (`block`: every window is let go): the planned windows no route holds
+     /// Next-layer staging: a release after the call's last route (`block` false: a window the copier still reads waits
+     /// for a later one), or the call's end (`block`: every window is let go): the planned windows no route holds posted
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
-@@ -12,6 +12,9 @@
+@@ -12,6 +12,8 @@
  const expert_routes = @import("routes.zig");
- /// turboexl3_ds41 (its src/stage.zig, `MLX_SERVE_DSV41_STAGE`): a wide prompt call's staging layout (`Stream.stageGroups`).
+ /// turboexl3_ds41 (its src/stage.zig): a wide prompt call's staging layout (`Stream.stageGroups`).
  const stage_cfg = @import("mlx_host").stage;
-+/// turboexl3_ds41 (its src/stage_votes.zig, `MLX_SERVE_DSV41_STAGE_VOTES`): staging's vote floor and every staged record's
-+/// votes (`stage_votes.plan` in `stageGroups` and `stageNext`, `postStaged`, `noteStaged`).
++/// turboexl3_ds41 (its src/stage_votes.zig): staging's vote floor (`stage_votes.plan` in `stageGroups` and `stageNext`).
 +const stage_votes = @import("mlx_host").stage_votes;
- /// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_TRIM, the plugin's src/stage_trim.zig): a wide call's staged parts its routes
- /// do not take withdrawn before the drive reaches them, the staged windows' parts in rank order.
+ /// turboexl3_ds41 (the plugin's src/stage_trim.zig): a wide call's staged parts its routes do not take withdrawn before
+ /// the drive reaches them, the staged windows' parts in rank order.
  const strim = @import("mlx_host").stage_trim;
-@@ -767,6 +770,8 @@
-             /// The planned layout's seed groups and per window its records; `next_posted[w]`: window w posted.
-             next_sg: usize = 0,
-             next_lay: stage_cfg.Layout = .{},
-+            /// MLX_SERVE_DSV41_STAGE_VOTES: `next_lay`'s records' votes, row for row.
-+            next_vlay: stage_cfg.Layout = .{},
-             next_posted: [max_wide_depth]bool = @splat(false),
-             /// P1's read-ahead of one layer: `loads[0..n]` (expert, slot) in file order, `reads[i]` false when the
-             /// slot still held the record; its pool jobs `parts[0..n_parts]` over them (a Route's tickets).
-@@ -800,6 +805,11 @@
-                 groups: [max_wide_depth][max_route_ids]u16 = undefined,
-                 reads: [max_wide_depth][max_route_ids]bool = undefined,
-                 order: [max_wide_depth][max_route_ids]u8 = undefined,
-+                /// MLX_SERVE_DSV41_STAGE_VOTES: each staged record's votes in the prediction (0: not known), whether a
-+                /// route adopted it, and the staging's jobs counted (`tallyJobs`).
-+                votes: [max_wide_depth][max_route_ids]u16 = undefined,
-+                adopted: [max_wide_depth][max_route_ids]bool = undefined,
-+                tallied: bool = false,
-                 n_parts: [max_wide_depth]u8 = @splat(0),
-                 parts: [max_wide_depth][max_route_ids]Part = undefined,
-                 pending: [max_wide_depth]bool = @splat(false),
-@@ -2064,14 +2074,17 @@
-             /// call's barrier), and behind every ticket the call's routes can claim before its windows land (its groups,
-             /// at most every expert of the layer plus a partial seed group and a partial stream group); a route of another
-             /// layer, the next read-ahead and the phase change land whatever is left. None while a route is live or a
+@@ -2002,12 +2004,14 @@
+             /// experts past the seed ranks the call will take (`LayerPolicy.prepareSeed`'s count: the persistent rows
+             /// no protection holds) that are not resident, hottest first. Each window's records from its first row, in
+             /// jobs of `max_items` records in file order, the window the call uses first first. The ring has no overrun
+-            /// check, so the staged records are capped to stay unclaimed until they land: beside P1's records (landed at the
+-            /// call's barrier), and behind every ticket the call's routes can claim before its windows land (its groups,
+-            /// at most every expert of the layer plus a partial seed group and a partial stream group); a route of another
+-            /// layer, the next read-ahead and the phase change land whatever is left. None while a route is live or a
 -            /// staged row is pinned or loading (none is between calls).
 -            pub fn stageGroups(self: *Stream, layer: u32, experts: []const u16) Error!void {
-+            /// staged row is pinned or loading (none is between calls). `votes`: each expert's votes in the prediction (by
-+            /// expert; empty: not known), MLX_SERVE_DSV41_STAGE_VOTES's (`stage_votes.plan`: the misses under its floor
-+            /// taken out of the plan, the records' votes beside them).
++            /// check, so the staged records are capped to stay unclaimed until they land: beside P1's records (landed
++            /// at the call's barrier), and behind every ticket the call's routes can claim before its windows land (its
++            /// groups, at most every expert of the layer plus a partial seed group and a partial stream group); a route
++            /// of another layer, the next read-ahead and the phase change land whatever is left. None while a route is
++            /// live or a staged row is pinned or loading (none is between calls). `votes`: each expert's votes in the
++            /// prediction (by expert; empty: not known), the staging floor's (`stage_votes.plan`: the misses under its
++            /// floor taken out of the plan, the records' votes beside them).
 +            pub fn stageGroups(self: *Stream, layer: u32, experts: []const u16, votes: []const u32) Error!void {
                  if (!self.prompt_stage or self.failed or self.phase != .prefill or self.prompt_reads != .stock or self.transient_released) return;
-                 // MLX_SERVE_DSV41_STAGE_NEXT: the layer staged during the last call takes that staging as its own, its windows
+                 // Next-layer staging: the layer staged during the last call takes that staging as its own, its windows
                  // not posted then posted now (no route holds any between calls).
-                 if (self.next_planned and self.next.layer == layer) if (try self.promoteNext()) return;
-                 try self.landNext();
-                 try self.landStage();
-+                tallyJobs(&self.stage);
-                 const st = &self.stage;
-                 st.* = .{ .layer = layer };
-                 try self.flush();
-@@ -2087,17 +2100,15 @@
+@@ -2029,13 +2033,7 @@
                  const room: usize = pol.capacity -| @as(u32, @intCast(pol.protected.count()));
                  const sa = @min(experts.len, room);
                  var misses: [max_wide_depth * max_route_ids]u16 = undefined;
@@ -146,64 +118,42 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 -                    misses[nm] = e;
 -                    nm += 1;
 -                }
-+                var mvotes: [max_wide_depth * max_route_ids]u16 = undefined;
-+                const nm = stage_votes.plan(pol, experts[sa..], votes, cap, &misses, &mvotes);
++                const nm = stage_votes.plan(pol, experts[sa..], votes, cap, &misses);
                  if (nm == 0) return;
                  const sg = (sa + width - 1) / width;
                  var lay: stage_cfg.Layout = undefined;
-                 stage_cfg.layout(misses[0..nm], sg, depth, width, &lay);
-+                // MLX_SERVE_DSV41_STAGE_VOTES: the records' votes laid out as the records are.
-+                var vlay: stage_cfg.Layout = undefined;
-+                stage_cfg.layout(mvotes[0..nm], sg, depth, width, &vlay);
-                 for (0..depth) |w| for (0..lay.n[w]) |r| {
-                     const m = self.locate(layer, pol.capacity + @as(u32, @intCast(w * width + r))).meta;
-                     if (m.pins != 0 or m.state == .loading) return;
-@@ -2105,13 +2116,14 @@
-                 for (0..depth) |j| {
-                     const w = stage_cfg.windowOf(sg, depth, j);
-                     if (lay.n[w] == 0) continue;
--                    try self.postStaged(st, layer, w, lay.window(w));
-+                    try self.postStaged(st, layer, w, lay.window(w), vlay.window(w));
+@@ -2050,8 +2048,8 @@
+                     try self.postStaged(st, layer, w, lay.window(w));
                  }
              }
-             /// MLX_SERVE_DSV41_STAGE: window `w`'s staged records `experts` (from its first row) into `st`: each row's state
-             /// set and pinned, read in jobs of `max_items` records in file order (a row already holding its record skips its
--            /// read), the window pending until a route or a landing takes it.
--            fn postStaged(self: *Stream, st: *Stage, layer: u32, w: usize, experts: []const u16) Error!void {
-+            /// read), the window pending until a route or a landing takes it. `votes`: each record's votes, row for row
-+            /// (MLX_SERVE_DSV41_STAGE_VOTES: kept with the row, the posted records counted by them).
-+            fn postStaged(self: *Stream, st: *Stage, layer: u32, w: usize, experts: []const u16, votes: []const u16) Error!void {
+-            /// MLX_SERVE_DSV41_STAGE: window `w`'s staged records `experts` (from its first row) into `st`: each row's state
+-            /// set and pinned, read in jobs of `max_items` records in file order (a row already holding its record skips its
++            /// Staging: window `w`'s staged records `experts` (from its first row) into `st`: each row's state set and
++            /// pinned, read in jobs of `max_items` records in file order (a row already holding its record skips its
+             /// read), the window pending until a route or a landing takes it.
+             fn postStaged(self: *Stream, st: *Stage, layer: u32, w: usize, experts: []const u16) Error!void {
                  const width: usize = self.max_route_ids;
-                 const pol = &self.layers[layer].policy;
-                 const mn = minisOf(&self.bank.layers[layer]);
-@@ -2126,6 +2138,8 @@
-                     st.rows[w][r] = e;
-                     st.groups[w][r] = e;
-                     st.order[w][r] = @intCast(r);
-+                    st.votes[w][r] = votes[r];
-+                    st.adopted[w][r] = false;
-                 }
-                 st.n[w] = @intCast(n);
-                 // File order: a layer's records ascend with the expert. MLX_SERVE_DSV41_STAGE_TRIM: rank order (the layout's,
-@@ -2159,13 +2173,15 @@
-                     start = end;
+@@ -2096,12 +2094,13 @@
                  }
                  self.counters.stage_posted += n;
-+                for (votes) |v| stage_votes.notePosted(v);
              }
-             /// MLX_SERVE_DSV41_STAGE_NEXT: the next wide layer `layer`'s staging planned during the current layer's call, after
-             /// its read-ahead (`readAheadNext`; `experts`: its prediction, hottest first): its stream misses laid out as
-             /// `stageGroups` lays them (`next_lay`), each window posted once no route holds it (`postNextWindows`). The ring
-             /// room is `stageGroups`' (the ring doubles again with STAGE_NEXT on: the current call's last reads, the read-ahead
+-            /// MLX_SERVE_DSV41_STAGE_NEXT: the next wide layer `layer`'s staging planned during the current layer's call, after
+-            /// its read-ahead (`readAheadNext`; `experts`: its prediction, hottest first): its stream misses laid out as
+-            /// `stageGroups` lays them (`next_lay`), each window posted once no route holds it (`postNextWindows`). The ring
+-            /// room is `stageGroups`' (the ring doubles again with STAGE_NEXT on: the current call's last reads, the read-ahead
 -            /// and these stay unclaimed together).
 -            pub fn stageNext(self: *Stream, layer: u32, experts: []const u16) !void {
-+            /// and these stay unclaimed together). `votes`: each expert's votes in the prediction (by expert),
-+            /// MLX_SERVE_DSV41_STAGE_VOTES's (`stage_votes.plan`).
++            /// Next-layer staging: the next wide layer `layer`'s staging planned during the current layer's call, after
++            /// its read-ahead (`readAheadNext`; `experts`: its prediction, hottest first): its stream misses laid out
++            /// as `stageGroups` lays them (`next_lay`), each window posted once no route holds it (`postNextWindows`).
++            /// The ring room is `stageGroups`' (the ring doubles again for next-layer staging: the current call's last
++            /// reads, the read-ahead and these stay unclaimed together). `votes`: each expert's votes in the prediction
++            /// (by expert), the staging floor's (`stage_votes.plan`).
 +            pub fn stageNext(self: *Stream, layer: u32, experts: []const u16, votes: []const u32) !void {
                  if (!self.prompt_stage or !self.prompt_stage_next or self.failed or self.phase != .prefill or self.prompt_reads != .stock or self.transient_released) return;
                  if (layer >= self.layers.len or self.max_route_ids != max_route_ids) return;
                  try self.landNext();
-@@ -2179,17 +2195,13 @@
+@@ -2115,13 +2114,7 @@
                  const room: usize = pol.capacity -| @as(u32, @intCast(pol.protected.count()));
                  const sa = @min(experts.len, room);
                  var misses: [max_wide_depth * max_route_ids]u16 = undefined;
@@ -214,81 +164,28 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 -                    misses[nm] = e;
 -                    nm += 1;
 -                }
-+                var mvotes: [max_wide_depth * max_route_ids]u16 = undefined;
-+                const nm = stage_votes.plan(pol, experts[sa..], votes, cap, &misses, &mvotes);
++                const nm = stage_votes.plan(pol, experts[sa..], votes, cap, &misses);
                  self.next = .{ .layer = layer };
                  self.next_posted = @splat(false);
                  self.next_sg = (sa + width - 1) / width;
-                 stage_cfg.layout(misses[0..nm], self.next_sg, depth, width, &self.next_lay);
-+                stage_cfg.layout(mvotes[0..nm], self.next_sg, depth, width, &self.next_vlay);
-                 self.next_planned = true;
-                 try self.postNextWindows(false);
-             }
-@@ -2221,7 +2233,7 @@
-                         if (m.pins != 0 or m.state == .loading) break false;
-                     } else true;
-                     if (!free) continue;
--                    try self.postStaged(&self.next, layer, w, self.next_lay.window(w));
-+                    try self.postStaged(&self.next, layer, w, self.next_lay.window(w), self.next_vlay.window(w));
-                     self.next_posted[w] = true;
-                     self.counters.stage_early += n;
-                 }
-@@ -2246,6 +2258,7 @@
-                     try self.landNext();
-                     return false;
-                 }
-+                tallyJobs(&self.stage);
-                 self.stage = self.next;
-                 self.next = .{};
-                 self.next_planned = false;
-@@ -2263,6 +2276,7 @@
-                 self.next_planned = false;
-                 self.next_posted = @splat(false);
-                 for (0..max_wide_depth) |w| try self.landWindowOf(&self.next, w);
-+                tallyJobs(&self.next);
-                 self.next = .{};
-             }
-             /// MLX_SERVE_DSV41_STAGE: the staged groups of `layer`'s windows, once, for its call over `depth` windows (the
-@@ -2300,7 +2314,12 @@
+@@ -2237,7 +2230,8 @@
              fn noteStaged(self: *Stream, layer: u32, w: u8, r: u32, e: u16, held: bool) void {
                  const st = &self.stage;
                  if (st.layer != layer or r >= st.n[w] or st.rows[w][r] == expert_policy.no_expert) return;
 -                self.counters.stage_adopted += @intFromBool(held and st.rows[w][r] == e);
 +                const adopted = held and st.rows[w][r] == e;
 +                self.counters.stage_adopted += @intFromBool(adopted);
-+                if (adopted) {
-+                    stage_votes.noteAdopted(st.votes[w][r]);
-+                    st.adopted[w][r] = true;
-+                }
                  st.rows[w][r] = expert_policy.no_expert;
              }
              /// turboexl3_ds41 (MLX_SERVE_DSV41_STAGE_TRIM): layer `layer`'s call has its routes (`used`: its distinct experts)
-@@ -2350,6 +2369,28 @@
-                         strim.records += p.n_reads / mn;
+@@ -2279,8 +2273,8 @@
                      }
                  }
-+            }
-+            /// MLX_SERVE_DSV41_STAGE_VOTES: staging `st`'s jobs (each a read-pool submission), once: each one's records read
-+            /// and how many of them no route adopted (`stage_votes.noteJob`); a job STAGE_TRIM withdrew is not counted.
-+            fn tallyJobs(st: *Stage) void {
-+                if (st.tallied) return;
-+                st.tallied = true;
-+                for (0..max_wide_depth) |w| for (st.parts[w][0..st.n_parts[w]]) |p| {
-+                    // MLX_SERVE_DSV41_STAGE_TRIM: a withdrawn job read nothing.
-+                    if (p.withdrawn) continue;
-+                    var read: u32 = 0;
-+                    var wasted: u32 = 0;
-+                    for (st.order[w][p.first..][0..p.n]) |r| if (st.reads[w][r]) {
-+                        read += 1;
-+                        wasted += @intFromBool(!st.adopted[w][r]);
-+                    };
-+                    stage_votes.noteJob(read, wasted);
-+                };
-+            }
-+            /// MLX_SERVE_DSV41_STAGE_VOTES: the prompt's end: its last staging's jobs, and a plan no layer took, counted.
-+            pub fn tallyStaging(self: *Stream) void {
-+                tallyJobs(&self.stage);
-+                if (self.next_planned) tallyJobs(&self.next);
              }
-             /// MLX_SERVE_DSV41_STAGE: window `w`'s staged reads landed, once: each job waited (its bytes counted), its rows'
-             /// states set, every staged row unpinned; a failed read fails the stream.
+-            /// MLX_SERVE_DSV41_STAGE: window `w`'s staged reads landed, once: each job waited (its bytes counted), its rows'
+-            /// states set, every staged row unpinned; a failed read fails the stream.
++            /// Staging: window `w`'s staged reads landed, once: each job waited (its bytes counted), its rows' states
++            /// set, every staged row unpinned; a failed read fails the stream.
+             fn landWindow(self: *Stream, w: usize) Error!void {
+                 return self.landWindowOf(&self.stage, w);
+             }

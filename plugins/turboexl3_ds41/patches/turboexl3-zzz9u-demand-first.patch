@@ -1,18 +1,7 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -273,6 +273,7 @@
-     pub const MLX_SERVE_DSV41_DECODE_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "split where its curves fit the pack, else flat", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode slot rows (turboexl3_ds41): unset, the flat bill's decode bytes split across the layers by its development corpus's misses-a-row curves, each layer between its prompt rows and 256, where the curves fit the pack (flat rows where they do not); flat: flat rows; split: the split required (refused by name, rows flat, where it does not fit)" };
-     pub const MLX_SERVE_DSV41_DEC_INVARIANT: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 indexer linears' decode rows the same words at any verify width (turboexl3_ds41): unset or 1, the indexer's head weights and index keys (plain bf16 linears MLX runs as its gemv for one row and as gemv_wide or its GEMM for more) at 2 to 6 rows on a batched twin of MLX's one-row gemv, every row that gemv's words, the weight read once a launch, the launch per weight shape and rows from this machine's timings; one row and wider calls keep MLX's matmul (one row: its gemv); check, on and every twin call compared with MLX's one-row matmul of each row, word for word ([gemv-twin] check lines), and the call's own matmul against the same words, reported ([gemv-twin] wide-vs-m1 lines); 0: MLX's matmul at every width" };
-     pub const MLX_SERVE_DSV41_DEC_PREFETCH: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 CED decoder prefetch (turboexl3_ds41): S[:K], a replaying prompt chunk's decoder layers' experts predicted at encoder layer S and read into their own rows, K layers at each routed call's end" };
-+    pub const MLX_SERVE_DSV41_DEMAND_FIRST: Var = .{ .kind = .kill, .type = .text, .default = "2", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode's lookahead reads behind its demand reads (turboexl3_ds41, df1): unset, empty or 2 (zzz9u), an unclaimed lookahead record reads only while no demand read is queued or running (every lookahead thread), in 1 MiB pieces, so it stops at the next piece once a demand read starts, and a claimed record's unread pieces are read by the demand reads waiting on it, each its own, adopted as soon as its own bytes landed; 1, the order alone; 0, off; reads only, the served bytes the same at every setting" };
-     pub const MLX_SERVE_DSV41_DIRECT_PARTS: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 read pool parts (turboexl3_ds41): each demand read's parts whose file offset, length and row lie on the file's block read straight into their rows (the gate's code on this pack: a third of a record no longer copied), the others staged and copied, the same bytes; [direct-parts] lines at each prompt's and request's end (=0: every part staged and copied)" };
-     pub const MLX_SERVE_DSV41_DRAFT_AHEAD: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 greedy round's next DSpark draft (turboexl3_ds41): launched at the end of the round before it, from its next token once its state is committed, when the next plan is the stages' block, and taken by the next round when it fits (the same token, position and state); the same ops, served bytes unchanged (unset or 1: on; 0: off; check: on, the next round makes its own draft too, compares the ids and confidences word for word and serves its own, [draft-ahead] lines)" };
-     pub const MLX_SERVE_DSV41_DECODE_STOP: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's decode stop (turboexl3_ds41): the decode phase's budget takes 1.0e9 B of the 2.0e9 B stop under the ceiling back for its slot rows (two more on the M5 Max at 16K), MLX's cache capped at 1 GiB from the phase change to decode and the prompt's cap restored at the change back; the prompt's budget and rows unchanged; the same bytes (unset or 1: on; 0: off; check: as 1, [decode-stop] lines)" };
 diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
 --- a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
 +++ b/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c
-@@ -132,6 +132,24 @@
+@@ -130,6 +130,24 @@
   *   dq1a's measurement rides along (RES_W 10): word 8 the range's lookahead flags (bit 0: an unclaimed speculative chunk
   *   in flight at its start; >> 1: those started while it read; a pre-bound range's: its pre-read's), word 9 its wait (an
   *   adopted range's for its record's chunks; a pre-bound range's for its pre-read).
@@ -37,7 +26,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
   */
  #include <errno.h>
  #include <mach/mach_time.h>
-@@ -303,6 +321,12 @@
+@@ -299,6 +317,12 @@
      int32_t readers;    /* demand ranges copying out of buf */
      int32_t adopted;    /* ranges served since it was queued */
      char *buf;
@@ -50,7 +39,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  } spec_t;
  
  static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-@@ -334,6 +358,26 @@
+@@ -330,6 +354,26 @@
  static int64_t dq_flags(int at_start, uint64_t s0) { return (int64_t)((spec_chunk_starts - s0) << 1) | (at_start ? 1 : 0); }
  static uint64_t spec_order = 0;
  static int64_t *sc = 0;
@@ -77,7 +66,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  
  /* ---- the pre-read class (lookahead3) */
  #define MAX_PRE 32
-@@ -958,6 +1002,133 @@
+@@ -953,6 +997,133 @@
      return -1;
  }
  
@@ -211,7 +200,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  /* ---------------------------------------------------------------- speculative: demand-side adoption */
  /* Serve one demand range from a speculative record.  Returns -1 when no record serves it (the caller reads
   * it the stock way), else the range status (ST_OK, or ST_DEADLINE when the deadline passed while waiting). */
-@@ -973,9 +1144,13 @@
+@@ -968,9 +1139,13 @@
          spec_t *s = &spec[i];
          int64_t need = rg->offset + total - s->base;
          if (s->landed >= need && (s->state == SP_LANDED || s->state == SP_INFLIGHT)) break;
@@ -225,7 +214,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
          if (job->deadline >= 0) {
              int64_t left = job->deadline - q3ld_monotonic_ns();
              if (left <= 0) {
-@@ -1325,6 +1500,7 @@
+@@ -1279,6 +1454,7 @@
  
  /* ---------------------------------------------------------------- speculative: reader threads */
  static int rule_ok(int ti) {   /* THE QUEUE RULE, demand side, for speculative thread ti (caller holds mu) */
@@ -233,7 +222,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      return qlen == 0 && busy <= (ti == 0 ? SPEC_MAX_DEMAND_BUSY : spec_idle_busy);
  }
  
-@@ -1336,8 +1512,10 @@
+@@ -1290,8 +1466,10 @@
      return n;
  }
  
@@ -246,7 +235,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  }
  
  /* caller holds mu: claimed (parked) first, then the nearest class, then the oldest; -1 if none */
-@@ -1419,9 +1597,14 @@
+@@ -1373,9 +1551,14 @@
              if (s->file_size - s->aligned < s->span) s->span = s->file_size - s->aligned;
              s->got = 0;
              s->landed = 0;
@@ -261,7 +250,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
          for (;;) {
              /* chunk boundary (also before the first chunk) */
              if ((s->abandon || stopping) && !s->claimed) {
-@@ -1435,6 +1618,23 @@
+@@ -1389,6 +1572,23 @@
                  else { sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); }
                  break;
              }
@@ -285,7 +274,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
              if (!s->claimed && !stopping && s->prio > 0 && (!rule_ok(ti) || nearer_queued(s->prio))) {
                  /* PARK: free this thread for demand-nearer work; any thread resumes the record later */
                  sc[SC_PARKS] += 1;
-@@ -1446,6 +1646,7 @@
+@@ -1400,6 +1600,7 @@
              }
              if (!s->claimed && !stopping && !rule_ok(ti)) {
                  sc[SC_PAUSES] += 1;
@@ -293,7 +282,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
                  pthread_cond_wait(&spec_cv, &mu);
                  continue;
              }
-@@ -1462,13 +1663,28 @@
+@@ -1416,13 +1617,28 @@
              }
              EV(s->claimed ? 7 : (ti > 0 ? 8 : 3), s->claimed ? s->base : nq);
              SPEC_HOLD(s);
@@ -326,7 +315,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
              pthread_mutex_unlock(&mu);
              SPEC_DELAY();
              int64_t done = 0;
-@@ -1484,6 +1700,10 @@
+@@ -1438,6 +1654,10 @@
              if (dq_uc) spec_reading -= 1;
              sc[SC_SPEC_CHUNKS] += 1;
              sc[SC_SPEC_BYTES] += done;
@@ -337,7 +326,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
              if (err) { s->landed = 0; sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); break; }
              s->got += done;
              int64_t payload = s->aligned + s->got - s->base;
-@@ -1528,6 +1748,8 @@
+@@ -1482,6 +1702,8 @@
      spec_inflight = 0;
      spec_reading = 0;
      spec_chunk_starts = 0;                            /* dq1a */
@@ -346,7 +335,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      spec_configured = 1;
      pthread_mutex_unlock(&mu);
      return 0;
-@@ -1550,7 +1772,7 @@
+@@ -1504,7 +1726,7 @@
      if (tb_denom == 0 && q3ld_init() != 0) return -1;
      pthread_mutex_lock(&mu);
      if (running || !spec_configured || nw < 1 || nw > MAX_WORKERS || psize <= 0 || sbytes % psize
@@ -355,7 +344,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      for (int i = 0; i < nspec; i++) {
          if (((uintptr_t)spec[i].buf) % (uintptr_t)psize) { pthread_mutex_unlock(&mu); return -1; }
      }
-@@ -1578,6 +1800,8 @@
+@@ -1531,6 +1753,8 @@
      wd_stop = 0; wd_running = 0;
      qcap = n_tickets * 2; qhead = 0; __atomic_store_n(&qlen, 0, __ATOMIC_RELAXED);
      gu_split = 0;                                     /* GU SPLIT: a new pool reads ranges whole until told */
@@ -364,7 +353,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
      res = res_arr; nt = n_tickets; logbuf = log_arr; logn = n_log; gauge = gauge_arr;
      staging_bytes = sbytes; page_size = psize;
      __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0;
-@@ -1887,6 +2111,10 @@
+@@ -1835,6 +2059,10 @@
          s->aligned = b / page_size * page_size;
          s->span = s->got = s->landed = 0;
          s->adopted = 0;
@@ -375,15 +364,15 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
          sc[SC_SUBMITTED] += 1;
          sc[SC_H_SUBMITTED + origin - 1] += 1;
          queued += 1;
-@@ -2104,6 +2332,7 @@
+@@ -2052,6 +2280,7 @@
      free(ranges); free(queue); free(pre_of); free(sub_len); ranges = 0; queue = 0; pre_of = 0; sub_len = 0;
-     free(split_left); free(split_chk); free(split_words); free(pre_of_b);
-     split_left = 0; split_chk = 0; split_words = 0; pre_of_b = 0; gu_split = 0;
+     free(split_left); free(split_words); free(pre_of_b);
+     split_left = 0; split_words = 0; pre_of_b = 0; gu_split = 0;
 +    demand_first = 0;
      for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
      pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
      res = 0; logbuf = 0; gauge = 0; sc = 0;
-@@ -2454,7 +2683,27 @@
+@@ -2402,7 +2631,27 @@
      return 0;
  }
  
@@ -415,18 +404,32 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
 diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
-@@ -77,6 +77,10 @@
- /// `MLX_SERVE_DSV41_GU_SPLIT` (the plugin's src/gu_split.zig, dq1b): decode's demand reads with each record's gate/up
- /// range in two range jobs, read side by side (the read pool's `q3ld_gu_split`, set at each phase change).
- const gu_split = @import("mlx_host").gu_split;
-+/// `MLX_SERVE_DSV41_DEMAND_FIRST` (the plugin's src/demand_first.zig, df1): decode's lookahead reads behind its demand
-+/// reads, and in mode 2 a claimed record's untaken pieces read by the demand (the read pool's `q3ld_demand_first`, set at
-+/// each phase change).
-+const demand_first = @import("mlx_host").demand_first;
- /// `MLX_SERVE_DSV41_STAGE_NEXT` (the plugin's src/stage_next.zig): the next routed layer's read-ahead and staging during
- /// the current layer's call (`nextAhead`, `Stream.readAheadNext`, `Stream.stageNext`).
- const stage_next = @import("mlx_host").stage_next;
-@@ -722,6 +726,8 @@
+@@ -45,24 +45,6 @@
+ /// turboexl3_ds41 (the plugin's src/decode_window.zig): decode's window 0 rows, the bill's decode term and the stream's
+ /// grow.
+ const dwin = @import("mlx_host").decode_window;
+-/// `MLX_SERVE_DSV41_STAGE` (the plugin's src/stage.zig): a wide prompt call's predicted transient loads staged in its windows
+-/// after P1's read-ahead (`Stream.stageGroups`).
+-const stage = @import("mlx_host").stage;
+-/// `MLX_SERVE_DSV41_DIRECT_PARTS` (the plugin's src/direct_parts.zig): the read pool's demand ranges part by part, the
+-/// block-aligned parts read straight into their rows.
+-const direct_parts = @import("mlx_host").direct_parts;
+-/// `MLX_SERVE_DSV41_GU_SPLIT` (the plugin's src/gu_split.zig, dq1b): decode's demand reads with each record's gate/up
+-/// range in two range jobs, read side by side (the read pool's `q3ld_gu_split`, set at each phase change).
+-const gu_split = @import("mlx_host").gu_split;
+-/// `MLX_SERVE_DSV41_STAGE_NEXT` (the plugin's src/stage_next.zig): the next routed layer's read-ahead and staging during
+-/// the current layer's call (`nextAhead`, `Stream.readAheadNext`, `Stream.stageNext`).
+-const stage_next = @import("mlx_host").stage_next;
+-/// `MLX_SERVE_DSV41_STAGE_VOTES` (the plugin's src/stage_votes.zig): staging's vote floor over the prediction's votes
+-/// (`readAhead`); the prompt's staged records by their votes (`[stage-votes]` with PROMPT_IO).
+-const stage_votes = @import("mlx_host").stage_votes;
+-/// `MLX_SERVE_DSV41_M1` (the plugin's src/m1.zig): the DIG-X waves' 128-row GEMMs with the B stage double-buffered
+-/// (`Accepted.routeM1`, before the scratch twins derive from them).
+-const m1 = @import("mlx_host").m1;
+ const dsv41_routes = @import("../../quant/exl3/stream/kernel_routes.zig");
+ const Combine = dsv41_routes.JoinlessCombine(G);
+ pub const Gate = Hook.Gate;
+@@ -500,6 +482,8 @@
                          self.stream.directPartsLive(false);
                          // MLX_SERVE_DSV41_GU_SPLIT is decode's: its reads (the grow's fills, its misses) split from here.
                          self.stream.guSplit(gu_split.poolMode());
@@ -435,7 +438,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
                          // MLX_SERVE_DSV41_SCRATCH_WAVES: the prompt's regions let go (MLX keeps a buffer while a command uses it).
                          scratch_waves.releaseAll();
                          self.released = (try h.releaseTransient()) > 0;
-@@ -739,6 +745,8 @@
+@@ -517,6 +501,8 @@
                          self.stream.directPartsLive(true);
                          // MLX_SERVE_DSV41_GU_SPLIT: the prompt's reads whole, as without it.
                          self.stream.guSplit(0);
@@ -444,17 +447,6 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
                          dec_prefetch.reset();
                          // `shrink` frees the grown rows and checks MLX's active bytes dropped by them, so no command may
                          // still hold them (the grow's own fills, a decode's last eval): a phase change right after the
-@@ -766,6 +774,10 @@
-     }
-     pub fn stats(self: *Source) expert_stream.Stats {
-         return self.source.stats();
-+    }
-+    /// MLX_SERVE_DSV41_DEMAND_FIRST: the read pool's df1 counters and its adoption waits (`Stream.demandFirstStats`).
-+    pub fn demandFirstStats(self: *Source) [sdk_ext.expert.io.df_n + 2]i64 {
-+        return self.stream.demandFirstStats();
-     }
- };
- /// `x`'s words as `dt` (MLX's view: the same buffer, bitcast), in `g`'s scope.
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weights/streamed/sdk_ext/expert/io.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/io.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/io.zig
@@ -473,7 +465,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  } else struct {};
 -/// The C pool's ABI (`q3ld_abi`): 2026110202, turboexl3_ds41's dq1b (`q3ld_gu_split`, `Pool.guSplit`: each record's gate/up
 +/// The C pool's ABI (`q3ld_abi`): 2026110203, turboexl3_ds41's df1 (`q3ld_demand_first`, `Pool.demandFirst`: the lookahead's
-+/// reads behind demand; `q3ld_df_stats`, `Pool.demandFirstStats`); 2026110202, turboexl3_ds41's dq1b (`q3ld_gu_split`, `Pool.guSplit`: each record's gate/up
++/// reads behind demand; `q3ld_df_stats`); 2026110202, turboexl3_ds41's dq1b (`q3ld_gu_split`, `Pool.guSplit`: each record's gate/up
  /// range read as two range jobs of one ticket; the `split_*` counters; ten status words a ticket: `Result.lookahead` and
  /// `Result.wait_ns`); 2026110101, the PARTS route (`Options.parts_block`) and its counters (2026102401:
  /// SCATTER ranges; 2026101401: DIRECT reads as a construction-time route; 2026101201: the submit-wide WITHDRAW over the
@@ -488,7 +480,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  pub const max_workers = 8;
  /// Records per job (one fill unit).
  pub const max_items = 8;
-@@ -336,8 +344,9 @@
+@@ -329,8 +337,9 @@
              return error.InvalidOptions;
          if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
              s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
@@ -499,7 +491,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
          const self = try allocator.create(Pool);
          errdefer allocator.destroy(self);
          const staging = try std.posix.mmap(null, @intCast(opt.workers * opt.staging_bytes), .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-@@ -394,6 +403,22 @@
+@@ -385,6 +394,15 @@
      pub fn guSplit(self: *Pool, mode: u32) void {
          _ = self;
          _ = c.q3ld_gu_split(@intCast(mode));
@@ -512,13 +504,6 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
 +    pub fn demandFirst(self: *Pool, mode: u32) void {
 +        _ = self;
 +        _ = c.q3ld_demand_first(@intCast(mode));
-+    }
-+    /// df1's counters since the start (`df_n`, in `q3ld_df_stats`'s order).
-+    pub fn demandFirstStats(self: *Pool) [df_n]i64 {
-+        _ = self;
-+        var out: [df_n]i64 = @splat(0);
-+        _ = c.q3ld_df_stats(&out, df_n);
-+        return out;
      }
      /// After the owned consumers settle: expire unbound reads and wait for the pool's activity to stop.
      /// Ready speculative records and their tags stay intact. A timeout refuses the phase change.
@@ -541,22 +526,14 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io_stub.zig b/sdk/
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
-@@ -3772,6 +3772,19 @@
+@@ -3473,6 +3473,11 @@
              pub fn guSplit(self: *Stream, mode: u32) void {
                  self.pool.guSplit(mode);
              }
-+            /// turboexl3_ds41 (df1, MLX_SERVE_DSV41_DEMAND_FIRST: the source's decode phase the setting's mode, its prompt
-+            /// phase off): the read pool's demand-first order for the reads from here on (`expert_io.Pool.demandFirst`).
++            /// turboexl3_ds41 (df1, demand first: the source's decode phase the setting's mode, its prompt phase off):
++            /// the read pool's demand-first order for the reads from here on (`expert_io.Pool.demandFirst`).
 +            pub fn demandFirst(self: *Stream, mode: u32) void {
 +                self.pool.demandFirst(mode);
-+            }
-+            /// df1's counters (`expert_io.Pool.demandFirstStats`), then the pool's adoption waits and their time (ns).
-+            pub fn demandFirstStats(self: *Stream) [expert_io.df_n + 2]i64 {
-+                var out: [expert_io.df_n + 2]i64 = undefined;
-+                out[0..expert_io.df_n].* = self.pool.demandFirstStats();
-+                out[expert_io.df_n] = self.pool.counter(.adopt_waits);
-+                out[expert_io.df_n + 1] = self.pool.counter(.adopt_wait_ns);
-+                return out;
 +            }
              pub fn stats(self: *Stream) Stats {
                  var s = self.counters;

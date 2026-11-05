@@ -1,39 +1,37 @@
 diff -ruN -x .generated a/env.zig b/env.zig
 --- a/env.zig
 +++ b/env.zig
-@@ -301,6 +301,7 @@
-     pub const MLX_SERVE_DSV41_ENGRAM_DIRECT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram tables (turboexl3_ds41): a prompt's rows read once a table (its spans' ids made distinct) and past the page cache, each row's bytes from the file system blocks that hold them, on up to 64 threads; the same bytes (=0: span by span through the page cache)" };
-     pub const MLX_SERVE_DSV41_ENGRAM_FIRST: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt Engram reads (turboexl3_ds41, with MLX_SERVE_DSV41_ENGRAM_DIRECT on, the default): on (unset, empty or 1), a prompt chunk's Engram row ids hashed and their read thread started first, before the phase change and the embedding, and a prompt grid's tables read on up to 128 threads (the stock: after them, 64 threads), so the first Engram layer waits less for table 0; check, as 1 and table 0's rows read again at 64 threads, the bytes compared ([engram-first] check lines); the same rows read and served (0: the stock start and threads)" };
-     pub const MLX_SERVE_DSV41_GU_SPLIT: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's demand reads (turboexl3_ds41, dq1b): 1 reads each missed record's gate/up range as two range jobs side by side (split at the part boundary nearest its middle), check also reads each split range again whole and compares it with the rows ([gu-split] mismatch); unset or 1 on (zzz9h), 0 off; the served bytes are the same at every setting" };
-+    pub const MLX_SERVE_DSV41_GATE_GEMM: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide router logits (turboexl3_ds41): on (unset, empty or 1), the chain (both casts and MLX's NAX matmul) as one launch of MLX's fused NAX GEMM body reading x and gate_w in their stored types at this machine's tile, where MLX runs its regular kernel, the same words; check, the chain served and the launch compared word for word ([gate-gemm] lines); 0: the chain" };
-     pub const MLX_SERVE_DSV41_HC_FUSE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' hyper-connection stages (turboexl3_ds41): on (unset, empty or 1), the attention side's mixes and norm (and the read-ahead's norm) in one launch and the FFN side's expand and norm in one launch into the x1 region, the splits from the mixes after: each stream read once less; check, the stock kernels served and the fused compared word for word ([hc-fuse] check lines); refused by name on a GPU that runs a fused kernel at fewer threads than the stock hc kernels; the same words (0: the stock kernels)" };
-     pub const MLX_SERVE_DSV41_ENGRAM_TWIN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram layers' wkv at 2..16 rows (turboexl3_ds41, eg2): on the batched twin of MLX's one-row gemv, every row its one-row words at any decode width; unset or 1 on, 0 off, check also compares every row with MLX's one-row matmul ([gemv-twin] check, [engram-twin] a request)" };
+@@ -276,7 +276,7 @@
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_DIR: Var = .{ .kind = .kill, .type = .text, .default = "the pack", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): the absolute directory its expert-usage-v1.json is read from" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_LABEL: Var = .{ .kind = .kill, .type = .text, .default = "unlabeled", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): the recorded prompt set's name, the file's provenance; needs MLX_SERVE_DSV41_EXPERT_USAGE_RECORD" };
+     pub const MLX_SERVE_DSV41_EXPERT_USAGE_RECORD: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): an absolute file path; each request's routed experts per layer counted into it (expert-usage-v1.json's form), written at the request's end" };
+-    pub const MLX_SERVE_DSV41_ENGRAM_LRU_MB: Var = .{ .kind = .kill, .type = .text, .default = "256", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram LRU's size in MiB with MLX_SERVE_DSV41_ENGRAM_DECODE on (turboexl3_ds41): its rows and their index, 1 to 16384, billed at load beside the host's bytes" };
++    pub const MLX_SERVE_DSV41_ENGRAM_LRU_MB: Var = .{ .kind = .kill, .type = .text, .default = "256", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram LRU's size in MiB (turboexl3_ds41): the rows kept across a conversation's turns and their index, 1 to 16384, billed at load beside the host's bytes" };
      pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+     pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
+     pub const MLX_SERVE_DSV41_FLASH_ATTN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' attention spans (turboexl3_ds41): unset, empty or 1, each span as one flash kernel (keys in blocks of 128, an online softmax, the scores and probabilities never in memory), its heads into the run region; NOT exact (the probabilities round to f16 before the division); =1 refuses a wide span the kernel cannot take; 0: the exact gather" };
 diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
-@@ -96,6 +96,9 @@
- /// turboexl3_ds41 (MLX_SERVE_DSV41_HC_FUSE, the plugin's src/hc_fuse.zig): a wide layer's hc stages with fewer passes
- /// over the stream.
+@@ -62,6 +62,9 @@
+ const sx1 = @import("../../../scratch_x1.zig");
+ /// turboexl3_ds41's src/hc_fuse.zig: a wide layer's hc stages with fewer passes over the stream.
  const hcf = @import("../../../hc_fuse.zig");
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_GATE_GEMM, the plugin's src/gate_gemm.zig): the wide router's logits as one launch of
-+/// MLX's fused NAX GEMM body at this machine's tile.
++/// turboexl3_ds41 (the plugin's src/gate_gemm.zig): the wide router's logits as one launch of MLX's fused NAX GEMM body
++/// at this machine's tile.
 +const ggemm = @import("../../../gate_gemm.zig");
- /// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_FIRST, the plugin's src/engram_first.zig): a prompt chunk's Engram read thread
- /// started first, before the phase change.
- const efirst = @import("../../../engram_first.zig");
-@@ -4025,8 +4028,13 @@
+ /// turboexl3_ds41's fused Markov chain (src/markov.zig): the draft's chain in B + 1 launches.
+ const markov = @import("../../../markov.zig");
+ /// turboexl3_ds41 (the plugin's src/engram_decode.zig): a round's bonus token's Engram
+@@ -3816,8 +3819,10 @@
      const L = dim(x, 0);
      const E = dim(ly.gate_w, 0);
      if (L > region_rows) {
-+        // turboexl3_ds41 (MLX_SERVE_DSV41_GATE_GEMM): the chain as one launch where MLX runs its regular NAX kernel (the
-+        // same words); `check` serves the chain and compares the launch with it.
++        // turboexl3_ds41: the chain as one launch where MLX runs its regular NAX kernel (the same words).
 +        if (try ggemm.router(sc.s, x, ly.gate_w, device.naxAvailable())) |y| return sc.keep(y);
          const w = try sc.astype(ly.gate_w, .float32);
 -        return sc.matmul(try sc.astype(x, .float32), try sc.transpose(w, &.{ 1, 0 }));
-+        const z = try sc.matmul(try sc.astype(x, .float32), try sc.transpose(w, &.{ 1, 0 }));
-+        try ggemm.checkRouter(sc.s, x, ly.gate_w, z, device.naxAvailable());
-+        return z;
++        return try sc.matmul(try sc.astype(x, .float32), try sc.transpose(w, &.{ 1, 0 }));
      }
      const sgs: usize = 8;
      var lo = mlx.mlx_vector_array_new();

@@ -34,7 +34,7 @@ extern fn q3ld_seq() i64;
 extern fn q3ld_wait(seen: i64, timeout_ns: i64) i64;
 extern fn q3ld_quiesce(timeout_ns: i64) c_int;
 extern fn q3ld_stop() c_int;
-/// dq1b: the gate/up split (0 off, 1 on, 2 checked), set after `q3ld_start` by `run` when `split_mode` is set.
+/// dq1b: the gate/up split (0 off, 1 on), set after `q3ld_start` by `run` when `split_mode` is set.
 extern fn q3ld_gu_split(mode: i32) c_int;
 
 /// The pool's Metal event backend (src/host_shims.zig in the plugin): never armed here, every gate off.
@@ -43,7 +43,7 @@ export fn q3ld_mtl_signal(event: ?*anyopaque, value: u64) void {
     _ = value;
 }
 
-const counters_n = 84;
+const counters_n = 82;
 /// The pool's counters (q3_lookahead4_exl3.c's SC_ enum).
 const sc_landed = 4;
 const sc_claimed = 8;
@@ -58,8 +58,6 @@ const sc_split_read = 76;
 const sc_split_adopted = 77;
 const sc_split_pre = 78;
 const sc_split_pre_issued = 79;
-const sc_split_checked = 82;
-const sc_split_mismatch = 83;
 /// dq1b's split test: the gate/up split `run` sets on each pool (0: none).
 var split_mode: i32 = 0;
 const res_w = 10;
@@ -408,7 +406,7 @@ test "a4k byte gate: the pool's slot rows hold every part from the classic and t
     }
 }
 
-test "a4k byte gate, dq1b: with the gate/up split checked the slot rows hold every part and every split ticket reads back equal, staged, by PARTS, adopted and bound to the halves' pre-reads" {
+test "a4k byte gate, dq1b: with the gate/up split the slot rows hold every part, staged, by PARTS, adopted and bound to the halves' pre-reads" {
     const a = testing.allocator;
     var parts = try Parts.init(a, 0xd1b_5eed);
     defer parts.deinit(a);
@@ -420,9 +418,9 @@ test "a4k byte gate, dq1b: with the gate/up split checked the slot rows hold eve
     defer fc.destroy(a);
     const fa = try TempFile.create(a, "a4k-split", img_a);
     defer fa.destroy(a);
-    split_mode = 2;
+    split_mode = 1;
     defer split_mode = 0;
-    // a gate/up ticket a record, two layers: each read as two halves, each ticket read again whole and compared
+    // a gate/up ticket a record, two layers: each read as two halves
     const tk: i64 = 2 * experts;
     for ([_]Route{ .staged, .parts, .spec, .pre }) |route| {
         for ([_]Layout{ .classic, .a4k }) |layout| {
@@ -431,8 +429,6 @@ test "a4k byte gate, dq1b: with the gate/up split checked the slot rows hold eve
             const cnt = try run(if (layout == .a4k) fa else fc, layout, route, &rows);
             try expectRowsHoldParts(&rows, &parts);
             try testing.expectEqual(tk, cnt[sc_split_tickets]);
-            try testing.expectEqual(tk, cnt[sc_split_checked]);
-            try testing.expectEqual(@as(i64, 0), cnt[sc_split_mismatch]);
             try testing.expectEqual(2 * tk, cnt[sc_split_read] + cnt[sc_split_adopted] + cnt[sc_split_pre]);
             switch (route) {
                 .staged, .parts => try testing.expectEqual(2 * tk, cnt[sc_split_read]),

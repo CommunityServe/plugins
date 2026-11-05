@@ -1,24 +1,19 @@
-//! `MLX_SERVE_DSV41_GATE_GEMM` (read at load; unset, empty or `1`: on; `0`: off; `check`: the chain served and the
-//! launch checked against it; anything else is refused by name): the wide router's f32 logits as one launch of MLX's
-//! fused NAX GEMM body at this machine's tile (hgf3u's pick on the M5 Max).
+//! The wide router's f32 logits as one launch of MLX's fused NAX GEMM body at this machine's tile (the pick on the M5
+//! Max).
 //!
 //! The copied model's `gateLogits` past the decode width runs `matmul(astype(x, f32), transpose(astype(gate_w, f32)))`,
 //! x bf16 [rows, 5,120] and gate_w [384, 5,120] (F16 on the pack): two casts and MLX's NAX matmul (MLX_ENABLE_TF32
-//! unset: 1), its regular fused kernel from 1,707 rows (K < 3 max(M, N)), its split K below. GATE_GEMM runs the chain as
+//! unset: 1), its regular fused kernel from 1,707 rows (K < 3 max(M, N)), its split K below. This runs the chain as
 //! one launch: MLX's fused NAX GEMM kernel at nt (steel/gemm/kernels/steel_gemm_fused_nax.h `gemm`, MLX 0.32.3:
 //! src/kernels/gate_gemm_nt.metal) and its gemm_loop (src/kernels/gate_gemm_loop.metal: verbatim but A's and B's memory
 //! types), reading x and gate_w in their stored types and static_casting each element to float as it loads (the values
 //! astype makes, bf16 and f16 alike: no cast passes), the statements of MLX's kernel at this machine's tile (bm 64, bn 128,
 //! bk 256, wm 2, wn 4, swizzle 1; MLX's own here is swizzle 2): each simdgroup's tile whole 16-row fragments and N pairs
 //! of 16 columns and BK whole SK 32 steps, so every output's k order is MLX's (the 16 x 32 x 16 MMA from k = 0, whatever
-//! the tile) and the words are the chain's. hgf3u (w-hgf3u-20261103-1359, src/f3_bench.zig in hg1 lane's bench tree, bf16
-//! operands): 0 differing words at 16,383, 4,097 and 2,048 rows; per call 1.773x at 16,383 rows (the chain 2,719 us, the
+//! the tile) and the words are the chain's. Measured (bf16 operands): 0 differing words at 16,383, 4,097 and 2,048 rows; per call 1.773x at 16,383 rows (the chain 2,719 us, the
 //! launch 1,536), 1.731x at 4,097 and 1.525x at 2,048. A call is taken only where MLX runs its regular kernel on the NAX
 //! path; elsewhere (fewer rows: decode's GEMV and the CED decoder's 128 rows on MLX's split K; no NAX; other shapes or
-//! types) the chain. `check`: the chain served and, at every call GATE_GEMM would take, its launch beside it compared word
-//! for word (one host read a call): `[gate-gemm] mode= calls= checks= words= differ=` at each request's end (calls:
-//! launches; checks, words, differ: check only). On against ctl55 (hggg2, w-pio-20261103-1626): 21 calls a 16K card,
-//! the check arm's words none different, cold +0.65% and new +0.21% (README).
+//! types) the chain. 21 calls a 16K card, every word the chain's; cold prefill +0.65%, new text +0.21%.
 
 const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
@@ -26,28 +21,6 @@ const steel = @import("mlx_steel_sources");
 
 const A = mlx.mlx_array;
 
-pub const Mode = enum { off, on, check };
-
-/// The switch (`configure`, at load).
-pub var mode: Mode = .on;
-
-pub const Error = error{GateGemmSetting};
-
-pub fn configure(value: ?[]const u8) Error!void {
-    mode = try parse(value);
-    reset();
-}
-
-/// `value`: null, empty or `1` on; `0` off; `check`; anything else refused by name.
-pub fn parse(value: ?[]const u8) Error!Mode {
-    const v = value orelse return .on;
-    if (v.len == 0 or std.mem.eql(u8, v, "1")) return .on;
-    if (std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "check")) return .check;
-    return error.GateGemmSetting;
-}
-
-/// MLX's tile: BM x BN, WM x WN simdgroups, BK, swizzle_log.
 pub const Tile = struct { bm: u16, bn: u16, bk: u16, wm: u8, wn: u8, swz: u8 };
 
 /// hgf3u's pick (w-hgf3u-20261103-1359): the widening launch at this tile.
@@ -186,87 +159,14 @@ fn launch(s: mlx.mlx_stream, a: A, b: A, mma: mlx.mlx_dtype, out_r: mlx.mlx_dtyp
     return y;
 }
 
-fn routerLaunch(s: mlx.mlx_stream, x: A, w: A, nax: bool) !?A {
+/// The router's f32 logits [rows, E] for x [rows, K] by gate_w [E, K] (each in its stored float type: x bf16 and gate_w
+/// f16 on the pack) as the launch (lazy, the caller owns them); null where it declines (no NAX, fewer rows than MLX's
+/// regular kernel takes, other shapes or types: the chain).
+pub fn router(s: mlx.mlx_stream, x: A, w: A, nax: bool) !?A {
     if (!nax or !mlx.streamIsGpu(s)) return null;
     const mnk = shapeOf(x, w) orelse return null;
     if (!mlxRegular(mnk[0], mnk[1], mnk[2])) return null;
-    const y = try launch(s, x, w, .float32, .float32, tile, mnk);
-    calls += 1;
-    return y;
-}
-
-/// On: the router's f32 logits [rows, E] for x [rows, K] by gate_w [E, K] (each in its stored float type: x bf16 and
-/// gate_w f16 on the pack) as the launch (lazy, the caller owns them); null where it declines (off or check, no NAX,
-/// fewer rows than MLX's regular kernel takes, other shapes or types: the chain).
-pub fn router(s: mlx.mlx_stream, x: A, w: A, nax: bool) !?A {
-    if (mode != .on) return null;
-    return routerLaunch(s, x, w, nax);
-}
-
-/// Check: the launch beside the chain's logits `want` (served), compared word for word (one host read).
-pub fn checkRouter(s: mlx.mlx_stream, x: A, w: A, want: A, nax: bool) !void {
-    if (mode != .check) return;
-    const got = (try routerLaunch(s, x, w, nax)) orelse return;
-    defer _ = mlx.mlx_array_free(got);
-    try compare(s, want, got);
-}
-
-/// `a` and `b` (f32, one shape) word for word: equal u32 views summed on the device, one host read.
-fn compare(s: mlx.mlx_stream, a: A, b: A) !void {
-    var tmp: [5]A = undefined;
-    for (&tmp) |*x| x.* = mlx.mlx_array_new();
-    defer for (tmp) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-    try mlx.check(mlx.mlx_view(&tmp[0], a, .uint32, s));
-    try mlx.check(mlx.mlx_view(&tmp[1], b, .uint32, s));
-    try mlx.check(mlx.mlx_equal(&tmp[2], tmp[0], tmp[1], s));
-    try mlx.check(mlx.mlx_sum(&tmp[3], tmp[2], false, s));
-    try mlx.check(mlx.mlx_astype(&tmp[4], tmp[3], .uint32, s));
-    try mlx.check(mlx.mlx_array_eval(tmp[4]));
-    const same = (mlx.mlx_array_data_uint32(tmp[4]) orelse return error.NoData)[0];
-    const n: u64 = mlx.mlx_array_size(a);
-    checks += 1;
-    words += n;
-    differ += n - same;
-}
-
-// The meters since the last line.
-var calls: u64 = 0;
-var checks: u64 = 0;
-var words: u64 = 0;
-var differ: u64 = 0;
-
-fn reset() void {
-    calls = 0;
-    checks = 0;
-    words = 0;
-    differ = 0;
-}
-
-/// `[gate-gemm] mode= calls= checks= words= differ=` (since the last line; "" off), then reset.
-pub fn meters(buf: []u8) []const u8 {
-    if (mode == .off) return buf[0..0];
-    const s = std.fmt.bufPrint(buf, "[gate-gemm] mode={t} calls={d} checks={d} words={d} differ={d}\n", .{ mode, calls, checks, words, differ }) catch return buf[0..0];
-    reset();
-    return s;
-}
-
-/// The load line.
-pub fn loadLine(buf: []u8) []const u8 {
-    const t = tile;
-    return switch (mode) {
-        .off => std.fmt.bufPrint(buf, "[turboexl3_ds41] wide router logits on MLX's matmul chain (MLX_SERVE_DSV41_GATE_GEMM=0)\n", .{}) catch buf[0..0],
-        .on => std.fmt.bufPrint(buf, "[turboexl3_ds41] wide router logits as one launch of MLX's fused NAX GEMM body, x and gate_w read as stored, where MLX runs its regular kernel (MLX_SERVE_DSV41_GATE_GEMM; =0: the chain): bm {d} bn {d} bk {d} wm {d} wn {d} swizzle {d}, the same words; [gate-gemm] at each request's end\n", .{ t.bm, t.bn, t.bk, t.wm, t.wn, t.swz }) catch buf[0..0],
-        .check => std.fmt.bufPrint(buf, "[turboexl3_ds41] wide router logits checked (MLX_SERVE_DSV41_GATE_GEMM=check): the chain served, the launch run beside every call it would take and compared word for word; [gate-gemm] checks= words= differ= at each request's end\n", .{}) catch buf[0..0],
-    };
-}
-
-test "gate_gemm setting: on unset, empty or 1; 0 off; check; anything else refused by name" {
-    for ([_]?[]const u8{ null, "", "1" }) |v| try std.testing.expectEqual(Mode.on, try parse(v));
-    try std.testing.expectEqual(Mode.off, try parse("0"));
-    try std.testing.expectEqual(Mode.check, try parse("check"));
-    for ([_][]const u8{ "on", "2", "Check", " 1", "true" }) |v| try std.testing.expectError(error.GateGemmSetting, parse(v));
+    return try launch(s, x, w, .float32, .float32, tile, mnk);
 }
 
 test "gate_gemm tiles: MLX's own and the pick are exact by construction; SN must be N pairs, BK whole steps" {

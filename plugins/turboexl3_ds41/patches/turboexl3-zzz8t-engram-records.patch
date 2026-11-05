@@ -1,7 +1,7 @@
 diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41/engram.zig
 --- a/plugins/deepseek_v41/engram.zig
 +++ b/plugins/deepseek_v41/engram.zig
-@@ -242,6 +242,12 @@
+@@ -241,6 +241,12 @@
          edir.unregister(self.fd);
          crt.close(self.fd);
      }
@@ -14,14 +14,13 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
      /// Bytes this table occupies inside the pack's safetensors shards (read by
      /// pread, never resident); a repack table lives outside them.
      pub fn shardBytes(self: *const Table) u64 {
-@@ -437,9 +443,18 @@
+@@ -435,8 +441,17 @@
                  var sb: edir.Block = .{};
                  var bb: edir.Block = .{};
                  const tb = r.t;
 +                const rec = tb.records();
                  for (first..last) |i| {
                      const row: u64 = r.ids[i];
-                     _ = edir.rows.fetchAdd(1, .monotonic);
 +                    if (rec) {
 +                        // a repacked table: the row's record, its codes then its scales, in one read
 +                        if (row >= tb.rows or !edir.readRecord(tb.fd, r.w[i * tb.wlen ..][0..tb.wlen], r.s[i * tb.slen ..][0..tb.slen], tb.w_off + row * tb.w_stride)) {
@@ -33,15 +32,14 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
                      if (row >= tb.rows or
                          !edir.readRow(tb.fd, r.w[i * tb.wlen ..][0..tb.wlen], tb.w_off + row * tb.w_stride) or
                          !sb.read(tb.fd, r.s[i * tb.slen ..][0..tb.slen], tb.s_off + row * tb.s_stride) or
-@@ -553,10 +568,19 @@
+@@ -548,9 +563,18 @@
+         /// keep the SSD's queue full, and the advice doubles the requests.
+         fn run(self: *const Job, first: usize, stride: usize, advise_first: bool) bool {
              const t = self.t;
-             // MLX_SERVE_DSV41_ENGRAM_DIRECT: no advice for a file read past the cache.
-             if (advise_first and !edir.on) t.advise(self.ids, first, stride);
 +            const rec = t.records();
              var i = first;
              while (i < self.ids.len) : (i += stride) {
                  const r: u64 = self.ids[i];
-                 _ = edir.rows.fetchAdd(1, .monotonic);
 +                if (rec) {
 +                    // a repacked table: the row's record, its codes then its scales, in one read
 +                    if (r >= t.rows or !edir.readRecord(t.fd, self.w[i * t.wlen ..][0..t.wlen], self.s[i * t.slen ..][0..t.slen], t.w_off + r * t.w_stride)) {

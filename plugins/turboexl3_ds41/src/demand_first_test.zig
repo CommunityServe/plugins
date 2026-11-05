@@ -1,4 +1,4 @@
-//! MLX_SERVE_DSV41_DEMAND_FIRST's byte gate (df1), a test of its own in `zig build test` (build.zig), MLX-free: the copied
+//! The demand-first order's byte gate (df1), a test of its own in `zig build test` (build.zig), MLX-free: the copied
 //! read pool's C file alone, built with its test hooks (-DQ3LD_INJECT: scripted per-offset preadv faults and sleeps, a
 //! delay before each of the lookahead's reads and before each demand range), reading the records of a temp file through
 //! the lookahead (the speculative class) and the demand path at each mode (0, 1, 2), the gate/up split on as served.
@@ -43,7 +43,7 @@ export fn q3ld_mtl_signal(event: ?*anyopaque, value: u64) void {
     _ = value;
 }
 
-const counters_n = 84;
+const counters_n = 82;
 const sc_started = 3;
 const sc_landed = 4;
 const sc_failed = 5;

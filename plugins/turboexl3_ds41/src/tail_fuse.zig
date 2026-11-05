@@ -1,47 +1,16 @@
-//! `MLX_SERVE_DSV41_TAIL_FUSE` (read at load; unset, empty or `1`: on; `0`: off; `check`: the chain served, the kernel
-//! checked against it): a wide prompt layer's tail as one kernel (kernels/tail_fuse.metal). Off, the layer's routed call
-//! ends in the joinless combine (the routed rows weighted and folded, plus the shared expert widened to f32, into an f32
-//! [rows, D]), the model rounds that to the activation dtype and the hc expand (glm5's kernel) mixes it into the layer's
-//! HC streams: three GB-sized transients a 16K-row layer (the widened shared rows, the f32 sum, its rounded copy, ~840
-//! MB) and four passes over them. On, the source runs one kernel over the same inputs (the waves' outputs where they
-//! wrote them, the routing weights, the shared expert as it came, the streams, each row's post and comb) and writes the
-//! new streams: every rounding where the chain takes it, so the same words. `check` serves the chain's streams and runs
-//! the kernel over each wide call's first and last `check_rows` rows, compared word for word with the chain's: a
-//! `[tail-fuse] check` line a call (the words compared, those that differ, the largest difference); the chain's memory
-//! and a few hundred MB more, so it fits a window's guard. The kernel is the joinless combine's: the setting follows
-//! `MLX_SERVE_DSV41_JOINLESS` (unset, off with it; set, refused without it).
+//! A wide prompt layer's tail as one kernel (kernels/tail_fuse.metal). Unfused, the layer's routed call ends in the
+//! joinless combine (the routed rows weighted and folded, plus the shared expert widened to f32, into an f32 [rows, D]),
+//! the model rounds that to the activation dtype and the hc expand (glm5's kernel) mixes it into the layer's HC streams:
+//! three GB-sized transients a 16K-row layer (the widened shared rows, the f32 sum, its rounded copy, ~840 MB) and four
+//! passes over them. Here the source runs one kernel over the same inputs (the waves' outputs where they wrote them, the
+//! routing weights, the shared expert as it came, the streams, each row's post and comb) and writes the new streams:
+//! every rounding where the chain takes it, so the same words.
 
 const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
 const glm5 = @import("mlx_serve/plugins/glm5_next/glm5_next.zig");
-/// MLX_SERVE_DSV41_SCRATCH_TAIL `check`'s word compare (src/scratch.zig's).
-const scratch = @import("scratch.zig");
 
 const A = mlx.mlx_array;
-
-pub const Mode = enum { off, on, check };
-pub var mode: Mode = .on;
-/// The setting was given (`configure`): with JOINLESS off the load refuses it; unset, it follows JOINLESS.
-pub var explicit: bool = false;
-
-pub const Error = error{TailFuseSetting};
-
-pub fn on() bool {
-    return mode != .off;
-}
-
-pub fn configure(value: ?[]const u8) Error!void {
-    mode = try parse(value);
-    explicit = if (value) |v| v.len > 0 else false;
-}
-
-pub fn parse(value: ?[]const u8) Error!Mode {
-    const v = value orelse return .on;
-    if (v.len == 0 or std.mem.eql(u8, v, "1")) return .on;
-    if (std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "check")) return .check;
-    return error.TailFuseSetting;
-}
 
 /// The routed sources' slots in the kernel (the joinless combine's).
 pub const sources = 24;
@@ -117,8 +86,8 @@ pub fn expand(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, res: 
     return out;
 }
 
-/// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE): a decode call's rows take one instance of the kernel, its NROWS (the
-/// grid guard's bound, never reached: the grid is the rows' columns exactly) at the most rows a decode stretch carries.
+/// turboexl3_ds41 (the decode tail fuse): a decode call's rows take one instance of the kernel, its NROWS (the grid
+/// guard's bound, never reached: the grid is the rows' columns exactly) at the most rows a decode stretch carries.
 pub const decode_rows: usize = 16;
 
 /// `expand` for a decode call (at most `decode_rows` rows): the same kernel and inputs, its NROWS `decode_rows` whatever
@@ -162,42 +131,7 @@ pub fn expandDecode(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A,
     return out;
 }
 
-/// One decode `check`'s tally: the words compared, those that differ, the largest absolute difference.
-pub const Tally = struct { words: u64, differ: u64, max_abs: f32 };
-
-/// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_FUSE) `check`: the decode instance (`expandDecode`) over the call's rows,
-/// compared with the chain's streams `ref` word for word on the device (the streams' 16-bit words), and the largest
-/// absolute difference; nothing printed.
-pub fn compareDecode(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, res: A, pc: A, ref: A) !Tally {
-    const fused = try expandDecode(s, outs, loc, w, shared, res, pc);
-    defer _ = mlx.mlx_array_free(fused);
-    var tmp: [9]A = @splat(.{ .ctx = null });
-    defer for (tmp) |x| if (x.ctx != null) {
-        _ = mlx.mlx_array_free(x);
-    };
-    for (&tmp) |*x| x.* = mlx.mlx_array_new();
-    const wt: mlx.mlx_dtype = if (mlx.mlx_array_dtype(ref) == .float32) .uint32 else .uint16;
-    try mlx.check(mlx.mlx_view(&tmp[0], fused, wt, s));
-    try mlx.check(mlx.mlx_view(&tmp[1], ref, wt, s));
-    try mlx.check(mlx.mlx_equal(&tmp[2], tmp[0], tmp[1], s));
-    try mlx.check(mlx.mlx_astype(&tmp[3], tmp[2], .uint32, s));
-    try mlx.check(mlx.mlx_sum(&tmp[4], tmp[3], false, s));
-    try mlx.check(mlx.mlx_astype(&tmp[5], fused, .float32, s));
-    try mlx.check(mlx.mlx_astype(&tmp[6], ref, .float32, s));
-    try mlx.check(mlx.mlx_subtract(&tmp[7], tmp[5], tmp[6], s));
-    var ad = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ad);
-    try mlx.check(mlx.mlx_abs(&ad, tmp[7], s));
-    try mlx.check(mlx.mlx_max(&tmp[8], ad, false, s));
-    try mlx.check(mlx.mlx_array_eval(tmp[4]));
-    try mlx.check(mlx.mlx_array_eval(tmp[8]));
-    const same = (mlx.mlx_array_data_uint32(tmp[4]) orelse return error.NoData)[0];
-    const m = (mlx.mlx_array_data_float32(tmp[8]) orelse return error.NoData)[0];
-    const nw: u64 = mlx.mlx_array_size(ref);
-    return .{ .words = nw, .differ = nw - same, .max_abs = m };
-}
-
-/// MLX_SERVE_DSV41_SCRATCH_TAIL (src/scratch_tail.zig): the kernel's write-into twin, its text derived from the stock
+/// The kernel's write-into twin, its text derived from the stock
 /// one at its first use: each row's new streams stored over `res` itself (the model's x1 region: every thread reads its
 /// row's HC copies of `res` into registers before it stores the row's HC outputs at those words, and no thread reads
 /// another's), and a one-word `carrier` (the output the region's publish waits behind) zeroed by the first thread; every
@@ -255,7 +189,7 @@ fn intoKernel() !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
-/// MLX_SERVE_DSV41_SCRATCH_TAIL: `expand`'s new streams written over `res` in place (`res` row-contiguous in a buffer of
+/// `expand`'s new streams written over `res` in place (`res` row-contiguous in a buffer of
 /// its own: the model's published x1 region), ordered after its inputs' writers by its bindings. Returns the one-word
 /// carrier (a new array the caller owns); `res`'s words are the new streams once the carrier is evaluated.
 pub fn expandInto(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, res: A, pc: A) !A {
@@ -296,117 +230,6 @@ pub fn expandInto(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, r
     return out;
 }
 
-/// MLX_SERVE_DSV41_SCRATCH_TAIL `check`, within the one routed call: the stock kernel's new streams first, evaluated
-/// before the twin is encoded (it reads `res`, which the twin overwrites), then the twin over `res`, evaluated, and
-/// `res`'s words compared with the stock's on the device. `fresh`: the stock's streams (a new array the caller owns, the
-/// one served).
-pub const Checked = struct { fresh: A, words: u64, differ: u64 };
-pub fn expandIntoChecked(s: mlx.mlx_stream, outs: []const A, loc: A, w: A, shared: A, res: A, pc: A) !Checked {
-    const fresh = try expand(s, outs, loc, w, shared, res, pc);
-    errdefer _ = mlx.mlx_array_free(fresh);
-    try mlx.check(mlx.mlx_array_eval(fresh));
-    const carrier = try expandInto(s, outs, loc, w, shared, res, pc);
-    defer _ = mlx.mlx_array_free(carrier);
-    try mlx.check(mlx.mlx_array_eval(carrier));
-    var t: scratch.Tally = .{};
-    try scratch.compare(s, res, fresh, &t);
-    return .{ .fresh = fresh, .words = t.words, .differ = t.differ };
-}
-
-/// The chain's new streams for `check`, a new array the caller owns: the combine's f32 sum `y` ([n, D]) rounded to
-/// `res`'s dtype, then glm5's hc expand of `res` by `pc`'s post and comb (the model's `hcExpand`).
-pub fn chain(s: mlx.mlx_stream, y: A, res: A, pc: A) !A {
-    const n = dimOf(res, 0);
-    const hc = dimOf(res, 1);
-    const d = dimOf(res, 2);
-    const dt = mlx.mlx_array_dtype(res);
-    var tmp: [6]A = undefined;
-    for (&tmp) |*t| t.* = mlx.mlx_array_new();
-    defer for (tmp) |t| {
-        _ = mlx.mlx_array_free(t);
-    };
-    try mlx.check(mlx.mlx_astype(&tmp[0], y, dt, s));
-    try mlx.check(mlx.mlx_expand_dims(&tmp[1], tmp[0], 0, s));
-    try mlx.check(mlx.mlx_reshape(&tmp[2], res, &[_]c_int{ 1, ci(n), ci(hc), ci(d) }, 4, s));
-    try mlx.check(mlx.mlx_slice(&tmp[3], pc, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(n), ci(hc) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-    var comb_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(comb_flat);
-    try mlx.check(mlx.mlx_slice(&comb_flat, pc, &[_]c_int{ 0, ci(hc) }, 2, &[_]c_int{ ci(n), ci(hc + hc * hc) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-    try mlx.check(mlx.mlx_reshape(&tmp[4], comb_flat, &[_]c_int{ ci(n), ci(hc), ci(hc) }, 3, s));
-    const c: glm5.Collapsed = .{ .x = .{ .ctx = null }, .post = tmp[3], .comb = tmp[4] };
-    const o = try glm5.expand(s, tmp[1], tmp[2], &c);
-    defer _ = mlx.mlx_array_free(o);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_reshape(&out, o, &[_]c_int{ ci(n), ci(hc), ci(d) }, 3, s));
-    return out;
-}
-
-/// `check`'s rows at each end of a wide call.
-pub const check_rows: usize = 2048;
-
-fn sliceRows(s: mlx.mlx_stream, x: A, lo: usize, hi: usize) !A {
-    const sh = mlx.getShape(x);
-    var start: [4]c_int = @splat(0);
-    var stop: [4]c_int = undefined;
-    var step: [4]c_int = @splat(1);
-    for (sh, 0..) |d, i| stop[i] = d;
-    start[0] = ci(lo);
-    stop[0] = ci(hi);
-    var o = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(o);
-    try mlx.check(mlx.mlx_slice(&o, x, &start, sh.len, &stop, sh.len, &step, sh.len, s));
-    return o;
-}
-
-/// `check`: the kernel over the first and the last `check_rows` rows of the call (its inputs' rows, the same sources),
-/// each compared with the chain's streams `ref` there, word for word on the device; one `[tail-fuse] check` line.
-pub fn checkRows(s: mlx.mlx_stream, layer: u32, outs: []const A, loc: A, w: A, shared: A, res: A, pc: A, ref: A) !void {
-    const n = dimOf(ref, 0);
-    var words: u64 = 0;
-    var differ: u64 = 0;
-    var max_abs: f32 = 0;
-    const first = @min(n, check_rows);
-    const windows = [2][2]usize{ .{ 0, first }, .{ @max(first, n -| check_rows), n } };
-    for (windows) |win| {
-        const lo, const hi = win;
-        if (hi <= lo) continue;
-        var ins: [6]A = @splat(.{ .ctx = null });
-        defer for (ins) |x| if (x.ctx != null) {
-            _ = mlx.mlx_array_free(x);
-        };
-        for (&ins, [_]A{ loc, w, shared, res, pc, ref }) |*o, x| o.* = try sliceRows(s, x, lo, hi);
-        const fused = try expand(s, outs, ins[0], ins[1], ins[2], ins[3], ins[4]);
-        defer _ = mlx.mlx_array_free(fused);
-        var tmp: [9]A = @splat(.{ .ctx = null });
-        defer for (tmp) |x| if (x.ctx != null) {
-            _ = mlx.mlx_array_free(x);
-        };
-        for (&tmp) |*x| x.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_view(&tmp[0], fused, .uint16, s));
-        try mlx.check(mlx.mlx_view(&tmp[1], ins[5], .uint16, s));
-        try mlx.check(mlx.mlx_equal(&tmp[2], tmp[0], tmp[1], s));
-        try mlx.check(mlx.mlx_astype(&tmp[3], tmp[2], .uint32, s));
-        try mlx.check(mlx.mlx_sum(&tmp[4], tmp[3], false, s));
-        try mlx.check(mlx.mlx_astype(&tmp[5], fused, .float32, s));
-        try mlx.check(mlx.mlx_astype(&tmp[6], ins[5], .float32, s));
-        try mlx.check(mlx.mlx_subtract(&tmp[7], tmp[5], tmp[6], s));
-        var ad = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ad);
-        try mlx.check(mlx.mlx_abs(&ad, tmp[7], s));
-        try mlx.check(mlx.mlx_max(&tmp[8], ad, false, s));
-        try mlx.check(mlx.mlx_array_eval(tmp[4]));
-        try mlx.check(mlx.mlx_array_eval(tmp[8]));
-        const same = (mlx.mlx_array_data_uint32(tmp[4]) orelse return error.NoData)[0];
-        const m = (mlx.mlx_array_data_float32(tmp[8]) orelse return error.NoData)[0];
-        const nw: u64 = mlx.mlx_array_size(ins[5]);
-        words += nw;
-        differ += nw - same;
-        max_abs = @max(max_abs, m);
-    }
-    std.debug.print("[tail-fuse] check layer={d} rows={d} words={d} differ={d} max_abs={e}\n", .{ layer, n, words, differ, max_abs });
-}
-
 test "tail_fuse into twin: each anchor once in the stock text; the store goes over res and the carrier is set" {
     const t = try intoSource(std.testing.allocator, body);
     defer std.testing.allocator.free(t);
@@ -420,13 +243,4 @@ test "tail_fuse into twin: each anchor once in the stock text; the store goes ov
 test "tail_fuse: the stock kernel and its twin bind 30 buffers, within Metal's 31" {
     try std.testing.expectEqual(@as(usize, 30), kernel_buffers);
     try std.testing.expect(kernel_buffers <= metal_buffers);
-}
-
-test "tail_fuse setting: on unset, empty or 1; 0 off; check; anything else refused by name" {
-    try std.testing.expectEqual(Mode.on, try parse(null));
-    try std.testing.expectEqual(Mode.on, try parse(""));
-    try std.testing.expectEqual(Mode.on, try parse("1"));
-    try std.testing.expectEqual(Mode.off, try parse("0"));
-    try std.testing.expectEqual(Mode.check, try parse("check"));
-    for ([_][]const u8{ "on", "2", "true", "Check", " 1" }) |v| try std.testing.expectError(error.TailFuseSetting, parse(v));
 }

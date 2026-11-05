@@ -1,15 +1,4 @@
-diff -ruN a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -273,6 +273,7 @@
-     pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
-     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
-     pub const MLX_SERVE_DSV41_MARKOV: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark draft's Markov chain on turboexl3_ds41's fused kernels, the op chain's bytes (=0: the op chain; flat: no zig-zag; check: both, compared)" };
-+    pub const MLX_SERVE_DSV41_PROMPT_IO: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt timeline (turboexl3_ds41): each routed call of a prompt timed and counted, the CED decoder's experts probed at encoder layers 10 and 19; [prompt-io], [stream-stats prompt] and [ced-probe] lines at each prompt's end" };
-     pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
-     pub const MLX_SERVE_DSV41_ROUTED_ONE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls' resident routed experts as one turboexl3 call (turboexl3_ds41: 1, resident, check)" };
-     pub const MLX_SERVE_DSV41_STAGE_PROF: Var = .{ .kind = .kill, .type = .int, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 stage profiler (turboexl3_ds41): each forward's stages synced and timed, the decode stretches eager, [stage-prof] lines at each request's end (N > 1: every N forwards as well)" };
-diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
 @@ -36,6 +36,8 @@
@@ -20,8 +9,8 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
 +const pio = @import("../../../prompt_io.zig");
  /// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
  const one_plan = @import("../../../one_plan.zig");
- /// turboexl3_ds41's fused Markov chain (src/markov.zig, `MLX_SERVE_DSV41_MARKOV`): the draft's chain in B + 1 launches.
-@@ -3684,6 +3686,12 @@
+ /// turboexl3_ds41's fused Markov chain (src/markov.zig): the draft's chain in B + 1 launches.
+@@ -3661,6 +3663,12 @@
          from = p.hi;
      }
      const enc_hi = if (tail != null) m.ced_split.? else m.n_layers;
@@ -34,7 +23,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      try runLayers(m, gpa, st, &sp, held, from, enc_hi);
      if (tail) |tl| {
          var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
-@@ -3868,6 +3876,7 @@
+@@ -3839,6 +3847,7 @@
      const x = try sc.concat(parts, 0);
      const pres = try sc.concat(sp.pres, 0);
      if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, x, pres, sp.img, ra, src.ctx);
@@ -42,7 +31,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      try prof.mark(.read_ahead, &.{ x, pres });
      const pa = try hcPreNormWide(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm);
      try prof.mark(.attn_hc, &.{ pa.sp.pre, pa.sp.post, pa.sp.comb, pa.h });
-@@ -3921,6 +3930,8 @@
+@@ -3891,6 +3900,8 @@
  /// A streamed prompt call's routes of layer `li` predicted before its attention (the FFN's input taken as the stream
  /// collapsed with the previous mix), handed to the source to read while the attention runs.
  fn readAhead(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, li: usize, x: A, pre: A, img: A, ra: anytype, ctx: *anyopaque) !void {
@@ -51,7 +40,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      const h = try sc.rms(try hcCollapse(sc, x, pre), ly.ffn_norm, m.cfg.rms_norm_eps);
      const r = try route(sc, m, ly, h, img);
      var host = mlx.mlx_array_new();
-@@ -3932,6 +3943,31 @@
+@@ -3902,6 +3913,31 @@
      defer sc.a.free(ids);
      for (ids, (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n]) |*o, v| o.* = @intCast(v);
      try ra(ctx, @intCast(li), ids).get();
@@ -83,7 +72,7 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
  }
  /// What crosses layers in `extend`: each span's stream and mix, the picks
  /// attention layers hand down, the DSpark main rows, and the Engram row ids.
-diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
 @@ -31,6 +31,8 @@
@@ -95,7 +84,7 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
  pub const Gate = Hook.Gate;
  pub const Phase = enum { prompt, decode };
  /// The trunk's MoE geometry the bank must match.
-@@ -222,6 +224,9 @@
+@@ -214,6 +216,9 @@
          defer g.reset();
          const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
          self.t3_state.n = 0;
@@ -105,7 +94,7 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
          if (routed_one.on() and self.phase == .prompt) switch (self.hook) {
              inline else => |*h| if (try routed_one.rows(&self.one, self.a, g, h, layer, x, ids, wts, decode_route_ids)) |y| return y,
          };
-@@ -231,6 +236,36 @@
+@@ -223,6 +228,36 @@
          const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
          return g.keep(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false));
      }
@@ -142,7 +131,7 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
      /// A prompt pass's predicted routes of `layer` (every row's ids): its experts, hottest first, read into its rows
      /// while its attention runs.
      pub fn readAhead(self: *Source, layer: u32, ids: []const u16) !void {
-@@ -255,12 +290,14 @@
+@@ -247,12 +282,14 @@
                  try h.flush();
                  switch (p) {
                      .decode => {

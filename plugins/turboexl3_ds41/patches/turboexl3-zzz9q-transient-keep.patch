@@ -1,52 +1,44 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -326,6 +326,7 @@
-     pub const MLX_SERVE_DSV41_T3_GROUP: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode hit wave on turboexl3's grouped banked decode (turboexl3_ds41, with MLX_SERVE_DSV41_ROUTED=turboexl3): its GEMVs share one weight decode among up to four row-slots of one expert, and the device route's pairs whose expert no bank holds run no expert in it (their rows come from the miss parts, as before); served bytes unchanged (=0: the banked texts, a miss pair computed from base row 0)" };
-     pub const MLX_SERVE_DSV41_TAIL_FUSE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layer tail (turboexl3_ds41): the joinless combine and the hc expand as one kernel, the same words, no f32 sum or rounded copy in memory (=0: the chain; check: the chain served, the kernel compared over each wide call's first and last rows, [tail-fuse] check lines); with MLX_SERVE_DSV41_JOINLESS on" };
-     pub const MLX_SERVE_DSV41_TIMELINE: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 decode verify GPU timeline (turboexl3_ds41's profile builds only, zig build -Dplugin-profile=true): an absolute directory; each request's VERIFY_GPU_TIMELINE line logged and its command buffers, verify stamps and rounds written there at its end" };
-+    pub const MLX_SERVE_DSV41_TRANSIENT_KEEP: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers (turboexl3_ds41): on, a wide layer with another wide one after it keeps its attention projections' large outputs (the attention norm's rows, wq_b's heads, their roped tail) past its teardown, and the next wide layer's start hands their buffers to MLX's cache (its limit lifted only while they are freed) for its own same arrays; the same kernels and words; check: as on, [transient-keep] reused= counts the buffers taken back; 0: off" };
-     pub const MLX_SERVE_DSV41_VISION_LAZY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 vision tower read from the pack for each image and freed after, not resident (turboexl3_ds41): its 0.9 GB become streamed slot rows; the bank holds its prompt rows while the tower is loaded; an image's rows unchanged (=0: resident)" };
-     pub const MLX_SERVE_DSV41_WHOLE_STREAM: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' stream (turboexl3_ds41): on, each takes the last wide layer's whole stream and FFN mix where every span still holds its rows of them, not their concatenation, the same words; 0: the concatenation" };
-     pub const MLX_SERVE_DSV41_WIDE_EARLY: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt calls (turboexl3_ds41, the TAIL_FUSE path): on, what the MoE does not read committed behind the routes before the routing barrier waits on them (the routes, then the next layer's predicted routes, then the shared expert and the layer's attention state, each its own commit), so the GPU runs them during the barrier's host work and the first read wait, the same kernels and words, the shared expert's evaluation billed in the prompt's working set; 0: off; check, on with the shared expert also built the old way and served, the two compared word for word ([wide-early] lines)" };
 diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
-@@ -64,6 +64,9 @@
- /// A wide layer's new streams committed at its call's end, before the layer's teardown (turboexl3_ds41's
- /// src/rest_early.zig, `MLX_SERVE_DSV41_REST_EARLY`).
- const rearly = @import("../../../rest_early.zig");
+@@ -51,6 +51,9 @@
+ /// What a wide call's MoE does not read, committed behind its routes before the routing barrier waits on them
+ /// (turboexl3_ds41's src/wide_early.zig).
+ const wearly = @import("../../../wide_early.zig");
 +/// A wide layer's attention projections' large outputs kept past its teardown, for the next wide layer's to take their
-+/// buffers back from MLX's cache (turboexl3_ds41's src/transient_keep.zig, `MLX_SERVE_DSV41_TRANSIENT_KEEP`).
++/// buffers back from MLX's cache (turboexl3_ds41's src/transient_keep.zig).
 +const tkeep = @import("../../../transient_keep.zig");
  /// A wide layer's heads left unroped, their roped last channels apart, read together by the gather's scores
- /// (turboexl3_ds41's src/q_tail.zig, `MLX_SERVE_DSV41_Q_TAIL`).
+ /// (turboexl3_ds41's src/q_tail.zig).
  const qtail = @import("../../../q_tail.zig");
-@@ -4612,6 +4615,8 @@
+@@ -4393,6 +4396,8 @@
      const n_spans = sp.xs.len;
      // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.
      const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
-+    // MLX_SERVE_DSV41_TRANSIENT_KEEP: a kept set no wide layer of this pass took is let go at its end.
++    // The kept projection outputs: a kept set no wide layer of this pass took is let go at its end.
 +    defer tkeep.drop();
      for (lo..hi) |li| {
-         prof.layer();
          if (wide) try wideLayer(m, gpa, st, sp, li, li + 1 < hi, li > lo) else for (0..n_spans) |k| {
-@@ -4730,6 +4735,8 @@
+             // A span's intermediates are dropped as soon as it is built, so the
+@@ -4508,8 +4513,8 @@
+ /// `next_wide`: layer `li + 1` runs wide over the same spans next (next-layer staging predicts it here); `prev_wide`:
+ /// layer `li - 1` ran wide over them just before (and predicted this one).
  fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, li: usize, next_wide: bool, prev_wide: bool) !void {
-     // turboexl3_ds41 (MLX_SERVE_DSV41_PROMPT_TL, with PROMPT_IO): the layer's `pre` stage starts.
-     pio.layerBegin(li);
-+    // MLX_SERVE_DSV41_TRANSIENT_KEEP: the last wide layer's kept projection outputs to MLX's cache, for this layer's.
+-    // turboexl3_ds41 (MLX_SERVE_DSV41_PROMPT_TL, with PROMPT_IO): the layer's `pre` stage starts.
+-    pio.layerBegin(li);
++    // The kept projection outputs: the last wide layer's kept projection outputs to MLX's cache, for this layer's.
 +    tkeep.release();
-     // MLX_SERVE_DSV41_SCRATCH_ATTN: the layer's attention spans on the ring (a streamed wide prompt layer on the GPU).
-     _ = try sat.layerBegin(sat.mode != .off and m.attn_gather != null and m.streamed != null and mlx.streamIsGpu(m.s), sp.span, m.cfg.num_attention_heads, m.cfg.sliding_window + m.cfg.dsv4_index_topk);
+     // src/scratch_attn.zig: the layer's attention spans on the ring (a streamed wide prompt layer on the GPU).
+     _ = try sat.layerBegin(m.attn_gather != null and m.streamed != null and mlx.streamIsGpu(m.s), sp.span, m.cfg.num_attention_heads, m.cfg.sliding_window + m.cfg.dsv4_index_topk);
      defer sat.layerEnd();
-@@ -4909,6 +4916,9 @@
+@@ -4671,6 +4676,10 @@
          // previous streams, so the new ones take their place in the live set.
-         if (rearly.on and k1 == n_spans) try asyncEvalAll(&.{xg});
+         if (k1 == n_spans) try asyncEvalAll(&.{xg});
      }
-+    // MLX_SERVE_DSV41_TRANSIENT_KEEP: the attention projections' large outputs (evaluated by the routed call) kept past
-+    // the teardown for the next wide layer of the pass: `wq_b`'s heads first, the attention norm's rows, the roped tail.
++    // The kept projection outputs: the attention projections' large outputs (evaluated by the routed call) kept past
++    // the teardown for the next wide layer of the pass: `wq_b`'s heads first, the attention norm's rows, the roped
++    // tail.
 +    tkeep.layerEnd(&.{ pj.q, pa.h, pj.qt }, next_wide);
  }
- /// `MLX_SERVE_DSV41_WOA_ROWS=check` over a layer's runs: the runs compared, those equal bit for bit, the elements that
- /// differ and the largest absolute difference.
+ /// A full run's `wo_a` over its region `x` (`[rows, og, in]`, published): turboexl3's
+ /// grouped linear reads that layout as it is (no join, no transpose), `[rows, og * o_lora]` in `m.act`, a new handle

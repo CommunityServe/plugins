@@ -1,62 +1,62 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -267,6 +267,7 @@
-     pub const MINIMAX_H3_VSA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 trained VSA sparse attention (=0: dense attention, no gate branch)" };
-     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
-     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
-+    pub const MLX_SERVE_DSV41_BANK_POOL: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's one pool (turboexl3_ds41, needs the host's HostGpu.alias; a host without it serves with the pool off, a [bank-pool] off line at load): the prompt's transient windows and the wave sets' regions, then decode's window 0 and whole ext arrays over the same bytes, so a phase change re-partitions it instead of freeing and freshly allocating; each pooled array its own buffer; neither phase holds more; the same bytes served (unset, empty or 1: on; 0: off; check: on, every range that changes hands filled with 0xFF first, [bank-pool] check lines); a [bank-pool] plan line at load" };
-     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
-     pub const MLX_SERVE_DSV41_COMPILE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 compiled decode stretches (=0: every op eager)" };
-     pub const MLX_SERVE_DSV41_DECODE_ROWS: Var = .{ .kind = .kill, .type = .text, .default = "split where its curves fit the pack, else flat", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode slot rows (turboexl3_ds41): unset, the flat bill's decode bytes split across the layers by its development corpus's misses-a-row curves, each layer between its prompt rows and 256, where the curves fit the pack (flat rows where they do not); flat: flat rows; split: the split required (refused by name, rows flat, where it does not fit)" };
 diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
 @@ -19,6 +19,8 @@
  const usage_cfg = &@import("mlx_host").expert_usage_cfg.setting;
- /// MLX_SERVE_DSV41_SCRATCH_WAVES (the plugin's src/scratch_waves.zig): the prefill waves' per-prompt regions.
+ /// The plugin's src/scratch_waves.zig: the prefill waves' per-prompt regions.
  const scratch_waves = @import("mlx_host").scratch_waves;
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL, the plugin's src/bank_pool.zig): both phases' rows over one buffer.
++/// turboexl3_ds41 (the plugin's src/bank_pool.zig): both phases' rows over one buffer.
 +const bank_pool = @import("mlx_host").bank_pool;
  const usage_arch = "deepseek_v41";
- /// The decode route recorder (`expert.routes`), armed by turboexl3_ds41's `MLX_SERVE_DSV41_ROUTES` in its route-recording
- /// builds (`recording`); every other build compiles none of it.
-@@ -259,6 +261,9 @@
+ const expert_event = sdk_ext.expert.event;
+ const expert_admission = @import("expert/admission.zig");
+@@ -227,6 +229,9 @@
              try self.set.selfCheck(a, &.{.dsv41_jl_combine_bf16}, .compile, &self.q.report, &diag);
          }
          const event = try expert_event.createMetal();
-+        // MLX_SERVE_DSV41_BANK_POOL: the wave sets' regions in the pool's prompt layout (with SCRATCH_WAVES on).
++        // The bank pool: the wave sets' regions in the pool's prompt layout.
 +        var wave_spares: [scratch_waves.pool_shapes.len]expert_stream.SpareArray = undefined;
 +        for (&wave_spares, scratch_waves.pool_shapes) |*o, sh| o.* = .{ .shape = sh.shape, .ndim = sh.ndim, .dtype = sh.dtype };
          self.stream = try expert_stream.Stream.init(a, &self.bank, .{
              .rows = self.prompt_rows,
              .slot_memory = .{ .mlx = s },
-@@ -273,8 +278,16 @@
-             // MLX_SERVE_DSV41_STAGE: the staged records' tickets stay unclaimed beside every call's own (`Stream.stageGroups`).
-             .pool = .{ .tickets = if (stage.on and stage_next.on) 4096 else if (stage.on) 2048 else 1024 },
-             .direct_parts = direct_parts.on,
-+            .bank_pool = if (bank_pool.on()) .{ .decode_rows = self.decode_rows, .spare = if (scratch_waves.on()) &wave_spares else &.{}, .poison = bank_pool.mode == .check } else null,
+@@ -235,14 +240,21 @@
+             .wide_depth = wide_depth,
+             .transient_rows = @as(u32, wide_depth) * sdk_ext.expert.policy.max_route_ids,
+             .transient_release = expert_stream.phase_change_releases_wide_windows and expert_stream.transient_release_default,
+-            .fill_reserve = fillReserve(self.prompt_rows),
+-            // MLX_SERVE_DSV41_DECODE_WINDOW: decode's window 0 rows (0: the widest decode route's).
+-            .decode_window_rows = dwin.rows(),
+-            // MLX_SERVE_DSV41_STAGE: the staged records' tickets stay unclaimed beside every call's own (`Stream.stageGroups`).
+-            .pool = .{ .tickets = if (stage.on and stage_next.on) 4096 else if (stage.on) 2048 else 1024 },
+-            .direct_parts = direct_parts.on,
++            // Decode's window 0 rows.
++            .decode_window_rows = dwin.window_rows,
++            // Staging: the staged records' tickets stay unclaimed beside every call's own (`Stream.stageGroups`).
++            .pool = .{ .tickets = 4096 },
++            .direct_parts = true,
++            .bank_pool = if (bank_pool.on) .{ .decode_rows = self.decode_rows, .spare = &wave_spares } else null,
          });
          errdefer self.stream.deinit();
-+        // MLX_SERVE_DSV41_BANK_POOL: the wave sets' regions take the pool's arrays (a reference each).
-+        if (bank_pool.on() and scratch_waves.on()) {
++        // The bank pool: the wave sets' regions take the pool's arrays (a reference each).
++        if (bank_pool.on) {
 +            var spares: [scratch_waves.pool_shapes.len]mlx.mlx_array = undefined;
 +            for (&spares, 0..) |*sp, i| sp.* = self.stream.poolSpare(i) orelse return error.BankPoolSpare;
 +            try scratch_waves.adoptPool(&spares);
 +        }
 +        errdefer scratch_waves.dropPool();
-         self.stream.prompt_stage = stage.on;
-         // MLX_SERVE_DSV41_STAGE_NEXT: the next layer's read-ahead and staged reads, the current call's last and its own stay
+         self.stream.prompt_stage = true;
+         // Next-layer staging: the next layer's read-ahead and staged reads, the current call's last and its own stay
          // unclaimed together (the ring doubles again above).
-@@ -410,6 +423,8 @@
+@@ -328,6 +340,8 @@
      pub fn deinit(self: *Source) void {
          _ = mlx.mlx_synchronize(self.g.s);
          scratch_waves.releaseAll();
-+        // MLX_SERVE_DSV41_BANK_POOL: the regions' references to the pool's arrays, before the stream frees the pool.
++        // The bank pool: the regions' references to the pool's arrays, before the stream frees the pool.
 +        scratch_waves.dropPool();
          self.source.dropNext();
-         switch (self.hook) {
-             inline else => |*h| h.deinit(),
+         self.hook.deinit();
+         self.a.free(self.gates_t3);
 diff -ruN -x .generated a/sdk/weights/streamed/expert/stream.zig b/sdk/weights/streamed/expert/stream.zig
 --- a/sdk/weights/streamed/expert/stream.zig
 +++ b/sdk/weights/streamed/expert/stream.zig
@@ -64,7 +64,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/expert/stream.zig b/sdk/weights/s
  pub const read_ahead_probed = S.read_ahead_probed;
  pub const ReadAheadProbe = S.ReadAheadProbe;
  pub const GrowFill = S.GrowFill;
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL): the pool's options and an extra prompt array (`S.BankPool`).
++/// turboexl3_ds41 (the bank pool): the pool's options and an extra prompt array (`S.BankPool`).
 +pub const PoolOptions = S.PoolOptions;
 +pub const SpareArray = S.SpareArray;
  pub const Residents = S.Residents;
@@ -75,29 +75,29 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
 @@ -12,6 +12,8 @@
  const expert_routes = @import("routes.zig");
- /// turboexl3_ds41 (its src/stage.zig, `MLX_SERVE_DSV41_STAGE`): a wide prompt call's staging layout (`Stream.stageGroups`).
+ /// turboexl3_ds41 (its src/stage.zig): a wide prompt call's staging layout (`Stream.stageGroups`).
  const stage_cfg = @import("mlx_host").stage;
 +/// turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL, the plugin's src/bank_pool.zig): the pool's plan (`BankPool`).
 +const pool_plan = @import("mlx_host").bank_pool;
- /// turboexl3_ds41 (its src/stage_votes.zig, `MLX_SERVE_DSV41_STAGE_VOTES`): staging's vote floor and every staged record's
- /// votes (`stage_votes.plan` in `stageGroups` and `stageNext`, `postStaged`, `noteStaged`).
+ /// turboexl3_ds41 (its src/stage_votes.zig): staging's vote floor (`stage_votes.plan` in `stageGroups` and `stageNext`).
  const stage_votes = @import("mlx_host").stage_votes;
-@@ -271,6 +273,9 @@
+ /// turboexl3_ds41 (the plugin's src/stage_trim.zig): a wide call's staged parts its routes do not take withdrawn before
+@@ -265,6 +267,9 @@
              }
          };
          extern fn dsv41_alloc_uninit(out: *mlx.mlx_array, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int;
-+        /// turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL): the host's no-copy alias (src/host_shims.zig over `HostGpu.alias`):
-+        /// `out` an evaluated array of `dtype` over `base`'s bytes from `offset`, its own buffer, holding `base`.
++        /// turboexl3_ds41 (the bank pool): the host's no-copy alias (src/host_shims.zig over `HostGpu.alias`): `out` an
++        /// evaluated array of `dtype` over `base`'s bytes from `offset`, its own buffer, holding `base`.
 +        extern fn dsv41_alloc_alias(out: *mlx.mlx_array, base: mlx.mlx_array, offset: u64, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int;
          /// MLX's allocated bytes (MLX slot memory only: the first read creates the Metal device).
          pub fn mlxActive() u64 {
              var n: usize = 0;
-@@ -305,6 +310,18 @@
+@@ -299,6 +304,18 @@
              base: [n_components]u64 = @splat(0),
              row_bytes: [n_components]u64 = @splat(0),
              backing: union(enum) { none, host: HostSlotRows, mlx: LayerSlotBank } = .none,
-+            /// MLX_SERVE_DSV41_BANK_POOL: bit c set when component c's array is a reference to the pool's (`BankPool`):
-+            /// its free returns nothing to MLX's allocator.
++            /// The bank pool: bit c set when component c's array is a reference to the pool's (`BankPool`): its free
++            /// returns nothing to MLX's allocator.
 +            pooled: u16 = 0,
 +            /// The bytes a free of these rows returns to MLX's allocator: `allocBytes` less the pool's components.
 +            fn freshBytes(self: *const Rows, layer: *const Layer) u64 {
@@ -111,22 +111,22 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The bytes these rows allocated on `layer`'s geometry (`arrayBytes` per component, the bank's floor
              /// included): what their free returns.
              fn allocBytes(self: *const Rows, layer: *const Layer) u64 {
-@@ -485,6 +502,9 @@
+@@ -477,6 +494,9 @@
              prompt_relocate: bool = false,
              /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
              tally: ?Tally = null,
-+            /// turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL): both phases' rows over one buffer (`BankPool`); null: each
-+            /// phase's rows allocated at its change, as before. MLX slot memory and the transient release only.
++            /// turboexl3_ds41 (the bank pool): both phases' rows over one buffer (`BankPool`); null: each phase's rows
++            /// allocated at its change, as before. MLX slot memory and the transient release only.
 +            bank_pool: ?PoolOptions = null,
          };
          /// The rate tally's settings (`expert.tally.Settings`) and the stream's geometry: each stream layer pins at most
          /// floor(`ratio` x its experts) experts, the rate's half-life `window` decode routes of the layer.
-@@ -499,6 +519,214 @@
+@@ -491,6 +511,189 @@
          /// a fill. Exact either way: a row is read only through a slot whose meta says its record landed (`SlotMeta.state`), and
          /// every record lands by its read into the row before that state is set.
          pub const GrowFill = enum { zeros, unfilled };
-+        /// turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL): an extra array the pool's prompt layout holds after the transient
-+        /// scratch (the source's per-prompt regions), by shape and MLX dtype.
++        /// turboexl3_ds41 (the bank pool): an extra array the pool's prompt layout holds after the transient scratch
++        /// (the source's per-prompt regions), by shape and MLX dtype.
 +        pub const SpareArray = struct { shape: [4]c_int = @splat(0), ndim: usize = 0, dtype: mlx.mlx_dtype = .uint8 };
 +        /// `Options.bank_pool`.
 +        pub const PoolOptions = struct {
@@ -134,8 +134,6 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +            decode_rows: []const u32,
 +            /// The source's extra prompt arrays, in order (`Stream.poolSpare` hands each back).
 +            spare: []const SpareArray = &.{},
-+            /// `check`: every range an install hands over filled with 0xFF first (a `[bank-pool] check` line each).
-+            poison: bool = false,
 +        };
 +        /// `Stream.decodeWindow`'s rule over its inputs: the pool lays window 0 out before the stream exists (`grow`
 +        /// refuses a window that differs from the pool's).
@@ -144,7 +142,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +            for (decode_rows) |r| if (r < 2 * max_route_ids) return route_ids;
 +            return w;
 +        }
-+        /// turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL, `Options.bank_pool`; the plan: the plugin's src/bank_pool.zig): one
++        /// turboexl3_ds41 (`Options.bank_pool`; the plan: the plugin's src/bank_pool.zig): one
 +        /// MLX buffer the prompt's transient scratch and extra arrays and decode's window 0 and ext arrays all carve, so
 +        /// a phase change re-partitions it instead of freeing one phase's rows and allocating the other's. Each pooled
 +        /// array is its own MTLBuffer over the buffer's pages (the host's alias: MLX orders it apart, as a separate
@@ -167,8 +165,6 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +            alt0: Group = @splat(.{}),
 +            /// [layer]: the ext arrays the pool holds (`arr` null: allocated at the grow).
 +            ext: []Group = &.{},
-+            poison: bool = false,
-+            filled: u64 = 0,
 +
 +            fn init(a: std.mem.Allocator, bank: *const B.Bank, opt: Options, po: PoolOptions, widest: usize, alt_layer: ?usize, n0: u32) !*BankPool {
 +                if (opt.slot_memory != .mlx) return error.BankPoolNeedsMlxRows;
@@ -177,7 +173,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                for (opt.rows, po.decode_rows) |pr, dr| if (dr < pr) return error.InvalidRows;
 +                const page: u64 = std.heap.pageSize();
 +                const bp = try a.create(BankPool);
-+                bp.* = .{ .poison = po.poison, .window_rows = n0 };
++                bp.* = .{ .window_rows = n0 };
 +                errdefer bp.deinit(a);
 +                bp.decode_rows = try a.dupe(u32, po.decode_rows);
 +                bp.spare = try a.alloc(Pooled, po.spare.len);
@@ -311,47 +307,26 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
 +                if (!lazy or !defer_eval) try b.bind();
 +                return .{ .rows = n_rows, .base = b.base, .row_bytes = b.row_bytes, .pooled = mask, .backing = .{ .mlx = b } };
 +            }
-+            /// `check`: bytes [0, end) (the layout an install hands over) all 0xFF, counted, and the line.
-+            fn poisonTo(bp: *BankPool, end: u64, to_decode: bool) !void {
-+                if (!bp.poison or end == 0) return;
-+                const p: [*]u8 = @constCast(mlx.mlx_array_data_uint8(bp.base) orelse return error.MlxNoData);
-+                @memset(p[0..@intCast(end)], 0xff);
-+                bp.filled += end;
-+                var buf: [160]u8 = undefined;
-+                std.debug.print("{s}", .{pool_plan.checkLine(to_decode, end, bp.filled, &buf)});
-+            }
-+            fn report(bp: *const BankPool) void {
-+                var tr: u64 = 0;
-+                for (bp.transient) |s| tr += s.bytes;
-+                for (bp.alt) |s| tr += s.bytes;
-+                var sp: u64 = 0;
-+                for (bp.spare) |s| sp += s.bytes;
-+                var w: u64 = 0;
-+                for (bp.window0) |s| w += s.bytes;
-+                for (bp.alt0) |s| w += s.bytes;
-+                var buf: [400]u8 = undefined;
-+                std.debug.print("{s}", .{pool_plan.planLine(bp.plan, tr, sp, w, &buf)});
-+            }
 +        };
          /// What the reverse phase change (`Stream.shrink`) leaves in the prompt rows for the next prompt: `forget` (no resident,
          /// as at construction) or `keep` (the residents decode left there, their bytes and meta as their reads landed). The
          /// rows themselves are the same either way.
-@@ -729,6 +957,8 @@
+@@ -720,6 +923,8 @@
              /// Direct reads (`Options.pool.direct`): the file's block every range and slot row was checked against at
              /// construction (and every row the phase changes allocate); 0 = the staging route.
              direct_block: u64 = 0,
-+            /// MLX_SERVE_DSV41_BANK_POOL (`Options.bank_pool`): null without it.
++            /// The bank pool (`Options.bank_pool`): null without it.
 +            bank_pool: ?*BankPool = null,
              /// Decode layer calls so far; a call's pre-reads and speculative records
              /// carry its tag, settled by its own step.
              clock: i64 = 0,
-@@ -976,12 +1206,20 @@
+@@ -943,12 +1148,20 @@
                      ls.* = .{ .policy = policy, .base = base, .meta = meta, .lens = lens };
                      n_init += 1;
                  }
 -                var transient = try Rows.init(&bank.layers[widest], opt.transient_rows, opt.slot_memory);
-+                // turboexl3_ds41 (MLX_SERVE_DSV41_BANK_POOL): both phases' rows over one buffer (`BankPool`), the prompt's
-+                // scratch installed from it.
++                // turboexl3_ds41 (the bank pool): both phases' rows over one buffer (`BankPool`), the prompt's scratch
++                // installed from it.
 +                var bank_pool: ?*BankPool = null;
 +                if (opt.bank_pool) |po| {
 +                    const route_ids: u32 = if (opt.decode_route_ids == 0) opt.max_route_ids else opt.decode_route_ids;
@@ -368,25 +343,15 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  errdefer if (alt_rows) |*x| x.deinit();
                  const alt_meta: []SlotMeta = if (alt_layer != null) try a.alloc(SlotMeta, opt.transient_rows) else &.{};
                  errdefer a.free(alt_meta);
-@@ -1089,11 +1327,17 @@
-                     .fill_loads = fill_loads,
-                     .fill_reads = fill_reads,
-                     .fill_parts = fill_parts,
+@@ -1025,6 +1238,7 @@
+                     .prompt_relocate = opt.prompt_relocate,
+                     .p7_rows = p7_rows,
+                     .ahead_job = ahead_job,
 +                    .bank_pool = bank_pool,
                  };
                  // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
                  if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
-                 self.direct_block = direct_block;
-                 if (direct_block != 0) try self.checkRowsDirect(.construction);
-+                // MLX_SERVE_DSV41_BANK_POOL: the plan's line; `check` fills the prompt layout before its first use.
-+                if (bank_pool) |bp| {
-+                    bp.report();
-+                    try bp.poisonTo(bp.plan.prompt_end, false);
-+                }
-                 return self;
-             }
-             /// Stops the pool (draining its reads) before freeing the rows it writes.
-@@ -1118,6 +1362,7 @@
+@@ -1054,6 +1268,7 @@
                      a.free(x.meta);
                  }
                  a.free(self.geom_of);
@@ -394,18 +359,18 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  if (self.selector) |*sel| sel.deinit(a);
                  if (self.event_word) |w| a.destroy(w);
                  a.free(self.ahead.loads);
-@@ -3187,6 +3432,10 @@
+@@ -2943,6 +3158,10 @@
                  if (self.held_base.items.len > 0) return error.RoutesLive;
                  var bytes: u64 = self.transient.allocBytes(&self.bank.layers[self.transient_layer]);
                  if (self.alt) |*x| bytes += x.rows.allocBytes(&self.bank.layers[x.layer]);
-+                // MLX_SERVE_DSV41_BANK_POOL: the pool's arrays stay its own (only their references go): MLX's active bytes
-+                // drop by the rest.
++                // The bank pool: the pool's arrays stay its own (only their references go): MLX's active bytes drop by
++                // the rest.
 +                var freed: u64 = self.transient.freshBytes(&self.bank.layers[self.transient_layer]);
 +                if (self.alt) |*x| freed += x.rows.freshBytes(&self.bank.layers[x.layer]);
                  const before = if (self.memory == .mlx) mlxActive() else 0;
                  self.transient.deinit();
                  self.allocator.free(self.transient_meta);
-@@ -3198,7 +3447,7 @@
+@@ -2954,7 +3173,7 @@
                  }
                  self.transient_released = true;
                  self.wide_depth = 1;
@@ -414,69 +379,64 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      self.failed = true;
                      return error.TransientStillReferenced;
                  }
-@@ -3221,6 +3470,13 @@
-             /// past window 0 and the plans left past it (`LayerPolicy`), since construction; `window`: the first layer's
-             /// bound now.
-             pub const DecodeAdmissions = struct { declined: u64 = 0, forced: u64 = 0, overflow: u64 = 0, window: u32 = 0 };
-+            /// MLX_SERVE_DSV41_BANK_POOL: the pool's extra prompt array `i` (`PoolOptions.spare`'s order), the stream's
-+            /// reference (the caller takes its own); null without a pool.
+@@ -2973,10 +3192,13 @@
+                 for (decode_rows) |r| if (r < 2 * max_route_ids) return self.decode_route_ids;
+                 return w;
+             }
+-            /// turboexl3_ds41 (MLX_SERVE_DSV41_DECODE_WINDOW): every layer's decode plans' declined misses, those admitted
+-            /// past window 0 and the plans left past it (`LayerPolicy`), since construction; `window`: the first layer's
+-            /// bound now.
+-            pub const DecodeAdmissions = struct { declined: u64 = 0, forced: u64 = 0, overflow: u64 = 0, window: u32 = 0 };
++            /// The bank pool: the pool's extra prompt array `i` (`PoolOptions.spare`'s order), the stream's reference
++            /// (the caller takes its own); null without a pool.
 +            pub fn poolSpare(self: *const Stream, i: usize) ?mlx.mlx_array {
 +                const bp = self.bank_pool orelse return null;
 +                if (i >= bp.spare.len or bp.spare[i].arr.ctx == null) return null;
 +                return bp.spare[i].arr;
 +            }
-             pub fn decodeAdmissions(self: *const Stream) DecodeAdmissions {
-                 var d: DecodeAdmissions = .{};
-                 for (self.layers) |*ls| {
-@@ -3238,6 +3494,10 @@
+             pub fn grow(self: *Stream, decode_rows: []const u32) !void {
+                 self.settleCopies();
+                 if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
+@@ -2984,6 +3206,10 @@
                  if (self.failed) return error.StreamFailed;
                  if (self.release_installed and !self.transient_released) return error.TransientNotReleased;
                  if (decode_rows.len != self.layers.len) return error.InvalidRows;
-+                // MLX_SERVE_DSV41_BANK_POOL: the pool was laid out for these rows and this window 0.
++                // The bank pool: the pool was laid out for these rows and this window 0.
 +                if (self.bank_pool) |bp| {
 +                    if (!std.mem.eql(u32, decode_rows, bp.decode_rows) or self.decodeWindow(decode_rows) + decode_staging_rows != bp.window_rows) return error.BankPoolRows;
 +                }
                  if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
                  try self.landStage();
                  self.stage = .{};
-@@ -3272,7 +3532,8 @@
+@@ -3018,7 +3244,8 @@
                      const geoms = [2]?u32{ self.transient_layer, if (self.alt) |x| x.layer else null };
                      for (geoms, [2]*?Rows{ &window0, &alt0 }, [2]*[]SlotMeta{ &meta0, &alt_meta0 }) |gl, w, m| {
                          const geom = &self.bank.layers[gl orelse continue];
 -                        w.* = switch (self.grow_fill) {
-+                        // MLX_SERVE_DSV41_BANK_POOL: window 0 is the pool's (references to its arrays).
++                        // The bank pool: window 0 is the pool's (references to its arrays).
 +                        w.* = if (self.bank_pool) |bp| try bp.rows(geom, n0, if (gl.? == self.transient_layer) &bp.window0 else &bp.alt0, self.grow_fill, self.memory.mlx, false) else switch (self.grow_fill) {
                              .zeros => try Rows.init(geom, n0, self.memory),
                              .unfilled => try Rows.initUnfilled(geom, n0, self.memory),
                          };
-@@ -3288,8 +3549,10 @@
+@@ -3034,8 +3261,10 @@
                  defer a.free(exts);
                  @memset(exts, null);
                  errdefer for (exts) |*e| if (e.*) |*rows| rows.deinit();
 -                for (self.layers, decode_rows, exts, self.bank.layers) |*ls, rows, *e, *geom| {
 -                    if (rows > ls.policy.capacity) e.* = switch (self.grow_fill) {
 +                for (self.layers, decode_rows, exts, self.bank.layers, 0..) |*ls, rows, *e, *geom, l| {
-+                    // MLX_SERVE_DSV41_BANK_POOL: the pool's ext arrays referenced, the rest allocated as below (zeros
-+                    // evaluated with every layer's in the one eval).
++                    // The bank pool: the pool's ext arrays referenced, the rest allocated as below (zeros evaluated
++                    // with every layer's in the one eval).
 +                    if (rows > ls.policy.capacity) e.* = if (self.bank_pool) |bp| try bp.rows(geom, rows - ls.policy.capacity, &bp.ext[l], self.grow_fill, self.memory.mlx, true) else switch (self.grow_fill) {
                          .zeros => try Rows.initLazy(geom, rows - ls.policy.capacity, self.memory),
                          .unfilled => try Rows.initUnfilled(geom, rows - ls.policy.capacity, self.memory),
                      };
-@@ -3319,6 +3582,8 @@
-                     // The tally's pins at decode's capacity, once per request (a route never re-ranks them).
-                     ls.policy.refreshPins();
-                 }
-+                // MLX_SERVE_DSV41_BANK_POOL `check`: the decode layout filled before any of its rows is loaded.
-+                if (self.bank_pool) |bp| try bp.poisonTo(bp.plan.decode_end, true);
-                 self.phase = .decode;
-                 // Decode routes take one window: no decode plan ever runs beside a live route's held slots (the decode
-                 // policy has no held set; `shrink` restores the prompt's depth).
-@@ -3343,13 +3608,15 @@
+@@ -3089,13 +3318,15 @@
                  if (prompt_rows.len != self.layers.len) return error.InvalidRows;
                  for (self.layers, prompt_rows) |*ls, rows| if (rows != ls.base.rows) return error.InvalidRows;
                  try self.settleRoutes();
-+                // MLX_SERVE_DSV41_BANK_POOL: the pool's arrays stay its own: the bytes freed are the rest (all of them
-+                // without a pool).
++                // The bank pool: the pool's arrays stay its own: the bytes freed are the rest (all of them without a
++                // pool).
                  var bytes: u64 = 0;
                  for (self.layers, self.bank.layers) |*ls, *geom| if (ls.ext) |*e| {
 -                    bytes += e.allocBytes(geom);
@@ -490,17 +450,17 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  };
                  const before = if (self.memory == .mlx) mlxActive() else 0;
                  for (self.layers, prompt_rows) |*ls, rows| {
-@@ -3424,7 +3691,8 @@
+@@ -3170,7 +3401,8 @@
                  if (self.phase != .prefill) return error.AlreadyGrown;
                  if (self.failed) return error.StreamFailed;
                  if (!self.transient_released) return error.TransientNotReleased;
 -                var t = try Rows.init(&self.bank.layers[self.transient_layer], self.prompt_transient_rows, self.memory);
-+                // MLX_SERVE_DSV41_BANK_POOL: the scratch is the pool's again (references to its arrays).
++                // The bank pool: the scratch is the pool's again (references to its arrays).
 +                var t = if (self.bank_pool) |bp| try bp.rows(&self.bank.layers[self.transient_layer], self.prompt_transient_rows, &bp.transient, .unfilled, self.memory.mlx, false) else try Rows.init(&self.bank.layers[self.transient_layer], self.prompt_transient_rows, self.memory);
                  // Until the install below; then the stream owns `t` and `meta`.
                  var installed = false;
                  errdefer if (!installed) t.deinit();
-@@ -3433,7 +3701,7 @@
+@@ -3179,7 +3411,7 @@
                  @memset(meta, .{});
                  var bytes: u64 = 0;
                  if (self.alt) |*x| {
@@ -509,12 +469,3 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      errdefer t2.deinit();
                      const meta2 = try self.allocator.alloc(SlotMeta, t2.rows);
                      @memset(meta2, .{});
-@@ -3447,6 +3715,8 @@
-                 self.transient_released = false;
-                 self.wide_depth = self.prompt_wide_depth;
-                 bytes += t.allocBytes(&self.bank.layers[self.transient_layer]);
-+                // MLX_SERVE_DSV41_BANK_POOL `check`: the prompt layout filled before any of its rows is loaded.
-+                if (self.bank_pool) |bp| try bp.poisonTo(bp.plan.prompt_end, false);
-                 if (self.direct_block != 0) self.checkRowsDirect(.regrow_transient) catch |e| return self.failDirect(e);
-                 return bytes;
-             }

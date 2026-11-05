@@ -1,34 +1,28 @@
-diff -ruN -x .generated a/env.zig b/env.zig
---- a/env.zig
-+++ b/env.zig
-@@ -288,6 +288,7 @@
-     pub const MLX_SERVE_DSV41_ENGRAM_DECODE: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram rows kept across a conversation's turns (turboexl3_ds41): an LRU of rows over the tables (MLX_SERVE_DSV41_ENGRAM_LRU_MB, billed at load) that a prompt grid's distinct rows and every row a decode read reads go into, a decode read taking the rows it holds and reading the others on a 64-thread pool, a round's bonus token's rows read while its draft runs; the same bytes (unset or 1: on; 0: off; check: on, every row of a decode read read again and the held ones compared, the read bytes served, [engram-decode] lines)" };
-     pub const MLX_SERVE_DSV41_ENGRAM_LRU_MB: Var = .{ .kind = .kill, .type = .text, .default = "256", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram LRU's size in MiB with MLX_SERVE_DSV41_ENGRAM_DECODE on (turboexl3_ds41): its rows and their index, 1 to 16384, billed at load beside the host's bytes" };
-     pub const MLX_SERVE_DSV41_ENGRAM_DIRECT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram tables (turboexl3_ds41): a prompt's rows read once a table (its spans' ids made distinct) and past the page cache, each row's bytes from the file system blocks that hold them, on up to 64 threads; the same bytes (=0: span by span through the page cache)" };
-+    pub const MLX_SERVE_DSV41_ENGRAM_FIRST: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 prompt Engram reads (turboexl3_ds41, with MLX_SERVE_DSV41_ENGRAM_DIRECT on, the default): on (unset, empty or 1), a prompt chunk's Engram row ids hashed and their read thread started first, before the phase change and the embedding, and a prompt grid's tables read on up to 128 threads (the stock: after them, 64 threads), so the first Engram layer waits less for table 0; check, as 1 and table 0's rows read again at 64 threads, the bytes compared ([engram-first] check lines); the same rows read and served (0: the stock start and threads)" };
-     pub const MLX_SERVE_DSV41_GU_SPLIT: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed decode's demand reads (turboexl3_ds41, dq1b): 1 reads each missed record's gate/up range as two range jobs side by side (split at the part boundary nearest its middle), check also reads each split range again whole and compares it with the rows ([gu-split] mismatch); unset or 1 on (zzz9h), 0 off; the served bytes are the same at every setting" };
-     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
-     pub const MLX_SERVE_DSV41_HW2: Var = .{ .kind = .kill, .type = .text, .default = "1", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 t3 route's banked calls (turboexl3_ds41, with the grouped banked decode): the hit wave's and each miss part's grouped GEMVs at hw2u's picked variants (gate|up t4, down t4: turboexl3 group_variants, another schedule of the same reads, decodes and sums) on the grouped texts the call runs (hw4b's M = 3 texts with MLX_SERVE_DSV41_HW4B on); served bytes unchanged (unset, empty or 1: the picked variants, on with the grouped banked decode (zzz9m), off without it; 0: variant 0; check: both, every call's words compared, variant 0's rows served, [hw2] lines, not beside MLX_SERVE_DSV41_HW4B=check)" };
 diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
-@@ -77,6 +77,9 @@
+@@ -64,11 +64,6 @@
  /// streams after its attention (src/scratch_x1.zig, `MLX_SERVE_DSV41_SCRATCH`).
  const scratch = @import("../../../scratch.zig");
  const sx1 = @import("../../../scratch_x1.zig");
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_FIRST, the plugin's src/engram_first.zig): a prompt chunk's Engram read thread
-+/// started first, before the phase change.
-+const efirst = @import("../../../engram_first.zig");
- /// turboexl3_ds41 (MLX_SERVE_DSV41_SCRATCH_TAIL, the plugin's src/scratch_tail.zig): a wide layer's new streams in place
- /// over its x1 region.
- const stail = @import("../../../scratch_tail.zig");
-@@ -4170,6 +4173,24 @@
-     // The stage profiler's forward: a decode token the engine's sampler made runs before its clock starts.
-     try prof.begin(m.s, if (st.verify != null) .verify else if (L == 1) .decode else .prompt, L, if (ids == .gpu) &.{ids.gpu} else &.{});
-     defer prof.end();
-+    // MLX_SERVE_DSV41_ENGRAM_FIRST: a prompt chunk's Engram row ids hashed and their read thread started first, before
-+    // the phase change, the embedding and the spans' setup (off, and a decode-sized chunk: after them, below). The
-+    // thread copies the ids and the tables it is handed, so nothing it reads depends on what follows.
+-/// turboexl3_ds41 (MLX_SERVE_DSV41_SCRATCH_TAIL, the plugin's src/scratch_tail.zig): a wide layer's new streams in place
+-/// over its x1 region.
+-const stail = @import("../../../scratch_tail.zig");
+-/// turboexl3_ds41's one-call routed prefill (src/one_plan.zig): the bill's routed term with `MLX_SERVE_DSV41_ROUTED_ONE` on.
+-const one_plan = @import("../../../one_plan.zig");
+ /// turboexl3_ds41's fused Markov chain (src/markov.zig): the draft's chain in B + 1 launches.
+ const markov = @import("../../../markov.zig");
+ /// turboexl3_ds41 (the plugin's src/engram_decode.zig): a round's bonus token's Engram
+@@ -4021,9 +4016,24 @@
+     const p0 = st.n;
+     const hc = c.dsv4_hc_mult;
+     const d = c.hidden_size;
+-    // The stage profiler's forward: a decode token the engine's sampler made runs before its clock starts.
+-    try prof.begin(m.s, if (st.verify != null) .verify else if (L == 1) .decode else .prompt, L, if (ids == .gpu) &.{ids.gpu} else &.{});
+-    defer prof.end();
++    // turboexl3_ds41: a prompt chunk's Engram row ids hashed and their read thread started first, before the phase
++    // change, the embedding and the spans' setup (a decode-sized chunk: after them, below). The thread copies the ids
++    // and the tables it is handed, so nothing it reads depends on what follows.
 +    const images = vision != null;
 +    const span = m.span;
 +    const eng_on = m.pair == null and m.engrams.len > 0;
@@ -39,15 +33,15 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
 +    defer gpa.free(eng_ids);
 +    var prefetch: ?*engram.Prefetch = null;
 +    defer if (prefetch) |pf| if (m.ahead != pf) pf.finish();
-+    const eng_early = efirst.mode != .off and ids == .host and L > region_rows;
++    const eng_early = ids == .host and L > region_rows;
 +    if (eng_early) {
 +        eng_ids = try engramIds(m, gpa, st, ids.host, images);
 +        if (eng_on) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
 +    }
-     // MLX_SERVE_DSV41_SCRATCH: the prompt's regions let go before a decode forward.
+     // src/scratch_x1.zig: the prompt's regions let go before a decode forward.
      if (L <= region_rows) sx1.releaseAll();
      if (m.streamed) |src| try src.phase(L > region_rows);
-@@ -4183,15 +4204,12 @@
+@@ -4037,15 +4047,12 @@
          try mlx.check(mlx.mlx_async_eval(tv));
      }
      // Engram row ids for the whole chunk (host hash); the rows themselves are
@@ -55,7 +49,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
 -    const images = vision != null;
 -    var eng_ids: []u32 = if (ids == .host) try engramIds(m, gpa, st, ids.host, images) else &.{};
 -    defer gpa.free(eng_ids);
-+    // read span by span at their layer (MLX_SERVE_DSV41_ENGRAM_FIRST: hashed above).
++    // read span by span at their layer (a prompt chunk's: hashed above).
 +    if (!eng_early and ids == .host) eng_ids = try engramIds(m, gpa, st, ids.host, images);
      const ncols: usize = if (m.hash) |*hs| hs.cols() else 0;
      // What crosses layers: each span's stream and mix, the picks attention
@@ -65,7 +59,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const n_spans = (L + span - 1) / span;
      const tail = cedTail(m, st, L, want);
      const n_tail = if (tail) |t| (t + span - 1) / span else 0;
-@@ -4255,14 +4273,8 @@
+@@ -4109,14 +4116,8 @@
      }
      // The chunk's Engram rows come off the SSD on a thread while the layers before them run (a
      // decode token's once it is read back), and the prompt's next chunk is read behind them: the
@@ -77,35 +71,36 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
 -    var prefetch: ?*engram.Prefetch = null;
 -    defer if (prefetch) |pf| if (m.ahead != pf) pf.finish();
 -    if (eng_on and ids == .host) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
-+    // previous call already did the same for this one (MLX_SERVE_DSV41_ENGRAM_FIRST: started above).
++    // previous call already did the same for this one (a prompt chunk's: started above).
 +    if (!eng_early and eng_on and ids == .host) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
      sp.prefetch = prefetch;
-     try prof.mark(.embed, held);
      var from: usize = 0;
+     if (ids == .gpu and m.engrams.len > 0) {
 diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41/engram.zig
 --- a/plugins/deepseek_v41/engram.zig
 +++ b/plugins/deepseek_v41/engram.zig
-@@ -13,6 +13,9 @@
- /// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DIRECT, the plugin's src/engram_direct.zig): the tables read past the page
- /// cache through their blocks; the reads' counters and the [engram] line.
+@@ -12,8 +12,8 @@
+ const qwen4_ple = @import("../qwen4_exp/ple_table.zig");
+ /// turboexl3_ds41 (the plugin's src/engram_direct.zig): the tables read past the page cache through their blocks.
  const edir = @import("../../../engram_direct.zig");
-+/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_FIRST, the plugin's src/engram_first.zig): a prompt grid's tables read on up to
-+/// `GRID_THREADS` threads; `check`: table 0 read again at the stock threads, the bytes compared.
-+const efirst = @import("../../../engram_first.zig");
- /// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DECODE, the plugin's src/engram_decode.zig): the Engram LRU a decode read takes
- /// its rows from, its misses read on a pool; a prompt grid's rows and the rounds' bonus rows go into it.
+-/// turboexl3_ds41 (MLX_SERVE_DSV41_ENGRAM_DECODE, the plugin's src/engram_decode.zig): the Engram LRU a decode read takes
+-/// its rows from, its misses read on a pool; a prompt grid's rows and the rounds' bonus rows go into it.
++/// turboexl3_ds41 (the plugin's src/engram_decode.zig): the Engram LRU a decode read takes its rows from, its misses
++/// read on a pool; a prompt grid's rows and the rounds' bonus rows go into it.
  const edec = @import("../../../engram_decode.zig");
-@@ -429,7 +432,8 @@
-     /// threads, each a contiguous run of them: a row's codes through the blocks that hold them, its scales (and biases)
-     /// from the block the run read last when it holds them, so neighbouring rows' scales cost one read. Rows in `ids`'s
-     /// order.
+ pub const MAX_LAYERS = 4;
+ pub const MAX_NGRAM = 8;
+@@ -427,7 +427,8 @@
+     /// The direct Engram reads: `ids` (sorted, distinct) read past the cache on up to `PAR_THREADS_DIRECT` threads,
+     /// each a contiguous run of them: a row's codes through the blocks that hold them, its scales (and biases) from the
+     /// block the run read last when it holds them, so neighbouring rows' scales cost one read. Rows in `ids`'s order.
 -    fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
 +    /// `cap`: the threads the read may run on (at most `GRID_THREADS`).
 +    fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, cap: usize) !Raw {
          const n = ids.len;
          const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
          errdefer gpa.free(w);
-@@ -472,8 +476,8 @@
+@@ -469,8 +470,8 @@
              }
          };
          var runs: Runs = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
@@ -116,35 +111,72 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
          for (threads[1..parts], 1..) |*slot, k| slot.* = std.Thread.spawn(.{}, Runs.go, .{ &runs, k * n / parts, (k + 1) * n / parts }) catch null;
          runs.go(0, n / parts);
          for (threads[1..parts], 1..) |th, k| {
-@@ -777,8 +781,18 @@
+@@ -500,12 +501,12 @@
+         if (parts > 1) {
+             var threads: [PAR_THREADS_DIRECT]?std.Thread = @splat(null);
+             for (threads[1..parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, Job.runVoid, .{ &job, k, parts }) catch null;
+-            var failed = !job.run(0, parts, false);
++            var failed = !job.run(0, parts);
+             for (threads[1..parts], 1..) |t, k| {
+-                if (t) |th| th.join() else failed = !job.run(k, parts, false) or failed;
++                if (t) |th| th.join() else failed = !job.run(k, parts) or failed;
+             }
+             if (failed or job.bad.load(.acquire)) return error.EngramRead;
+-        } else if (!job.run(0, 1, true)) return error.EngramRead;
++        } else if (!job.run(0, 1)) return error.EngramRead;
+         return .{ .w = w, .s = sc, .b = bi };
+     }
+     /// turboexl3_ds41: `job`'s rows (at most `GCD_ROWS`) the LRU holds copied out of it, the others read on the LRU's
+@@ -588,10 +589,10 @@
+         bad: std.atomic.Value(bool) = .init(false),
+         fn applyOne(ctx: ?*anyopaque, i: usize) callconv(.c) void {
+             const job: *const Job = @ptrCast(@alignCast(ctx.?));
+-            _ = job.run(i, job.ids.len, true);
++            _ = job.run(i, job.ids.len);
+         }
+         fn runVoid(self: *const Job, first: usize, stride: usize) void {
+-            _ = self.run(first, stride, false);
++            _ = self.run(first, stride);
+         }
+         /// turboexl3_ds41: one read of the job's rows at `pos`, a work item of the LRU's pool: item `i` is
+         /// row `pos[i / parts]`'s record (a repacked table, `parts` 1), else its codes, scales or biases (`i % parts`).
+@@ -619,10 +620,9 @@
+                 };
+             }
+         };
+-        /// Every `stride`-th row from `first` (`advise_first`: asked of the kernel first): preads run in parallel where
+-        /// faults on one mapping would serialize. A prompt's threads skip the advice: at 32 of them the preads alone
+-        /// keep the SSD's queue full, and the advice doubles the requests.
+-        fn run(self: *const Job, first: usize, stride: usize, advise_first: bool) bool {
++        /// Every `stride`-th row from `first`, read past the page cache: preads run in parallel where faults on one
++        /// mapping would serialize.
++        fn run(self: *const Job, first: usize, stride: usize) bool {
+             const t = self.t;
+             const rec = t.records();
+             var i = first;
+@@ -740,8 +740,8 @@
+                 nu += 1;
              }
          }
-         _ = edir.distinct.fetchAdd(nu, .monotonic);
+-        _ = edir.distinct.fetchAdd(nu, .monotonic);
 -        const u = table.readSorted(self.gpa, uniq[0..nu]) catch return failTable(g, layer, n_spans);
-+        // MLX_SERVE_DSV41_ENGRAM_FIRST: the table on up to `GRID_THREADS` threads (off: the stock 64).
-+        const cap: usize = if (efirst.mode != .off) GRID_THREADS else PAR_THREADS_DIRECT;
-+        const u = table.readSorted(self.gpa, uniq[0..nu], cap) catch return failTable(g, layer, n_spans);
++        // turboexl3_ds41: the table on up to `GRID_THREADS` threads.
++        const u = table.readSorted(self.gpa, uniq[0..nu], GRID_THREADS) catch return failTable(g, layer, n_spans);
          defer u.deinit(self.gpa);
-+        // MLX_SERVE_DSV41_ENGRAM_FIRST=check: table 0's rows read again at the stock threads, the two reads' bytes compared
-+        // (the wider read's served).
-+        if (efirst.mode == .check and layer == 0) {
-+            if (table.readSorted(self.gpa, uniq[0..nu], PAR_THREADS_DIRECT)) |v| {
-+                defer v.deinit(self.gpa);
-+                efirst.report(nu, u.w.len + u.s.len + u.b.len, efirst.differ(u.w, v.w) + efirst.differ(u.s, v.s) + efirst.differ(u.b, v.b));
-+            } else |_| efirst.report(nu, u.w.len + u.s.len + u.b.len, u.w.len + u.s.len + u.b.len);
-+        }
          for (0..n_spans) |k| {
              const lo = k * self.span;
-             const hi = @min(g.len, lo + self.span);
-@@ -872,6 +886,11 @@
+@@ -823,6 +823,14 @@
  const PAR_THREADS = 32;
- /// MLX_SERVE_DSV41_ENGRAM_DIRECT: a prompt span's read threads when the reads go past the cache.
+ /// The direct Engram reads: a prompt span's read threads when the reads go past the cache.
  const PAR_THREADS_DIRECT = 64;
-+/// MLX_SERVE_DSV41_ENGRAM_FIRST: a prompt grid's table read's threads with the switch on.
-+const GRID_THREADS = efirst.grid_threads;
++/// turboexl3_ds41: a prompt grid's table read's threads (the stock: 64), a deeper queue for the drive (a machine
++/// parameter, not the cell's). The table's distinct rows, about 155K on a cold 16K card at about 4 KB each, one direct
++/// pread a row; the first Engram layer otherwise waits on table 0 with the GPU idle. Exact: the same rows into the same
++/// buffers; only how many threads read them.
++const GRID_THREADS = 128;
 +comptime {
-+    if (GRID_THREADS < PAR_THREADS_DIRECT) @compileError("engram_first.grid_threads below the stock 64");
++    if (GRID_THREADS < PAR_THREADS_DIRECT) @compileError("GRID_THREADS below the stock 64");
 +}
- /// MLX_SERVE_DSV41_ENGRAM_DIRECT: a grid of at least this many tokens (a prompt's) reads each table whole.
+ /// The direct Engram reads: a grid of at least this many tokens (a prompt's) reads each table whole.
  const grid_rows = 1024;
  fn preadAll(fd: c_int, dst: []u8, off: u64) bool {

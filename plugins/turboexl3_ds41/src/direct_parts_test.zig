@@ -1,9 +1,9 @@
-//! `MLX_SERVE_DSV41_DIRECT_PARTS`'s byte gate, a test of its own in `zig build test` (build.zig): the copied read pool
-//! (its C file alone, no MLX, no stream) reads records laid out as the pack lays them, K = 3 and K = 2 (hidden 5,120,
-//! intermediate 2,304, each record padded to 4,096 B; two layers of two experts, two records a submit), through the PARTS
-//! route and through the staging route. Both land the file's bytes in every slot row with the same status words; PARTS'
-//! counters are exactly the gate codes (the only parts on the block). A row off the block stages its part, still the
-//! file's bytes; a file that ends inside a record ends both routes' ranges short with the same payloads.
+//! The direct parts route's byte gate, a test of its own in `zig build test` (build.zig): the copied read pool (its C
+//! file alone, no MLX, no stream) reads records laid out as the pack lays them, K = 3 and K = 2 (hidden 5,120,
+//! intermediate 2,304, each record padded to 4,096 B; two layers of two experts, two records a submit), through the
+//! PARTS route and through the staging route. Both land the file's bytes in every slot row with the same status words;
+//! PARTS' counters are exactly the gate codes (the only parts on the block). A row off the block stages its part, still
+//! the file's bytes; a file that ends inside a record ends both routes' ranges short with the same payloads.
 
 const std = @import("std");
 const testing = std.testing;
@@ -28,7 +28,7 @@ export fn q3ld_mtl_signal(event: ?*anyopaque, value: u64) void {
 }
 
 const abi = 2026110203;
-const counters_n = 84;
+const counters_n = 82;
 /// The pool's SC_PARTS_DIRECT, SC_PARTS_DIRECT_BYTES, SC_PARTS_STAGED_BYTES.
 const sc_parts = 72;
 const res_w = 10;

@@ -1,19 +1,16 @@
-diff -ruN a/env.zig b/env.zig
+diff -ruN -x .generated a/env.zig b/env.zig
 --- a/env.zig
 +++ b/env.zig
-@@ -268,7 +268,11 @@
+@@ -268,6 +268,8 @@
      pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
      pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
      pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
-+    pub const MLX_SERVE_DSV41_COMPILE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 compiled decode stretches (=0: every op eager)" };
 +    pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
 +    pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy: the drafts the calibrated confidence pays for on the measured verify ladder, and the drafting backoff (=0: every round verifies the whole block)" };
      pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
-+    pub const MLX_SERVE_DSV41_ROUTED: Var = .{ .kind = .kill, .type = .text, .default = "the streamer's kernels", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed experts' math (turboexl3: turboexl3_ds41's moeClamped)" };
      pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
      pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
-     // ── diagnostics ──
-diff -ruN a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/bill.zig
+diff -ruN -x .generated a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/bill.zig
 --- a/plugins/deepseek_v41/bill.zig
 +++ b/plugins/deepseek_v41/bill.zig
 @@ -32,12 +32,16 @@
@@ -34,7 +31,7 @@ diff -ruN a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/bill.zig
  /// The table's `bill`: only the KV sources' compressed latents and index keys grow per token (bf16); the windows
  /// are a fixed ring per slot inside the module's state.
  pub fn bill(p: *const abi.Parsed, shape: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
+diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
 @@ -32,6 +32,8 @@
@@ -339,14 +336,14 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
      return compressFrom(sc, m, st, li, cw, proj, p0);
  }
  /// `compressFrom` on the fused pool step (`decode/idx_score.zig`); false (nothing moved) where it declines.
-@@ -3143,9 +3266,22 @@
+@@ -3143,8 +3266,21 @@
          if (dim(x, 0) > region_rows) return slotPrefill(sc, m, &sl, x, r.wts, try shared(sc, m, ly, x));
          return withShared(sc, m, ly, x, try rowSum(sc, try slotRows(sc, m, &sl, x, r.wts, null)));
      };
 +    if (ly.experts.x3) |*b| return withShared(sc, m, ly, x, try routedExl3(sc, m, b, x, r.idx, r.wts));
      if (dim(x, 0) > region_rows) return moePrefill(sc, m, ly, x, r.idx, r.wts, try shared(sc, m, ly, x));
      return withShared(sc, m, ly, x, try routed(sc, m, ly, x, r.idx, r.wts));
- }
++}
 +/// A resident EXL3 bank's routed sum `[L, d]` f32: turboexl3's MoE with the pack's SwiGLU clamp.
 +fn routedExl3(sc: *Scope, m: *const Dsv41Model, b: *const t3.Bank, x: A, idx: A, wts: A) !A {
 +    const L = dim(x, 0);
@@ -358,20 +355,10 @@ diff -ruN a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepsee
 +    const inds = try sc.reshape(try sc.astype(idx, .uint32), &.{ 1, ci(L), ci(k) });
 +    const y = try sc.keep(try t3.moeClamped(sc.s, x3, b.*, inds, try sc.reshape(wts, &.{ 1, ci(L), ci(k) }), .mul1, @intFromFloat(limit)));
 +    return sc.astype(try sc.reshape(y, &.{ ci(L), ci(d) }), .float32);
-+}
+ }
  // ── Engram ──────────────────────────────────────────────────────────────
  /// The gated write of the n-gram rows into the stream `[L, hc, dim]`: `wkv`
- /// turns the rows into one key per copy plus a shared value, and the gate is
-@@ -3849,6 +3985,8 @@
-     return rows <= region_rows and m.regions.len > 0 and m.trace == null;
- }
- fn compileRegions(m: *Dsv41Model) !void {
-+    // `MLX_SERVE_DSV41_COMPILE=0`: every decode stretch runs eager (no region is compiled).
-+    if (env.get(.MLX_SERVE_DSV41_COMPILE)) |v| if (v[0] == '0') return;
-     m.regions = try m.gpa.alloc(LayerRegions, m.n_layers);
-     for (m.regions, 0..) |*r, li| r.* = .{ .m = m, .li = li };
-     for (m.regions) |*r| inline for (comptime std.enums.values(Region)) |kind| {
-diff -ruN a/plugins/deepseek_v41/vision.zig b/plugins/deepseek_v41/vision.zig
+diff -ruN -x .generated a/plugins/deepseek_v41/vision.zig b/plugins/deepseek_v41/vision.zig
 --- a/plugins/deepseek_v41/vision.zig
 +++ b/plugins/deepseek_v41/vision.zig
 @@ -436,6 +436,15 @@
@@ -390,7 +377,7 @@ diff -ruN a/plugins/deepseek_v41/vision.zig b/plugins/deepseek_v41/vision.zig
          var l = Lin{ .w = try self.must(fmt ++ ".weight", args), .bias = self.get(fmt ++ ".bias", args) orelse .{ .ctx = null } };
          if (self.get(fmt ++ ".scales", args)) |sc| {
              l.scales = sc;
-diff -ruN a/plugins/glm5_next/vision.zig b/plugins/glm5_next/vision.zig
+diff -ruN -x .generated a/plugins/glm5_next/vision.zig b/plugins/glm5_next/vision.zig
 --- a/plugins/glm5_next/vision.zig
 +++ b/plugins/glm5_next/vision.zig
 @@ -22,6 +22,7 @@
@@ -433,7 +420,7 @@ diff -ruN a/plugins/glm5_next/vision.zig b/plugins/glm5_next/vision.zig
  }
  /// Weight lookup under the tower's prefix; handles are BORROWED from the weights map.
  const NameCtx = struct {
-diff -ruN a/sdk/util/shared.zig b/sdk/util/shared.zig
+diff -ruN -x .generated a/sdk/util/shared.zig b/sdk/util/shared.zig
 --- a/sdk/util/shared.zig
 +++ b/sdk/util/shared.zig
 @@ -10,7 +10,8 @@
@@ -455,7 +442,7 @@ diff -ruN a/sdk/util/shared.zig b/sdk/util/shared.zig
          fn addr() callconv(.c) *anyopaque {
              return @ptrCast(&storage);
          }
-diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
+diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_source.zig
 --- a/sdk/weights/streamed/exl3_source.zig
 +++ b/sdk/weights/streamed/exl3_source.zig
 @@ -21,6 +21,12 @@
@@ -476,13 +463,13 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
      stream: *expert_stream.Stream,
      source: xp.StreamSource,
 -    hook: Hook,
-+    hook: Hooks,
++    hook: HookT3,
 +    gates_t3: []HookT3.Gate = &.{},
 +    t3_state: MathT3.State = .{ .limit = 0 },
      bill: Bill,
      phase: Phase = .prompt,
      released: bool = false,
-@@ -160,12 +168,25 @@
+@@ -160,12 +168,23 @@
          });
          errdefer self.stream.deinit();
          self.source = xp.StreamSource.init(self.stream);
@@ -502,15 +489,12 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
      }
      pub fn deinit(self: *Source) void {
          _ = mlx.mlx_synchronize(self.g.s);
--        self.hook.deinit();
-+        switch (self.hook) {
-+            inline else => |*h| h.deinit(),
-+        }
+         self.hook.deinit();
 +        self.a.free(self.gates_t3);
          self.stream.deinit();
          self.q.deinit(&self.g);
          kernel_set.Set.uninstall(G, &self.g);
-@@ -184,7 +205,10 @@
+@@ -184,7 +203,10 @@
          const g = &self.g;
          defer g.reset();
          const ids = if (g.dtypeOf(idx) == .int32) idx else try g.astype(idx, .int32);
@@ -522,7 +506,7 @@ diff -ruN a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/streamed/exl3_sou
          const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
          return g.keep(try g.sum(try g.mul(try g.astype(ro, .float32), try g.expandDims(w, -1)), -2, false));
      }
-@@ -199,32 +223,40 @@
+@@ -199,32 +221,40 @@
          for (ids) |e| counts[e] += 1;
          const ranked = try self.a.alloc(u16, n);
          defer self.a.free(ranked);

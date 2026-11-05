@@ -1,4 +1,4 @@
-//! `MLX_SERVE_DSV41_SCRATCH_WAVES`'s write-into twins: a DIG-X wave launch's stock text rewritten so its outputs land
+//! The scratch waves' write-into twins: a DIG-X wave launch's stock text rewritten so its outputs land
 //! in buffers the caller binds as inputs (src/scratch_waves.zig's regions), derived at construction from the registry's
 //! pinned stock texts (the copied quant's `IntoTwins`), never stored.
 //!
