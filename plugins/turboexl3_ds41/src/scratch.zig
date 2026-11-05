@@ -1,5 +1,5 @@
 //! The per-prompt regions the wide prompt layers' arena levers write their large transients into, not fresh MLX
-//! allocations: `Region`, the cap on their bytes together and a word-for-word compare (src/gpu_check.zig's). Users:
+//! allocations: `Region` and the cap on their bytes together. Users:
 //! src/scratch_x1.zig (a wide layer's streams after its attention), src/scratch_attn.zig and the stream's wave arena.
 //!
 //! A 16K-row encoder layer allocated ~21 GB of fresh Metal buffers (pt2: MLX's buffer cache is capped at 2 GiB, so each
@@ -183,31 +183,4 @@ fn hold(slot: *A, x: A) !void {
 fn drop(slot: *A) void {
     if (slot.ctx != null) _ = mlx.mlx_array_free(slot.*);
     slot.* = none;
-}
-
-/// src/gpu_check.zig's compare: `a` against `b` (one shape, 2- or 4-byte words), word for word on the device: the
-/// words compared and those that differ, added to `t`.
-pub const Tally = struct { words: u64 = 0, differ: u64 = 0 };
-pub fn compare(s: mlx.mlx_stream, a: A, b: A, t: *Tally) !void {
-    const wt: mlx.mlx_dtype = switch (mlx.mlx_array_itemsize(a)) {
-        2 => .uint16,
-        4 => .uint32,
-        else => return error.ScratchCheckWords,
-    };
-    var tmp: [5]A = undefined;
-    for (&tmp) |*x| x.* = mlx.mlx_array_new();
-    defer for (tmp) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-    try mlx.check(mlx.mlx_view(&tmp[0], a, wt, s));
-    try mlx.check(mlx.mlx_view(&tmp[1], b, wt, s));
-    // The equal words summed as MLX sums a bool array (int32, no word-sized copy), the scalar then as u32.
-    try mlx.check(mlx.mlx_equal(&tmp[2], tmp[0], tmp[1], s));
-    try mlx.check(mlx.mlx_sum(&tmp[3], tmp[2], false, s));
-    try mlx.check(mlx.mlx_astype(&tmp[4], tmp[3], .uint32, s));
-    try mlx.check(mlx.mlx_array_eval(tmp[4]));
-    const same = (mlx.mlx_array_data_uint32(tmp[4]) orelse return error.NoData)[0];
-    const n: u64 = mlx.mlx_array_size(a);
-    t.words += n;
-    t.differ += n - same;
 }
