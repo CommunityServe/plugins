@@ -1381,6 +1381,14 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   included; chk's 80 `[hc-fuse]` check lines differ=0; bank rows 147/176 in every measured arm; the guard's peak
   103.7/99.7 GiB against 107.9/104.2 (not up: the fused launches make the same large arrays at the same points as the
   stock kernels, and no fresh stream).
+- The index layers' span groups (src/idx_group.zig, patches/turboexl3-zzzza4-idx-group.patch; always on, no switch): a
+  wide prompt layer that indexes evaluates its spans' top-k picks in groups of G spans, G the most whose pending picks
+  (G x 256 rows x the compressed blocks x 9 B) stay within 2.5 GiB: 64, every span as before, up to a 16K prompt, then
+  35, 17, 8 and 4 at 32K, 64K, 128K and 256K; before, a 16,384-row chunk held all 64 spans' picks pending to the layer's
+  end, a size that grows with the context. Exact: the same picks in the same order (MLX-free test: the selection grouped
+  and ungrouped the same). No speed A/B; read as mc281a, mc225a and mc168a (M5 Max, w-20261104-0419 / 0534 / 0627, the
+  2.81 pack and turboderp's 2.25 and 1.68 repacks): every text the same bytes as lad281a, lad225a and lad168a without it,
+  at the same rows, at 1K, 4K, 16K and 64K.
 
 ## The pack
 

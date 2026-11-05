@@ -101,6 +101,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(flash_plan).step);
+    // A wide index layer's indexer spans in groups (src/idx_group.zig, the patch turboexl3-zzzza4-idx-group): the
+    // grouping, the cuts, and the selection grouped and ungrouped on a synthetic case, MLX-free.
+    const idx_group = b.addTest(.{ .name = "idx_group", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/idx_group.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(idx_group).step);
     // MLX_SERVE_DSV41_DIRECT_PARTS's byte gate: the copied read pool's C file alone (no MLX) reading the pack's record
     // layout through the PARTS route and the staging route, the same slot bytes (src/direct_parts_test.zig).
     const parts_gate = b.addTest(.{ .name = "direct_parts", .root_module = b.createModule(.{
