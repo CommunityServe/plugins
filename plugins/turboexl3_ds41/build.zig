@@ -78,6 +78,22 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "turboexl3_format", .module = format }},
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(exact).step);
+    // MLX_SERVE_DSV41_FRAC (src/frac.zig): its MLX-free switch, width rules, load line and parked ring; and its tile
+    // gate: turboexl3's reference decode of real turboderp n 40 / n 24 tiles (and n 32 / 48 controls) against exllamav3
+    // frac.cu's rule (src/frac_test.zig, src/frac_tiles.json).
+    const frac_sw = b.addTest(.{ .name = "frac", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/frac.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(frac_sw).step);
+    const frac_tiles = b.addTest(.{ .name = "frac_tiles", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/frac_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "turboexl3_format", .module = format }},
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(frac_tiles).step);
     // MLX_SERVE_DSV41_SEED_FREE on the streamer's own policy, MLX-free: src/seed_free_test.zig as a test of its own (the
     // policy is the `mlx_stream` module's file, never the plugin root's).
     const free = b.addTest(.{ .name = "seed_free", .root_module = b.createModule(.{

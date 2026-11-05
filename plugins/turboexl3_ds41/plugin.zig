@@ -209,6 +209,9 @@ pub const hc_fuse = @import("src/hc_fuse.zig");
 /// The wide router's logits as one launch of MLX's fused NAX GEMM body at this machine's tile
 /// (`MLX_SERVE_DSV41_GATE_GEMM`, src/gate_gemm.zig, read by the copied model's `gateLogits`).
 pub const gate_gemm = @import("src/gate_gemm.zig");
+/// Routed layers at a half-integer EXL3 rate (exllamav3 1.6's K 1.5 and 2.5) on turboexl3, the rest on their lanes as
+/// before (`MLX_SERVE_DSV41_FRAC`, src/frac.zig, read by the copied bank, quant and the t3 math).
+pub const frac = @import("src/frac.zig");
 /// A wide prompt call's DIG-X waves' 128-row GEMMs with the B stage double-buffered (`MLX_SERVE_DSV41_M1`, src/m1.zig),
 /// read by the copied quant and source.
 pub const m1 = @import("src/m1.zig");
@@ -378,6 +381,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     routed_t3.enabled = config.routedT3(env.span(.MLX_SERVE_DSV41_ROUTED)) catch |e| {
         log.err("[turboexl3_ds41] MLX_SERVE_DSV41_ROUTED is neither turboexl3 nor streamer (unset: turboexl3): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    // Before the model's load (the bank's claim and open read it): the half-integer-rate layers, on the t3 route only.
+    frac.configure(env.span(.MLX_SERVE_DSV41_FRAC), routed_t3.enabled) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_FRAC is none of 0, 1, check, or is 1 or check with MLX_SERVE_DSV41_ROUTED=streamer ({s}): the load is refused\n", .{@errorName(e)});
         out.* = switch (e) {
             inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
         };
@@ -1728,7 +1739,9 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     const l3l = l39_last.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len ..]);
     // MLX_SERVE_DSV41_GATE_GEMM: the [gate-gemm] line ("" off).
     const ggl = gate_gemm.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len + l3l.len ..]);
-    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len + l3l.len + ggl.len]);
+    // MLX_SERVE_DSV41_FRAC: the [frac] line ("" off, or no fractional call since the last request's end).
+    const frl = frac.meters(meter_buf[n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len + l3l.len + ggl.len ..]);
+    out.* = abi.Str.of(meter_buf[0 .. n + io.len + dmd.len + gsl.len + csl.len + tkl.len + etl.len + dfl1.len + scl.len + bml.len + l3l.len + ggl.len + frl.len]);
 }
 
 /// `MLX_SERVE_DSV41_EXPERT_USAGE_RECORD`: the request's routed experts into the record, its file written (a failed write is

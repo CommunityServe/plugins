@@ -1327,6 +1327,33 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   buffers, allocated earlier: about 48 MB over the phase change and the embedding (the row ids, the thread's copy, table
   0's read buffers, 64 more threads' stacks), at most about 45 MB more at L1's activation peak; nothing in GPU/MLX memory
   or the page cache (direct reads).
+- `MLX_SERVE_DSV41_FRAC` (src/frac.zig, src/routed_t3.zig, src/frac_test.zig, src/frac_tiles.json,
+  patches/turboexl3-zzzza3-frac.patch; on by default, `=0` a fractional bank refused by name, `=check` checked; needs
+  the t3 route): routed layers at exllamav3 1.6's half-integer rates (K 1.5 and K 2.5: 24 and 40 halfwords a 256-weight
+  tile; exllamav3_ext/quant/frac.cu: a weight takes KA or KA + 1 fresh bits by mask 0xAAAA, its codeword the 16 ring bits
+  ending at the running sum, MSB-first in 32-bit words, mul1 after, which is turboexl3's `Rate` at n = 16 K: its kernels
+  take such a tile with only the integer-rate reader off). turboderp's DeepSeek-V4.1-Flash-1017 EXL3 branches route
+  layers at n 40 (2.25bpw: layers 0-5 and 35-39; 2.68bpw: 6-34) and n 24 (1.68bpw: 6-34), the rest at n 32 / 48. The
+  copied bank reads a v2 layer's K as a number (16 K whole and even; an integer manifest parses as before) and admits a
+  half-integer one only at a width the switch serves; the copied quant claims such a layer (its segments checked at its
+  width) and its `kIndexOf` refuses any code width but 32 and 48 by name (before: any other width took the K 3 texts).
+  The t3 math runs every call of a fractional layer on turboexl3: a wide prompt call's pairs, sorted by slot, as
+  `moeClamped` calls at top-1 and weight 1 over the bank's slot arrays, at most 4,096 pairs each (`frac.prefill_rows`: a
+  chunk's working set about half a GiB, two in flight, the stock waves' mark / resetTo lifecycle), each pair's row in
+  its assignment row, rounded to bf16 as the lane stores them, and every prompt call on turboexl3's prefill GEMM:
+  moeClamped runs a call of 16 rows or fewer on its decode kernels, which agree with the GEMM within tolerance, not byte
+  for byte, and a call's pair count follows the bank's residency, so such a call is padded to 17 pairs with zero-score
+  copies of its first (`frac.gemm_min_rows`, checked against turboexl3's DECODE_ROWS_MAX at compile time) and a pair's
+  bytes, and the text, do not depend on the bank's rows; a cold-row chunk the same way at its
+  down (its gate and up parked from its gate|up; its values the hot path's, bf16 where the lane stores bf16, in f32),
+  the banked decode as before;
+  `warm` compiles the banked kernels of each width's first layer. A layer at n 32 or 48 runs exactly as before, and a bank
+  without a fractional layer never reads a call's width: a K 2 / K 3 pack (the 2.81 canonical) is served byte for byte as
+  before. `check`: each fractional layer's first two calls a request (and the first two cold chunks) compared on four
+  sampled rows with each row's expert in f64 from the bank's own bytes (src/one_exact.zig), at ROUTED_ONE's bars; a
+  `[frac] check` line a call and a `[frac]` line at each request's end (calls, rows, chunks, host time, checks). The tile gate
+  (`zig build test`): turboexl3's reference decode of 70 real tiles (n 40, n 24 and the n 32 / 48 controls) is the
+  f16 bits exllamav3's rule gives (tools/frac_ref.py, whose integer states equal the converter's exl3_ref.dq_states).
 - `MLX_SERVE_DSV41_GATE_GEMM` (src/gate_gemm.zig, src/kernels/gate_gemm_loop.metal, src/kernels/gate_gemm_nt.metal,
   patches/turboexl3-zzzza2-gate-gemm.patch; on by default, `=0` off, `=check` checked): the wide router's f32 logits
   (`gateLogits` past the decode width: both casts and MLX's NAX matmul, x bf16 [rows, 5120], gate_w [384, 5120], F16 on
