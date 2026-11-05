@@ -2368,7 +2368,36 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
      /// Bytes this table occupies inside the pack's safetensors shards (read by
      /// pread, never resident); a repack table lives outside them.
      pub fn shardBytes(self: *const Table) u64 {
-@@ -462,6 +477,62 @@
+@@ -272,7 +287,7 @@
+                 const fd = try openAt(a, dir_path, path);
+                 errdefer crt.close(fd);
+                 if (fileSize(fd) != rows * rec) return error.EngramTableSize;
+-                return records(fd, rows, head_dim, 0);
++                return mxfp8Records(fd, rows, head_dim, 0);
+             }
+             return error.EngramManifest;
+         } else |_| {}
+@@ -361,7 +376,7 @@
+             const fd = try openAt(a, std.fs.path.dirname(loc.path) orelse ".", std.fs.path.basename(loc.path));
+             errdefer crt.close(fd);
+             if (fileSize(fd) < loc.offset + rows * rec) return error.EngramTableSize;
+-            return records(fd, rows, head_dim, loc.offset);
++            return mxfp8Records(fd, rows, head_dim, loc.offset);
+         }
+         const loc = set.locate(ds41_gguf.ple_table) orelse return error.EngramTableMissing;
+         const t = loc.tensor;
+@@ -371,8 +386,9 @@
+         const fd = try openAt(a, std.fs.path.dirname(loc.path) orelse ".", std.fs.path.basename(loc.path));
+         return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .gguf, .bits = 4, .group_size = 32, .w_off = loc.offset + start * row, .w_stride = row, .wlen = row, .s_off = 0, .s_stride = 0, .slen = 0 };
+     }
++    /// turboexl3_ds41: named apart from the method `records`, the plugin's.
+     /// `rows` mxfp8 records from `base`: `head_dim` e4m3 codes, then one e8m0 scale per 32.
+-    fn records(fd: c_int, rows: u64, head_dim: u32, base: u64) Table {
++    fn mxfp8Records(fd: c_int, rows: u64, head_dim: u32, base: u64) Table {
+         const rec: u64 = head_dim + head_dim / 32;
+         return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base, .w_stride = rec, .wlen = head_dim, .s_off = base + head_dim, .s_stride = rec, .slen = head_dim / 32 };
+     }
+@@ -462,6 +478,62 @@
          }
          return .{ .w = w, .s = sc, .b = bi };
      }
@@ -2431,7 +2460,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
      fn readAll(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
          const n = ids.len;
          const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
-@@ -472,25 +543,56 @@
+@@ -472,25 +544,56 @@
          errdefer gpa.free(bi);
          const job: Job = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
          if (builtin.os.tag.isDarwin() and n <= GCD_ROWS) {
@@ -2497,7 +2526,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
      /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (caller frees).
      pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
          if (self.mode == .gguf) {
-@@ -551,24 +653,57 @@
+@@ -551,24 +654,57 @@
          bad: std.atomic.Value(bool) = .init(false),
          fn applyOne(ctx: ?*anyopaque, i: usize) callconv(.c) void {
              const job: *const Job = @ptrCast(@alignCast(ctx.?));
@@ -2565,7 +2594,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
                  {
                      @constCast(&self.bad).store(true, .release);
                      return false;
-@@ -647,9 +782,15 @@
+@@ -647,9 +783,15 @@
              for (0..self.tables.len) |layer| for (self.grids) |*g| if (!self.readGrid(g, layer)) return;
          } else for (self.grids) |*g| for (0..self.tables.len) |layer| if (!self.readGrid(g, layer)) return;
      }
@@ -2582,7 +2611,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
          for (0..n_spans) |k| {
              if (self.stop.load(.acquire)) return false;
              const item = &g.items[layer * n_spans + k];
-@@ -658,6 +799,66 @@
+@@ -658,6 +800,66 @@
          }
          return true;
      }
@@ -2649,7 +2678,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
      fn readSpan(self: *Prefetch, g: *const Grid, table: *const Table, layer: usize, k: usize) !Table.Raw {
          const lo = k * self.span;
          const hi = @min(g.len, lo + self.span);
-@@ -699,6 +900,18 @@
+@@ -699,6 +901,18 @@
  extern "c" fn dispatch_apply_f(iterations: usize, queue: ?*anyopaque, context: ?*anyopaque, work: *const fn (?*anyopaque, usize) callconv(.c) void) void;
  const PAR_ROWS_PER_THREAD = 16;
  const PAR_THREADS = 32;
@@ -2668,7 +2697,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/engram.zig b/plugins/deepseek_v41
  fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
      return crt.pread(fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
  }
-@@ -717,6 +930,8 @@
+@@ -717,6 +931,8 @@
      if (fd < 0) return error.FileNotFound;
      // Rows are read at random: read-ahead would pull their neighbours in.
      if (comptime builtin.os.tag.isDarwin()) _ = std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0));
@@ -2775,7 +2804,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41
      caps: abi.Caps,
      s: mlx.mlx_stream,
      /// A streamed pack's expert bank, and the prompt positions its slot rows were billed for.
-@@ -232,7 +235,9 @@
+@@ -232,13 +235,16 @@
      m.cfg = c.*;
      // The driver's map never holds the vision tower (the engine's encoder reads it and hands its rows to `forward`).
      const taken = if (ctx.weights) |w| Resident.take(w) else null;
@@ -2786,7 +2815,15 @@ diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41
      errdefer m.weights.deinit();
      // The worker's layers when the driver's load planned a Thunderbolt pair.
      const pair: ?dsv41.Pair = if (ctx.pair_remote.count > 0) .{ .lo = ctx.pair_remote.first, .hi = ctx.pair_remote.first + ctx.pair_remote.count, .worker = false } else null;
-@@ -249,7 +254,10 @@
+     m.s = s;
+     m.caps = ctx.parsed.caps;
+-    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
++    // turboexl3_ds41: no tensor split (the kit's LoadCtx has no tp_rank / tp_size; the model refuses one at init).
++    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
+     errdefer m.mdl.deinit();
+     m.bank = null;
+     m.owner = 0;
+@@ -249,7 +255,10 @@
          if (c.dsv41_exl3_bank) try openBank(m, io, dir, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
      }
      errdefer closeBank(m);
@@ -2798,7 +2835,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41
      return m;
  }
  /// The pack's EXL3 bank at the slot rows the box holds beside the residents and a request of the model's `ctx_size`,
-@@ -270,8 +278,49 @@
+@@ -270,8 +279,49 @@
          if (fit.rows.prompt >= bill_mod.stream_min_rows) break rung;
      } else bill_mod.stream_context;
      const budget = bill_mod.streamBudget(c, context, wired_margin);
@@ -2848,7 +2885,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41
      m.bank = .{ .exl3 = b };
      m.bank_context = context;
      mdl.streamed = streamed.exl3Routed(b);
-@@ -298,6 +347,15 @@
+@@ -298,6 +348,15 @@
      }
      m.bank = null;
  }
@@ -2864,7 +2901,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41
  /// The per-model `ctx_size` setting: the prompt positions a streamed bank bills.
  fn ctxSetting(settings_json: []const u8) ?u64 {
      if (settings_json.len == 0) return null;
-@@ -310,6 +368,7 @@
+@@ -310,6 +369,7 @@
      const m: *Model = @ptrCast(@alignCast(mp));
      closeBank(m);
      if (m.tower) |*t| t.deinit();
@@ -2872,7 +2909,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41
      var it = m.parked.valueIterator();
      while (it.next()) |k| k.deinit();
      m.parked.deinit(gpa);
-@@ -335,7 +394,10 @@
+@@ -335,7 +395,10 @@
      if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
          return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
      const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;

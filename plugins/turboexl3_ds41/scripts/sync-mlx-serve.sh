@@ -51,7 +51,7 @@ imp = re.compile(r'@import\("([^"]+\.zig)"\)')
 kernel_text = re.compile(r'"((?:kernels|plugins/[a-z0-9_]+/kernels)/[^"]+\.(?:metal|h))"')
 # What a copy embeds by a literal path relative to itself, and the folders a copy embeds by computed names.
 embed_text = re.compile(r'@embedFile\("([^"]+)"\)')
-embed_dirs = ["sdk/quant/exl3/stream/kernels"]
+embed_dirs = ["sdk/quant/exl3/stream/kernels", "sdk/quant/gguf/metal"]
 # The read pool the streamer calls (build.zig compiles it as C), copied as it is; mlx-serve's other C and C++ beside it
 # reaches MLX's private headers, which src/host_shims.zig stands in for.
 c_sources = ["sdk/weights/streamed/csrc/q3_lookahead4_exl3.c", "sdk/weights/streamed/csrc/q3_lookahead4.h"]
