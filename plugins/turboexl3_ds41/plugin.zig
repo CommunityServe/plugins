@@ -253,7 +253,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     // The pool's arrays are the host's aliases (HostGpu.alias, mlx-serve's additive ABI entry): a host without it serves
     // with the pool off.
     if (!shims.hasAlias()) {
-        log.info("[turboexl3_ds41] [bank-pool] off: the server's host table has no HostGpu.alias entry (its HostGpu {d} bytes, the entry at bytes 96-104: mlx-serve without host-alias.patch); the streamed bank's rows freed and freshly allocated at each phase change\n", .{shims.gpuBytes()});
+        log.info("[turboexl3_ds41] [bank-pool] off: the server's host table has no HostGpu.alias entry (its HostGpu {d} bytes, the entry at bytes 96-104: an mlx-serve before 26.11.2, which has ddalcu/mlx-serve#1065, e5cdd78); the streamed bank's rows freed and freshly allocated at each phase change\n", .{shims.gpuBytes()});
         bank_pool.on = false;
     }
     engram_decode.lru_mb = engram_decode.parseMb(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB)) catch |e| {

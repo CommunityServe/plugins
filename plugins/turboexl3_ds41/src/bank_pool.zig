@@ -10,8 +10,9 @@
 //! decode layout is part of decode's own rows. Every pooled array is its own MTLBuffer (the host's `HostGpu.alias`): MLX
 //! orders each apart, as separate allocations. Exact: the same plans, rows, kernels and words; a pooled row is read
 //! only after its record landed, and a range changes hands only at a phase change, after the stream's drains and the
-//! source's synchronize. A host whose table has no `HostGpu.alias` (an mlx-serve without host-alias.patch: its HostGpu 96
-//! bytes) serves with the pool off, a load line naming the missing entry (`hostHasAlias`).
+//! source's synchronize. A host whose table has no `HostGpu.alias` (an mlx-serve before 26.11.2, which has
+//! ddalcu/mlx-serve#1065, e5cdd78: its HostGpu 96 bytes) serves with the pool off, a load line naming the missing entry
+//! (`hostHasAlias`).
 //!
 //! This file: the plan (MLX-free).
 
@@ -117,7 +118,7 @@ fn disjoint(items: []const Item, page: u64) !void {
     }
 }
 
-test "bank_pool: a host's HostGpu of 96 bytes has no alias entry; one of 104 (host-alias.patch) or more has" {
+test "bank_pool: a host's HostGpu of 96 bytes has no alias entry; one of 104 (26.11.2 on, #1065) or more has" {
     try testing.expect(!hostHasAlias(0));
     try testing.expect(!hostHasAlias(96));
     try testing.expect(!hostHasAlias(103));

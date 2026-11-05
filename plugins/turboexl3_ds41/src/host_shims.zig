@@ -124,9 +124,10 @@ export fn dsv41_alloc_last_error() [*:0]const u8 {
     return &last_error;
 }
 
-/// The bank pool: the host's `HostGpu.alias` (mlx-serve's additive ABI entry, host-alias.patch), read at its offset
-/// (src/bank_pool.zig `alias_at`: appended after `buffer_addresses`) when the host's table holds it, so the plugin
-/// builds against a kit without it and loads on a host without it (`hasAlias` false: the load turns the pool off).
+/// The bank pool: the host's `HostGpu.alias` (mlx-serve's additive ABI entry, ddalcu/mlx-serve#1065, e5cdd78, in
+/// 26.11.2), read at its offset (src/bank_pool.zig `alias_at`: appended after `buffer_addresses`) when the host's table
+/// holds it, so the plugin builds against a kit without it and loads on a host without it (`hasAlias` false: the load
+/// turns the pool off).
 const AliasFn = *const fn (ctx: ?*anyopaque, base: common.Array, offset: u64, shape: [*]const i32, ndim: usize, dtype: i32, out: *common.Array) callconv(.c) common.Verdict;
 const bank_pool = @import("bank_pool.zig");
 comptime {
@@ -154,7 +155,7 @@ pub fn hasAlias() bool {
 export fn dsv41_alloc_alias(out: *mlx.mlx_array, base: mlx.mlx_array, offset: u64, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int {
     const g = gpu() orelse return noTable("alloc_alias");
     const f = aliasEntry() orelse {
-        const text = "alloc_alias: the server's HostGpu has no alias entry (mlx-serve without host-alias.patch)";
+        const text = "alloc_alias: the server's HostGpu has no alias entry (an mlx-serve before 26.11.2, #1065)";
         @memcpy(last_error[0..text.len], text);
         last_error[text.len] = 0;
         return -1;
