@@ -186,7 +186,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/csrc/q3_lookahead4_exl3.c b/sdk/w
  static int run_range_scatter(const job_t *job, const range_t *rg, char *stage, int64_t *out);
  static int (*run_range)(const job_t *, const range_t *, char *, int64_t *) = run_range_staged;
  
-+/* PARTS (turboexl3_ds41 zzz8i, MLX_SERVE_DSV41_DIRECT_PARTS; ABI 2026110101): the demand ranges' per-part route, set on a
++/* PARTS (turboexl3_ds41 zzz8i; ABI 2026110101): the demand ranges' per-part route, set on a
 + * stopped pool by q3ld_parts_config(block).  block > 0 (the file system block, fstatfs f_bsize: APFS 4,096 B, a power of
 + * two >= 512): a range's parts are read in file order, each part whose file offset, length and row address are
 + * multiples of `block` straight into its row (preadv, the uncached F_NOCACHE path: no staging, no copy), each run of
@@ -1606,7 +1606,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/exl3_source.zig b/sdk/weights/str
 diff -ruN -x .generated a/sdk/weights/streamed/expert/a4k.zig b/sdk/weights/streamed/expert/a4k.zig
 --- a/sdk/weights/streamed/expert/a4k.zig
 +++ b/sdk/weights/streamed/expert/a4k.zig
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,115 @@
 +//! The a4k record layout of an EXL3 v2 expert bank (`sidecar.layout` "a4k" in expert-manifest-v2.json; turboexl3_ds41's
 +//! zzzzt): each record's nine segments at offsets that put every code on a 4 KiB block, so the read pool's PARTS route
 +//! (direct parts) reads all three codes straight into their slot rows (the classic layout puts only the gate's code on
@@ -1626,6 +1626,18 @@ diff -ruN -x .generated a/sdk/weights/streamed/expert/a4k.zig b/sdk/weights/stre
 +pub const disk_order = [n_components]u8{ 1, 2, 4, 5, 0, 3, 6, 7, 8 };
 +/// The components' own order: a classic bank's order on disk.
 +pub const identity = [n_components]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8 };
++
++/// The read pool's order on disk for `bank` (`expert_io.Options.disk_order`, `max` components, the rest 0): the bank's
++/// own (`Bank.diskOrder`: an a4k bank's `disk_order`), or null (a classic bank, or a bank type without the hook) for the
++/// components' order. The stream's `Stream.init` sets its pool options from it, so `Records.onDisk` lays each record's
++/// rows and lengths out in the file's order.
++pub fn poolDiskOrder(comptime Bank: type, bank: *const Bank, comptime max: usize) ?[max]u8 {
++    if (comptime !@hasDecl(Bank, "diskOrder")) return null;
++    const d = bank.diskOrder() orelse return null;
++    var order: [max]u8 = @splat(0);
++    @memcpy(order[0..d.len], &d);
++    return order;
++}
 +
 +pub const Geometry = struct {
 +    /// Each component's offset in its record (component order).
@@ -2915,7 +2927,12 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/policy.zig b/sdk/w
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
-@@ -10,6 +10,18 @@
+@@ -7,9 +7,23 @@
+ const mlx = @import("sdk").mlx;
+ const expert = @import("../expert.zig");
+ const expert_io = @import("io.zig");
++/// The a4k layout's order on disk (`poolDiskOrder`: the read pool's from the bank's).
++const a4k = @import("../../expert/a4k.zig");
  const expert_policy = @import("policy.zig");
  const expert_lookahead = @import("lookahead.zig");
  const expert_routes = @import("routes.zig");
@@ -2934,7 +2951,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
  const log = @import("sdk").log;
  /// The route recorder (`expert.routes`) is a diagnostic: its hooks compile into profile builds (`sdk.plugin_profile`) and
  /// the tests only; a served build has no recorder branch on any route.
-@@ -36,10 +48,24 @@
+@@ -36,10 +50,24 @@
          pub fn miniStride(l: *const Layer) u64 {
              return if (comptime @hasField(Layer, "minis")) l.record_bytes else 0;
          }
@@ -2961,7 +2978,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          /// The most records a routed id may have (a read job holds `expert_io.max_items` records).
          pub const max_minis = expert_io.max_items;
          /// The most records any layer's routed id has.
-@@ -241,6 +267,9 @@
+@@ -241,6 +269,9 @@
              }
          };
          extern fn dsv41_alloc_uninit(out: *mlx.mlx_array, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int;
@@ -2971,7 +2988,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          /// MLX's allocated bytes (MLX slot memory only: the first read creates the Metal device).
          pub fn mlxActive() u64 {
              var n: usize = 0;
-@@ -275,6 +304,18 @@
+@@ -275,6 +306,18 @@
              base: [n_components]u64 = @splat(0),
              row_bytes: [n_components]u64 = @splat(0),
              backing: union(enum) { none, host: HostSlotRows, mlx: LayerSlotBank } = .none,
@@ -2990,7 +3007,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The bytes these rows allocated on `layer`'s geometry (`arrayBytes` per component, the bank's floor
              /// included): what their free returns.
              fn allocBytes(self: *const Rows, layer: *const Layer) u64 {
-@@ -400,12 +441,21 @@
+@@ -400,12 +443,21 @@
              /// A decode plan's transient loads number at most its distinct ids (`LayerPolicy.planWith`), so a caller whose
              /// decode routes never exceed it never writes past the window.
              decode_route_ids: u32 = 0,
@@ -3012,7 +3029,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The pool's staging buffers sized from the bank (`stagingBytes`: its widest gate/up or down span,
              /// page-rounded, plus a page of alignment) in place of `pool.staging_bytes`. A pre-read range must fit one
              /// buffer, so a bank whose spans exceed the pool's default needs it.
-@@ -444,6 +494,9 @@
+@@ -444,6 +496,9 @@
              prompt_relocate: bool = false,
              /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
              tally: ?Tally = null,
@@ -3022,7 +3039,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          };
          /// The rate tally's settings (`expert.tally.Settings`) and the stream's geometry: each stream layer pins at most
          /// floor(`ratio` x its experts) experts, the rate's half-life `window` decode routes of the layer.
-@@ -458,6 +511,189 @@
+@@ -458,6 +513,189 @@
          /// a fill. Exact either way: a row is read only through a slot whose meta says its record landed (`SlotMeta.state`), and
          /// every record lands by its read into the row before that state is set.
          pub const GrowFill = enum { zeros, unfilled };
@@ -3212,7 +3229,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          /// What the reverse phase change (`Stream.shrink`) leaves in the prompt rows for the next prompt: `forget` (no resident,
          /// as at construction) or `keep` (the residents decode left there, their bytes and meta as their reads landed). The
          /// rows themselves are the same either way.
-@@ -483,6 +719,10 @@
+@@ -483,6 +721,10 @@
              tau: f32 = std.math.inf(f32),
              /// Records read ahead per layer call; 2 x budget staging slots.
              budget: u32 = 2,
@@ -3223,7 +3240,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// Chunks per speculative record: 1, 2, 4 or 8.
              chunks: u32 = 4,
              /// Speculative threads >= 1 start a chunk only while at most this many
-@@ -548,6 +788,9 @@
+@@ -548,6 +790,9 @@
              ticket: u32 = 0,
              n_reads: u32 = 0,
              settled: bool = false,
@@ -3233,7 +3250,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          };
          pub const Route = struct {
              layer: u32 = 0,
-@@ -568,6 +811,11 @@
+@@ -568,6 +813,11 @@
              gates: ?Gates = null,
              /// Its record in the route recorder (`Stream.recorder`).
              rec: u32 = expert_routes.none,
@@ -3245,7 +3262,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              pub fn partsOf(r: *const Route) []const Part {
                  return r.parts[0..r.n_parts];
              }
-@@ -626,6 +874,8 @@
+@@ -626,6 +876,8 @@
              max_route_ids: u32,
              /// Decode's window 0 rows (`Options.decode_route_ids`, resolved): the widest decode route.
              decode_route_ids: u32,
@@ -3254,7 +3271,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              records_per_part: u32,
              wide_depth: u8 = 1,
              phase: Phase = .prefill,
-@@ -664,14 +914,22 @@
+@@ -664,14 +916,22 @@
              /// The lookahead's precision: the records read ahead for the next routed layer (their experts, the top-k
              /// position each was chosen at, the bank layer it is in) until that layer's call routes, then per bank layer
              /// and position the records read ahead and those the call routed (`by_rank`).
@@ -3277,7 +3294,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// Decode layer calls so far; a call's pre-reads and speculative records
              /// carry its tag, settled by its own step.
              clock: i64 = 0,
-@@ -704,6 +962,22 @@
+@@ -704,6 +964,22 @@
              p7: P7 = .{},
              p7_rows: []P7Row = &.{},
              ahead_job: []u8 = &.{},
@@ -3300,7 +3317,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// P1's read-ahead of one layer: `loads[0..n]` (expert, slot) in file order, `reads[i]` false when the
              /// slot still held the record; its pool jobs `parts[0..n_parts]` over them (a Route's tickets).
              const Ahead = struct {
-@@ -722,6 +996,24 @@
+@@ -722,6 +998,24 @@
                  /// Per job: landed (its reads waited, its rows' states set and unpinned).
                  landed: []bool,
              };
@@ -3325,7 +3342,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The second geometry's transient scratch: its rows, their meta and the layer whose geometry it has.
              const AltTransient = struct { rows: Rows, meta: []SlotMeta, layer: u32 };
              /// P7 overlap: one prompt call's schedule, from `planCall` to its last group's `releaseP7`.
-@@ -804,7 +1096,7 @@
+@@ -804,7 +1098,7 @@
                      if (la.preread) for (bank.layers) |l| {
                          var gu: u64 = 0;
                          for (l.segments[0..gu_components]) |sg| gu += sg.length;
@@ -3334,7 +3351,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                          if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
                      };
                  }
-@@ -817,6 +1109,13 @@
+@@ -817,6 +1111,13 @@
                      try expert_io.checkDirectBlock(direct_block, std.heap.pageSize());
                      try checkDirectReads(bank, direct_block);
                  }
@@ -3348,7 +3365,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
                  if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
                  errdefer if (selector) |*sel| sel.deinit(a);
-@@ -854,12 +1153,20 @@
+@@ -854,12 +1155,20 @@
                      ls.* = .{ .policy = policy, .base = base, .meta = meta, .lens = lens };
                      n_init += 1;
                  }
@@ -3371,7 +3388,16 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  errdefer if (alt_rows) |*x| x.deinit();
                  const alt_meta: []SlotMeta = if (alt_layer != null) try a.alloc(SlotMeta, opt.transient_rows) else &.{};
                  errdefer a.free(alt_meta);
-@@ -919,9 +1226,12 @@
+@@ -891,6 +1200,8 @@
+                 const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts) else &.{};
+                 errdefer if (ahead_job.len > 0) a.free(ahead_job);
+                 @memset(ahead_job, no_job);
++                // An a4k bank's records lie on disk in its own order: the pool lays their rows and lengths out in it.
++                if (a4k.poolDiskOrder(B.Bank, bank, expert_io.max_disk_components)) |order| pool_opt.disk_order = order;
+                 const pool = try expert_io.Pool.start(a, pool_opt);
+                 errdefer pool.stop();
+                 if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);
+@@ -919,9 +1230,12 @@
                      .memory = opt.slot_memory,
                      .max_route_ids = opt.max_route_ids,
                      .decode_route_ids = if (opt.decode_route_ids == 0) opt.max_route_ids else opt.decode_route_ids,
@@ -3384,7 +3410,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      .preread = if (opt.lookahead) |la| la.preread else false,
                      .event_word = word,
                      .gated = opt.event != null,
-@@ -933,6 +1243,7 @@
+@@ -933,6 +1247,7 @@
                      .prompt_relocate = opt.prompt_relocate,
                      .p7_rows = p7_rows,
                      .ahead_job = ahead_job,
@@ -3392,7 +3418,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  };
                  // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
                  if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
-@@ -962,6 +1273,7 @@
+@@ -962,6 +1277,7 @@
                      a.free(x.meta);
                  }
                  a.free(self.geom_of);
@@ -3400,7 +3426,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  if (self.selector) |*sel| sel.deinit(a);
                  if (self.event_word) |w| a.destroy(w);
                  a.free(self.ahead.loads);
-@@ -1147,6 +1459,13 @@
+@@ -1147,6 +1463,13 @@
                      defer c.mutex.unlock(io);
                      while (c.done < seq) c.cond.waitUncancelable(io, &c.mutex);
                  }
@@ -3414,7 +3440,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              };
              /// `copies` (one promotion of `layer`, from the transient slots of `items`) handed to the copier; run here
              /// when it cannot take them.
-@@ -1363,6 +1682,9 @@
+@@ -1363,6 +1686,9 @@
                  const tag = self.clock + 1;
                  if (self.route_preread) try self.preRead(layer, ids, tag);
                  try self.flush();
@@ -3424,7 +3450,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  if (self.n_free == 0) return self.fail(error.RoutesExhausted);
                  self.n_free -= 1;
                  const r = &self.routes[self.free[self.n_free]];
-@@ -1391,7 +1713,13 @@
+@@ -1391,7 +1717,13 @@
                  self.copier.waitFor(self.copier.window_seq[window]);
                  r.* = .{ .layer = layer, .window = window };
                  const ls = &self.layers[layer];
@@ -3439,7 +3465,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  // A persistent load may take a row a promotion of this layer still writes.
                  if (r.plan.n_persistent > 0 and self.copier.thread != null) self.copier.waitFor(self.copier.layer_seq.items[layer]);
                  const plan = &r.plan;
-@@ -1399,14 +1727,20 @@
+@@ -1399,14 +1731,20 @@
                      s.* = ls.policy.slotOf(e).?;
                      self.locate(layer, s.*).meta.pins += 1;
                  }
@@ -3461,7 +3487,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      if (!held) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
                      m.pins = 1;
                  }
-@@ -1444,7 +1778,7 @@
+@@ -1444,7 +1782,7 @@
                  var bases: [expert_lookahead.max_candidates * max_minis]i64 = undefined;
                  var n: usize = 0;
                  for (misses) |e| for (0..minisOf(geom)) |m| {
@@ -3470,7 +3496,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      n += 1;
                  };
                  _ = B.Records.preRead(self.pool, self.bank.sidecar, tag, bases[0..n], &self.layers[layer].lens) catch
-@@ -1473,6 +1807,12 @@
+@@ -1473,6 +1811,12 @@
              pub fn lookaheadByRank(self: *const Stream) ByRank {
                  return self.by_rank;
              }
@@ -3483,7 +3509,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The records just read ahead for routed layer `routed` (`side`: each one's bank layer of it, null = 0).
              fn notePending(self: *Stream, routed: u32, experts: []const u16, ranks: []const u8, side: ?[]const u8) void {
                  self.ahead_pending_layer = routed;
-@@ -1491,7 +1831,11 @@
+@@ -1491,7 +1835,11 @@
                      const sel = &self.selector.?;
                      var chosen: [expert_lookahead.max_budget]u16 = undefined;
                      var ranks: [expert_lookahead.max_budget]u8 = undefined;
@@ -3496,7 +3522,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      if (comptime recording) if (self.recorder) |rec| rec.spec(r.rec, picked);
                      for (picked) |e| {
                          bases[n] = @intCast(self.bank.recordOffset(next, e));
-@@ -1503,6 +1847,13 @@
+@@ -1503,6 +1851,13 @@
                  _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
                      return self.fail(error.SpecRefused);
              }
@@ -3510,7 +3536,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// `speculate` for a bank of several bank layers per routed layer (`B.banks_per_layer`): the next routed
              /// layer's experts over all its bank layers, each checked against its own bank layer's residency, each record
              /// its bank layer's span (one step of records of different lengths).
-@@ -1523,7 +1874,9 @@
+@@ -1523,7 +1878,9 @@
                      }.f;
                      var chosen: [expert_lookahead.max_budget]u16 = undefined;
                      var ranks: [expert_lookahead.max_budget]u8 = undefined;
@@ -3521,7 +3547,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      if (comptime recording) if (self.recorder) |rec| rec.spec(r.rec, picked);
                      var side: [expert_lookahead.max_budget]u8 = undefined;
                      for (picked) |e| {
-@@ -1544,6 +1897,8 @@
+@@ -1544,6 +1901,8 @@
              /// tickets). Null when nothing is read.
              pub fn gate(self: *Stream, r: *Route) Error!?Gates {
                  std.debug.assert(self.gated and r.state == .live and r.gates == null);
@@ -3530,7 +3556,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  const n = r.n_parts;
                  if (n == 0) return null;
                  const lo = self.gate_value;
-@@ -1675,6 +2030,8 @@
+@@ -1675,6 +2034,8 @@
              /// still be reading): the gate/up kernels of its records can run.
              pub fn waitGu(self: *Stream, r: *Route, part: u32) Error!void {
                  const p = &r.parts[part];
@@ -3539,7 +3565,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  if (p.settled) return;
                  self.waitReads(p.ticket, p.n_reads) catch |e| return self.fail(e);
                  for (0..p.n_reads) |i| {
-@@ -1692,6 +2049,8 @@
+@@ -1692,6 +2053,8 @@
                  return self.settle(r, &r.parts[part]);
              }
              fn settle(self: *Stream, r: *Route, p: *Part) Error!void {
@@ -3548,7 +3574,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  if (p.settled) return;
                  const count = 2 * p.n_reads;
                  const waited = self.waitReads(p.ticket, count);
-@@ -1733,14 +2092,29 @@
+@@ -1733,14 +2096,29 @@
              /// the call's plans (`planCall`: `p7Tail`), or for the layer's await (every record then). `whole` and
              /// `whole_trim`: every record now (`whole_trim` withdraws the jobs still queued at the plans: `p7Withdraw`).
              pub fn readAheadSeed(self: *Stream, layer: u32, experts: []const u16) !void {
@@ -3579,7 +3605,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  // The rows live routes of the layer serve from and the deferred base call's are never a read-ahead's victims
                  // (as a plan beside them holds them): their records are being read by a wave.
                  const held_set = &self.held_scratch;
-@@ -1879,6 +2253,537 @@
+@@ -1879,6 +2257,537 @@
                  for (ah.loads[p.first..][0..p.n]) |l| self.locate(ah.layer, l.slot).meta.pins -= 1;
                  if (failure) |e| return self.fail(e);
              }
@@ -4117,7 +4143,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// Whether read-ahead job `j` has landed or its reads have all completed (never blocks).
              fn aheadJobDone(self: *Stream, j: u32) bool {
                  const ah = &self.ahead;
-@@ -2345,6 +3250,14 @@
+@@ -2345,6 +3254,14 @@
                  for (self.layers) |*ls| _ = ls.policy.forgetPrompt();
                  return n;
              }
@@ -4132,7 +4158,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The usage profile's route counting on (`LayerPolicy.count_routes`), once at construction: each decode route
              /// counts its experts into the request's counts even without the rate tally (`addUsage` reads them).
              pub fn countRoutes(self: *Stream) void {
-@@ -2463,11 +3376,18 @@
+@@ -2463,11 +3380,18 @@
                  if (self.failed) return error.StreamFailed;
                  if (self.transient_released) return error.TransientAlreadyReleased;
                  if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
@@ -4151,7 +4177,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  const before = if (self.memory == .mlx) mlxActive() else 0;
                  self.transient.deinit();
                  self.allocator.free(self.transient_meta);
-@@ -2479,7 +3399,7 @@
+@@ -2479,7 +3403,7 @@
                  }
                  self.transient_released = true;
                  self.wide_depth = 1;
@@ -4160,7 +4186,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      self.failed = true;
                      return error.TransientStillReferenced;
                  }
-@@ -2489,6 +3409,22 @@
+@@ -2489,6 +3413,22 @@
              /// `decode_rows` (the added rows empty, residents unmoved); routes are
              /// decode routes from here on. Needs every route released and the scratch released first: decode's window 0
              /// (plus `decode_staging_rows`) is allocated here, before the added rows.
@@ -4183,7 +4209,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              pub fn grow(self: *Stream, decode_rows: []const u32) !void {
                  self.settleCopies();
                  if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
-@@ -2496,7 +3432,14 @@
+@@ -2496,7 +3436,14 @@
                  if (self.failed) return error.StreamFailed;
                  if (self.release_installed and !self.transient_released) return error.TransientNotReleased;
                  if (decode_rows.len != self.layers.len) return error.InvalidRows;
@@ -4198,7 +4224,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  try self.flush();
                  for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
                  if (self.held_base.items.len > 0) return error.RoutesLive;
-@@ -2516,14 +3459,19 @@
+@@ -2516,14 +3463,19 @@
                      w.deinit();
                      a.free(alt_meta0);
                  };
@@ -4221,7 +4247,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                              .zeros => try Rows.init(geom, n0, self.memory),
                              .unfilled => try Rows.initUnfilled(geom, n0, self.memory),
                          };
-@@ -2539,8 +3487,10 @@
+@@ -2539,8 +3491,10 @@
                  defer a.free(exts);
                  @memset(exts, null);
                  errdefer for (exts) |*e| if (e.*) |*rows| rows.deinit();
@@ -4234,7 +4260,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                          .zeros => try Rows.initLazy(geom, rows - ls.policy.capacity, self.memory),
                          .unfilled => try Rows.initUnfilled(geom, rows - ls.policy.capacity, self.memory),
                      };
-@@ -2565,6 +3515,8 @@
+@@ -2565,6 +3519,8 @@
                      ls.ext = e.*;
                      e.* = null;
                      ls.policy.grow(rows) catch unreachable;
@@ -4243,7 +4269,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      // The tally's pins at decode's capacity, once per request (a route never re-ranks them).
                      ls.policy.refreshPins();
                  }
-@@ -2592,13 +3544,15 @@
+@@ -2592,13 +3548,15 @@
                  if (prompt_rows.len != self.layers.len) return error.InvalidRows;
                  for (self.layers, prompt_rows) |*ls, rows| if (rows != ls.base.rows) return error.InvalidRows;
                  try self.settleRoutes();
@@ -4262,7 +4288,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  };
                  const before = if (self.memory == .mlx) mlxActive() else 0;
                  for (self.layers, prompt_rows) |*ls, rows| {
-@@ -2673,7 +3627,8 @@
+@@ -2673,7 +3631,8 @@
                  if (self.phase != .prefill) return error.AlreadyGrown;
                  if (self.failed) return error.StreamFailed;
                  if (!self.transient_released) return error.TransientNotReleased;
@@ -4272,7 +4298,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  // Until the install below; then the stream owns `t` and `meta`.
                  var installed = false;
                  errdefer if (!installed) t.deinit();
-@@ -2682,7 +3637,7 @@
+@@ -2682,7 +3641,7 @@
                  @memset(meta, .{});
                  var bytes: u64 = 0;
                  if (self.alt) |*x| {
@@ -4281,7 +4307,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      errdefer t2.deinit();
                      const meta2 = try self.allocator.alloc(SlotMeta, t2.rows);
                      @memset(meta2, .{});
-@@ -2734,6 +3689,21 @@
+@@ -2734,6 +3693,21 @@
                  self.read_ns += ns;
                  if (res.preadv_calls == 0 and res.payload > 0) self.copy_only_ns += ns;
              }
@@ -4303,7 +4329,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              pub fn stats(self: *Stream) Stats {
                  var s = self.counters;
                  s.expert_read_seconds = @as(f64, @floatFromInt(self.read_ns)) / 1e9;
-@@ -2747,6 +3717,12 @@
+@@ -2747,6 +3721,12 @@
                      .{ "gates", .ev_gates },            .{ "gates_forced", .ev_wd_forced },
                      .{ "spec_expired", .expired },      .{ "spec_abandoned", .abandoned }, .{ "spec_discarded", .discarded },
                      .{ "spec_cancelled", .cancelled_by_demand }, .{ "direct_ranges", .direct_ranges },

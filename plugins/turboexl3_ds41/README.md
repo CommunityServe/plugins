@@ -220,7 +220,7 @@ Buffers and commits:
   teardown, and the next layer's start hands their buffers to MLX's cache. Exact. +0.63% cold prefill.
 - MLX's command-buffer split is raised to 500 MB during prompts and put back to MLX's (50 MB on the M5 Max) at the
   change to decode. A user's `MLX_MAX_MB_PER_BUFFER` wins. It needs mlx-serve's additive
-  `HostGpu.command_buffer_limits`; on an older host, MLX's own split in every phase (the load line says so). Exact.
+  `HostGpu.command_buffer_limits`; on an older host, MLX's own split in every phase. Exact.
   +3.1% cold prefill, +4.1% on new text.
 - The token embedding table (1.32 GB) stays on disk and its rows are read by pread at each lookup, each distinct id
   once, in parallel. The vision tower (0.94 GB) stays on disk too: each image reads it, encodes and frees it, and a

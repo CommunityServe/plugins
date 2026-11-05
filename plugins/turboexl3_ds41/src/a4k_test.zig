@@ -611,3 +611,39 @@ test "a4k real-file gate (A4K_GATE_PACKS=<classic pack>:<a4k pack>): the two pac
     try testing.expectEqual(@as(i64, @intCast(4 * n_records)), direct_parts);
     try testing.expect(n_records >= 2 * ne);
 }
+
+// The read pool's order on disk from the bank (`a4k.poolDiskOrder`, which the stream's `Stream.init` sets
+// `pool_opt.disk_order` from): an a4k bank hands the pool its components in their file order, so `Records.onDisk` lays
+// each record's rows and lengths out as the file holds them; without it every a4k record's parts land in the wrong
+// slot rows.
+const A4kBank = struct {
+    pub fn diskOrder(_: *const @This()) ?[a4k.n_components]u8 {
+        return a4k.disk_order;
+    }
+};
+const ClassicBank = struct {
+    pub fn diskOrder(_: *const @This()) ?[a4k.n_components]u8 {
+        return null;
+    }
+};
+const HooklessBank = struct {};
+const max_disk_components = 16;
+
+test "a4k: an a4k bank's order on disk reaches the read pool's options; a classic bank's, and a bank without the hook, none" {
+    const got = a4k.poolDiskOrder(A4kBank, &.{}, max_disk_components) orelse return error.TestExpectedOrder;
+    try testing.expectEqualSlices(u8, &a4k.disk_order, got[0..a4k.n_components]);
+    for (got[a4k.n_components..]) |x| try testing.expectEqual(@as(u8, 0), x);
+    try testing.expect(a4k.poolDiskOrder(ClassicBank, &.{}, max_disk_components) == null);
+    try testing.expect(a4k.poolDiskOrder(HooklessBank, &.{}, max_disk_components) == null);
+}
+
+test "a4k: the stream's pool options take the bank's order on disk (Stream.init sets pool_opt.disk_order from it)" {
+    const src = @embedFile("mlx_serve/sdk/weights/streamed/sdk_ext/expert/stream.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn init(a: std.mem.Allocator, bank: *const B.Bank, opt: Options) !*Stream {") orelse
+        return error.TestStreamInitMissing;
+    const start = std.mem.indexOfPos(u8, src, at, "const pool = try expert_io.Pool.start(a, pool_opt);") orelse
+        return error.TestPoolStartMissing;
+    const set = "if (a4k.poolDiskOrder(B.Bank, bank, expert_io.max_disk_components)) |order| pool_opt.disk_order = order;";
+    const i = std.mem.indexOfPos(u8, src, at, set) orelse return error.TestDiskOrderNotSet;
+    try testing.expect(i < start);
+}
