@@ -103,6 +103,7 @@ pub const Generator = struct {
     mtp_adaptive: adaptive.MtpAdaptive = .{},
     mtp_price: adaptive.MtpPriceWindow = .{},
     mtp_serial_left: u32 = 0,
+    mtp_probe: ?round_cost.SerialProbe = null,
     mtp_low_accept: u32 = 0,
     mtp_tok_ema: f32 = 0,
     mtp_serial_exit: adaptive.MtpSerialExit = .none,
