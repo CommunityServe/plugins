@@ -40,7 +40,7 @@ EDGES="env.zig mlx/ffi.zig mlx/array.zig mlx/device.zig mlx/dtype.zig mlx/kernel
 engines/mlx/transformer.zig engines/mlx/cluster/distributed.zig engines/mlx/plugin/config.zig sdk/blocks/dit/w8a8.zig
 plugins/hy_v3/load.zig sdk/util/shared.zig engines/mlx/generate/generator.zig engines/mlx/spec/mtp_head_ref.zig
 sdk/ane/offload.zig sdk/quant/formats.zig engines/mlx/load/exl3_bank.zig sdk/kv/cache.zig engines/mlx/forward_ctx.zig
-plugins/qwen4_exp/trunk.zig sdk/config/model.zig"
+plugins/qwen4_exp/trunk.zig sdk/config/model.zig sdk/quant/gguf/root.zig"
 
 repo="${1:?mlx-serve checkout}"
 sha="$(git -C "$repo" rev-parse HEAD)"

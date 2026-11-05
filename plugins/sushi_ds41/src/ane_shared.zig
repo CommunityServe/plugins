@@ -1,6 +1,6 @@
 //! The shared expert of a wide prefill chunk on the Neural Engine (`SUSHI_DS41_ANE_SHARED`, a prototype, off by
-//! default): one int8 SwiGLU procedure per covered layer in one bank per unit (src/ane, a renamed copy of mlx-serve's
-//! lib/ane). With two units each die takes half the chunk's rows, so a layer's program takes half the time and both
+//! default): one int8 SwiGLU procedure per covered layer in one bank per unit, built and run through the host's Neural
+//! Engine (`Host.ane`). With two units each die takes half the chunk's rows, so a layer's program takes half the time and both
 //! dies run at once. The GPU runs the routed experts meanwhile; the model adds this output before the next layer.
 //!
 //! I/O is fp16 in channel-major planes: unit u reads `[hidden][rows]` of rows `u * rows ..`, and writes `[hidden][rows]`.
@@ -19,19 +19,10 @@ const none = sc_mod.none;
 const dim = sc_mod.dim;
 const ci = sc_mod.ci;
 
-const Mlp = opaque {};
-const Bank = opaque {};
-extern fn s41_ane_available() c_int;
-extern fn s41_ane_bank_create() ?*Bank;
-extern fn s41_ane_bank_free(b: ?*Bank) void;
-extern fn s41_ane_bank_add_mlp(b: ?*Bank, hidden: u32, ffn: u32, rows: u32, gate_q: [*]const i8, gate_s: [*]const f32, up_q: [*]const i8, up_s: [*]const f32, down_q: [*]const i8, down_s: [*]const f32, limit: f32, err: [*]u8, err_size: usize) c_int;
-extern fn s41_ane_bank_finish(b: ?*Bank, name: [*:0]const u8, ane_instance: c_int, input_plane: ?*anyopaque, output_plane: ?*anyopaque, err: [*]u8, err_size: usize) ?*Mlp;
-extern fn s41_ane_mlp_free(m: ?*Mlp) void;
-extern fn s41_ane_mlp_input(m: ?*Mlp) ?[*]f16;
-extern fn s41_ane_mlp_output(m: ?*Mlp) ?[*]f16;
-extern fn s41_ane_mlp_eval(m: ?*Mlp, procedure: u32, err: [*]u8, err_size: usize) c_int;
-extern fn s41_ane_mlp_compile_seconds(m: ?*const Mlp) f64;
-extern fn s41_ane_mlp_cache_hit(m: ?*const Mlp) c_int;
+const kit = @import("mlx_serve");
+const HostAne = kit.abi.host.HostAne;
+const Bank = kit.abi.host.AneBank;
+const Mlp = kit.abi.host.AneBankProgram;
 
 pub const max_units = 2;
 
@@ -41,10 +32,6 @@ pub fn nowNs() u64 {
     return @intCast(std.Io.Timestamp.now(io, .boot).nanoseconds);
 }
 pub const max_layers = 64;
-
-pub fn available() bool {
-    return s41_ane_available() != 0;
-}
 
 /// Per-output-row int8 of a row-major `[rows, cols]` f32 weight: `q` `[rows, cols]`, `s` `[rows]` (w ~ q * s).
 pub fn quantizeRows(w: []const f32, rows: usize, cols: usize, q: []i8, s: []f32) void {
@@ -60,6 +47,7 @@ pub fn quantizeRows(w: []const f32, rows: usize, cols: usize, q: []i8, s: []f32)
 }
 
 pub const Programs = struct {
+    ane: *const HostAne,
     units: [max_units]?*Mlp = @splat(null),
     banks: [max_units]?*Bank = @splat(null),
     n_units: usize,
@@ -70,20 +58,20 @@ pub const Programs = struct {
     /// The bank procedure of each layer, -1 where the layer has none.
     proc: [max_layers]i32 = @splat(-1),
 
-    pub fn init(n_units: usize, chunk_rows: u32, hidden: u32, ffn: u32) !Programs {
+    pub fn init(ane: *const HostAne, n_units: usize, chunk_rows: u32, hidden: u32, ffn: u32) !Programs {
         if (n_units == 0 or n_units > max_units or chunk_rows % (32 * @as(u32, @intCast(n_units))) != 0) return error.AneSharedShape;
-        var p: Programs = .{ .n_units = n_units, .rows = chunk_rows / @as(u32, @intCast(n_units)), .hidden = hidden, .ffn = ffn };
-        for (0..n_units) |u| p.banks[u] = s41_ane_bank_create() orelse return error.AneSharedBank;
+        var p: Programs = .{ .ane = ane, .n_units = n_units, .rows = chunk_rows / @as(u32, @intCast(n_units)), .hidden = hidden, .ffn = ffn };
+        for (0..n_units) |u| p.banks[u] = ane.bank_create(ane.ctx) orelse return error.AneSharedBank;
         return p;
     }
 
     pub fn deinit(self: *Programs) void {
         for (&self.banks) |*b| if (b.*) |x| {
-            s41_ane_bank_free(x);
+            self.ane.bank_free(self.ane.ctx, x);
             b.* = null;
         };
         for (&self.units) |*u| if (u.*) |x| {
-            s41_ane_mlp_free(x);
+            self.ane.bank_program_free(self.ane.ctx, x);
             u.* = null;
         };
     }
@@ -93,7 +81,7 @@ pub const Programs = struct {
         var err: [256]u8 = @splat(0);
         var idx: c_int = -1;
         for (0..self.n_units) |u| {
-            const got = s41_ane_bank_add_mlp(self.banks[u], self.hidden, self.ffn, self.rows, gq.ptr, gs.ptr, uq.ptr, us.ptr, dq.ptr, ds.ptr, limit, &err, err.len);
+            const got = self.ane.bank_add_swiglu(self.ane.ctx, self.banks[u].?, self.hidden, self.ffn, self.rows, gq.ptr, gs.ptr, uq.ptr, us.ptr, dq.ptr, ds.ptr, limit, &err, err.len);
             if (got < 0) {
                 log.err("[sushi_ds41] ane shared: layer {d} program: {s}\n", .{ li, std.mem.sliceTo(&err, 0) });
                 return error.AneSharedBank;
@@ -113,14 +101,14 @@ pub const Programs = struct {
             name[txt.len] = 0;
             const nm: [*:0]const u8 = @ptrCast(&name);
             // A single unit gets no instance hint (the runtime picks a die); two pin one die each.
-            const inst: c_int = if (self.n_units == 1) 0 else @intCast(u + 1);
-            const b = self.banks[u];
+            const inst: i32 = if (self.n_units == 1) 0 else @intCast(u + 1);
+            const b = self.banks[u].?;
             self.banks[u] = null;
-            self.units[u] = s41_ane_bank_finish(b, nm, inst, null, null, &err, err.len) orelse {
+            self.units[u] = self.ane.bank_finish(self.ane.ctx, b, nm, inst, null, null, &err, err.len) orelse {
                 log.err("[sushi_ds41] ane shared: compile of unit {d}: {s}\n", .{ u, std.mem.sliceTo(&err, 0) });
                 return error.AneSharedCompile;
             };
-            log.info("[sushi_ds41] ane shared: unit {d} (die hint {d}) {d} rows, compile {d:.2} s, cache {s}\n", .{ u, inst, self.rows, s41_ane_mlp_compile_seconds(self.units[u]), if (s41_ane_mlp_cache_hit(self.units[u]) != 0) "hit" else "miss" });
+            log.info("[sushi_ds41] ane shared: unit {d} (die hint {d}) {d} rows, compile {d:.2} s, cache {s}\n", .{ u, inst, self.rows, self.ane.bank_program_compile_seconds(self.ane.ctx, self.units[u].?), if (self.ane.bank_program_cache_hit(self.ane.ctx, self.units[u].?)) "hit" else "miss" });
         }
     }
 
@@ -129,11 +117,11 @@ pub const Programs = struct {
     }
 
     pub fn input(self: *const Programs, u: usize) [*]f16 {
-        return s41_ane_mlp_input(self.units[u]).?;
+        return self.ane.bank_program_input(self.ane.ctx, self.units[u].?).?;
     }
 
     pub fn output(self: *const Programs, u: usize) [*]const f16 {
-        return s41_ane_mlp_output(self.units[u]).?;
+        return self.ane.bank_program_output(self.ane.ctx, self.units[u].?).?;
     }
 
     const Job = struct { p: *const Programs, u: usize, proc: u32, x: ?[*]const f16, ok: bool = false, ns: u64 = 0, copy_ns: u64 = 0 };
@@ -141,13 +129,12 @@ pub const Programs = struct {
     fn runUnit(j: *Job) void {
         const t0 = nowNs();
         const n = j.p.slabLen();
-        const dst = s41_ane_mlp_input(j.p.units[j.u]).?;
+        const dst = j.p.input(j.u);
         // A null input means the GPU already wrote the plane (`input`).
         if (j.x) |x| @memcpy(dst[0..n], x[j.u * n ..][0..n]);
         j.copy_ns = nowNs() - t0;
         var err: [256]u8 = @splat(0);
-        // eval returns 1 on success.
-        j.ok = s41_ane_mlp_eval(j.p.units[j.u], j.proc, &err, err.len) == 1;
+        j.ok = j.p.ane.bank_program_eval(j.p.ane.ctx, j.p.units[j.u].?, j.proc, &err, err.len);
         if (!j.ok) log.warn("[sushi_ds41] ane shared: eval unit {d}: {s}\n", .{ j.u, std.mem.sliceTo(&err, 0) });
         j.ns = nowNs() - t0;
     }
@@ -228,11 +215,19 @@ pub const AneState = struct {
     chunk: struct { layers: u32 = 0, ane: u64 = 0, ane_max: u64 = 0, join: u64 = 0 } = .{},
 };
 
-/// Reads `SUSHI_DS41_ANE_SHARED` (1 or 2 units) and builds the programs. A failure leaves the GPU path serving.
-pub fn setAneShared(m: *dsv.Model) void {
+/// Reads `SUSHI_DS41_ANE_SHARED` (1 or 2 units) and builds the programs on the host's Neural Engine (`host`, the
+/// load's `LoadCtx.host`). No ANE on this host, or a failure, leaves the GPU path serving.
+pub fn setAneShared(m: *dsv.Model, host: ?*const anyopaque) void {
     const raw = std.c.getenv("SUSHI_DS41_ANE_SHARED") orelse return;
     const units = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 1;
-    m.ane = init(m, units) catch |e| {
+    const ane = blk: {
+        const h = kit.host.Host.of(host) catch break :blk null;
+        break :blk h.ane();
+    } orelse {
+        log.warn("[sushi_ds41] ane shared: off (this host has no Neural Engine to offer)\n", .{});
+        return;
+    };
+    m.ane = init(m, ane, units) catch |e| {
         log.warn("[sushi_ds41] ane shared: off ({s})\n", .{@errorName(e)});
         return;
     };
@@ -262,14 +257,13 @@ fn linF32(m: *const dsv.Model, lin: *const dsv.Lin, in: usize, dst: []f32) !void
     @memcpy(dst, host);
 }
 
-fn init(m: *dsv.Model, units: usize) !*AneState {
-    if (!available()) return error.AneUnavailable;
+fn init(m: *dsv.Model, ane: *const HostAne, units: usize) !*AneState {
     const c = &m.cfg;
     const d: usize = c.dim;
     const f: usize = m.layers[0].shared[0].outDim();
     const chunk: usize = cfg_mod.prefill_width;
     const layers = @min(m.ced_split orelse c.layers, @min(c.layers, max_layers));
-    var progs = try Programs.init(units, @intCast(chunk), @intCast(d), @intCast(f));
+    var progs = try Programs.init(ane, units, @intCast(chunk), @intCast(d), @intCast(f));
     errdefer progs.deinit();
     const gpa = m.gpa;
     const wf = try gpa.alloc(f32, d * f);
