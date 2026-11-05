@@ -184,6 +184,9 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         .intermediate = c.moe_inter,
         .exl3_n = priv.exl3_n,
         .exl3_rates = priv.exl3_rates,
+        // The order the pack's routed trellis lies in. The store reads it off the index and refuses a geometry that
+        // says otherwise, so a pair-major pack needs this named here and not only at the engine below.
+        .tile_order = priv.tile_order,
     };
     const per = try stream.expertBillFor(gpa, dir, geo, .exl3_k4);
     geo.shape = per.shape;
