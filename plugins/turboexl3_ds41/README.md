@@ -1389,6 +1389,17 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   and ungrouped the same). No speed A/B; read as mc281a, mc225a and mc168a (M5 Max, w-20261104-0419 / 0534 / 0627, the
   2.81 pack and turboderp's 2.25 and 1.68 repacks): every text the same bytes as lad281a, lad225a and lad168a without it,
   at the same rows, at 1K, 4K, 16K and 64K.
+- One compressed-cache buffer a KV-source layer (src/comp_once.zig, patches/turboexl3-zzzza5-comp-once.patch; always on,
+  no switch): a wide prompt layer that is a KV source (its compressed latents and index keys appended per token) runs its
+  compressor for every span before the span loop (`Shared.compressed`), so the chunk's rows append to one cache buffer
+  and each span's attention and indexer read its causal prefix of it (clen = (p0 + span end) / ratio); before, each
+  span's append copied the whole cache and the earlier spans' pending views kept every copy alive to the layer's end.
+  Exact (MLX-free test: each span's rows the same as per span, no whole-cache copy). The prompt's peak over the load peak
+  on the 2.81 pack at the same rows (M5 Max; mc281a/b without, mx281a with, w-20261104-0419 / 0515 / 1334): 3.02 / 3.60
+  / 4.56 / 5.43 GiB at 16K / 32K / 64K / 128K before, 2.97 / 3.25 / 3.67 / 3.02 after, every text the same bytes; 256K
+  served at a 99.50 GiB peak (mf281c, w-20261104-1515). Speed, a = without, b = with, at 16K on the 2.81 pack, every text
+  the same bytes in every arm: rmp1 (pio, w-pio-20261104-1311) cold prefill -0.80% (pairs -1.25%, -0.35%), new text
+  -0.17% (+0.08%, -0.43%); rmc1 (cells, w-20261104-1319) card decode +0.61%, greedy -0.26%, the card's cold prefill 0.00%.
 
 ## The pack
 

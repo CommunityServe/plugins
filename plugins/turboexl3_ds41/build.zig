@@ -109,6 +109,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(idx_group).step);
+    // A wide KV-source layer's compressor for every span first (src/comp_once.zig, the patch turboexl3-zzzza5-comp-once):
+    // the view arithmetic, and every span's rows the same as per span with no whole-cache copy, MLX-free.
+    const comp_once = b.addTest(.{ .name = "comp_once", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/comp_once.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(comp_once).step);
     // MLX_SERVE_DSV41_DIRECT_PARTS's byte gate: the copied read pool's C file alone (no MLX) reading the pack's record
     // layout through the PARTS route and the staging route, the same slot bytes (src/direct_parts_test.zig).
     const parts_gate = b.addTest(.{ .name = "direct_parts", .root_module = b.createModule(.{
