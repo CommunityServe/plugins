@@ -42,7 +42,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "mlx_host", .module = gpu }},
     });
     gpu.addImport("sushi_exl3", gpu_exl3);
-    // The slice's model reaches `ane_shared.zig`, which names the kit's `HostAne`.
     gpu.addImport("mlx_serve", root.import_table.get("mlx_serve").?);
     const gpu_run = b.addRunArtifact(b.addTest(.{ .root_module = gpu, .filters = &.{"sushi_ds41 gpu"} }));
     gpu_run.setEnvironmentVariable("SUSHI_DS41_GPU_TEST", "1");

@@ -781,7 +781,6 @@ pub const Model = struct {
     /// A wide chunk's shared expert rides the routed prefill launches where the trellis chain takes it there; off, it runs
     /// as a chain of its own (the tests' oracle).
     shared_fold: bool = true,
-    /// The shared expert of wide prefill chunks on the Neural Engine (`ane_shared.zig`).
     ane: ?*ane_mod.AneState = null,
     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
     decode_engram_ahead: bool = true,
@@ -2369,7 +2368,6 @@ pub const Expand = struct { x: A, post: A, comb: A };
 pub const SharedOp = union(enum) {
     array: A,
     layer: struct { m: *const Model, li: usize, expand: ?Expand = null },
-    /// A wide chunk's routed sum alone: the caller adds the shared expert (`ane_shared.moe`).
     none,
 
     pub fn value(self: SharedOp, sc: *Scope, x: A) !A {
@@ -2450,7 +2448,6 @@ pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *co
     if (shared == .layer) {
         if (try prefillWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k, early)) |y| return y;
     }
-    // The routed sum alone, through the same launches (and staged planes) as the sum below.
     if (shared == .none) {
         exl3.kernels.setDecodeParams(dec);
         return sc.astype(try sc.keep(try exl3.rate_groups.moePrefillEarly(sc.s, x, rb, flat, scores, k, limit, early)), .float32);
@@ -2636,7 +2633,6 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
             }
             return out;
         }
-        // Wide chunks only, so never a folded expand (`foldsExpand` takes decode widths).
         if (m.ane) |st| if (expand == null and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX) {
             if (try ane_mod.moe(sc, m, st, li, ly, h, hk, r, ride)) |out| return out;
         };
