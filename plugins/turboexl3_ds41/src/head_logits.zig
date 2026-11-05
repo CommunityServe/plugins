@@ -8,7 +8,7 @@ const std = @import("std");
 
 /// Whether `head` (a `Lin`: `w`, an MLX array, and `x3`, an optional EXL3 projection) is a head to apply.
 pub fn projects(head: anytype) bool {
-    return head.w.ctx != null;
+    return head.w.ctx != null or head.x3 != null;
 }
 
 // ── tests ──
