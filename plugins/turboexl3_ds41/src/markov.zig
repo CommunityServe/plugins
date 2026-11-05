@@ -1,5 +1,5 @@
 //! The DSpark draft's Markov chain in B + 1 launches (the plan is MLX-free in src/markov_plan.zig). The copied model's
-//! draftRows (patches/turboexl3-z-markov.patch) hands `chain` the head's logits;
+//! draftRows (patches/turboexl3-model.patch) hands `chain` the head's logits;
 //! without it every draft position is five dependent op groups (a take, a [1, rank] x [rank, vocab] matmul in the
 //! activation dtype, its cast, the add to the logits row, an argmax and its cast) and the confidence head's dot.
 //!

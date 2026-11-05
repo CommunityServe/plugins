@@ -1,6 +1,6 @@
 //! The token embedding table (`embed.weight`, bf16 [vocab, hidden]: 1.32 GB in the full pack) read from
 //! the pack by pread at each lookup instead of held resident. The copied model leaves it out of the load and reads its
-//! rows here (patches/turboexl3-zzz8d-embed-vision.patch), so the streamed bank, sized from the memory in use when it
+//! rows here (patches/turboexl3-model.patch), so the streamed bank, sized from the memory in use when it
 //! opens, takes the bytes as slot rows. A decode round looks up 6 to 7 rows (the verify's ids and the draft's first id), a
 //! 16K prompt its distinct ids; the preads run in parallel and the OS page cache keeps the hot rows. The rows are the
 //! table's bytes, so the served bytes are the same.

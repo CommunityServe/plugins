@@ -1,5 +1,5 @@
 //! Free seed rows on the streamer's own policy (src/mlx_serve/sdk/weights/streamed/sdk_ext/expert/policy.zig,
-//! patches/turboexl3-zz5-seed-free.patch), MLX-free: a test of its own in `zig build test` (build.zig), since the
+//! patches/turboexl3-stream.patch), MLX-free: a test of its own in `zig build test` (build.zig), since the
 //! policy is the `mlx_stream` module's file and never the plugin root's.
 
 const std = @import("std");

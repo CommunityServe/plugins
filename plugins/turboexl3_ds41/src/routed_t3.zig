@@ -1,7 +1,7 @@
 //! The routed experts' decode on turboexl3, for the copied expert streamer (sdk/weights/streamed/exl3_source.zig). The
 //! streamer's decode waves run its banked route on turboexl3's banked decode (`moeClampedBanked`): a wave's pairs over the
 //! layer's three slot banks in one call, each pair one row-slot whose id is packed (bank << 24 | slot row), DEVROUTE's
-//! device wave among them (patches/turboexl3-t3-banked.patch binds both). The call runs whole at the wave's down:
+//! device wave among them (patches/turboexl3-stream.patch binds both). The call runs whole at the wave's down:
 //! turboexl3's gate|up finish prepares the down's input, so it reads the down projection's suh, and a gated miss part's
 //! down arrays are waited only for its down (the streamer's own gate|up reads gate and up arrays alone). The slot arrays
 //! are turboexl3's banks (code as the trellis, rin as suh, rout as svh); each pair's row comes back in f32 at weight 1 and
@@ -47,8 +47,8 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         /// The banked route's state: the clamp limit.
         pub const State = struct {
             limit: c_int,
-            /// Cleared at each layer call by the source's `rows` (patches/turboexl3.patch); nothing reads it since the
-            /// prompt calls run on the stock math.
+            /// Cleared at each layer call by the source's `rows` (patches/turboexl3-stream.patch); nothing reads it
+            /// since the prompt calls run on the stock math.
             n: usize = 0,
         };
 

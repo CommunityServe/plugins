@@ -1,6 +1,6 @@
 //! The decode's slot rows split across the layers, MLX-free: the split on a pack whose geometry the curves fit and flat
 //! rows (every layer the bill's decode rows, one info line) on any other. The copied EXL3 source
-//! (patches/turboexl3-zzz1-decode-rows.patch) hands `split` the flat rows, each layer's prompt rows and record bytes
+//! (patches/turboexl3-stream.patch) hands `split` the flat rows, each layer's prompt rows and record bytes
 //! and the bank's expert count when it opens; the split spends the flat bill's decode bytes (or fewer), each layer between
 //! its prompt rows (at least the curves' first count) and 256 rows, one row at a time where it saves the most misses a
 //! byte on the layer's curve below. The stream grows each layer to its own rows at the phase change, as it does flat.

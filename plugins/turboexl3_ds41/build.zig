@@ -68,7 +68,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(flash_plan).step);
-    // A wide index layer's indexer spans in groups (src/idx_group.zig, the patch turboexl3-zzzza4-idx-group): the
+    // A wide index layer's indexer spans in groups (src/idx_group.zig, patches/turboexl3-model.patch): the
     // grouping, the cuts, and the selection grouped and ungrouped on a synthetic case, MLX-free.
     const idx_group = b.addTest(.{ .name = "idx_group", .root_module = b.createModule(.{
         .root_source_file = b.path("src/idx_group.zig"),
@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(idx_group).step);
-    // A wide KV-source layer's compressor for every span first (src/comp_once.zig, the patch turboexl3-zzzza5-comp-once):
+    // A wide KV-source layer's compressor for every span first (src/comp_once.zig, patches/turboexl3-model.patch):
     // the view arithmetic, and every span's rows the same as per span with no whole-cache copy, MLX-free.
     const comp_once = b.addTest(.{ .name = "comp_once", .root_module = b.createModule(.{
         .root_source_file = b.path("src/comp_once.zig"),
@@ -84,9 +84,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(comp_once).step);
-    // The streamed bank's bill calibrated against the box's measured peaks (src/bill_cal.zig, the patch
-    // turboexl3-zzzza6-bill-cal): the setting, the measured conditions, the tables' points and interpolation, and the 2.81
-    // pack's rows at the 16K and 256K cells against the calibration model, MLX-free.
+    // The streamed bank's bill calibrated against the box's measured peaks (src/bill_cal.zig,
+    // patches/turboexl3-model.patch): the setting, the measured conditions, the tables' points and interpolation, and
+    // the 2.81 pack's rows at the 16K and 256K cells against the calibration model, MLX-free.
     const bill_cal = b.addTest(.{ .name = "bill_cal", .root_module = b.createModule(.{
         .root_source_file = b.path("src/bill_cal.zig"),
         .target = target,
