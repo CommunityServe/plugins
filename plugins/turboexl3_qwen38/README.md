@@ -1,7 +1,8 @@
 # turboexl3_qwen38
 
-Serves the fully EXL3 Qwen3.8-Flash-Next packs K2 to K5 (OpensourceWTF/Qwen3.8-Flash-Next-EXL3-{2.05,3.05,4.05,5.05}
--mlx-serve) through turboexl3. It claims a `qwen4_exp` pack only when its config has a `trunk_quant` block.
+Serves the fully EXL3 Qwen3.8-Flash-Next packs K2 to K5 (the 2.05bpw, 3.05bpw, 4.05bpw and 5.05bpw branches of
+OpensourceWTF/Qwen3.8-Flash-Next-exl3) through turboexl3. It claims a `qwen4_exp` pack only when
+its config has a `trunk_quant` block.
 
     scripts/build.sh turboexl3_qwen38                                # from the repo root: tests, then ReleaseFast
     plugins/turboexl3_qwen38/scripts/prepare.sh                      # generate src/mlx_serve/ (build.sh runs it)
