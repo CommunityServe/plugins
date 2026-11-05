@@ -1,0 +1,21 @@
+.{
+    .name = .turboexl3_ds41,
+    .version = "0.0.0",
+    .fingerprint = 0x707be5b734e0c8e7,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .mlx_serve_kit = .{ .path = "../../.kit/kit" },
+        // turboexl3 (davidtai/turboexl3): the EXL3 kernels and its plugin-kit launcher, at eb1339d, on turboexl3 main
+        // through #3's merge c3bb0e2: 65c72d1 (PR 3: the banked decode, moeClampedBanked, for the streamer's banked waves
+        // and device route, and its grouped texts with the skip id, Config.banked_group 4; 5-row chunks on the lean
+        // text) + pgemm (pg2: a dense linear's prefill matmul and finish as one launch at this machine's tiles) + the grouped banked
+        // decode's M=3 member path (Config.banked_m3, hw4b) + the grouped GEMVs' variants on either grouped text set
+        // (Config.banked_variant_gu / banked_variant_dn; t4: a codeword's two pair sums to t as one half2, hw2) + the
+        // decode shared expert's finish, SwiGLU and prepare in one launch (F3: sharedSwiglu, shfin).
+        .turboexl3 = .{
+            .url = "https://github.com/davidtai/turboexl3/archive/eb1339d8ca2cc62a48f04f7964f05c97a946ae16.tar.gz",
+            .hash = "turboexl3-0.1.0-tZE8bzsZPwFFvQVf8AWeMOYXL8EKkfoDOwFR0Wix04lU",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "scripts", "patches", "tests", "NOTICE", "README.md" },
+}

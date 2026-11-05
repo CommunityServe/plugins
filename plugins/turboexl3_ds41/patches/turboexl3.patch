@@ -1,0 +1,194 @@
+diff -ruN -x .generated a/env.zig b/env.zig
+--- a/env.zig
++++ b/env.zig
+@@ -240,6 +240,7 @@
+     pub const MLXSERVE_DEVICE: Var = .{ .kind = .public, .type = .text, .default = "the GPU", .owner = "mlx", .since = "26.7.2", .doc = "iOS: `cpu` forces the CPU device" };
+     pub const MLXSERVE_LOWMEM: Var = .{ .kind = .public, .type = .flag, .default = "by total RAM", .owner = "host/media_jobs", .since = "26.7.2", .doc = "low-memory media mode (1 on, 0 off)" };
+     pub const MLX_ENABLE_TF32: Var = .{ .kind = .public, .type = .flag, .default = "on", .owner = "mlx", .since = "26.9.3", .doc = "MLX's own TF32 switch; the QSA score and Idol's 3xTF32 RePo follow it" };
++    pub const MLX_MAX_MB_PER_BUFFER: Var = .{ .kind = .public, .type = .int, .default = "the chip's (50 on the M5 Max)", .owner = "mlx", .since = "26.11.1", .doc = "MLX's command buffer split, MB of bound arrays: read once by MLX's Metal device at the server's start, process-wide; set, turboexl3_ds41 leaves the split as set in every phase" };
+     pub const MLX_METAL_FAST_SYNCH: Var = .{ .kind = .public, .type = .flag, .default = "on in a Thunderbolt group, else MLX's off", .owner = "engines/mlx/cluster", .since = "unreleased", .doc = "MLX's shared-memory GPU/CPU fences; the group's collectives hand off through them" };
+     pub const MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS: Var = .{ .kind = .public, .type = .int, .default = "1000 on macOS (MLX's 0 = off)", .owner = "mlx", .since = "unreleased", .doc = "how often MLX re-requests residency of its wired sets; exported when unset" };
+     pub const MLX_PTX_CACHE_DIR: Var = .{ .kind = .public, .type = .text, .default = "$TMPDIR/mlx/<mlx stamp>/ptx", .owner = "mlx", .since = "26.10.3", .doc = "MLX's CUDA PTX cache; exported per MLX build when unset" };
+@@ -269,8 +270,20 @@
+     pub const MINIMAX_H3_VSA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 trained VSA sparse attention (=0: dense attention, no gate branch)" };
+     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
+     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
++    pub const MLX_SERVE_DSV41_BILL_CAL: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's bill calibrated against the box's measured peaks (turboexl3_ds41): each phase's budget the recommended working set less a 410 MiB margin, the memory in use and the phase's measured working set at the context (the wired margin, the host's, the Engram LRU's and the decode stop's bytes inside what was measured); [bank-bill] cal=on and the readings at the bank's open (self_mb, spec_mb, purg_mb); on only under the calibration's conditions (--prefill-chunk 16384, MLX_SERVE_CACHE_LIMIT 2 GiB, an Apple M5 Max with 128 GB, a 112 GiB wired limit), else the bill as before and a load line naming what differs: unset, empty or 1 on; 0 the bill as before; anything else refuses the load" };
+     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
++    pub const MLX_SERVE_DSV41_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark copy rounds: a long match in the context drafts its continuation (=0: the stages draft every round)" };
++    pub const MLX_SERVE_DSV41_DSPARK_COSTS: Var = .{ .kind = .kill, .type = .text, .default = "unset", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark fixed verify policy's tables (turboexl3_ds41; with MLX_SERVE_DSV41_DSPARK_POLICY unset or =fixed only, refused beside =0 or =1; sampled requests only, a greedy request's rounds verify the whole block; unset: the built-in tables fitted on an M5 Max, src/rounds.zig DEFAULT_COSTS): v1,v2,...,vN/d, the verify ms by rows from one to N (2..16) then the ms a stage draft takes, or such tables by context U1:t1+U2:t2+...+tK (the bounds ascending positions, the last table unbounded, at most 8; a round reads the first table whose bound exceeds its position), fitted once per box and pack; the cut and the drafting backoff read it instead of the measured ladder and the round's wall time, so a request's text is the same run to run; refused by name when malformed" };
++    pub const MLX_SERVE_DSV41_DSPARK_FIXED_GREEDY: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.2", .doc = "DeepSeek-V4.1 DSpark fixed verify policy on greedy requests too (turboexl3_ds41): its cut and backoff on the fixed tables, never the clock, so deterministic; on the batch-invariant trunk a round's width leaves the greedy text the 1-row decode's (off by default after aw1s, the cut losing on the same greedy text: greedy rounds verify the whole block, the policy standing aside; =1 on)" };
++    pub const MLX_SERVE_DSV41_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "fixed", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 DSpark verify policy (turboexl3_ds41): fixed, the default, on sampled requests: the drafts the calibrated confidence pays for and the drafting backoff on a fixed cost table by context (MLX_SERVE_DSV41_DSPARK_COSTS, else the built-in tables fitted on an M5 Max), never the clock, so a request's text is the same run to run; a greedy request's rounds verify the whole block; =1 the live policy (the measured verify ladder and the round's wall time); =0 off: every round verifies the whole block" };
++    pub const MLX_SERVE_DSV41_EXPERT_USAGE_DIR: Var = .{ .kind = .kill, .type = .text, .default = "the pack", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): the absolute directory its expert-usage-v1.json is read from" };
++    pub const MLX_SERVE_DSV41_EXPERT_USAGE_LABEL: Var = .{ .kind = .kill, .type = .text, .default = "unlabeled", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): the recorded prompt set's name, the file's provenance; needs MLX_SERVE_DSV41_EXPERT_USAGE_RECORD" };
++    pub const MLX_SERVE_DSV41_EXPERT_USAGE_RECORD: Var = .{ .kind = .kill, .type = .text, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 expert usage record (turboexl3_ds41): an absolute file path; each request's routed experts per layer counted into it (expert-usage-v1.json's form), written at the request's end" };
++    pub const MLX_SERVE_DSV41_ENGRAM_LRU_MB: Var = .{ .kind = .kill, .type = .text, .default = "256", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram LRU's size in MiB (turboexl3_ds41): the rows kept across a conversation's turns and their index, 1 to 16384, billed at load beside the host's bytes" };
++    pub const MLX_SERVE_DSV41_FRAC: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed routed layers at a half-integer EXL3 rate (turboexl3_ds41, exllamav3 1.6's K 1.5 and K 2.5: 24 and 40 halfwords a tile): on (unset, empty or 1), the bank admits them and every call of such a layer runs on turboexl3 (a wide prompt call's pairs as moeClamped calls at top-1 over the slot arrays, sorted by slot, at most 4,096 pairs each; cold rows and the banked decode as banked calls), every K 2 and K 3 layer on its lane as before (a pack without a fractional layer: the same launches and words); 0: a fractional bank refused by name; anything else refuses the load" };
+     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
++    pub const MLX_SERVE_DSV41_RESIDENT_SEED: Var = .{ .kind = .kill, .type = .text, .default = "by the pack: usage when it has expert-usage-v1.json", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 streamed bank's resident seed (turboexl3_ds41): usage (the prompt rows filled at the load with each layer's most used experts of expert-usage-v1.json; refused without the file) or none" };
++    pub const MLX_SERVE_DSV41_FLASH_ATTN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' attention spans (turboexl3_ds41): unset, empty or 1, each span as one flash kernel (keys in blocks of 128, an online softmax, the scores and probabilities never in memory), its heads into the run region; NOT exact (the probabilities round to f16 before the division); =1 refuses a wide span the kernel cannot take; 0: the exact gather" };
+     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
+     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
+     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
+diff -ruN -x .generated a/plugins/glm5_next/vision.zig b/plugins/glm5_next/vision.zig
+--- a/plugins/glm5_next/vision.zig
++++ b/plugins/glm5_next/vision.zig
+@@ -22,6 +22,7 @@
+ const fused_activations = @import("../../sdk/blocks/mlp/fused_activations.zig");
+ const params_mod = @import("../../sdk/quant/params.zig");
+ const log = @import("../../sdk/util/log.zig");
++const t3 = @import("turboexl3");
+ /// OPENAI_CLIP_MEAN / OPENAI_CLIP_STD, the processor's normalization.
+ const MEAN = [3]f32{ 0.48145466, 0.4578275, 0.40821073 };
+ const STD = [3]f32{ 0.26862954, 0.26130258, 0.27577711 };
+@@ -131,6 +132,8 @@
+     biases: mlx.mlx_array = .{ .ctx = null },
+     bias: mlx.mlx_array = .{ .ctx = null },
+     qp: ?params_mod.QuantParams = null,
++    /// An exllamav3 pack's EXL3 linear (`w` unset): turboexl3 runs it.
++    x3: ?t3.Proj = null,
+ };
+ const Block = struct {
+     norm1: mlx.mlx_array,
+@@ -409,6 +412,14 @@
+ };
+ /// A dense or quantized `x @ w.T`, plus the bias when the linear has one.
+ pub fn linear(x: mlx.mlx_array, l: Lin, s: mlx.mlx_stream) !mlx.mlx_array {
++    // An EXL3 linear: turboexl3's, its bias (the pack's f16) in x's dtype.
++    if (l.x3) |p| {
++        if (l.bias.ctx == null) return t3.linear(s, x, p.trellis, p.suh, p.svh, .mul1);
++        var b = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(b);
++        try mlx.check(mlx.mlx_astype(&b, l.bias, mlx.mlx_array_dtype(x), s));
++        return t3.linearBias(s, x, p.trellis, p.suh, p.svh, b, .mul1);
++    }
+     var out = mlx.mlx_array_new();
+     if (l.qp) |qp| {
+         try mlx.check(mlx.mlx_quantized_matmul(&out, x, l.w, l.scales, l.biases, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), s));
+@@ -483,6 +494,7 @@
+     for ([_]mlx.mlx_array{ l.w, l.scales, l.biases, l.bias }) |a| {
+         if (a.ctx != null) try list.append(allocator, a);
+     }
++    if (l.x3) |p| try list.appendSlice(allocator, &.{ p.trellis, p.suh, p.svh });
+ }
+ /// Weight lookup under the tower's prefix; handles are BORROWED from the weights map.
+ const NameCtx = struct {
+diff -ruN -x .generated a/sdk/util/shared.zig b/sdk/util/shared.zig
+--- a/sdk/util/shared.zig
++++ b/sdk/util/shared.zig
+@@ -10,7 +10,8 @@
+     return struct {
+         var storage: T = init;
+         var cached: ?*T = null;
+-        const sym = "mlx_serve_shared_" ++ name;
++        // This plugin's copies export under their own prefix: the kit's own copy of a file (its log) exports its name.
++        const sym = "turboexl3_ds41_shared_" ++ name;
+         fn addr() callconv(.c) *anyopaque {
+             return &storage;
+         }
+@@ -32,7 +33,7 @@
+ pub fn SharedThreadLocal(comptime T: type, comptime name: []const u8, comptime init: T) type {
+     return struct {
+         threadlocal var storage: T = init;
+-        const sym = "mlx_serve_shared_tls_" ++ name;
++        const sym = "turboexl3_ds41_shared_tls_" ++ name;
+         fn addr() callconv(.c) *anyopaque {
+             return @ptrCast(&storage);
+         }
+diff -ruN -x .generated a/sdk/util/system.zig b/sdk/util/system.zig
+--- a/sdk/util/system.zig
++++ b/sdk/util/system.zig
+@@ -196,6 +196,18 @@
+     if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
+     return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.purgeable_count, vm.wire_count, vm.compressor_page_count, page);
+ }
++/// turboexl3_ds41 (MLX_SERVE_DSV41_BILL_CAL's `[bank-bill]` readings): the host's speculative and purgeable pages, bytes
++/// (zeros off Darwin or on a failed query): the part of "the total less the available" that is neither wired, anonymous
++/// nor compressed (speculative) and the anonymous part the OS drops first (purgeable).
++pub fn speculativePurgeableBytes() struct { speculative: u64, purgeable: u64 } {
++    if (comptime !builtin.os.tag.isDarwin()) return .{ .speculative = 0, .purgeable = 0 };
++    var page: usize = 0;
++    if (host_page_size(mach_host_self(), &page) != 0) return .{ .speculative = 0, .purgeable = 0 };
++    var vm = std.mem.zeroes(VmStats64);
++    var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
++    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return .{ .speculative = 0, .purgeable = 0 };
++    return .{ .speculative = @as(u64, vm.speculative_count) * @as(u64, page), .purgeable = @as(u64, vm.purgeable_count) * @as(u64, page) };
++}
+ const MemoryStatusEx = extern struct {
+     dwLength: u32 = @sizeOf(MemoryStatusEx),
+     dwMemoryLoad: u32 = 0,
+diff -ruN -x .generated a/sdk/weights/routed.zig b/sdk/weights/routed.zig
+--- a/sdk/weights/routed.zig
++++ b/sdk/weights/routed.zig
+@@ -33,6 +33,25 @@
+     read_ahead_fn: ?*const fn (*anyopaque, u32, []const u16) Ret(void) = null,
+     /// Routed ids a decode-phase call takes: a wider call is a prompt pass, which a source refuses in decode.
+     decode_ids: usize = max_call_ids,
++    /// turboexl3_ds41 (the joinless combine): a wide call's (more than `decode_ids` ids) routed sum plus the
++    /// shared expert's rows (`[n, hidden]` f32, the last argument) as one combine over the call's unjoined outputs:
++    /// `source`'s sum + the shared rows, word for word. Null: the source has none.
++    source_shared: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
++    /// turboexl3_ds41 (src/tail_fuse.zig): `source_shared` (the shared expert as the model made it) with the
++    /// model's hc expand of the streams `res` [n, hc, d] by `pc` (f32 [n, hc + hc * hc], each row's post then comb) in
++    /// the combine's kernel: the layer's new streams. Null: not offered.
++    source_expand: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
++    /// turboexl3_ds41: `source_expand`'s fused tail for a decode-lane call (at most
++    /// `decode_ids` ids; the same arguments, the shared expert's rows committed behind the call's waves): the layer's new
++    /// streams, the words of `source`'s sum and the model's `ffn_post_shared`. Null: not offered.
++    source_decode_expand: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
++    /// turboexl3_ds41 (src/tail_fuse.zig's write-into twin): `source_expand` with the new streams written over `res` in
++    /// place (the model's x1 region); returns the write's one-word carrier. Null: not offered.
++    source_expand_into: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
++    /// turboexl3_ds41 (next-layer staging): the next routed layer's predicted routes (an unevaluated int32 [rows, k]
++    /// array the model made before the call before that layer's), read ahead during that call once its routes are all
++    /// made (`NextAhead`). Null: not offered.
++    next_fn: ?*const fn (*anyopaque, NextAhead, mlx.mlx_array) Ret(void) = null,
+     pub fn settle(r: Routed) !void {
+         return r.settle_fn(r.ctx).get();
+     }
+@@ -40,6 +59,10 @@
+         if (r.phase_fn) |f| try f(r.ctx, prompt).get();
+     }
+ };
++/// turboexl3_ds41: what `Routed.next_fn` reads ahead for model layer `layer`: records into its persistent rows (at most
++/// the read pool's room), by P1's row rule (the coldest resident the prediction left out), and its predicted stream
++/// misses staged into the windows the call before it lets go.
++pub const NextAhead = extern struct { layer: u32 };
+ /// A `Routed` call's result. The source is built in the plugin's compile unit and may be called from another (a
+ /// DSpark round runs in the modules unit), where an `anyerror` value names a different error: it crosses by name.
+ pub fn Ret(comptime T: type) type {
+diff -ruN -x .generated a/sdk/weights/streamed.zig b/sdk/weights/streamed.zig
+--- a/sdk/weights/streamed.zig
++++ b/sdk/weights/streamed.zig
+@@ -66,8 +66,30 @@
+             const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
+             return .of(s.readAhead(layer, experts));
+         }
++        fn rowsShared(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array, shared: mlx.mlx_array) routed.Ret(mlx.mlx_array) {
++            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.rowsShared(layer, x, idx, wts, shared));
++        }
++        fn rowsSharedExpand(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array, shared: mlx.mlx_array, res: mlx.mlx_array, pc: mlx.mlx_array) routed.Ret(mlx.mlx_array) {
++            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.rowsSharedExpand(layer, x, idx, wts, shared, res, pc));
++        }
++        fn rowsSharedExpandInto(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array, shared: mlx.mlx_array, res: mlx.mlx_array, pc: mlx.mlx_array) routed.Ret(mlx.mlx_array) {
++            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.rowsSharedExpandInto(layer, x, idx, wts, shared, res, pc));
++        }
++        fn rowsDecodeExpand(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array, shared: mlx.mlx_array, res: mlx.mlx_array, pc: mlx.mlx_array) routed.Ret(mlx.mlx_array) {
++            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.rowsDecodeExpand(layer, x, idx, wts, shared, res, pc));
++        }
++        fn nextAhead(ctx: *anyopaque, na: routed.NextAhead, ids: mlx.mlx_array) routed.Ret(void) {
++            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.nextAhead(na.layer, ids));
++        }
+     };
+-    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead, .decode_ids = Exl3.decode_route_ids };
++    // turboexl3_ds41: the joinless combine, when the source built it; next-layer staging: the next routed layer's
++    // prediction.
++    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead, .decode_ids = Exl3.decode_route_ids, .source_shared = if (src.joinlessOn()) &C.rowsShared else null, .source_expand = if (src.joinlessOn()) &C.rowsSharedExpand else null, .source_expand_into = if (src.joinlessOn()) &C.rowsSharedExpandInto else null, .next_fn = &C.nextAhead, .source_decode_expand = &C.rowsDecodeExpand };
+ }
+ /// GLM-5.3-Flash's EXL3 bank (`streamed/glm5n_source.zig`): the source returns routed sums.
+ pub const Glm5n = if (build_options.mlx_stream) plugin.glm5n_source else struct {};
