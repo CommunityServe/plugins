@@ -17,7 +17,8 @@ Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`
 The slice is sushi ec2f5a29 (main, past v1.4.1; NOTICE). The numbers below were measured on the slice of sushi 3fc47d8a
 and later ones. Against the cc1981df slice, ec2f5a29 measured prefill +1.5-2.4% (8k-64k) and decode +1.2-4.6% on an
 M5 Ultra, output byte-identical (https://github.com/CommunityServe/plugins/pull/28). This repo's edits to the slice are `patches/index-nax.patch`,
-`patches/prefill-pipeline.patch` and `patches/stream-ablation.patch`, applied in that order by `scripts/sync-sushi.sh`.
+`patches/prefill-pipeline.patch`, `patches/shared-expert-ane.patch` and `patches/stream-ablation.patch`, applied in that
+order by `scripts/sync-sushi.sh`.
 
 Measured on M4 Max 128 GB, Sushi-STQ-1.75bpw, greedy:
 
@@ -68,6 +69,14 @@ DSpark on or off.
   logprobs byte-identical on 8k to 64k prompts, a merged tail, an image and a prefix-cache restore.
 - Prefill pipeline: a prefill-width layer is submitted, not waited on, with up to 2 in flight
   (`SUSHI_DS41_PREFILL_PIPELINE`, 0 turns it off; `patches/prefill-pipeline.patch`, `pipeOn`). Same graphs, same bytes.
+- Shared expert on the Neural Engine, prefill, off by default (`SUSHI_DS41_ANE_SHARED=1|2`, the number of ANE units;
+  `src/ane_shared.zig`, `patches/shared-expert-ane.patch`): in each 2,048-row chunk, the layers below the
+  CED split run the shared expert's SwiGLU as int8 weights and fp16 activations on the ANE while the GPU runs the
+  routed experts. Lossy. The load self-check compares every covered layer against the GPU chain (worst `cos 0.999767`
+  on the release pack), and if the ANE is missing or a program fails to build, the GPU path keeps serving
+  (`ane shared: off (...)`). The programs are built and run by the host's Neural Engine runtime (`Host.ane`,
+  mlx-serve's `lib/ane`); a host without it serves this plugin on the GPU. M5 Ultra, `=2`: cold prefill x1.037 at 25.6k and x1.042 at 60k, KL 0.0108 against the
+  GPU path, peak footprint +3 GB, API KLD to the FP8 teacher 0.1849 (unchanged).
 - Directional ablation (`Caps.ablation`, mlx-serve's `--ablation-profiles`): a request's direction is removed from
   every write to the hyper-connection stream: the embedding (text and image rows, and the DSpark stages' block input),
   each attention output, each FFN output (in the fused decode kernel's expanded stream through its component formula)

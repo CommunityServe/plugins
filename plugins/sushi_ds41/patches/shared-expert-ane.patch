@@ -1,0 +1,105 @@
+diff --git a/src/sushi/dsv41/dsv41_model.zig b/src/sushi/dsv41/dsv41_model.zig
+index bd1aec4..18a089c 100644
+--- a/src/sushi/dsv41/dsv41_model.zig
++++ b/src/sushi/dsv41/dsv41_model.zig
+@@ -20,6 +20,7 @@ const model_mod = @import("../model.zig");
+ const exl3 = @import("sushi_exl3");
+ const expert_usage = @import("expert_usage.zig");
+ const transient_peak = @import("transient_peak.zig");
++const ane_mod = @import("../../ane_shared.zig");
+ 
+ const A = sc_mod.A;
+ const S = sc_mod.S;
+@@ -236,7 +237,7 @@ const Hc = struct {
+ const CompW = struct { wkv: Lin, wgate: ?Lin, norm: A, shared: ?exl3.linear.Shared = null };
+ const IdxW = struct { wq_b: Lin, weights_proj: Lin, wk: ?Lin, k_norm: A };
+ 
+-const Layer = struct {
++pub const Layer = struct {
+     attn_norm: A,
+     ffn_norm: A,
+     q_norm: A,
+@@ -705,6 +706,7 @@ pub const Model = struct {
+     /// A wide chunk's shared expert rides the routed prefill launches where the trellis chain takes it there; off, it runs
+     /// as a chain of its own (the tests' oracle).
+     shared_fold: bool = true,
++    ane: ?*ane_mod.AneState = null,
+     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
+     decode_engram_ahead: bool = true,
+     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
+@@ -765,6 +767,7 @@ pub const Model = struct {
+     pub fn deinit(self: *Model) void {
+         pipeDrain(self) catch {};
+         if (self.profile) |pf| self.gpa.destroy(pf);
++        if (self.ane) |st| ane_mod.deinit(self, st);
+         if (self.dec_state) |*st| st.deinit();
+         self.dropAhead();
+         for (self.engrams) |*e| closeEngram(e);
+@@ -2286,11 +2289,13 @@ pub const Expand = struct { x: A, post: A, comb: A };
+ pub const SharedOp = union(enum) {
+     array: A,
+     layer: struct { m: *const Model, li: usize, expand: ?Expand = null },
++    none,
+ 
+     pub fn value(self: SharedOp, sc: *Scope, x: A) !A {
+         return switch (self) {
+             .array => |a| a,
+             .layer => |l| sharedExpert(sc, l.m, l.li, &l.m.layers[l.li], x),
++            .none => error.Dsv41SharedNone,
+         };
+     }
+ };
+@@ -2364,6 +2369,10 @@ pub fn stqRoutedEarly(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *co
+     if (shared == .layer) {
+         if (try prefillWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k, early)) |y| return y;
+     }
++    if (shared == .none) {
++        exl3.kernels.setDecodeParams(dec);
++        return sc.astype(try sc.keep(try exl3.rate_groups.moePrefillEarly(sc.s, x, rb, flat, scores, k, limit, early)), .float32);
++    }
+     const sy = try shared.value(sc, x);
+     exl3.kernels.setDecodeParams(dec);
+     const y = try sc.astype(try sc.keep(try exl3.rate_groups.moePrefillEarly(sc.s, x, rb, flat, scores, k, limit, early)), .float32);
+@@ -2383,7 +2392,7 @@ pub const pipe_max = 8;
+ /// not wait for this chunk's last layers, so `extendState` drains before it returns when the experts stream
+ /// (`streamsExperts`), and interleaving two chunks' layers (a wavefront) under this pipeline would let a slab write race
+ /// a queued reader of the other chunk.
+-fn pipeOn(m: *const Model, rows: usize) bool {
++pub fn pipeOn(m: *const Model, rows: usize) bool {
+     comptime std.debug.assert(cfg_mod.ring_slack <= exl3.kernels.DECODE_ROWS_MAX);
+     return m.pipe_depth > 0 and rows > exl3.kernels.DECODE_ROWS_MAX and !m.sync_layers and m.profile == null and m.trace == null and m.tap == null;
+ }
+@@ -2490,7 +2499,7 @@ fn sharedFused(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !?A {
+     return try sc.reshape(y, &.{ r, ci(dim(h, 1)) });
+ }
+ 
+-fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) !A {
++pub fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) !A {
+     if (try sharedFused(sc, m, ly, h)) |y| return y;
+     const g = try ly.shared[0].apply(sc, h);
+     const u = try ly.shared[1].apply(sc, h);
+@@ -2545,6 +2554,9 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
+             }
+             return out;
+         }
++        if (m.ane) |st| if (expand == null and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX) {
++            if (try ane_mod.moe(sc, m, st, li, ly, h, hk, r, ride)) |out| return out;
++        };
+         // At decode widths the GPU runs the shared expert while the host reads the picks and fills the misses, and the
+         // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
+         const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
+diff --git a/src/sushi/dsv41/dsv41_stream.zig b/src/sushi/dsv41/dsv41_stream.zig
+index f900433..5abc256 100644
+--- a/src/sushi/dsv41/dsv41_stream.zig
++++ b/src/sushi/dsv41/dsv41_stream.zig
+@@ -67,7 +67,9 @@ pub const Stream = struct {
+     fn applyOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, _: A, shared: ?model.SharedOp) anyerror!A {
+         const self: *Stream = @ptrCast(@alignCast(ctx));
+         const y = try self.apply(sc, layer, x, idx, wts);
+-        return if (shared) |op| sc.add(y, try sc.astype(try op.value(sc, x), .float32)) else y;
++        const op = shared orelse return y;
++        if (op == .none) return y;
++        return sc.add(y, try sc.astype(try op.value(sc, x), .float32));
+     }
+ 
+     fn leaseOpaque(ctx: *anyopaque, sc: *Scope, layer: usize, idx: A) anyerror!model.Experts.Lease {

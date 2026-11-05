@@ -28,6 +28,7 @@ const index_nax = @import("src/index_nax.zig");
 const vision_key = @import("src/vision_key.zig");
 const copy_lookup = @import("src/copy_lookup.zig");
 const ablation = @import("src/ablation.zig");
+const ane_shared = @import("src/ane_shared.zig");
 const tap_files = @import("src/tap.zig");
 
 /// Shown at install and in Settings.
@@ -215,6 +216,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     dsv.setIndexNax(m.mdl);
     log.info("[sushi_ds41] wide-span attention: {s}\n", .{if (m.mdl.attn_nax) "matmul2d (the M5's matrix units)" else "attnFused (simdgroup matrices)"});
     log.info("[sushi_ds41] decode index scan: {s}\n", .{if (m.mdl.index_nax) "matmul2d (the M5's matrix units)" else "scalar kernel"});
+    ane_shared.setAneShared(m.mdl, ctx.host);
     const idx_nax = index_nax.fits(c.index_heads, c.index_head_dim, .bfloat16);
     log.info("[sushi_ds41] prefill index scores: {s}\n", .{if (idx_nax) "matmul2d (the M5's matrix units)" else "indexScoresTile (simdgroup matrices)"});
     // As sushi's server does: a synced per-stage `[dsv41-prof]` line per wide chunk, and with the verify profile per
