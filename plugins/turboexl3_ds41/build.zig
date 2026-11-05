@@ -47,8 +47,9 @@ pub fn build(b: *std.Build) void {
     const dep = b.dependency("turboexl3", .{ .target = target, .optimize = optimize });
     // MLX_SERVE_DSV41_FRAC (src/frac.zig): its MLX-free switch, width rules, load line and parked ring; and its tile
     // gate: turboexl3's reference decode of real turboderp n 40 / n 24 tiles (and n 32 / 48 controls) against exllamav3
-    // frac.cu's rule (src/frac_test.zig, src/frac_tiles.json), turboexl3's MLX-free src/format.zig as a module of its own.
-    const format = b.createModule(.{ .root_source_file = dep.path("src/format.zig"), .target = target, .optimize = optimize });
+    // frac.cu's rule (src/frac_test.zig, src/frac_tiles.json), turboexl3's MLX-free src/core/format.zig as a module of its
+    // own.
+    const format = b.createModule(.{ .root_source_file = dep.path("src/core/format.zig"), .target = target, .optimize = optimize });
     const frac_sw = b.addTest(.{ .name = "frac", .root_module = b.createModule(.{
         .root_source_file = b.path("src/frac.zig"),
         .target = target,
