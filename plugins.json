@@ -18,10 +18,10 @@
       "version": "0.1.0",
       "summary": "turboderp's fully EXL3 Qwen3.8-Flash packs (K2 to K5) through turboexl3, on M5-class Macs (NAX).",
       "models": [
-        "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3, branch 2.05bpw)",
-        "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3, branch 3.05bpw)",
-        "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3, branch 4.05bpw)",
-        "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3, branch 5.05bpw)"
+        "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3@2.05bpw)",
+        "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3@3.05bpw)",
+        "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3@4.05bpw)",
+        "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3@5.05bpw)"
       ],
       "requires_mlx_serve": ">=26.11.1",
       "fixture": "none"
