@@ -1,8 +1,6 @@
-//! The decode's slot rows split across the layers (`MLX_SERVE_DSV41_DECODE_ROWS`, read at load), MLX-free: unset or
-//! empty, the split on a pack whose geometry the curves fit and flat rows (every layer the bill's decode rows, one info
-//! line) on any other; `flat`, flat rows; `split`, the split required (a geometry it does not fit logged by name with
-//! log.err, the rows flat); any other value refused by name. The copied EXL3 source
-//! (patches/turboexl3-zzz1-decode-rows.patch) hands `split` the flat rows, each layer's prompt rows and record bytes
+//! The decode's slot rows split across the layers, MLX-free: the split on a pack whose geometry the curves fit and flat
+//! rows (every layer the bill's decode rows, one info line) on any other. The copied EXL3 source
+//! (patches/turboexl3-stream.patch) hands `split` the flat rows, each layer's prompt rows and record bytes
 //! and the bank's expert count when it opens; the split spends the flat bill's decode bytes (or fewer), each layer between
 //! its prompt rows (at least the curves' first count) and 256 rows, one row at a time where it saves the most misses a
 //! byte on the layer's curve below. The stream grows each layer to its own rows at the phase change, as it does flat.
@@ -20,21 +18,6 @@
 //! and 32 to 39 of 8891904). Any other geometry is refused by name and the rows stay flat.
 
 const std = @import("std");
-
-/// `auto` (unset): the split where the curves fit the pack, else flat; `flat`; `split` (required).
-pub const Mode = enum { auto, flat, split };
-
-/// Set at load.
-pub var mode: Mode = .auto;
-
-/// `MLX_SERVE_DSV41_DECODE_ROWS` (null or empty: auto; `flat`; `split`; any other value refused).
-pub fn parse(value: ?[]const u8) error{DecodeRowsSetting}!Mode {
-    const v = value orelse return .auto;
-    if (v.len == 0) return .auto;
-    if (std.mem.eql(u8, v, "flat")) return .flat;
-    if (std.mem.eql(u8, v, "split")) return .split;
-    return error.DecodeRowsSetting;
-}
 
 pub const n_layers = 40;
 pub const n_experts: u32 = 384;
@@ -154,14 +137,6 @@ pub fn split(rows: []u32, prompt: []const u32, bytes: []const u64, experts: u32)
 // ── tests ──
 
 const testing = std.testing;
-
-test "decode rows setting: unset is auto, flat and split by name, anything else refused" {
-    try testing.expectEqual(Mode.auto, try parse(null));
-    try testing.expectEqual(Mode.auto, try parse(""));
-    try testing.expectEqual(Mode.flat, try parse("flat"));
-    try testing.expectEqual(Mode.split, try parse("split"));
-    for ([_][]const u8{ "auto", "0", "1", "Split", "on", "flat " }) |v| try testing.expectError(error.DecodeRowsSetting, parse(v));
-}
 
 fn flatRows(r: u32) [n_layers]u32 {
     return @splat(r);

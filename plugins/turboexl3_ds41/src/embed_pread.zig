@@ -1,29 +1,12 @@
-//! `MLX_SERVE_DSV41_EMBED_PREAD` (read at load; on by default, `0` turns it off, any other value is refused by
-//! name): the token embedding table (`embed.weight`, bf16 [vocab, hidden]: 1.32 GB in the full pack) read from
+//! The token embedding table (`embed.weight`, bf16 [vocab, hidden]: 1.32 GB in the full pack) read from
 //! the pack by pread at each lookup instead of held resident. The copied model leaves it out of the load and reads its
-//! rows here (patches/turboexl3-zzz8d-embed-vision.patch), so the streamed bank, sized from the memory in use when it
+//! rows here (patches/turboexl3-model.patch), so the streamed bank, sized from the memory in use when it
 //! opens, takes the bytes as slot rows. A decode round looks up 6 to 7 rows (the verify's ids and the draft's first id), a
 //! 16K prompt its distinct ids; the preads run in parallel and the OS page cache keeps the hot rows. The rows are the
 //! table's bytes, so the served bytes are the same.
 
 const std = @import("std");
 const builtin = @import("builtin");
-
-/// The switch (`configure`, at load).
-pub var on: bool = true;
-
-pub const Error = error{EmbedPreadSetting};
-
-pub fn configure(value: ?[]const u8) Error!void {
-    on = try parse(value);
-}
-
-pub fn parse(value: ?[]const u8) Error!bool {
-    const v = value orelse return true;
-    if (v.len == 0) return true;
-    if (std.mem.eql(u8, v, "0")) return false;
-    return error.EmbedPreadSetting;
-}
 
 /// The table's tensor name in the pack (its index's `weight_map` names the shard).
 pub const tensor = "embed.weight";
@@ -192,14 +175,6 @@ fn shardOf(gpa: std.mem.Allocator, dir: []const u8) error{ EmbedPreadIndex, OutO
     const shard = wm.object.get(tensor) orelse return error.EmbedPreadIndex;
     if (shard != .string or shard.string.len == 0 or std.mem.indexOfScalar(u8, shard.string, '/') != null) return error.EmbedPreadIndex;
     return gpa.dupe(u8, shard.string);
-}
-
-test "embed_pread setting: on unset, 0 off, anything else refused by name" {
-    const t = std.testing;
-    try t.expect(try parse(null));
-    try t.expect(try parse(""));
-    try t.expect(!try parse("0"));
-    for ([_][]const u8{ "1", "on", "2", "00" }) |v| try t.expectError(error.EmbedPreadSetting, parse(v));
 }
 
 /// A test pack in a fresh directory under /tmp: an index naming `shard` for `tensor`, and `shard` holding a header, a

@@ -1,17 +1,15 @@
-//! `MLX_SERVE_DSV41_ATTN_CORE` (read at load; unset, empty or `1`: on; `0`: off; `check`: off's launches served, the
-//! new ones run beside every gather call and compared word for word; anything else is refused by name): a wide prompt
-//! layer's attention gather (the copied model's `attnGather`) on two exact changes. Each moves only which threads
-//! compute a word, never how it is computed.
+//! A wide prompt layer's attention gather (the copied model's `attnGather`) on two exact changes. Each moves only which
+//! threads compute a word, never how it is computed.
 //!
-//! pv at 64 output columns a threadgroup. The stock attn_pv.metal gives a threadgroup one row's 128 output columns of all
-//! 64 heads: four simdgroups of 16 heads on the 16 x 128 x 32 tensor op, 32 keys a step staged in threadgroup memory a
-//! step ahead (each thread 64 bytes of a key), a lane's accumulator 64 floats. On, its text at DT 64 (`derivePv64`, at
-//! load, from the stock text the plugin compiles: the tile constant, the staging registers, and the fetch and the store
-//! at 32 bytes a thread): the op 16 x 64 x 32, D / 64 threadgroups a row, a lane's accumulator 32 floats, the staging
-//! half. Every output word is the same contraction: the same 32 keys a step in the stock order on the same tensor op,
-//! accumulated in f32, then the same epilogue on it (the inverse-roped tail and the grouped store, or the plain store).
-//! The SCRATCH_ATTN ring twin and SCRATCH_HEADS' pv twin derive from the DT-64 text as they do from the stock one (their
-//! prologue, and the grouped store's one statement, which the DT-64 text keeps).
+//! pv at 64 output columns a threadgroup. The stock attn_pv.metal gives a threadgroup one row's 128 output columns of
+//! all 64 heads: four simdgroups of 16 heads on the 16 x 128 x 32 tensor op, 32 keys a step staged in threadgroup
+//! memory a step ahead (each thread 64 bytes of a key), a lane's accumulator 64 floats. Served: its text at DT 64
+//! (`derivePv64`, at load, from the stock text the plugin compiles: the tile constant, the staging registers, and the
+//! fetch and the store at 32 bytes a thread): the op 16 x 64 x 32, D / 64 threadgroups a row, a lane's accumulator 32
+//! floats, the staging half. Every output word is the same contraction: the same 32 keys a step in the stock order on
+//! the same tensor op, accumulated in f32, then the same epilogue on it (the inverse-roped tail and the grouped store,
+//! or the plain store). The ring twin and the heads pv twin (src/scratch_attn.zig) derive from the DT-64 text as they
+//! do from the stock one (their prologue, and the grouped store's one statement, which the DT-64 text keeps).
 //!
 //! The 3D launch. The gather's tensor-op launches (qk, Q_TAIL's qk_t and pv, fresh and as their ring and heads twins)
 //! go as MLX's own NAX GEMMs do: threadgroup (32, 1, 4) over (x / 4, rows, 4) threads, not (128, 1, 1) over (x, rows,
@@ -22,48 +20,13 @@
 //! differing words against the stock at DT 64, in 1D and in 3D; 425.6 -> 336.6 us a call at DT 64 (1.264x), 332.1 with
 //! the 3D launch (1.285x). ls1u (w-ls1u-20261102-0630): the 3D launch alone 0 differing words, qk 1.066x, qk_t 1.064x,
 //! pv 1.016x.
-//!
-//! `check` serves the stock texts at the stock launches and, beside every gather call, runs its scores launch (qk, or
-//! qk_t as served) at the stock launch and in 3D, its sm, and its pv on the stock text at the stock launch and on the
-//! DT-64 text in 3D, in a scope of its own; each pair compared word for word on the device: `[attn-core] check kind=
-//! calls= words= differ= max_ulps=`, a kind every 128 calls, at its first differing word and at the model's end.
 
 const std = @import("std");
-const mlx = @import("mlx_serve").mlx;
-
-const A = mlx.mlx_array;
-
-pub const Mode = enum { off, on, check };
-pub var mode: Mode = .on;
 
 pub const Error = error{
-    /// MLX_SERVE_DSV41_ATTN_CORE is none of 0, 1, check (unset or empty: on).
-    AttnCoreSetting,
     /// A statement `derivePv64` rewrites is not in the stock attn_pv text exactly once.
     AttnCorePvStatement,
 };
-
-pub fn configure(value: ?[]const u8) Error!void {
-    mode = try parse(value);
-}
-
-pub fn parse(value: ?[]const u8) Error!Mode {
-    const v = value orelse return .on;
-    if (v.len == 0 or std.mem.eql(u8, v, "1")) return .on;
-    if (std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "check")) return .check;
-    return error.AttnCoreSetting;
-}
-
-/// The gather's tensor-op launches go three-dimensional (on; off and check serve the stock launches).
-pub fn three() bool {
-    return mode == .on;
-}
-
-/// pv's output columns a threadgroup as served: 64 on, the stock 128 off and in check.
-pub fn pvCols() usize {
-    return if (mode == .on) 64 else 128;
-}
 
 /// A gather launch's grid and threadgroup. `grid`: the stock launch's threads (x, rows), at (128, 1, 1); `three_d`: MLX's
 /// NAX GEMMs' shape, (32, 1, 4) over (x / 4, rows, 4), the same threadgroups.
@@ -110,116 +73,11 @@ pub fn derivePv64(a: std.mem.Allocator, stock: []const u8) (Error || error{OutOf
     return a.dupeSentinel(u8, body, 0);
 }
 
-// ── check ──
-
-/// The launches `check` compares: the scores (qk, or Q_TAIL's qk_t, as served) and pv.
-pub const Kind = enum { qk, qk_t, pv };
-pub const Tally = struct { calls: u64 = 0, words: u64 = 0, differ: u64 = 0, max_ulps: u64 = 0 };
-pub var tallies: std.enums.EnumArray(Kind, Tally) = .initFill(.{});
-const report_every: u64 = 128;
-
-/// `check`: `got` (the new launch) against `want` (the stock one) word for word, counted under `kind`.
-pub fn compare(s: mlx.mlx_stream, kind: Kind, got: A, want: A) !void {
-    const st = try compareWords(s, got, want);
-    const t = tallies.getPtr(kind);
-    const first_bad = t.differ == 0 and st.differ > 0;
-    t.calls += 1;
-    t.words += st.words;
-    t.differ += st.differ;
-    t.max_ulps = @max(t.max_ulps, st.max_ulps);
-    if (first_bad or t.calls % report_every == 0) line(kind, t);
-}
-
-fn line(kind: Kind, t: *const Tally) void {
-    std.debug.print("[attn-core] check kind={s} calls={d} words={d} differ={d} max_ulps={d}\n", .{ @tagName(kind), t.calls, t.words, t.differ, t.max_ulps });
-}
-
-/// Every compared kind's line (the model's deinit).
-pub fn report() void {
-    for (std.enums.values(Kind)) |k| {
-        const t = tallies.getPtrConst(k);
-        if (t.calls > 0) line(k, t);
-    }
-}
-
-const Stats = struct { words: u64 = 0, differ: u64 = 0, max_ulps: u64 = 0 };
-
-/// `a` against `b` (one size, 2- or 4-byte float words, any shapes of that size), word for word on the device; the
-/// largest distance in units in the last place only when a word differs.
-fn compareWords(s: mlx.mlx_stream, a: A, b: A) !Stats {
-    const isz = mlx.mlx_array_itemsize(b);
-    if (mlx.mlx_array_itemsize(a) != isz or mlx.mlx_array_size(a) != mlx.mlx_array_size(b)) return error.AttnCoreCheckShape;
-    const st: mlx.mlx_dtype, const ut: mlx.mlx_dtype, const lo: i32 = switch (isz) {
-        2 => .{ .int16, .uint16, -32768 },
-        4 => .{ .int32, .uint32, std.math.minInt(i32) },
-        else => return error.AttnCoreCheckWords,
-    };
-    const n: u64 = mlx.mlx_array_size(b);
-    const flat = [_]c_int{-1};
-    var f: [2]A = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
-    defer for (f) |v| {
-        _ = mlx.mlx_array_free(v);
-    };
-    try mlx.check(mlx.mlx_reshape(&f[0], a, &flat, 1, s));
-    try mlx.check(mlx.mlx_reshape(&f[1], b, &flat, 1, s));
-    var t: [5]A = undefined;
-    for (&t) |*v| v.* = mlx.mlx_array_new();
-    defer for (t) |v| {
-        _ = mlx.mlx_array_free(v);
-    };
-    try mlx.check(mlx.mlx_view(&t[0], f[0], ut, s));
-    try mlx.check(mlx.mlx_view(&t[1], f[1], ut, s));
-    try mlx.check(mlx.mlx_equal(&t[2], t[0], t[1], s));
-    try mlx.check(mlx.mlx_astype(&t[3], t[2], .uint32, s));
-    try mlx.check(mlx.mlx_sum(&t[4], t[3], false, s));
-    try mlx.check(mlx.mlx_array_eval(t[4]));
-    const same: u64 = (mlx.mlx_array_data_uint32(t[4]) orelse return error.NoData)[0];
-    if (same == n) return .{ .words = n };
-    var u: [12]A = undefined;
-    for (&u) |*v| v.* = mlx.mlx_array_new();
-    defer for (u) |v| {
-        _ = mlx.mlx_array_free(v);
-    };
-    const zero = mlx.mlx_array_new_int(0);
-    defer _ = mlx.mlx_array_free(zero);
-    const low = mlx.mlx_array_new_int(lo);
-    defer _ = mlx.mlx_array_free(low);
-    try mlx.check(mlx.mlx_view(&u[0], f[0], st, s));
-    try mlx.check(mlx.mlx_view(&u[1], f[1], st, s));
-    try mlx.check(mlx.mlx_astype(&u[2], u[0], .int64, s));
-    try mlx.check(mlx.mlx_astype(&u[3], u[1], .int64, s));
-    for ([_]usize{ 2, 3 }, [_]usize{ 4, 7 }) |src, dst| {
-        try mlx.check(mlx.mlx_less(&u[dst], u[src], zero, s));
-        try mlx.check(mlx.mlx_subtract(&u[dst + 1], low, u[src], s));
-        try mlx.check(mlx.mlx_where(&u[dst + 2], u[dst], u[dst + 1], u[src], s));
-    }
-    try mlx.check(mlx.mlx_subtract(&u[10], u[6], u[9], s));
-    var ab = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ab);
-    try mlx.check(mlx.mlx_abs(&ab, u[10], s));
-    var mx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mx);
-    try mlx.check(mlx.mlx_max(&mx, ab, false, s));
-    try mlx.check(mlx.mlx_astype(&u[11], mx, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(u[11]));
-    const ulps: f32 = (mlx.mlx_array_data_float32(u[11]) orelse return error.NoData)[0];
-    return .{ .words = n, .differ = n - same, .max_ulps = @intFromFloat(@min(@max(ulps, 0), 1.8e19)) };
-}
-
 const testing = std.testing;
 /// The stock text the plugin compiles (the copied model's `ATTN_PV_SOURCE`) and its header (`MPP_HEADER`).
 const stock_pv = @embedFile("mlx_serve/plugins/deepseek_v41/kernels/attn_pv.metal");
 const mpp_header = @embedFile("mlx_serve/kernels/common/mpp_tensor.metal");
 const twins = @import("attn_twins.zig");
-
-test "attn_core setting: on unset, empty or 1; 0 off; check; anything else refused by name" {
-    try testing.expectEqual(Mode.on, try parse(null));
-    try testing.expectEqual(Mode.on, try parse(""));
-    try testing.expectEqual(Mode.on, try parse("1"));
-    try testing.expectEqual(Mode.off, try parse("0"));
-    try testing.expectEqual(Mode.check, try parse("check"));
-    for ([_][]const u8{ "on", "2", "01", "true", "Check", " 1" }) |v| try testing.expectError(error.AttnCoreSetting, parse(v));
-}
 
 test "attn_core launch: the 3D launch keeps the stock threadgroups, 128 threads each" {
     for ([_][2]c_int{ .{ 1280, 1 }, .{ 1280, 256 }, .{ 1024, 7 }, .{ 512, 256 } }) |g| {
@@ -264,7 +122,7 @@ test "attn_core pv64: the stock text at DT 64, every other statement unchanged" 
     try testing.expectError(error.AttnCorePvStatement, derivePv64(testing.allocator, t));
 }
 
-test "attn_core pv64: the SCRATCH_ATTN ring twin and SCRATCH_HEADS' twin derive from the DT-64 text" {
+test "attn_core pv64: the ring twin and the heads twin derive from the DT-64 text" {
     const t = try derivePv64(testing.allocator, stock_pv);
     defer testing.allocator.free(t);
     const p_io = [_]twins.Io{.{ .name = "p", .mtype = "float16_t" }};

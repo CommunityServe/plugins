@@ -124,8 +124,8 @@ export fn dsv41_alloc_last_error() [*:0]const u8 {
     return &last_error;
 }
 
-/// MLX_SERVE_DSV41_BANK_POOL: the host's `HostGpu.alias` (mlx-serve's additive ABI entry, host-alias.patch), read at its
-/// offset (src/bank_pool.zig `alias_at`: appended after `buffer_addresses`) when the host's table holds it, so the plugin
+/// The bank pool: the host's `HostGpu.alias` (mlx-serve's additive ABI entry, host-alias.patch), read at its offset
+/// (src/bank_pool.zig `alias_at`: appended after `buffer_addresses`) when the host's table holds it, so the plugin
 /// builds against a kit without it and loads on a host without it (`hasAlias` false: the load turns the pool off).
 const AliasFn = *const fn (ctx: ?*anyopaque, base: common.Array, offset: u64, shape: [*]const i32, ndim: usize, dtype: i32, out: *common.Array) callconv(.c) common.Verdict;
 const bank_pool = @import("bank_pool.zig");
@@ -149,8 +149,8 @@ pub fn hasAlias() bool {
     return aliasEntry() != null;
 }
 
-/// MLX_SERVE_DSV41_BANK_POOL (the copied stream's `BankPool`): `out` an evaluated array of `dtype` over `base`'s bytes
-/// from `offset`, its own buffer (the host's `HostGpu.alias`); refused by name on a host without the entry.
+/// The bank pool (the copied stream's `BankPool`): `out` an evaluated array of `dtype` over `base`'s bytes from
+/// `offset`, its own buffer (the host's `HostGpu.alias`); refused by name on a host without the entry.
 export fn dsv41_alloc_alias(out: *mlx.mlx_array, base: mlx.mlx_array, offset: u64, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int {
     const g = gpu() orelse return noTable("alloc_alias");
     const f = aliasEntry() orelse {

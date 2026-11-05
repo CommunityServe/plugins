@@ -1,5 +1,5 @@
 //! The expert usage profile's settings (mlx-serve's `expert.usage`: the resident seed and the record), MLX-free, read at
-//! load before the stream opens; the copied EXL3 source (exl3_source.zig, patches/turboexl3-zz4-usage-seed.patch) reads
+//! load before the stream opens; the copied EXL3 source (exl3_source.zig, patches/turboexl3-stream.patch) reads
 //! them through this root. The model settings' keys of the in-tree archs (`resident_seed`, `expert_usage_record`,
 //! `expert_usage_label`) do not reach an outside plugin's load, so they are environment variables here:
 //! - `MLX_SERVE_DSV41_RESIDENT_SEED`: `usage` (the prompt rows filled at the load with each layer's most used experts of

@@ -1,8 +1,7 @@
-//! The routed experts' decode on turboexl3, for the copied expert streamer (sdk/weights/streamed/exl3_source.zig) when
-//! the default (`MLX_SERVE_DSV41_ROUTED=streamer` keeps the streamer's own EXL3 kernels throughout). The
+//! The routed experts' decode on turboexl3, for the copied expert streamer (sdk/weights/streamed/exl3_source.zig). The
 //! streamer's decode waves run its banked route on turboexl3's banked decode (`moeClampedBanked`): a wave's pairs over the
 //! layer's three slot banks in one call, each pair one row-slot whose id is packed (bank << 24 | slot row), DEVROUTE's
-//! device wave among them (patches/turboexl3-t3-banked.patch binds both). The call runs whole at the wave's down:
+//! device wave among them (patches/turboexl3-stream.patch binds both). The call runs whole at the wave's down:
 //! turboexl3's gate|up finish prepares the down's input, so it reads the down projection's suh, and a gated miss part's
 //! down arrays are waited only for its down (the streamer's own gate|up reads gate and up arrays alone). The slot arrays
 //! are turboexl3's banks (code as the trellis, rin as suh, rout as svh); each pair's row comes back in f32 at weight 1 and
@@ -22,20 +21,23 @@
 const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
 const t3 = @import("turboexl3");
-const t3_group = @import("t3_group.zig");
-const hw4b = @import("hw4b.zig");
-const hw2 = @import("hw2.zig");
 const frac = @import("frac.zig");
-const exact = @import("one_exact.zig");
 
-/// Set at load from `MLX_SERVE_DSV41_ROUTED` (`config.routedT3`), before the bank opens.
-pub var enabled: bool = false;
+/// The GEMV variants (turboexl3 `group_variants` names) the banked calls run: the gate|up GEMV's and the down GEMV's,
+/// picked on the M5 Max.
+pub const pick_gu = "t4";
+pub const pick_dn = "t4";
 
-/// At load, after `MLX_SERVE_DSV41_T3_GROUP` (src/t3_group.zig) and before the bank opens (`warm` builds the banked
-/// kernels at it): turboexl3's banked GEMVs at the setting's row-slots of one packed id per lead.
-pub fn configureGroup() error{InvalidTurboexl3Config}!void {
+/// At load, before the bank opens (`warm` builds the banked kernels at it): turboexl3's banked decode on its grouped
+/// texts (up to four row-slots of one expert a weight decode, a pair whose expert no bank holds skipped), with the M = 3
+/// member path (`banked_m3`: a lead with three members of an expert runs them, not the M = 4 path padded) and the
+/// picked GEMV variants.
+pub fn configure() error{ InvalidTurboexl3Config, RoutedT3Variant }!void {
     var c = t3.config.get().*;
-    c.banked_group = t3_group.bankedGroup();
+    c.banked_group = 4;
+    c.banked_m3 = true;
+    c.banked_variant_gu = t3.groupVariantOf(pick_gu) orelse return error.RoutedT3Variant;
+    c.banked_variant_dn = t3.groupVariantOf(pick_dn) orelse return error.RoutedT3Variant;
     try t3.configure(c);
 }
 
@@ -53,46 +55,17 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         state: *State,
         stock: Stock,
 
-        /// The banked route's counters; `begin` at each layer call (the source's `rows`).
+        /// The banked route's state: the clamp limit.
         pub const State = struct {
             limit: c_int,
-            /// Cleared at each layer call by the source's `rows` (patches/turboexl3.patch); nothing reads it since the
-            /// prompt calls run on the stock math.
+            /// Cleared at each layer call by the source's `rows` (patches/turboexl3-stream.patch); nothing reads it
+            /// since the prompt calls run on the stock math.
             n: usize = 0,
-            tally: Tally = .{},
-            /// the current layer call's banked calls and its last one's pairs
-            call_banked: u32 = 0,
-            call_last: u32 = 0,
             /// MLX_SERVE_DSV41_FRAC: the bank holds a layer at a half-integer rate (`warm`); false, no call reads a width.
             any_frac: bool = false,
             /// A fractional cold-row chunk's gate and up arrays, from its `gateUp` to its `down`.
             parked: frac.Parked(Proj) = .{},
-
-            /// A layer call begins: the last one's banked calls counted (`Tally`).
-            pub fn begin(st: *State) void {
-                if (st.call_banked > 1) st.tally.last_part_pairs += st.call_last;
-                st.call_banked = 0;
-                st.call_last = 0;
-            }
-
-            /// `[routed-t3]` since the last request's end: the banked route's layer calls, banked calls and miss parts.
-            pub fn meters(st: *State, buf: []u8) []const u8 {
-                if (!enabled) return buf[0..0];
-                st.begin();
-                const t = st.tally;
-                st.tally = .{};
-                var w = std.Io.Writer.fixed(buf);
-                w.print("[routed-t3] banked_calls={d} layer_calls={d} parts={d} part_pairs={d} last_part_pairs={d}\n", .{ t.banked, t.layer_calls, t.parts, t.part_pairs, t.last_part_pairs }) catch {};
-                return w.buffered();
-            }
         };
-
-        /// The banked route's work since the last request's end. A layer call's first banked call is its resident pairs'
-        /// (DEVROUTE's device wave in decode, the hit wave of a prompt call of at most 48 pairs), each later one a miss
-        /// part, which runs whole once its down bytes landed (`downBanked`): in the streamer's own route a part's gate|up
-        /// runs once its gate and up bytes land, so a call's last part (`last_part_pairs`) is where that order can
-        /// lengthen it.
-        pub const Tally = struct { banked: u64 = 0, layer_calls: u64 = 0, parts: u64 = 0, part_pairs: u64 = 0, last_part_pairs: u64 = 0 };
 
         /// The stock math's decode GEMV (a wide prompt call's cold rows; the decode waves are banked). A fractional layer's
         /// (MLX_SERVE_DSV41_FRAC): the rows, bf16, its gate and up parked for its `down`, which runs the whole expert.
@@ -118,9 +91,6 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
                 const tb = try t3View(g, b);
                 const y32 = try self.fracGemm(g, h, ids, rows, tb);
                 const y = if (self.stock.q.expert_bf16) try g.astype(try g.astype(y32, .bfloat16), .float32) else y32;
-                frac.stats.cold_calls += 1;
-                frac.stats.cold_rows += rows;
-                if (frac.mode == .check) try self.checkRows(g, 0, h, ids, null, y32, b, .cold);
                 return y;
             }
             return self.stock.down(g, h, ids, d);
@@ -169,7 +139,6 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
                 xc = try g.take(xb, ia, 0);
                 sc_ids = try g.take(slot, ia, 0);
                 sc = try g.hostArray(std.mem.sliceAsBytes(w[0..]), &.{ 1, nc, 1 }, .float32);
-                frac.stats.padded_calls += 1;
             } else sc = try g.ones(&.{ 1, nc, 1 }, .float32);
             const x3 = try g.reshape(try g.astype(xc, .float32), &.{ 1, nc, hidden });
             const inds = try g.reshape(sc_ids, &.{ 1, nc, 1 });
@@ -187,12 +156,11 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         /// The streamer's banked route (its hook's `banked`, and DEVROUTE's device wave over it).
         pub const has_banked = true;
 
-        /// DEVROUTE's LUT entry for a pair whose expert no bank holds: turboexl3's skip id on its grouped decode
-        /// (`MLX_SERVE_DSV41_T3_GROUP`: the row-slot runs no expert, its row 0), else 0 (base row 0, computed). The miss
-        /// part's row replaces it in the join either way.
+        /// DEVROUTE's LUT entry for a pair whose expert no bank holds: turboexl3's skip id on its grouped decode (the
+        /// row-slot runs no expert, its row 0). The miss part's row replaces it in the join.
         pub fn lutMissing(self: *const Self) u32 {
             _ = self;
-            return if (t3_group.on) t3.banked_skip_id else 0;
+            return t3.banked_skip_id;
         }
 
         /// A wave's gate|up: nothing runs yet; `x` [pairs, hidden] (row-slot r's row) is what `downBanked` receives. The
@@ -211,20 +179,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         /// miss part, every array waited (gate and up at the gate value, down at the part's).
         pub fn downBanked(self: *const Self, g: *G, x: T, ids: T, banks: *const [3]Bank) !T {
             const tb = t3Banks(banks);
-            // MLX_SERVE_DSV41_HW2's check, or MLX_SERVE_DSV41_HW4B's call (its check, or turboexl3's call as configured);
-            // one check mode at a time (the load refuses both)
-            const yb = if (hw2.mode == .check) try hw2.banked(g.s, x, &tb, ids, .mul1, self.state.limit) else try hw4b.banked(g.s, x, &tb, ids, .mul1, self.state.limit);
-            const y = try g.adopt(yb);
-            const st = self.state;
-            const pairs_n: u32 = @intCast(g.shapeOf(ids).dim(0));
-            st.tally.banked += 1;
-            if (st.call_banked == 0) st.tally.layer_calls += 1 else {
-                st.tally.parts += 1;
-                st.tally.part_pairs += pairs_n;
-            }
-            st.call_banked += 1;
-            st.call_last = pairs_n;
-            return y;
+            return g.adopt(try t3.moeClampedBanked(g.s, x, &tb, ids, .mul1, self.state.limit));
         }
 
         /// What `warm` compiled: its calls and their wall time.
@@ -264,10 +219,6 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
                     out.calls += 1;
                 }
             }
-            // the warm-up's calls are no request's
-            self.state.tally = .{};
-            self.state.call_banked = 0;
-            self.state.call_last = 0;
             out.ms = (nowNs() - t0) / std.time.ns_per_ms;
             if (self.state.any_frac) {
                 var lb: [512]u8 = undefined;
@@ -297,7 +248,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
 
         /// A wide prompt call's waves: the stock math's (its DIG-X lane).
         pub fn prefill(self: *const Self, g: *G, layer: u32, x: T, rows: PrefillRows, bank: Bank) !T {
-            if (self.state.any_frac and fracCode(g, bank.gate.code)) return self.fracPrefill(g, layer, x, rows, bank);
+            if (self.state.any_frac and fracCode(g, bank.gate.code)) return self.fracPrefill(g, x, rows, bank);
             return self.stock.prefill(g, layer, x, rows, bank);
         }
 
@@ -309,8 +260,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         /// GPU still needs them), async-evaluated, at most two chunks in flight. Each chunk's KEPT output (f32 [rows,
         /// hidden], rounded to bf16 where the lane stores its expert outputs in bf16: `routeExpertBf16`) is appended to
         /// `outs` (the caller releases it) and each of its rows' assignment rows to `pos`.
-        fn fracParts(self: *const Self, g: *G, layer: u32, x: T, rows: PrefillRows, bank: Bank, alloc: std.mem.Allocator, outs: *std.ArrayList(T), pos: *std.ArrayList(u32)) !void {
-            const t0 = nowNs();
+        fn fracParts(self: *const Self, g: *G, x: T, rows: PrefillRows, bank: Bank, alloc: std.mem.Allocator, outs: *std.ArrayList(T), pos: *std.ArrayList(u32)) !void {
             const n = rows.slot.len;
             if (n == 0) return;
             const a = self.stock.q.a;
@@ -360,7 +310,6 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
                 const xb = if (g.dtypeOf(xr) == .bfloat16) xr else try g.astype(xr, .bfloat16);
                 const sid = try g.hostArray(std.mem.sliceAsBytes(sorted_slot[c0..c1]), &.{mc}, .uint32);
                 const y32 = try self.fracGemm(g, xb, sid, c1 - c0, tb);
-                if (frac.mode == .check) try self.checkRows(g, layer, xb, sid, sorted_slot[c0..c1], y32, bank, .prefill);
                 const y = if (self.stock.q.expert_bf16) try g.astype(y32, .bfloat16) else y32;
                 outs.appendAssumeCapacity(g.keep(y));
                 pos.appendSliceAssumeCapacity(order[c0..c1]);
@@ -368,16 +317,12 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
                 flight[n_flight] = g.keep(y);
                 n_flight += 1;
                 g.resetTo(m);
-                frac.stats.prefill_chunks += 1;
             }
-            frac.stats.prefill_calls += 1;
-            frac.stats.prefill_rows += n;
-            frac.stats.prefill_ns += nowNs() - t0;
         }
 
         /// `fracParts` joined: a KEPT [A, hidden] in assignment-row order (the stock call's `take(concatenate(waves),
         /// argsort(positions))`, the permutation made on the host).
-        fn fracPrefill(self: *const Self, g: *G, layer: u32, x: T, rows: PrefillRows, bank: Bank) !T {
+        fn fracPrefill(self: *const Self, g: *G, x: T, rows: PrefillRows, bank: Bank) !T {
             if (rows.slot.len == 0) return error.FracEmptyCall;
             const a = self.stock.q.a;
             var parts: std.ArrayList(T) = .empty;
@@ -387,7 +332,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
             }
             var at: std.ArrayList(u32) = .empty;
             defer at.deinit(a);
-            try self.fracParts(g, layer, x, rows, bank, a, &parts, &at);
+            try self.fracParts(g, x, rows, bank, a, &parts, &at);
             const m = g.mark();
             defer g.resetTo(m);
             const joined = if (parts.items.len == 1) parts.items[0] else try g.concat(parts.items, 0);
@@ -402,128 +347,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
             return self.stock.finishPrefill(g);
         }
 
-        const CheckKind = enum { prefill, cold };
-        const Ex = exact.Exact(t3.format);
-
-        /// MLX_SERVE_DSV41_FRAC=check: a fractional call's rows `y` (f32 [rows, hidden], before any bf16 store) against
-        /// each sampled row's expert in f64 (src/one_exact.zig over turboexl3's format, from the bank's own bytes: the
-        /// slot's three projections and the clamped SwiGLU), at most `frac.check_calls` calls a layer a request
-        /// (`frac.takeCheck`), `frac.check_rows` rows each. `x` the call's input rows (bf16), `ids` their slots (or
-        /// `slots`, the host's copy).
-        fn checkRows(self: *const Self, g: *G, layer: u32, x: T, ids: T, slots: ?[]const u32, y: T, bank: Bank, kind: CheckKind) !void {
-            if (!frac.takeCheck(layer, kind == .cold)) return;
-            const rows: usize = @intCast(g.shapeOf(y).dim(0));
-            const hidden: usize = @intCast(g.shapeOf(y).dim(1));
-            if (rows == 0) return;
-            var sample: [frac.check_rows]u32 = undefined;
-            var nr: usize = 0;
-            const cand = [_]usize{ 0, rows / 3, (2 * rows) / 3, rows - 1 };
-            next: for (cand) |r| {
-                for (sample[0..nr]) |q| if (q == r) continue :next;
-                sample[nr] = @intCast(r);
-                nr += 1;
-            }
-            const a = std.heap.page_allocator;
-            const sel = try g.hostArray(std.mem.sliceAsBytes(sample[0..nr]), &.{@intCast(nr)}, .uint32);
-            const hy = try a.alloc(f32, 2 * nr * hidden);
-            defer a.free(hy);
-            const hx = hy[nr * hidden ..];
-            _ = try g.hostF32(try g.astype(try g.take(y, sel, 0), .float32), hy[0 .. nr * hidden]);
-            _ = try g.hostF32(try g.astype(try g.take(x, sel, 0), .float32), hx);
-            var sl: [frac.check_rows]u32 = undefined;
-            if (slots) |sh| {
-                for (sample[0..nr], 0..) |r, i| sl[i] = sh[r];
-            } else _ = try g.hostU32(try g.take(ids, sel, 0), sl[0..nr]);
-            // The bank's bytes as the call read them (evaluated: the call above waited for their reads).
-            try g.evalAll(&.{ bank.gate.code, bank.gate.rin, bank.gate.rout, bank.up.code, bank.up.rin, bank.up.rout, bank.down.code, bank.down.rin, bank.down.rout });
-            const gp = try HostProj.of(bank.gate);
-            const upp = try HostProj.of(bank.up);
-            const dp = try HostProj.of(bank.down);
-            const inter = gp.out;
-            if (gp.in != hidden or upp.out != inter or dp.in != inter or dp.out != hidden) return error.FracCheckShape;
-            const ex = Ex.init();
-            const limit: f64 = @floatFromInt(self.state.limit);
-            const wide = @max(hidden, inter);
-            const f = try a.alloc(f64, 2 * hidden + wide + 3 * inter);
-            defer a.free(f);
-            const x64 = f[0..hidden];
-            const ts = f[hidden..][0..wide];
-            const gv = f[hidden + wide ..][0..inter];
-            const uv = f[hidden + wide + inter ..][0..inter];
-            const td = f[hidden + wide + 2 * inter ..][0..inter];
-            const dv = f[hidden + wide + 3 * inter ..][0..hidden];
-            const hf: f64 = @floatFromInt(hidden);
-            var worst_rms: f64 = 0;
-            var worst_ratio: f64 = 0;
-            var fails: u32 = 0;
-            for (0..nr) |i| {
-                for (hx[i * hidden ..][0..hidden], x64) |v, *o| o.* = v;
-                const s0 = sl[i];
-                if (s0 >= gp.slots) return error.FracCheckSlot;
-                const sg = gp.slot(s0);
-                const su = upp.slot(s0);
-                const sd = dp.slot(s0);
-                const xs = [_][]const f64{x64};
-                const tss = [_][]f64{ts};
-                ex.project(sg.code, sg.suh, sg.svh, hidden, inter, gp.rate, &xs, &tss, &[_][]f64{gv});
-                ex.project(su.code, su.suh, su.svh, hidden, inter, upp.rate, &xs, &tss, &[_][]f64{uv});
-                for (gv, uv) |*o, uu| o.* = exact.swigluClamped(o.*, uu, limit);
-                ex.project(sd.code, sd.suh, sd.svh, inter, hidden, dp.rate, &[_][]const f64{gv}, &[_][]f64{td}, &[_][]f64{dv});
-                var ss_d: f64 = 0;
-                var ss_r: f64 = 0;
-                var max_d: f64 = 0;
-                for (hy[i * hidden ..][0..hidden], dv) |got, want| {
-                    const d = @as(f64, got) - want;
-                    ss_d += d * d;
-                    ss_r += want * want;
-                    max_d = @max(max_d, @abs(d));
-                }
-                const rms_ref = @sqrt(ss_r / hf);
-                const fl = if (rms_ref > 0) rms_ref else 1;
-                const rr = @sqrt(ss_d / hf) / fl;
-                const ra = max_d / fl;
-                // NaN compares false: a NaN row fails.
-                if (!(rr <= frac.bar_rms and ra <= frac.bar_ratio)) fails += 1;
-                if (!(rr <= worst_rms)) worst_rms = rr;
-                if (!(ra <= worst_ratio)) worst_ratio = ra;
-            }
-            frac.noteCheck(layer, nr, fails, worst_rms, worst_ratio);
-            std.debug.print("[frac] check layer={d} kind={t} n={d} rows={d} sampled={d} rms_ratio={e:.3} max_ratio={e:.3} bar={e:.1}/{e:.1} {s}\n", .{ layer, kind, gp.rate.halfwords(), rows, nr, worst_rms, worst_ratio, frac.bar_rms, frac.bar_ratio, if (fails == 0) "PASS" else "FAIL" });
-        }
-
-        /// One projection of a slot bank on the host (src/routed_one.zig's): code u16 halfwords [slots, in/16, out/16, n],
-        /// rin (suh) and rout (svh) f16 bits, read in place from the stream's unified-memory arrays.
-        const HostProj = struct {
-            code: []const u16,
-            rin: []const u16,
-            rout: []const u16,
-            in: usize,
-            out: usize,
-            slots: usize,
-            rate: t3.format.Rate,
-            stride: usize,
-
-            fn of(p: Proj) !HostProj {
-                const sh = mlx.getShape(p.code);
-                if (sh.len != 4) return error.FracCheckShape;
-                const in: usize = @intCast(sh[1] * 16);
-                const out: usize = @intCast(sh[2] * 16);
-                const rate = t3.format.Rate.fromN(@intCast(sh[3])) orelse return error.FracCheckRate;
-                return .{ .code = try hostU16(p.code), .rin = try hostU16(p.rin), .rout = try hostU16(p.rout), .in = in, .out = out, .slots = @intCast(sh[0]), .rate = rate, .stride = (in / 16) * (out / 16) * rate.halfwords() };
-            }
-
-            fn slot(p: HostProj, s: usize) struct { code: []const u16, suh: []const u16, svh: []const u16 } {
-                return .{ .code = p.code[s * p.stride ..][0..p.stride], .suh = p.rin[s * p.in ..][0..p.in], .svh = p.rout[s * p.out ..][0..p.out] };
-            }
-        };
-
-        fn hostU16(arr: mlx.mlx_array) ![]const u16 {
-            const p = mlx.mlx_array_data_uint8(arr) orelse return error.FracCheckNoData;
-            const words: [*]const u16 = @ptrCast(@alignCast(p));
-            return words[0..mlx.mlx_array_size(arr)];
-        }
-
-        /// The slot code as u16 (the same bits), tracked by the backend (src/routed_one.zig's `viewU16`).
+        /// The slot code as u16 (the same bits), tracked by the backend.
         fn viewU16(g: *G, code: T) !T {
             var v = mlx.mlx_array_new();
             mlx.check(mlx.mlx_view(&v, code, .uint16, g.s)) catch |e| {
@@ -537,7 +361,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         pub const has_parts = Stock.has_parts;
         pub fn prefillParts(self: *const Self, g: *G, layer: u32, x: T, rows: PrefillRows, bank: Bank, alloc: std.mem.Allocator, outs: *std.ArrayList(T), pos: *std.ArrayList(u32)) !void {
             // A fractional layer's call: `fracParts`' chunks as its parts, each row in its assignment row.
-            if (self.state.any_frac and fracCode(g, bank.gate.code)) return self.fracParts(g, layer, x, rows, bank, alloc, outs, pos);
+            if (self.state.any_frac and fracCode(g, bank.gate.code)) return self.fracParts(g, x, rows, bank, alloc, outs, pos);
             return self.stock.prefillParts(g, layer, x, rows, bank, alloc, outs, pos);
         }
     };

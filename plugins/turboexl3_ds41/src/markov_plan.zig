@@ -1,31 +1,9 @@
-//! The host plan of `MLX_SERVE_DSV41_MARKOV` (src/markov.zig), MLX-free: the setting, the drafts the fused chain takes,
-//! how its step kernel covers the vocabulary, when the confidence head's logit is the last kernel's (every product of its
-//! dot exact), and `check`'s tally.
+//! The host plan of the DSpark draft's fused Markov chain (src/markov.zig), MLX-free: the drafts the fused chain takes,
+//! how its step kernel covers the vocabulary, and when the confidence head's logit is the last kernel's (every product
+//! of its dot exact).
 
 const std = @import("std");
 
-/// `MLX_SERVE_DSV41_MARKOV`:
-/// - `on` (unset, empty or `1`): the fused kernels, B + 1 launches a draft with the op chain's bytes: a launch a
-///   position (its bias row, the add, the threadgroups' argmax pairs, the rows in zig-zag order) and one for the tokens
-///   and the confidence head.
-/// - `off` (`0`): the draft's Markov chain as the copied model's op chain, five op groups a position.
-/// - `flat`: `on` with every position reading the rows in one order (no zig-zag).
-/// - `check`: both every draft; the op chain's draft served, the two compared bit for bit (tokens, confidence logits,
-///   biased rows) and the tally logged at each request's end.
-pub const Mode = enum { off, on, flat, check };
-
-/// The setting's mode, or `error.MarkovSetting` for a value it does not name (the load refuses it by name).
-pub fn modeOf(value: ?[]const u8) error{MarkovSetting}!Mode {
-    const v = value orelse return .on;
-    if (v.len == 0 or std.mem.eql(u8, v, "1")) return .on;
-    if (std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "flat")) return .flat;
-    if (std.mem.eql(u8, v, "check")) return .check;
-    return error.MarkovSetting;
-}
-
-/// The step kernel: threadgroups of 256 threads, each of its 8 simdgroups summing a quad (4 rows) at a time; the last
-/// kernel: a threadgroup of 512 threads a position (MLX's dot_product geometry).
 pub const step_threads: u32 = 256;
 pub const step_simdgroups: u32 = step_threads / 32;
 pub const final_threads: u32 = 512;
@@ -102,42 +80,9 @@ pub fn exact16(ws: []const f32) bool {
     return true;
 }
 
-/// `check`'s tally since the last request's end: the drafts, those the fused kernels took, the compared ones, and what
-/// differed (tokens, confidence logits by bits, biased rows by element bits).
-pub const Tally = struct {
-    drafts: u64 = 0,
-    fused: u64 = 0,
-    refused: u64 = 0,
-    checked: u64 = 0,
-    token_drafts: u64 = 0,
-    conf_drafts: u64 = 0,
-    row_elems: u64 = 0,
-    elems: u64 = 0,
-
-    pub fn clean(t: Tally) bool {
-        return t.token_drafts == 0 and t.conf_drafts == 0 and t.row_elems == 0;
-    }
-
-    /// `[markov] ...`, one line.
-    pub fn line(t: Tally, mode: Mode, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "[markov] mode={s} drafts={d} fused={d} refused={d} checked={d} token_differ={d} conf_differ={d} rows_differ={d}/{d}{s}\n", .{
-            @tagName(mode), t.drafts, t.fused, t.refused, t.checked, t.token_drafts, t.conf_drafts, t.row_elems, t.elems,
-            if (t.checked == 0) "" else if (t.clean()) " IDENTICAL" else " DIFFER",
-        }) catch buf[0..0];
-    }
-};
-
 // ── tests ──
 
 const testing = std.testing;
-
-test "markov: the fused chain is on unless the setting is 0; any value it does not name is refused by name" {
-    for ([_]?[]const u8{ null, "", "1" }) |v| try testing.expectEqual(Mode.on, try modeOf(v));
-    try testing.expectEqual(Mode.off, try modeOf("0"));
-    try testing.expectEqual(Mode.flat, try modeOf("flat"));
-    try testing.expectEqual(Mode.check, try modeOf("check"));
-    for ([_][]const u8{ "on", "2", "1 ", "Check", "off" }) |v| try testing.expectError(error.MarkovSetting, modeOf(v));
-}
 
 /// Every (threadgroup, simdgroup, turn) of a step as the kernel walks them: how often each quad is read.
 fn coverage(quads: u32, groups: u32, k: u32, zigzag: bool, seen: []u8) void {
@@ -203,15 +148,4 @@ test "markov: the confidence logit is the last kernel's only where every product
     try testing.expect(exact16(&.{@as(f32, @bitCast(@as(u32, 0x47800000) | 0x10000))}));
     try testing.expect(!exact16(&.{0.1}));
     try testing.expect(!exact16(&.{ 1.0, std.math.nan(f32) }));
-}
-
-test "markov: check's line says what differed, and IDENTICAL only once a draft was compared" {
-    var buf: [256]u8 = undefined;
-    var t: Tally = .{ .drafts = 3, .fused = 3 };
-    try testing.expectEqualStrings("[markov] mode=on drafts=3 fused=3 refused=0 checked=0 token_differ=0 conf_differ=0 rows_differ=0/0\n", t.line(.on, &buf));
-    t.checked = 3;
-    t.elems = 300;
-    try testing.expect(std.mem.endsWith(u8, t.line(.check, &buf), " IDENTICAL\n"));
-    t.row_elems = 2;
-    try testing.expect(std.mem.endsWith(u8, t.line(.check, &buf), "rows_differ=2/300 DIFFER\n"));
 }

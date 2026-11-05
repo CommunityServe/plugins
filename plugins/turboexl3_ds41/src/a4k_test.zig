@@ -15,6 +15,7 @@
 const std = @import("std");
 const testing = std.testing;
 const a4k = @import("mlx_serve/sdk/weights/streamed/expert/a4k.zig");
+const io = @import("mlx_serve/sdk/weights/streamed/sdk_ext/expert/io.zig");
 
 // a4k.zig's own tests (its geometry at DeepSeek-V4.1's records, the order's permutation) run with these.
 test {
@@ -34,7 +35,7 @@ extern fn q3ld_seq() i64;
 extern fn q3ld_wait(seen: i64, timeout_ns: i64) i64;
 extern fn q3ld_quiesce(timeout_ns: i64) c_int;
 extern fn q3ld_stop() c_int;
-/// dq1b: the gate/up split (0 off, 1 on, 2 checked), set after `q3ld_start` by `run` when `split_mode` is set.
+/// dq1b: the gate/up split (0 off, 1 on), set after `q3ld_start` by `run` when `split_mode` is set.
 extern fn q3ld_gu_split(mode: i32) c_int;
 
 /// The pool's Metal event backend (src/host_shims.zig in the plugin): never armed here, every gate off.
@@ -43,7 +44,7 @@ export fn q3ld_mtl_signal(event: ?*anyopaque, value: u64) void {
     _ = value;
 }
 
-const counters_n = 84;
+const counters_n = 82;
 /// The pool's counters (q3_lookahead4_exl3.c's SC_ enum).
 const sc_landed = 4;
 const sc_claimed = 8;
@@ -58,8 +59,6 @@ const sc_split_read = 76;
 const sc_split_adopted = 77;
 const sc_split_pre = 78;
 const sc_split_pre_issued = 79;
-const sc_split_checked = 82;
-const sc_split_mismatch = 83;
 /// dq1b's split test: the gate/up split `run` sets on each pool (0: none).
 var split_mode: i32 = 0;
 const res_w = 10;
@@ -408,7 +407,7 @@ test "a4k byte gate: the pool's slot rows hold every part from the classic and t
     }
 }
 
-test "a4k byte gate, dq1b: with the gate/up split checked the slot rows hold every part and every split ticket reads back equal, staged, by PARTS, adopted and bound to the halves' pre-reads" {
+test "a4k byte gate, dq1b: with the gate/up split the slot rows hold every part, staged, by PARTS, adopted and bound to the halves' pre-reads" {
     const a = testing.allocator;
     var parts = try Parts.init(a, 0xd1b_5eed);
     defer parts.deinit(a);
@@ -420,9 +419,9 @@ test "a4k byte gate, dq1b: with the gate/up split checked the slot rows hold eve
     defer fc.destroy(a);
     const fa = try TempFile.create(a, "a4k-split", img_a);
     defer fa.destroy(a);
-    split_mode = 2;
+    split_mode = 1;
     defer split_mode = 0;
-    // a gate/up ticket a record, two layers: each read as two halves, each ticket read again whole and compared
+    // a gate/up ticket a record, two layers: each read as two halves
     const tk: i64 = 2 * experts;
     for ([_]Route{ .staged, .parts, .spec, .pre }) |route| {
         for ([_]Layout{ .classic, .a4k }) |layout| {
@@ -431,8 +430,6 @@ test "a4k byte gate, dq1b: with the gate/up split checked the slot rows hold eve
             const cnt = try run(if (layout == .a4k) fa else fc, layout, route, &rows);
             try expectRowsHoldParts(&rows, &parts);
             try testing.expectEqual(tk, cnt[sc_split_tickets]);
-            try testing.expectEqual(tk, cnt[sc_split_checked]);
-            try testing.expectEqual(@as(i64, 0), cnt[sc_split_mismatch]);
             try testing.expectEqual(2 * tk, cnt[sc_split_read] + cnt[sc_split_adopted] + cnt[sc_split_pre]);
             switch (route) {
                 .staged, .parts => try testing.expectEqual(2 * tk, cnt[sc_split_read]),
@@ -614,4 +611,45 @@ test "a4k real-file gate (A4K_GATE_PACKS=<classic pack>:<a4k pack>): the two pac
     // every record's gate code direct from the classic pack, all three codes from the a4k one
     try testing.expectEqual(@as(i64, @intCast(4 * n_records)), direct_parts);
     try testing.expect(n_records >= 2 * ne);
+}
+
+// The read pool's order on disk from the bank (`a4k.poolDiskOrder`, through `io.poolOptions`, whose value the stream's
+// `Stream.init` starts its pool on): an a4k bank hands the pool its components in their file order, so
+// `Records.onDisk` lays each record's rows and lengths out as the file holds them; without it every a4k record's parts
+// land in the wrong slot rows.
+const A4kBank = struct {
+    pub fn diskOrder(_: *const @This()) ?[a4k.n_components]u8 {
+        return a4k.disk_order;
+    }
+};
+const ClassicBank = struct {
+    pub fn diskOrder(_: *const @This()) ?[a4k.n_components]u8 {
+        return null;
+    }
+};
+const HooklessBank = struct {};
+const max_disk_components = 16;
+
+test "a4k: an a4k bank's order on disk reaches the read pool's options; a classic bank's, and a bank without the hook, none" {
+    const got = a4k.poolDiskOrder(A4kBank, &.{}, max_disk_components) orelse return error.TestExpectedOrder;
+    try testing.expectEqualSlices(u8, &a4k.disk_order, got[0..a4k.n_components]);
+    for (got[a4k.n_components..]) |x| try testing.expectEqual(@as(u8, 0), x);
+    try testing.expect(a4k.poolDiskOrder(ClassicBank, &.{}, max_disk_components) == null);
+    try testing.expect(a4k.poolDiskOrder(HooklessBank, &.{}, max_disk_components) == null);
+}
+
+test "a4k: the read pool's options for a bank: an a4k bank's order on disk, a classic bank's none, the rest as given" {
+    // The stream's pool options as it builds them (its default `pool`, a staging size, a lookahead's spec, a block).
+    const base: io.Options = .{ .tickets = 1024 };
+    const d: io.Derived = .{ .staging_bytes = 3 << 20, .spec = .{ .threads = 2, .slots = 8, .record_bytes = 70_000, .chunk_bytes = 16_384, .idle_busy = 0 }, .parts_block = 4096 };
+    var want = base;
+    want.staging_bytes = d.staging_bytes;
+    want.spec = d.spec;
+    want.parts_block = d.parts_block;
+    try testing.expectEqualDeep(want, io.poolOptions(ClassicBank, &.{}, base, d));
+    try testing.expectEqualDeep(want, io.poolOptions(HooklessBank, &.{}, base, d));
+    var order: [io.max_disk_components]u8 = @splat(0);
+    @memcpy(order[0..a4k.n_components], &a4k.disk_order);
+    want.disk_order = order;
+    try testing.expectEqualDeep(want, io.poolOptions(A4kBank, &.{}, base, d));
 }

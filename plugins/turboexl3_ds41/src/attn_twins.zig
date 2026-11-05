@@ -1,4 +1,4 @@
-//! `MLX_SERVE_DSV41_SCRATCH_ATTN`'s ring twins: an attention gather launch's stock text (attn_qk, Q_TAIL's attn_qk_t,
+//! The ring twins (src/scratch_attn.zig): an attention gather launch's stock text (attn_qk, Q_TAIL's attn_qk_t,
 //! attn_sm, attn_pv) rewritten so the scores and probabilities it writes or reads live in a slot of a per-prompt region
 //! (src/scratch_attn.zig), derived at load from the stock texts the plugin compiles, never stored.
 //!
@@ -31,7 +31,7 @@ pub const Error = error{
 /// One array the twin rebinds to a region's slot: its stock name, Metal type (MLX's: `float`, `float16_t`, ...; or a
 /// template type the stock text has, `OT`) and the `soff` word that offsets it (null: the region's first word).
 pub const Io = struct { name: []const u8, mtype: []const u8, off: ?u8 = 0 };
-/// One stock statement the twin replaces (it must occur once): MLX_SERVE_DSV41_SCRATCH_HEADS's pv twin moves its
+/// One stock statement the twin replaces (it must occur once): the heads pv twin moves its
 /// grouped store to the run region's row layout.
 pub const Sub = struct { old: []const u8, new: []const u8 };
 

@@ -1,4 +1,4 @@
-//! MLX_SERVE_DSV41_STAGE on the streamer's own policy (src/mlx_serve/sdk/weights/streamed/sdk_ext/expert/policy.zig,
+//! Staging on the streamer's own policy (src/mlx_serve/sdk/weights/streamed/sdk_ext/expert/policy.zig,
 //! `PlanOpts.held_rows`), MLX-free: a test of its own in `zig build test` (build.zig), since the policy is the
 //! `mlx_stream` module's file and never the plugin root's.
 

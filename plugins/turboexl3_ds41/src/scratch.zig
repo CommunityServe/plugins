@@ -1,7 +1,6 @@
 //! The per-prompt regions the wide prompt layers' arena levers write their large transients into, not fresh MLX
-//! allocations: `Region`, the cap on their bytes together, the setting's values (each lever has its own setting) and the
-//! word-for-word check. Users: src/scratch_x1.zig (`MLX_SERVE_DSV41_SCRATCH`, a wide layer's streams after its attention)
-//! and the stream's wave arena.
+//! allocations: `Region` and the cap on their bytes together. Users:
+//! src/scratch_x1.zig (a wide layer's streams after its attention), src/scratch_attn.zig and the stream's wave arena.
 //!
 //! A 16K-row encoder layer allocated ~21 GB of fresh Metal buffers (pt2: MLX's buffer cache is capped at 2 GiB, so each
 //! layer's GB-sized transients are new `newBufferWithLength` calls, ~15 ms/GB of allocator, residency and fresh pages).
@@ -39,20 +38,6 @@ const mlx = @import("mlx_serve").mlx;
 const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
 
-/// A lever's setting (unset, empty or `0`: off; `1`: on; `check`: the fresh arrays served, each region-backed one
-/// compared with them word for word; anything else is refused by name).
-pub const Mode = enum { off, on, check };
-
-pub const Error = error{ScratchSetting};
-
-pub fn parse(value: ?[]const u8) Error!Mode {
-    const v = value orelse return .off;
-    if (v.len == 0 or std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "1")) return .on;
-    if (std.mem.eql(u8, v, "check")) return .check;
-    return error.ScratchSetting;
-}
-
 /// The host's (src/host_shims.zig): an evaluated array over one fresh buffer, bytes unspecified; the event wait.
 extern fn dsv41_alloc_uninit(out: *A, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int;
 extern fn dsv41ev_create_metal(start: u64, object: *u64) i32;
@@ -71,8 +56,8 @@ fn readyEvent() !i32 {
 }
 
 pub const max_ndim = 4;
-/// MLX_SERVE_DSV41_BANK_POOL (src/bank_pool.zig): an array the copied stream's pool holds for a region, by shape and
-/// dtype (src/scratch_waves.zig's wave sets').
+/// The bank pool (src/bank_pool.zig): an array the copied stream's pool holds for a region, by shape and dtype
+/// (src/scratch_waves.zig's wave sets').
 pub const Shape = struct { shape: [max_ndim]c_int = @splat(0), ndim: usize = 0, dtype: mlx.mlx_dtype = .float32 };
 /// The most bytes the regions hold together (a machine bound for the M5 Max's 128 GB beside the pack, never a prompt's).
 pub const cap_bytes: u64 = 4 << 30;
@@ -89,8 +74,8 @@ pub const Region = struct {
     carrier: A = none,
     /// An output of the last reader of the region's words (a reference): the next writer binds it (`after`).
     release: A = none,
-    /// MLX_SERVE_DSV41_BANK_POOL: the pool's array for the region (a reference) and its shape: `ensure` takes it, not a
-    /// fresh buffer, whenever its shape is the one asked.
+    /// The bank pool: the pool's array for the region (a reference) and its shape: `ensure` takes it, not a fresh
+    /// buffer, whenever its shape is the one asked.
     pooled: A = none,
     pooled_shape: Shape = .{},
 
@@ -104,7 +89,7 @@ pub const Region = struct {
         for (shape) |d| n *= @intCast(d);
         if (held_bytes + n > cap_bytes) return null;
         var out = mlx.mlx_array_new();
-        // MLX_SERVE_DSV41_BANK_POOL: the pool's array when its shape is the one asked (a reference, nothing allocated).
+        // The bank pool: the pool's array when its shape is the one asked (a reference, nothing allocated).
         const pooled = r.pooled.ctx != null and r.pooled_shape.ndim == shape.len and std.mem.eql(c_int, r.pooled_shape.shape[0..shape.len], shape) and r.pooled_shape.dtype == dtype;
         if (if (pooled) mlx.mlx_array_set(&out, r.pooled) != 0 else dsv41_alloc_uninit(&out, shape.ptr, shape.len, dtype) != 0) {
             _ = mlx.mlx_array_free(out);
@@ -161,8 +146,7 @@ pub const Region = struct {
         if (dsv41ev_wait(&gated, 2, try readyEvent(), 1, null, 0, true, s, &outs) != 0) return error.ScratchPublish;
         return outs[0];
     }
-    /// MLX_SERVE_DSV41_BANK_POOL: the pool's array for the region (`ensure` takes it), a reference kept until
-    /// `dropPooled`.
+    /// The bank pool: the pool's array for the region (`ensure` takes it), a reference kept until `dropPooled`.
     pub fn adoptPooled(r: *Region, arr: A, sh: Shape) !void {
         try hold(&r.pooled, arr);
         r.pooled_shape = sh;
@@ -199,40 +183,4 @@ fn hold(slot: *A, x: A) !void {
 fn drop(slot: *A) void {
     if (slot.ctx != null) _ = mlx.mlx_array_free(slot.*);
     slot.* = none;
-}
-
-/// `check`: `a` against `b` (one shape, 2- or 4-byte words), word for word on the device: the words compared and those
-/// that differ, added to `t`.
-pub const Tally = struct { words: u64 = 0, differ: u64 = 0 };
-pub fn compare(s: mlx.mlx_stream, a: A, b: A, t: *Tally) !void {
-    const wt: mlx.mlx_dtype = switch (mlx.mlx_array_itemsize(a)) {
-        2 => .uint16,
-        4 => .uint32,
-        else => return error.ScratchCheckWords,
-    };
-    var tmp: [5]A = undefined;
-    for (&tmp) |*x| x.* = mlx.mlx_array_new();
-    defer for (tmp) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-    try mlx.check(mlx.mlx_view(&tmp[0], a, wt, s));
-    try mlx.check(mlx.mlx_view(&tmp[1], b, wt, s));
-    // The equal words summed as MLX sums a bool array (int32, no word-sized copy), the scalar then as u32.
-    try mlx.check(mlx.mlx_equal(&tmp[2], tmp[0], tmp[1], s));
-    try mlx.check(mlx.mlx_sum(&tmp[3], tmp[2], false, s));
-    try mlx.check(mlx.mlx_astype(&tmp[4], tmp[3], .uint32, s));
-    try mlx.check(mlx.mlx_array_eval(tmp[4]));
-    const same = (mlx.mlx_array_data_uint32(tmp[4]) orelse return error.NoData)[0];
-    const n: u64 = mlx.mlx_array_size(a);
-    t.words += n;
-    t.differ += n - same;
-}
-
-test "scratch setting: off unset, empty or 0; 1 on; check; anything else refused by name" {
-    try std.testing.expectEqual(Mode.off, try parse(null));
-    try std.testing.expectEqual(Mode.off, try parse(""));
-    try std.testing.expectEqual(Mode.off, try parse("0"));
-    try std.testing.expectEqual(Mode.on, try parse("1"));
-    try std.testing.expectEqual(Mode.check, try parse("check"));
-    for ([_][]const u8{ "on", "2", "true", "Check", " 1" }) |v| try std.testing.expectError(error.ScratchSetting, parse(v));
 }
