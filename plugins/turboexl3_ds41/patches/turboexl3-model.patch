@@ -106,7 +106,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/bill.zig b/plugins/deepseek_v41/b
 diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepseek_v41/deepseek_v41.zig
 --- a/plugins/deepseek_v41/deepseek_v41.zig
 +++ b/plugins/deepseek_v41/deepseek_v41.zig
-@@ -33,6 +33,59 @@
+@@ -33,6 +33,62 @@
  const streamed = @import("../../sdk/weights/streamed.zig");
  const dkern = @import("decode/decode.zig");
  const device = @import("../../mlx/device.zig");
@@ -163,10 +163,13 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
 +/// turboexl3_ds41 (MLX_SERVE_DSV41_FLASH_ATTN, the plugin's src/flash_attn.zig): a wide span's attention as one flash
 +/// kernel (an online softmax; the scores and probabilities never leave a threadgroup), not exact.
 +const fa = @import("../../../flash_attn.zig");
++/// turboexl3_ds41 (src/head_logits.zig): whether the last streams go through the LM head, an EXL3 head (`x3`, no `w`)
++/// included.
++const hlog = @import("../../../head_logits.zig");
  const Shard = @import("../../sdk/weights/shard.zig").Shard;
  const A = mlx.mlx_array;
  const S = mlx.mlx_stream;
-@@ -254,7 +307,10 @@
+@@ -254,7 +310,10 @@
      s: A = none,
      b: A = none,
      qp: QuantParams = .{ .bits = 0, .group_size = 0 },
@@ -177,7 +180,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          if (self.s.ctx == null) return sc.matmul(x, try sc.t2(self.w));
          // Not f32: MLX runs f32 GEMMs on the matrix units as TF32.
          if (mlx.mlx_array_dtype(x) != .float32 and mlx.mlx_array_size(x) / @as(usize, @intCast(dim(x, -1))) >= DENSE_ROWS)
-@@ -280,7 +336,8 @@
+@@ -280,7 +339,8 @@
  };
  /// `wkv` above ratio 1: the kv rows then the gate rows as one linear whose
  /// f32 input meets f32 math (scales widened to f32), since pooling runs in f32.
@@ -187,7 +190,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  pub const Idx = struct { wq_b: Lin, weights_proj: Lin, wk: ?Lin, k_norm: A };
  /// Stacked routed experts `[E, out, in]`; `gather_qmm` reads them by index.
  pub const Bank = struct {
-@@ -295,7 +352,8 @@
+@@ -295,7 +355,8 @@
  /// in their place (they address experts from the buffer pointer): MLX bills
  /// a command buffer for each bound array's size, and a whole bank forced a
  /// commit at every kernel.
@@ -197,7 +200,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  pub const Layer = struct {
      attn_norm: A,
      ffn_norm: A,
-@@ -345,6 +403,8 @@
+@@ -345,6 +406,8 @@
      cfg: Config,
      act: mlx.mlx_dtype,
      embed: Lin,
@@ -206,7 +209,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      head: Lin,
      norm: A,
      /// The trunk, then the DSpark stages.
-@@ -406,6 +466,8 @@
+@@ -406,6 +469,8 @@
      hc_stage_x_kernel: mlx.mlx_fast_metal_kernel,
      hc_split_kernel: mlx.mlx_fast_metal_kernel,
      rope_kernel: mlx.mlx_fast_metal_kernel,
@@ -215,7 +218,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      kv_row_kernel: mlx.mlx_fast_metal_kernel,
      engram_kernel: mlx.mlx_fast_metal_kernel,
      moe_gu_kernel: mlx.mlx_fast_metal_kernel,
-@@ -446,10 +508,13 @@
+@@ -446,10 +511,13 @@
          self.ahead = null;
      }
      pub fn deinit(self: *Dsv41Model) void {
@@ -229,7 +232,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          self.gpa.free(self.engrams);
          self.gpa.free(self.token_map);
          for (self.owned.items) |x| _ = mlx.mlx_array_free(x);
-@@ -459,6 +524,7 @@
+@@ -459,6 +527,7 @@
          _ = mlx.mlx_fast_metal_kernel_free(self.attn_split_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(self.attn_merge_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(self.attn_softmax_kernel);
@@ -237,7 +240,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          if (self.attn_gather) |*g| g.deinit();
          if (self.moe_wt_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
          _ = mlx.mlx_fast_metal_kernel_free(self.idx_score_kernel);
-@@ -477,9 +543,12 @@
+@@ -477,9 +546,12 @@
          _ = mlx.mlx_fast_metal_kernel_free(self.moe_act_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(self.moe_combine_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(self.rope_kernel);
@@ -250,7 +253,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          freeRegions(self);
          self.gpa.destroy(self);
      }
-@@ -644,6 +713,7 @@
+@@ -644,6 +716,7 @@
      return w.get(name);
  }
  fn getLin(w: *const Weights, in_dim: usize, comptime base: []const u8, args: anytype) !Lin {
@@ -258,7 +261,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const wt = try getW(w, base ++ ".weight", args);
      const sc = getOpt(w, base ++ ".scales", args) orelse return .{ .w = wt };
      // A `--mlx-gguf` set's routed experts stay raw ggml blocks beside their type sentinel (`sdk/quant/gguf`).
-@@ -656,6 +726,95 @@
+@@ -656,6 +729,95 @@
      };
      return .{ .w = wt, .s = sc, .b = bi, .qp = qp };
  }
@@ -354,7 +357,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// A dense weight that an mxfp8 code plus e8m0 scale per 32 columns holds
  /// exactly (fp8 blocks a converter widened to bf16) as that pair, half the
  /// bytes; null when any value would move.
-@@ -773,6 +932,16 @@
+@@ -773,6 +935,16 @@
      }
      return out;
  }
@@ -371,7 +374,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// `kv` and `gate` as `Comp.wkv` holds them above ratio 1: rows fused when the
  /// formats agree (affine scales and biases widened to f32; dense rows as
  /// stored, `denseF32x` reads them), else both dequantized to f32 rows.
-@@ -860,6 +1029,8 @@
+@@ -860,6 +1032,8 @@
          .up = bankOf(try getLin(w, d, pfx ++ ".{d}.ffn.experts.w3", .{li})),
          .down = bankOf(try getLin(w, inter, pfx ++ ".{d}.ffn.experts.w2", .{li})),
      };
@@ -380,7 +383,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      if (getOpt(w, pfx ++ ".{d}.ffn.experts.0.w1.weight", .{li}) != null) {
          var banks: [3]Bank = undefined;
          inline for (.{ "w1", "w3", "w2" }, 0..) |proj, k| {
-@@ -906,8 +1077,11 @@
+@@ -906,8 +1080,11 @@
      const ratio: u8 = if (trunk_li) |t| c.dsv4_compress_ratios[t] else 0;
      const is_kv = if (trunk_li) |t| m.isKvSource(t) else false;
      const is_ix = if (trunk_li) |t| m.isIndexSource(t) else false;
@@ -394,7 +397,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          // A decode step reads every wo_a: half the bytes, the same values.
          wo_a = .{ .w = try m.own(pair[0]), .s = try m.own(pair[1]), .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
          var buf: NameBuf = undefined;
-@@ -939,14 +1113,11 @@
+@@ -939,14 +1116,11 @@
          .wo_b = try getLin(w, og * ol, pfx ++ ".{d}.attn.wo_b", .{li}),
          .sink = sink,
          .ratio = ratio,
@@ -412,7 +415,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              .k_norm = if (is_kv) try ownCast(m, try getW(w, pfx ++ ".{d}.attn.indexer.k_norm.weight", .{li}), m.act) else none,
          } else null,
          .gate_w = try getW(w, pfx ++ ".{d}.ffn.gate.weight", .{li}),
-@@ -1054,17 +1225,106 @@
+@@ -1054,17 +1228,106 @@
      qk: mlx.mlx_fast_metal_kernel,
      sm: mlx.mlx_fast_metal_kernel,
      pv: mlx.mlx_fast_metal_kernel,
@@ -520,7 +523,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      }
  };
  /// The indexer's scores `[L, nb]`: sum over heads of weight * relu(q_h . k_n),
-@@ -1276,7 +1536,9 @@
+@@ -1276,7 +1539,9 @@
  /// The pack's tensors as the engine's loader reads a V4.1 pack: the text prefix stripped, a tensor two shards carry
  /// from the shard the index names, the vision tower only on `vision`, the Engram projections kept beside its tables.
  pub fn loadPack(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, vision: bool) !Weights {
@@ -531,7 +534,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      errdefer w.deinit();
      const path = try std.fmt.allocPrintSentinel(gpa, "{s}/engram/engram-residents.safetensors", .{dir}, 0);
      defer gpa.free(path);
-@@ -1286,6 +1548,30 @@
+@@ -1286,6 +1551,30 @@
      try weights_load.loadSafetensorsFile(gpa, &w, path, s, .{});
      return w;
  }
@@ -562,7 +565,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  pub const InitOpts = struct {
      /// The activation dtype; tests run f32 against the f32 reference.
      act: mlx.mlx_dtype = .bfloat16,
-@@ -1308,6 +1594,8 @@
+@@ -1308,6 +1597,8 @@
      var sliced = whole.*;
      // A streamed bank reads whole experts and only rank 0 opens one; a split's ranks hold half of each.
      if (opts.tp != null and opts.streamed_experts) return error.Dsv41TpStreamedExperts;
@@ -571,7 +574,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      if (opts.tp) |t| {
          sliced.moe_intermediate_size /= t.size;
          sliced.num_attention_heads /= t.size;
-@@ -1318,7 +1606,7 @@
+@@ -1318,7 +1609,7 @@
      errdefer gpa.destroy(m);
      const n_layers = cfg.num_hidden_layers;
      // A tensor split's rank 0 holds the DSpark stages whole and drafts alone.
@@ -580,7 +583,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          cfg.dsv4_n_compress_ratios - n_layers
      else
          0;
-@@ -1352,6 +1640,7 @@
+@@ -1352,6 +1643,7 @@
          .hc_stage_x_kernel = try buildKernel("dsv41_hc_stage_x", &HC_STAGE_X_INS, &HC_STAGE_X_OUTS, HC_STAGE_X_SOURCE, ""),
          .hc_split_kernel = try buildKernel("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, HC_SPLIT_SOURCE, ""),
          .rope_kernel = try buildKernel("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, ROPE_TAIL_SOURCE, FP8_HEADER),
@@ -588,7 +591,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          .kv_row_kernel = try buildKernel("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, KV_ROW_SOURCE, FP8_HEADER),
          .engram_kernel = try buildKernel("dsv41_engram", &ENGRAM_INS, &.{"out"}, ENGRAM_SOURCE, ""),
          .moe_gu_kernel = try buildKernel("dsv41_moe_gu", &MOE_GU_INS, &.{"out"}, MOE_GU_SOURCE, MOE_HEADER),
-@@ -1392,6 +1681,7 @@
+@@ -1392,6 +1684,7 @@
          _ = mlx.mlx_fast_metal_kernel_free(m.hc_stage_x_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(m.hc_split_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(m.rope_kernel);
@@ -596,7 +599,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          _ = mlx.mlx_fast_metal_kernel_free(m.kv_row_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(m.engram_kernel);
          _ = mlx.mlx_fast_metal_kernel_free(m.moe_gu_kernel);
-@@ -1404,9 +1694,12 @@
+@@ -1404,9 +1697,12 @@
          m.head = .{ .w = none };
          m.norm = none;
      } else {
@@ -611,7 +614,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
              log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
          }
-@@ -1417,6 +1710,7 @@
+@@ -1417,6 +1713,7 @@
      for (0..n_layers) |li| m.layers[li] = if (!m.held(li)) std.mem.zeroes(Layer) else try loadLayer(m, w, "layers", li, li);
      m.ced_split = cedSplit(cfg);
      try probeHcThreads(gpa, m);
@@ -619,7 +622,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      try probeTopkThreads(gpa, m);
      if (mlx.streamIsGpu(s)) m.dec = try Dec.init(gpa, cfg);
      if (opts.tp != null and m.dec.moe_fp4 != null) for (&m.tp_units, 1..) |*u, R| {
-@@ -1424,6 +1718,8 @@
+@@ -1424,6 +1721,8 @@
          u.* = .{ .pre = try ownConst(m, &.{ r, 1, ci(cfg.hidden_size) }, .bfloat16, 0), .post = try ownConst(m, &.{ r, 1 }, .float32, 1), .comb = try ownConst(m, &.{ r, 1, 1 }, .float32, 0) };
      };
      try compileRegions(m);
@@ -628,7 +631,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      if (n_stages > 0) {
          for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
          const last = n_stages - 1;
-@@ -1432,8 +1728,9 @@
+@@ -1432,8 +1731,9 @@
              .main_proj = try getLin(w, cfg.hidden_size * targets, "mtp.0.main_proj", .{}),
              .main_norm = try ownCast(m, try getW(w, "mtp.0.main_norm.weight", .{}), m.act),
              .norm = try ownCast(m, try getW(w, "mtp.{d}.norm.weight", .{last}), m.act),
@@ -640,7 +643,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              .conf = try ownCast(m, try getW(w, "mtp.{d}.confidence_head.proj.weight", .{last}), .float32),
          };
          m.n_mtp = n_stages;
-@@ -1450,10 +1747,40 @@
+@@ -1450,10 +1750,40 @@
          m.lhs_gu = try m.own(mlx.mlx_array_new_data(&ks, &[_]c_int{ 1, ci(k) }, 2, .uint32));
      }
      try evalWeights(m);
@@ -681,7 +684,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// Every array the model reads, evaluated one layer at a time. A compiled region captures its layer's weights,
  /// and a lazy load in its trace would read the weight from disk into a fresh buffer on every call.
  fn evalWeights(m: *Dsv41Model) !void {
-@@ -1521,8 +1848,21 @@
+@@ -1521,8 +1851,21 @@
      const idx_bytes = span * seq * 4 * 3;
      // A pair's gate/up rows, its activation and its down row, in the activation dtype (bf16).
      const moe_bytes = @min(c, MOE_ROWS) * config.num_experts_per_tok * (3 * config.moe_intermediate_size + d) * 2;
@@ -704,7 +707,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// The DSpark stages load when the pack ships them, unless `--no-mtp` or the model's `mtp` setting turn them off
  /// (`applyModelSettings` folds both into `mtp_override`); V4's `MLX_SERVE_DSV4_DSPARK` turns them on either way.
  pub fn dsparkWanted(cfg: *const Config, pair: ?Pair, mtp: ?bool) bool {
-@@ -1588,7 +1928,7 @@
+@@ -1588,7 +1931,7 @@
  }
  /// Engram for the pack in `dir`: the token map, the hash, and each layer's
  /// table and projections. Without Engram layers in the config this is a no-op.
@@ -713,7 +716,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const c = &m.cfg;
      if (c.dsv41_n_engram_layers == 0) return;
      m.token_map = try engram.loadTokenMap(m.gpa, dir, c.vocab_size, c.dsv41_engram_compressed_vocab);
-@@ -1622,7 +1962,7 @@
+@@ -1622,7 +1965,7 @@
          try mlx.check(mlx.mlx_array_eval(prod));
          m.engrams[k] = .{
              .layer = l,
@@ -722,7 +725,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              .qk = prod,
              .table = try engram.Table.open(m.gpa, dir, k, l, c.dsv41_engram_rows[k], c.dsv41_engram_head_dim),
          };
-@@ -1870,6 +2210,32 @@
+@@ -1870,6 +2213,32 @@
      var o = mlx.mlx_array_new();
      return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
  }
@@ -755,7 +758,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  pub fn ropeFor(m: *const Dsv41Model, li: usize) *const Rope {
      return if (m.ratio(li) > 0) &m.rope_yarn else &m.rope_plain;
  }
-@@ -1879,21 +2245,25 @@
+@@ -1879,21 +2248,25 @@
  /// previous mix: the staggered hyper-connections). A decode-width block is one
  /// stage (`hcStage`), a wide one the mix and norm kernels.
  pub fn hcPreNorm(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, norm_w: A) !Normed {
@@ -786,7 +789,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      var zv = mlx.mlx_vector_array_new();
      defer _ = mlx.mlx_vector_array_free(zv);
      {
-@@ -1910,8 +2280,7 @@
+@@ -1910,8 +2283,7 @@
          try mlx.check(mlx.mlx_fast_metal_kernel_apply(&zv, m.hc_mix_kernel, iv, cfg, sc.s));
      }
      var z = mlx.mlx_array_new();
@@ -796,7 +799,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  }
  /// Metal caps a register-heavy kernel's threadgroup below 1024 on some GPUs (M1/M2): launches every hc kernel once at
  /// `m.hc_tg` threads and halves it until they run.
-@@ -1964,7 +2333,8 @@
+@@ -1964,7 +2336,8 @@
  pub fn hcEps(sc: *Scope, m: *const Dsv41Model) !A {
      return sc.keep(mlx.mlx_array_new_data(&[_]f32{ m.cfg.rms_norm_eps, m.cfg.dsv4_hc_eps }, &[_]c_int{2}, 1, .float32));
  }
@@ -806,7 +809,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  pub const Expand = struct { y: A, sp: *const Split };
  /// `hcPreNorm` (with `ex`: `hcExpandPreNorm`, the stream being `hcExpand(x, y, ex.sp)`) as
  /// `HC_STAGE_SOURCE` and `HC_SPLIT_SOURCE`.
-@@ -2030,11 +2400,44 @@
+@@ -2030,11 +2403,44 @@
  /// width the expand is rebuilt wherever the stage reads it, saving its dispatch from the chain; a wide
  /// block pays for that rebuild in every mix, so it expands once.
  pub fn hcExpandPreNorm(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !Staged {
@@ -854,7 +857,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// The hc split of the mixes `z` and the collapse of `x` with `cpre`, rms-normed.
  pub fn hcNorm(sc: *Scope, m: *const Dsv41Model, z: A, x: A, cpre: A, norm_w: A, eps: A) !Normed {
      const L = dim(x, 0);
-@@ -2066,6 +2469,185 @@
+@@ -2066,6 +2472,185 @@
      }
      return .{ .sp = .{ .pre = outs[0], .post = outs[1], .comb = outs[2] }, .h = outs[3] };
  }
@@ -1040,7 +1043,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// Collapse the hc copies `[L, hc, D]` with `pre` `[L, hc]`, in f32.
  pub fn hcCollapse(sc: *Scope, x: A, pre: A) !A {
      const w = try sc.expand(pre, 1); // [L, 1, hc]
-@@ -2098,6 +2680,9 @@
+@@ -2098,6 +2683,9 @@
      floor: ?usize = null,
      /// Set by `attention` when it handed back the heads grouped and inverse-roped (`attnGather`'s `grouped`).
      grouped: bool = false,
@@ -1050,7 +1053,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  };
  /// `x` normed attention input `[L, dim]` at positions [p0, p0 + L). With `pre` (the rows' projections,
  /// made over the whole chunk by `wideLayer`) the heads `[L, H, hd]` come back before `attnOut`.
-@@ -2115,7 +2700,7 @@
+@@ -2115,7 +2703,7 @@
          try runRegion(sc, m, li, .q_kv, &.{ x, pos }, &a);
          pj = .{ .q = a[0], .kv = a[1], .qr = a[2] };
      } else pj = try qkvProj(sc, m, ly, ropeFor(m, li).fwd, x, pos);
@@ -1059,7 +1062,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const qr = pj.qr;
      const kv = pj.kv;
      const window = c.sliding_window;
-@@ -2139,7 +2724,10 @@
+@@ -2139,7 +2727,10 @@
      const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
      const f16_core = m.attn_f16 and (m.act == .bfloat16 or m.act == .float16) and dim(keys_w, 0) + K <= ATTN_SOFTMAX_MAX_COLS and mlx.streamIsGpu(sc.s);
      const want_grouped: ?Grouped = if (pre != null) .{ .periods = ropeFor(m, li).inv, .p0 = p0 } else null;
@@ -1071,7 +1074,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          sh.grouped = want_grouped != null;
          break :blk g;
      } else if (f16_core)
-@@ -2161,7 +2749,7 @@
+@@ -2161,7 +2752,7 @@
      const ly = &m.layers[li];
      if (ly.ratio == 0) return .{ none, none };
      const clen = (p0 + dim(x, 0)) / ly.ratio;
@@ -1080,7 +1083,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      if (ly.idx) |*iw| sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
      if (clen == 0 or sh.topk.ctx == null) return .{ none, sh.topk };
      return .{ try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s)), sh.topk };
-@@ -2181,7 +2769,8 @@
+@@ -2181,7 +2772,8 @@
  /// The wide core on the matrix units, null where it does not serve (no NAX, not bf16, another head geometry): each row's
  /// scores against its own window and selected rows, read in place, never gathered.
  /// The heads `[L, H, D]`, or with `grouped` already inverse-roped and grouped.
@@ -1090,7 +1093,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const g = m.attn_gather orelse return null;
      const L = dim(q, 0);
      const H = dim(q, 1);
-@@ -2199,12 +2788,14 @@
+@@ -2199,12 +2791,14 @@
      const comp = if (K > 0) comp_rows else keys_w;
      const hs: c_int = @intCast(H / 4);
      const run = struct {
@@ -1108,7 +1111,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              for (ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t.name, t.v));
              for (types) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, t[0], t[1]));
              const iv = mlx.mlx_vector_array_new_data(ins.ptr, ins.len);
-@@ -2216,14 +2807,152 @@
+@@ -2216,14 +2810,152 @@
              return s.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
          }
      }.one;
@@ -1264,7 +1267,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// `[L, wp + L]`: query i sees the window rows (wp + i - window, wp + i].
  pub fn windowBand(sc: *Scope, wp: usize, L: usize, window: usize) !A {
      const qpos = try sc.reshape(try sc.arange(wp, wp + L), &.{ ci(L), 1 });
-@@ -2452,12 +3181,24 @@
+@@ -2452,12 +3184,24 @@
  pub fn attnSplits(rows: usize) c_int {
      return @intCast(@max(1, @min(8, rows / 160)));
  }
@@ -1291,7 +1294,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// `qkvProj` before the rope: the query heads `[L, H, hd]`, the window row unnormed, the query latent.
  pub fn qkvRows(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Proj {
      const c = &m.cfg;
-@@ -2503,12 +3244,17 @@
+@@ -2503,12 +3247,17 @@
  /// `attnOut` of heads already inverse-roped.
  pub fn attnOutRoped(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A) !A {
      const L = dim(r, 0);
@@ -1311,7 +1314,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
      const oa = if (wd.ctx != null)
          try sc.matmul(ob, try sc.transpose(wd, &.{ 0, 2, 1 }))
-@@ -2521,6 +3267,7 @@
+@@ -2521,6 +3270,7 @@
  /// `x` [L, K] f32 through the dense linear `l` in f32: decode rows read `l`
  /// as stored (`DENSE_F32X_SOURCE`); wider inputs widen it (MLX promotes).
  pub fn denseF32x(sc: *Scope, m: *const Dsv41Model, l: *const Lin, x: A) !A {
@@ -1319,7 +1322,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const L = dim(x, 0);
      const N = dim(l.w, 0);
      const K = dim(x, 1);
-@@ -2545,7 +3292,10 @@
+@@ -2545,7 +3295,10 @@
  /// latent at its group's first position and stores it fp4-simulated.
  pub fn compress(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Comp, x: A, p0: usize) !void {
      // Pooling runs in f32, weights included (the reference promotes them).
@@ -1331,7 +1334,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      return compressFrom(sc, m, st, li, cw, proj, p0);
  }
  /// `compressFrom` on the fused pool step (`decode/idx_score.zig`); false (nothing moved) where it declines.
-@@ -2615,7 +3365,7 @@
+@@ -2615,7 +3368,7 @@
      }
      const g0 = p0 / r;
      if (ly.idx) |*iw| if (iw.wk) |*wk| {
@@ -1340,7 +1343,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          k = try ropeQat(sc, m, k, m.rope_yarn.fwd, try sc.i(ci(g0)), @floatFromInt(r), .fp4_ue8m0, null);
          try ls.idx_k.?.append(k, sc.s);
      };
-@@ -2650,8 +3400,21 @@
+@@ -2650,8 +3403,21 @@
      const c = &m.cfg;
      const L = dim(x, 0);
      const q = try ropeQat(sc, m, try sc.reshape(try iw.wq_b.apply(sc, qr), &.{ ci(L), ci(c.dsv4_index_n_heads), ci(c.dsv4_index_head_dim) }), m.rope_yarn.fwd, try sc.i(ci(p0)), 1.0, .fp4_ue8m0, .float32);
@@ -1363,7 +1366,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// `indexer` from the rows' roped, round-tripped index queries `q` [L, heads, dim] f32 and head weights `w` [L, heads].
  fn indexerQ(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, w: A, q: A, p0: usize, sh: *Shared) !A {
      const c = &m.cfg;
-@@ -3223,8 +3986,10 @@
+@@ -3223,8 +3989,10 @@
      const L = dim(x, 0);
      const E = dim(ly.gate_w, 0);
      if (L > region_rows) {
@@ -1375,7 +1378,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      }
      const sgs: usize = 8;
      var lo = mlx.mlx_vector_array_new();
-@@ -3243,10 +4008,13 @@
+@@ -3243,10 +4011,13 @@
  }
  /// `img` (`[L]` bool, or none) names the rows inside an image span, which pick their experts by `gate_bias_vl`.
  pub fn route(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, img: A) !Routes {
@@ -1391,7 +1394,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const bias = if (img.ctx != null and ly.gate_bias_vl != null) try sc.where(try sc.expand(img, -1), ly.gate_bias_vl.?, ly.gate_bias) else ly.gate_bias;
      const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
      const cfg = mlx.mlx_fast_metal_kernel_config_new();
-@@ -3269,7 +4037,8 @@
+@@ -3269,7 +4040,8 @@
  }
  /// The routed sum `y` (f32) plus the shared expert.
  pub fn withShared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A) !A {
@@ -1401,7 +1404,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  }
  pub fn shared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
      // A prompt's rows take the routed experts' activation kernel (weight 1): one pass, not the f32 op chain's five.
-@@ -3281,6 +4050,10 @@
+@@ -3281,6 +4053,10 @@
          const act = try flatKernel(sc, m.moe_act_kernel, &.{ y, try sc.ones(&.{ci(L)}, .float32), lim }, &.{ ci(L), ci(n) }, m.act, L * n, &.{.{ .name = "N", .v = ci(n) }});
          return ly.shared[2].apply(sc, act);
      };
@@ -1412,7 +1415,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const g, const u = if (ly.shared_gu) |*gu| blk: {
          const y = try gu.apply(sc, x);
          const n = dim(y, -1) / 2;
-@@ -3297,12 +4070,19 @@
+@@ -3297,12 +4073,19 @@
      const r = try route(sc, m, ly, x, img);
      // The DSpark stages' experts stay resident.
      if (li < m.n_layers) if (m.streamed) |src| {
@@ -1432,7 +1435,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const y = try moePartial(sc, m, ly, x, r.idx, r.wts);
      return if (li < m.n_layers) tpSum(sc, m, y) else sc.astype(y, m.act);
  }
-@@ -3328,15 +4108,151 @@
+@@ -3328,15 +4111,151 @@
      defer sc.deinit();
      return sc.out(try moePartial(&sc, m, &m.layers[li], x, idx, wts));
  }
@@ -1585,7 +1588,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// `engramApply` after `wkv` as the op chain.
  pub fn engramGateOps(sc: *Scope, m: *const Dsv41Model, qk: A, x: A, kv: A) !A {
      const c = &m.cfg;
-@@ -3407,6 +4323,17 @@
+@@ -3407,6 +4326,17 @@
          if (m.streamed) |src| {
              var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
              try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, a[0], a[1], a[2] }, &p);
@@ -1603,7 +1606,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              const ro = switch (src.math) {
                  .source => |f| try sc.keep(try f(src.ctx, @intCast(li), p[4], p[5], p[6]).get()),
                  .trunk => blk: {
-@@ -3415,7 +4342,15 @@
+@@ -3415,7 +4345,15 @@
                  },
              };
              var y: [1]A = undefined;
@@ -1620,7 +1623,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              pre.* = p[1];
              return y[0];
          }
-@@ -3426,10 +4361,12 @@
+@@ -3426,10 +4364,12 @@
          return o[0];
      }
      const mid = try blockAttn(sc, m, st, li, x, pre.*, p0, sh);
@@ -1635,7 +1638,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  }
  /// `block` for at most `dkern.max_rows` rows on the fused decode kernels (`decode/`), today's stretches where one is
  /// missing; null (before any state moves) where a kernel declines the layer.
-@@ -3525,6 +4462,16 @@
+@@ -3525,6 +4465,16 @@
      const first = try sc.op2(mlx.mlx_equal, try sc.arange(0, hc), try sc.i(0));
      return sc.broadcast(try sc.astype(first, .float32), &.{ ci(L), ci(hc) });
  }
@@ -1652,7 +1655,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// `t`'s one integer value; waits for the batch that computes `t` only (no new op on it).
  fn hostToken(t: A) !u32 {
      try mlx.check(mlx.mlx_array_eval(t));
-@@ -3544,6 +4491,12 @@
+@@ -3544,6 +4494,12 @@
      defer _ = mlx.mlx_vector_array_free(vec);
      try mlx.check(mlx.mlx_eval(vec));
  }
@@ -1665,7 +1668,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// Advance `st` by `ids` and return the logits (f32, `[1, V]` for the last
  /// position or `[L, V]` for every one; caller frees). Chunks wider than one
  /// span run a layer at a time over all spans, evaluating per layer.
-@@ -3565,6 +4518,18 @@
+@@ -3565,6 +4521,18 @@
      try st.hist.appendSlice(st.gpa, comp_ids);
      return out;
  }
@@ -1684,7 +1687,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// The Engram rows of `ids` (the chunk at `st.n - ids.len`, whose hash is `rows`) as a prefetch: the one the
  /// previous chunk started for it, or a new one; either way the prompt's next chunk is read behind. `m.ahead`
  /// keeps a prefetch that still has a chunk to hand over; the caller finishes the other.
-@@ -3636,6 +4601,29 @@
+@@ -3636,6 +4604,29 @@
      const p0 = st.n;
      const hc = c.dsv4_hc_mult;
      const d = c.hidden_size;
@@ -1714,7 +1717,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      if (m.streamed) |src| try src.phase(L > region_rows);
      if (ids == .gpu) {
          if (L != 1 or m.pair != null or m.tp != null) return error.Dsv41GpuIdsUnsupported;
-@@ -3661,20 +4649,18 @@
+@@ -3661,20 +4652,18 @@
          try step(ids.host, p0, if (st.snap_at) |at| at == p0 + L else false, want == .all, if (st.verify) |v| v.n0 == p0 else false, m.state_gen, if (img_rows.ctx != null) img_rows else null);
      };
      // Engram row ids for the whole chunk (host hash); the rows themselves are
@@ -1739,7 +1742,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      defer {
          for (held) |x| if (x.ctx != null) {
              _ = mlx.mlx_array_free(x);
-@@ -3683,6 +4669,7 @@
+@@ -3683,6 +4672,7 @@
      }
      @memset(held, none);
      var sp = spansOf(held, n_spans, targets, span, L, p0);
@@ -1747,7 +1750,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      sp.eng_ids = eng_ids;
      sp.ncols = ncols;
      var img_mask: A = none;
-@@ -3696,7 +4683,16 @@
+@@ -3696,7 +4686,16 @@
              .host => |h| try sc.ints(@ptrCast(h), &.{ci(L)}),
              .gpu => |t| try sc.reshape(t, &.{1}),
          };
@@ -1765,7 +1768,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          if (img_rows.ctx != null) {
              emb = try spliceImages(&sc, m, emb, id_arr, ids.host, img_rows, &img_mask);
              sp.img = img_mask;
-@@ -3709,14 +4705,8 @@
+@@ -3709,14 +4708,8 @@
      }
      // The chunk's Engram rows come off the SSD on a thread while the layers before them run (a
      // decode token's once it is read back), and the prompt's next chunk is read behind them: the
@@ -1782,7 +1785,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      sp.prefetch = prefetch;
      var from: usize = 0;
      if (ids == .gpu and m.engrams.len > 0) {
-@@ -3746,6 +4736,7 @@
+@@ -3746,6 +4739,7 @@
      try runLayers(m, gpa, st, &sp, held, from, enc_hi);
      if (tail) |tl| {
          var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
@@ -1790,7 +1793,16 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          tsp.floor = tsp.p0;
          try cedReplayIn(m, gpa, st, &sp, &tsp, enc_hi);
          m.ced_stats.chunks += 1;
-@@ -3800,8 +4791,10 @@
+@@ -3779,7 +4773,7 @@
+         h = try sc.concat(parts.items, 0);
+     }
+     // A tensor rank past 0 holds no head: its last stream stands in for the logits.
+-    const logits = if (m.head.w.ctx == null) try sc.astype(h, .float32) else try sc.astype(try m.head.apply(&sc, try sc.rms(h, m.norm, c.rms_norm_eps)), .float32);
++    const logits = if (!hlog.projects(m.head)) try sc.astype(h, .float32) else try sc.astype(try m.head.apply(&sc, try sc.rms(h, m.norm, c.rms_norm_eps)), .float32);
+     var ev: std.ArrayList(A) = .empty;
+     defer ev.deinit(gpa);
+     try ev.append(gpa, logits);
+@@ -3800,8 +4794,10 @@
      const n_spans = sp.xs.len;
      // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.
      const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
@@ -1802,7 +1814,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              // A span's intermediates are dropped as soon as it is built, so the
              // layer's evaluation frees each one when its consumers are done.
              var sc = Scope.init(gpa, m.s);
-@@ -3810,6 +4803,10 @@
+@@ -3810,6 +4806,10 @@
              const a, const b = sp.bounds(k);
              var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .img = try sp.imgSlice(&sc, a, b) };
              var pre = sp.pres[k];
@@ -1813,7 +1825,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              x = try block(&sc, m, st, li, x, &pre, sp.p0 + k * sp.span, &sh);
              if (m.trace) |t| try t.put("stream_{d}", .{li}, x);
              hold(&sp.xs[k], x);
-@@ -3823,6 +4820,14 @@
+@@ -3823,6 +4823,14 @@
              defer ev.deinit(gpa);
              for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
              try appendLayerState(gpa, &ev, &st.layers[li]);
@@ -1828,7 +1840,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              if (!decode) try evalAll(ev.items) else {
                  // A decode step's graph takes the host about as long as the GPU
                  // takes to run it: hand each layer over as it is built.
-@@ -3849,6 +4854,8 @@
+@@ -3849,6 +4857,8 @@
          hold(&sp.topks[k], none);
          hold(&sp.cands[k], none);
      }
@@ -1837,7 +1849,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  }
  /// Worker: its layers over one step the host handed over (`x` [L, hc, dim], `pre` [L, hc]),
  /// returning both as they stand after them (caller frees). The state follows the host's: a step
-@@ -4081,7 +5088,14 @@
+@@ -4081,7 +5091,14 @@
  /// Layer `li` over a wide chunk: the row-wise stages (hc mixes, projections, `attnOut`, the FFN half) run
  /// once over all of the chunk's rows, attention's state-bound core per span, the MoE over `moe_rows` at a
  /// time. A span-wide linear fills a few threadgroups per GPU core; the chunk's rows fill the GPU. New streams and mixes land in `sp.xs` / `sp.pres`.
@@ -1853,7 +1865,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      const n_spans = sp.xs.len;
      const ly = &m.layers[li];
      var sc = Scope.init(gpa, m.s);
-@@ -4089,37 +5103,133 @@
+@@ -4089,37 +5106,133 @@
      const parts = try gpa.alloc(A, n_spans);
      defer gpa.free(parts);
      for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
@@ -2003,7 +2015,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      // A streamed bank reads each layer's experts once per call: one MoE over all of its rows.
      const group = if (m.streamed != null) n_spans else @max(1, m.moe_rows / sp.span);
      var k0: usize = 0;
-@@ -4129,21 +5239,71 @@
+@@ -4129,21 +5242,71 @@
          const hi = sp.bounds(k1 - 1)[1];
          var gsc = Scope.init(gpa, m.s);
          defer gsc.deinit();
@@ -2081,7 +2093,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      var host = mlx.mlx_array_new();
      defer _ = mlx.mlx_array_free(host);
      try mlx.check(mlx.mlx_astype(&host, r.idx, .uint32, sc.s));
-@@ -4154,6 +5314,17 @@
+@@ -4154,6 +5317,17 @@
      for (ids, (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n]) |*o, v| o.* = @intCast(v);
      try ra(ctx, @intCast(li), ids).get();
  }
@@ -2099,7 +2111,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// What crosses layers in `extend`: each span's stream and mix, the picks
  /// attention layers hand down, the DSpark main rows, and the Engram row ids.
  pub const Spans = struct {
-@@ -4173,6 +5344,9 @@
+@@ -4173,6 +5347,9 @@
      /// `[L]` bool, the chunk's rows inside an image span (none for text): they route by the VL bias and
      /// Engram leaves them untouched.
      img: A = none,
@@ -2109,7 +2121,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      /// A batch of states (`extendBatched`): span k is rows [offs[k], offs[k + 1]), each its own width.
      offs: []const usize = &.{},
      fn bounds(sp: *const Spans, k: usize) [2]usize {
-@@ -4249,7 +5423,7 @@
+@@ -4249,7 +5426,7 @@
  pub const region_rows = 16;
  /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
  /// barrier, cut where `ffn` has no fusable op across the cut.
@@ -2118,7 +2130,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  const LayerRegions = struct {
      m: *Dsv41Model,
      li: usize,
-@@ -4283,8 +5457,19 @@
+@@ -4283,8 +5460,19 @@
      const in = mlx.mlx_vector_array_new_data(args.ptr, args.len);
      defer _ = mlx.mlx_vector_array_free(in);
      var res = mlx.mlx_vector_array_new();
@@ -2140,7 +2152,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
      for (out, 0..) |*o, i| {
          var x = mlx.mlx_array_new();
          o.* = try sc.res(mlx.mlx_vector_array_get(&x, res, i), &x);
-@@ -4357,6 +5542,15 @@
+@@ -4357,6 +5545,15 @@
                      const ro = if (mlx.getShape(a[4]).len == 2) a[4] else try rowSum(&sc, a[4]);
                      res.* = mlx.mlx_vector_array_new_data(&.{try hcExpand(&sc, a[0], try withShared(&sc, m, ly, a[3], ro), &sp)}, 1);
                  },
@@ -2156,7 +2168,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
              }
          }
      };
-@@ -4946,7 +6140,7 @@
+@@ -4946,7 +6143,7 @@
          const all = try gpa.alloc(u32, R);
          defer gpa.free(all);
          for (chunks, 0..) |ch, k| @memcpy(all[offs[k]..offs[k + 1]], ch);
@@ -2165,7 +2177,16 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
          for (0..N) |k| {
              const lo, const hi = sp.bounds(k);
              hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, lo, hi), 1), &.{ ci(hi - lo), ci(c.dsv4_hc_mult), ci(c.hidden_size) }));
-@@ -5137,12 +6331,152 @@
+@@ -4976,7 +6173,7 @@
+     defer gpa.free(rows);
+     for (rows, 0..) |*h, k| h.* = try hcCollapse(&sc, sp.xs[k], sp.pres[k]);
+     // A tensor rank past 0 holds no head: its last streams stand in for the logits.
+-    const logits = if (m.head.w.ctx == null) try sc.astype(try sc.concat(rows, 0), .float32) else try sc.astype(try m.head.apply(&sc, try sc.rms(try sc.concat(rows, 0), m.norm, c.rms_norm_eps)), .float32);
++    const logits = if (!hlog.projects(m.head)) try sc.astype(try sc.concat(rows, 0), .float32) else try sc.astype(try m.head.apply(&sc, try sc.rms(try sc.concat(rows, 0), m.norm, c.rms_norm_eps)), .float32);
+     var ev: std.ArrayList(A) = .empty;
+     defer ev.deinit(gpa);
+     try ev.append(gpa, logits);
+@@ -5137,12 +6334,152 @@
      defer m.ds_draft_ns = @intCast((monoUs() - t0) * 1000);
      return draftRows(m, gpa, st, t1, false);
  }
@@ -2321,7 +2342,7 @@ diff -ruN -x .generated a/plugins/deepseek_v41/deepseek_v41.zig b/plugins/deepse
  /// `dsparkDraft` of each of `states` from its committed token `t1s[k]`, into `out[k]` (each owned by the caller): the
  /// stages run once over every state's block, attention per state against its own window of committed main rows, and
  /// the Markov chain steps every state's row at once. `keep_logits` also copies the Markov-biased rows to the host.
-@@ -5160,7 +6494,11 @@
+@@ -5160,7 +6497,11 @@
      for (t1s, 0..) |t1, k| for (0..B) |j| {
          ids[k * B + j] = @intCast(if (j == 0) t1 else c.dsv4_dspark_noise_token_id);
      };

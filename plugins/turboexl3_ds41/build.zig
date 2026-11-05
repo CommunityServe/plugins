@@ -101,6 +101,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(comp_once).step);
+    // Whether a chunk's logits go through the LM head (src/head_logits.zig, patches/turboexl3-model.patch): an EXL3 head
+    // (no `w`) is applied, only a head with neither is a tensor rank's, MLX-free.
+    const head_logits = b.addTest(.{ .name = "head_logits", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/head_logits.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(head_logits).step);
     // The streamed bank's bill calibrated against the box's measured peaks (src/bill_cal.zig,
     // patches/turboexl3-model.patch): the setting, the measured conditions, the tables' points and interpolation, and
     // the 2.81 pack's rows at the 16K and 256K cells against the calibration model, MLX-free.
