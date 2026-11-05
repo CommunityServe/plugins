@@ -114,6 +114,9 @@ pub const bill_pin = @import("src/bill_pin.zig");
 /// The streamed bank's decode bill with a decode phase's runtime floor (`MLX_SERVE_DSV41_DECODE_FLOOR`,
 /// src/decode_floor.zig): the generated bill's `decode_floor` hook.
 pub const decode_floor = @import("src/decode_floor.zig");
+/// The streamed bank's bill calibrated against the box's measured peaks (`MLX_SERVE_DSV41_BILL_CAL`, src/bill_cal.zig):
+/// the generated bill's `cal` hook.
+pub const bill_cal = @import("src/bill_cal.zig");
 /// A wide prompt layer followed by another wide one committed at its end, not waited for (`MLX_SERVE_DSV41_REST_ASYNC`,
 /// src/rest_async.zig), read by the copied model.
 pub const rest_async = @import("src/rest_async.zig");
@@ -240,6 +243,37 @@ const v4plugin = @import("src/mlx_serve/plugins/deepseek_v4/plugin.zig");
 const rounds = @import("src/rounds.zig");
 const stage_prof = @import("src/stage_prof.zig");
 const bill = @import("src/mlx_serve/plugins/deepseek_v41/bill.zig");
+/// MLX_SERVE_DSV41_BILL_CAL: src/bill_cal.zig's terms as the generated bill's `CalTerms`.
+fn calTerms(context: u64) bill.CalTerms {
+    const t = bill_cal.terms(context);
+    return .{ .margin = t.margin, .wp = t.wp, .wd = t.wd };
+}
+extern "c" fn _NSGetArgc() *c_int;
+extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*anyopaque, newlen: usize) c_int;
+extern "c" fn _NSGetArgv() *[*][*:0]u8;
+var cal_chip_buf: [128]u8 = undefined;
+/// MLX_SERVE_DSV41_BILL_CAL's conditions as this server has them: the server's `--prefill-chunk` (its command line; null
+/// when not given), MLX_SERVE_CACHE_LIMIT in bytes (null when unset or not a whole number), hw.memsize, the chip
+/// (machdep.cpu.brand_string) and iogpu.wired_limit_mb (null where a reading fails).
+fn calConditions() bill_cal.Conditions {
+    var c: bill_cal.Conditions = .{ .prefill_chunk = null, .cache_limit = null, .memsize = null, .chip = null, .wired_limit_mb = null };
+    const argc: usize = @intCast(_NSGetArgc().*);
+    const argv = _NSGetArgv().*;
+    var i: usize = 1;
+    while (i + 1 < argc) : (i += 1) {
+        if (std.mem.eql(u8, std.mem.span(argv[i]), "--prefill-chunk")) c.prefill_chunk = std.fmt.parseInt(u64, std.mem.span(argv[i + 1]), 10) catch null;
+    }
+    if (env.span(.MLX_SERVE_CACHE_LIMIT)) |v| c.cache_limit = std.fmt.parseInt(u64, std.mem.trim(u8, v, " "), 10) catch null;
+    var mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    if (sysctlbyname("hw.memsize", &mem, &len, null, 0) == 0) c.memsize = mem;
+    len = cal_chip_buf.len;
+    if (sysctlbyname("machdep.cpu.brand_string", &cal_chip_buf, &len, null, 0) == 0 and len > 0) c.chip = std.mem.sliceTo(cal_chip_buf[0..len], 0);
+    var wl: u64 = 0;
+    len = @sizeOf(u64);
+    if (sysctlbyname("iogpu.wired_limit_mb", &wl, &len, null, 0) == 0) c.wired_limit_mb = wl;
+    return c;
+}
 const shims = @import("src/host_shims.zig");
 const t3kit = @import("turboexl3_kit");
 
@@ -324,6 +358,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     bill.decode_floor = decode_floor.floor();
+    // MLX_SERVE_DSV41_BILL_CAL: the calibrated budget the bill reads at the bank's open (=0: the bill as before).
+    bill_cal.configure(env.span(.MLX_SERVE_DSV41_BILL_CAL), calConditions()) catch |e| {
+        log.err("[turboexl3_ds41] MLX_SERVE_DSV41_BILL_CAL is neither 0 nor 1 (unset: on): the load is refused\n", .{});
+        out.* = switch (e) {
+            inline else => |x| Verdict.refuse(.unsupported, "turboexl3_ds41: " ++ @errorName(x)),
+        };
+        return null;
+    };
+    bill.cal = if (bill_cal.on()) &calTerms else null;
     // MLX_SERVE_DSV41_BUFFER_MB: the prompt's split through the host's HostGpu.command_buffer_limits (null on a host
     // without the entry); a user's MLX_MAX_MB_PER_BUFFER wins.
     buffer_mb.configure(env.span(.MLX_SERVE_DSV41_BUFFER_MB), env.span(.MLX_MAX_MB_PER_BUFFER), kit.host.Host.of(ctx.host) catch null) catch |e| {
@@ -1039,6 +1082,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     {
         var df_buf: [512]u8 = undefined;
         log.info("{s}", .{decode_floor.loadLine(&df_buf)});
+    }
+    {
+        var bc_buf: [512]u8 = undefined;
+        log.info("{s}", .{bill_cal.loadLine(&bc_buf)});
     }
     switch (transient_keep.mode) {
         .off => log.info("[turboexl3_ds41] wide prompt layers' attention projections' outputs freed at the layer's teardown (MLX_SERVE_DSV41_TRANSIENT_KEEP=0)\n", .{}),

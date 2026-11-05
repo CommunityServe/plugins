@@ -1400,6 +1400,22 @@ M5-class GPUs (NAX) only; any other GPU is refused by name at load.
   served at a 99.50 GiB peak (mf281c, w-20261104-1515). Speed, a = without, b = with, at 16K on the 2.81 pack, every text
   the same bytes in every arm: rmp1 (pio, w-pio-20261104-1311) cold prefill -0.80% (pairs -1.25%, -0.35%), new text
   -0.17% (+0.08%, -0.43%); rmc1 (cells, w-20261104-1319) card decode +0.61%, greedy -0.26%, the card's cold prefill 0.00%.
+- `MLX_SERVE_DSV41_BILL_CAL` (src/bill_cal.zig, the generated bill's `cal` hook in
+  patches/turboexl3-zzzza6-bill-cal.patch; on by default, `=0` the bill as before): the streamed bank's bill calibrated
+  against measured peaks (8 windows, 172 servers: the load's non-bank memory a constant per pack, the prompt's and
+  decode's working sets the same on every pack). Each phase's budget is MLX's recommended working set less 410 MiB, the
+  memory in use (a window's live pin) and the phase's measured working set at the context (prompt 12.32 GiB for one 16K
+  call up to 13.60 at 256K; decode 0.16 GiB at 1K up to 2.58 at 256K), so the box's non-file baseline plus the server's
+  peak lands 1.5 GiB under the guard's 112 GiB (410 MiB is 1.5 GiB less the live reading's smallest over-read of that
+  sum, 1.1 GiB). The wired margin, the host's, the Engram LRU's and the decode stop's terms drop out: they are inside what
+  was measured. On only under the calibration's conditions (`--prefill-chunk 16384`, MLX_SERVE_CACHE_LIMIT 2 GiB, an
+  Apple M5 Max with 128 GB, a 112 GiB wired limit), else the bill as before and a load line naming what differs.
+  `[bank-bill]` gains `cal=` and the bank-open readings `self_mb`, `spec_mb` and `purg_mb`. Read as cv281v and the
+  calibrated ladder (M5 Max, 2026-11-04, every pack 1K-256K in 13 windows, each on its own live pin): every server's peak
+  within -0.14/+0.20 GiB of its prediction, the baseline plus the server's peak at most 110.46 GiB (the guard's own
+  sampled peak up to 111.8 GiB: the box's non-file above that sum at some second, under study); the 2.81 pack's texts
+  the same bytes as before at every size. Rows (prompt / decode) at 16K and 256K, baselines 11.0-12.3 GiB: 2.81
+  146/183 and 144/179, 2.25 200/247 and 197/240, 1.68 267/324 and 263/316, 2.68 160/199 and 158/195.
 
 ## The pack
 

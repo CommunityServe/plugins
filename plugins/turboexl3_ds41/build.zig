@@ -117,6 +117,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(comp_once).step);
+    // The streamed bank's bill calibrated against the box's measured peaks (src/bill_cal.zig, the patch
+    // turboexl3-zzzza6-bill-cal): the setting, the measured conditions, the tables' points and interpolation, and the 2.81
+    // pack's rows at the 16K and 256K cells against the calibration model, MLX-free.
+    const bill_cal = b.addTest(.{ .name = "bill_cal", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/bill_cal.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(bill_cal).step);
     // MLX_SERVE_DSV41_DIRECT_PARTS's byte gate: the copied read pool's C file alone (no MLX) reading the pack's record
     // layout through the PARTS route and the staging route, the same slot bytes (src/direct_parts_test.zig).
     const parts_gate = b.addTest(.{ .name = "direct_parts", .root_module = b.createModule(.{
