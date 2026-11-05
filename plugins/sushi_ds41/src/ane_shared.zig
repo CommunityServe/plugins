@@ -20,9 +20,12 @@ const dim = sc_mod.dim;
 const ci = sc_mod.ci;
 
 const kit = @import("mlx_serve");
-const HostAne = kit.abi.host.HostAne;
-const Bank = kit.abi.host.AneBank;
-const Mlp = kit.abi.host.AneBankProgram;
+/// Whether the kit carries the host's Neural Engine table (mlx-serve after ddalcu/mlx-serve#1083; the 26.11.1 release
+/// kit has none). Without it the entry points below compile to "off" and nothing that names the table is analyzed.
+pub const supported = @hasDecl(kit.abi.host, "HostAne");
+const HostAne = if (supported) kit.abi.host.HostAne else opaque {};
+const Bank = if (supported) kit.abi.host.AneBank else opaque {};
+const Mlp = if (supported) kit.abi.host.AneBankProgram else opaque {};
 
 pub const max_units = 2;
 
@@ -218,6 +221,11 @@ pub const AneState = struct {
 /// Reads `SUSHI_DS41_ANE_SHARED` (1 or 2 units) and builds the programs on the host's Neural Engine (`host`, the
 /// load's `LoadCtx.host`). No ANE on this host, or a failure, leaves the GPU path serving.
 pub fn setAneShared(m: *dsv.Model, host: ?*const anyopaque) void {
+    if (std.c.getenv("SUSHI_DS41_ANE_SHARED") == null) return;
+    if (comptime supported) setOnHost(m, host) else log.warn("[sushi_ds41] ane shared: off (built against a kit without Host.ane)\n", .{});
+}
+
+fn setOnHost(m: *dsv.Model, host: ?*const anyopaque) void {
     const raw = std.c.getenv("SUSHI_DS41_ANE_SHARED") orelse return;
     const units = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 1;
     const ane = blk: {
@@ -234,6 +242,10 @@ pub fn setAneShared(m: *dsv.Model, host: ?*const anyopaque) void {
 }
 
 pub fn deinit(m: *dsv.Model, st: *AneState) void {
+    if (comptime supported) deinitOnHost(m, st) else unreachable; // `setAneShared` never sets `Model.ane` without the table.
+}
+
+fn deinitOnHost(m: *dsv.Model, st: *AneState) void {
     for (st.planes) |a| if (a.ctx != null) {
         _ = mlx.mlx_array_free(a);
     };
@@ -422,6 +434,10 @@ fn layerOut(m: *const dsv.Model, out: A) !void {
 /// runs the routed ones. Evaluated, or submitted under the prefill pipeline (`layerOut`). Null where the ANE does not
 /// take this layer (the GPU path serves).
 pub fn moe(sc: *Scope, m: *const dsv.Model, st: *AneState, li: usize, ly: *const dsv.Layer, h: A, hk: dsv.Experts.Hook, r: kernels.Routes, ride: []const A) !?A {
+    if (comptime supported) return moeOnHost(sc, m, st, li, ly, h, hk, r, ride) else unreachable; // as `deinit`
+}
+
+fn moeOnHost(sc: *Scope, m: *const dsv.Model, st: *AneState, li: usize, ly: *const dsv.Layer, h: A, hk: dsv.Experts.Hook, r: kernels.Routes, ride: []const A) !?A {
     const rows = dim(h, 0);
     if (st.disabled or m.tap != null or li >= st.layers or rows != st.chunk_rows) return null;
     if (li == 0) {
