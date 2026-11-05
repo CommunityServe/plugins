@@ -15,6 +15,7 @@
 const std = @import("std");
 const testing = std.testing;
 const a4k = @import("mlx_serve/sdk/weights/streamed/expert/a4k.zig");
+const io = @import("mlx_serve/sdk/weights/streamed/sdk_ext/expert/io.zig");
 
 // a4k.zig's own tests (its geometry at DeepSeek-V4.1's records, the order's permutation) run with these.
 test {
@@ -612,10 +613,10 @@ test "a4k real-file gate (A4K_GATE_PACKS=<classic pack>:<a4k pack>): the two pac
     try testing.expect(n_records >= 2 * ne);
 }
 
-// The read pool's order on disk from the bank (`a4k.poolDiskOrder`, which the stream's `Stream.init` sets
-// `pool_opt.disk_order` from): an a4k bank hands the pool its components in their file order, so `Records.onDisk` lays
-// each record's rows and lengths out as the file holds them; without it every a4k record's parts land in the wrong
-// slot rows.
+// The read pool's order on disk from the bank (`a4k.poolDiskOrder`, through `io.poolOptions`, whose value the stream's
+// `Stream.init` starts its pool on): an a4k bank hands the pool its components in their file order, so
+// `Records.onDisk` lays each record's rows and lengths out as the file holds them; without it every a4k record's parts
+// land in the wrong slot rows.
 const A4kBank = struct {
     pub fn diskOrder(_: *const @This()) ?[a4k.n_components]u8 {
         return a4k.disk_order;
@@ -637,13 +638,18 @@ test "a4k: an a4k bank's order on disk reaches the read pool's options; a classi
     try testing.expect(a4k.poolDiskOrder(HooklessBank, &.{}, max_disk_components) == null);
 }
 
-test "a4k: the stream's pool options take the bank's order on disk (Stream.init sets pool_opt.disk_order from it)" {
-    const src = @embedFile("mlx_serve/sdk/weights/streamed/sdk_ext/expert/stream.zig");
-    const at = std.mem.indexOf(u8, src, "pub fn init(a: std.mem.Allocator, bank: *const B.Bank, opt: Options) !*Stream {") orelse
-        return error.TestStreamInitMissing;
-    const start = std.mem.indexOfPos(u8, src, at, "const pool = try expert_io.Pool.start(a, pool_opt);") orelse
-        return error.TestPoolStartMissing;
-    const set = "if (a4k.poolDiskOrder(B.Bank, bank, expert_io.max_disk_components)) |order| pool_opt.disk_order = order;";
-    const i = std.mem.indexOfPos(u8, src, at, set) orelse return error.TestDiskOrderNotSet;
-    try testing.expect(i < start);
+test "a4k: the read pool's options for a bank: an a4k bank's order on disk, a classic bank's none, the rest as given" {
+    // The stream's pool options as it builds them (its default `pool`, a staging size, a lookahead's spec, a block).
+    const base: io.Options = .{ .tickets = 1024 };
+    const d: io.Derived = .{ .staging_bytes = 3 << 20, .spec = .{ .threads = 2, .slots = 8, .record_bytes = 70_000, .chunk_bytes = 16_384, .idle_busy = 0 }, .parts_block = 4096 };
+    var want = base;
+    want.staging_bytes = d.staging_bytes;
+    want.spec = d.spec;
+    want.parts_block = d.parts_block;
+    try testing.expectEqualDeep(want, io.poolOptions(ClassicBank, &.{}, base, d));
+    try testing.expectEqualDeep(want, io.poolOptions(HooklessBank, &.{}, base, d));
+    var order: [io.max_disk_components]u8 = @splat(0);
+    @memcpy(order[0..a4k.n_components], &a4k.disk_order);
+    want.disk_order = order;
+    try testing.expectEqualDeep(want, io.poolOptions(A4kBank, &.{}, base, d));
 }

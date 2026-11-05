@@ -2392,7 +2392,16 @@ diff -ruN -x .generated a/sdk/weights/streamed/mimo/stream_source.zig b/sdk/weig
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weights/streamed/sdk_ext/expert/io.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/io.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/io.zig
-@@ -24,7 +24,12 @@
+@@ -17,6 +17,8 @@
+ const builtin = @import("builtin");
+ const io_util = @import("sdk").io_util;
+ const policy = @import("policy.zig");
++/// The a4k layout's order on disk (`poolOptions`: the pool's from the bank's).
++const a4k = @import("../../expert/a4k.zig");
+ // 1:1 mirror of lib/expert_io/q3_lookahead4.h. The C pool and the event shims compile on macOS graphs only (the host's
+ // `macos_engines` graphs: the macOS exe and tests); the Linux exe and the iOS lib get the refusing stand-ins, whose
+ // q3ld_abi answers 0 so Pool.start refuses before any read. A macOS artifact that does not link the C objects (the
+@@ -24,7 +26,12 @@
  const c = if (builtin.os.tag == .macos) struct {
      pub extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
      pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
@@ -2405,7 +2414,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
      pub extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
      pub extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
      pub extern fn q3ld_submit_scatter(n: i32, ngu: i32, ndown: i32, fds: [*]const i32, sizes: [*]const i64, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
-@@ -62,9 +67,18 @@
+@@ -62,9 +69,18 @@
      pub const abi = c;
      pub const status_words = res_w;
  } else struct {};
@@ -2427,7 +2436,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  pub const max_workers = 8;
  /// Records per job (one fill unit).
  pub const max_items = 8;
-@@ -78,7 +92,7 @@
+@@ -78,7 +94,7 @@
  /// down ticket per record of the widest route, its ids each of at most `max_items` minis.
  pub const max_gate_tickets = 2 * policy.max_route_ids * max_items;
  /// Status words per ticket (`Result`'s fields, in order).
@@ -2436,7 +2445,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  pub const spec_state_w = 11;
  pub const pre_state_w = 5;
  /// `q3ld_submit` reads -1 as no deadline; 0 would expire every range at once.
-@@ -95,6 +109,12 @@
+@@ -95,6 +111,12 @@
      t_start_ns: i64,
      t_end_ns: i64,
      worker: i64,
@@ -2449,7 +2458,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  };
  /// The pool's counter words (q3_lookahead4_exl3.c `SC_*`), written under its
  /// mutex; the h_* entries are the first of four horizon classes.
-@@ -156,8 +176,22 @@
+@@ -156,8 +178,22 @@
      ev_host_released = 69,
      ev_stop_released = 70,
      direct_ranges = 71,
@@ -2473,7 +2482,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
  /// read by `threads` threads in `chunk_bytes` preadv steps.
  pub const Spec = struct {
-@@ -182,8 +216,18 @@
+@@ -182,8 +218,38 @@
      /// range: the owner proves the alignment once at construction (`checkDirectBlock` + the stream's
      /// `checkDirectReads`), so the uncached preadv takes the drive's direct path.
      direct: bool = false,
@@ -2489,10 +2498,30 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
  };
 +/// The most components a record of a bank with its own order on disk (`Options.disk_order`) has.
 +pub const max_disk_components = 16;
++/// What a stream derives for its pool from the bank and its own options (`poolOptions`).
++pub const Derived = struct {
++    /// the staging buffer's bytes (the bank's largest range, or the stream's `pool.staging_bytes`)
++    staging_bytes: u64,
++    /// the lookahead's speculative reads (null without a lookahead)
++    spec: ?Spec,
++    /// the PARTS route's file block (0: off)
++    parts_block: u64,
++};
++/// The read pool's `Pool.start` options for `bank`: `base` (the stream's `pool`) with what the stream derived (`d`) and
++/// the bank's order on disk (`a4k.poolDiskOrder`: an a4k bank's, so `Records.onDisk` lays each record out in the file's
++/// order; a classic bank, or a bank type without the hook, keeps `base`'s). The stream starts its pool on this value.
++pub fn poolOptions(comptime Bank: type, bank: *const Bank, base: Options, d: Derived) Options {
++    var o = base;
++    o.staging_bytes = d.staging_bytes;
++    o.spec = d.spec;
++    o.parts_block = d.parts_block;
++    if (a4k.poolDiskOrder(Bank, bank, max_disk_components)) |order| o.disk_order = order;
++    return o;
++}
  /// A speculative staging slot: the page-rounded record plus two pages.
  pub fn slotBytes(record_bytes: u64, page: u64) u64 {
      return std.mem.alignForward(u64, record_bytes, page) + 2 * page;
-@@ -282,6 +326,8 @@
+@@ -282,6 +348,8 @@
      /// Demand's tickets end here.
      demand_tickets: u32 = 0,
      record_bytes: u64 = 0,
@@ -2501,7 +2530,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
      /// Starts the process's pool (the speculative class, when given, is
      /// configured first). Staging, status words, counters and the log live
      /// here and stay put until `stop`.
-@@ -291,8 +337,9 @@
+@@ -291,8 +359,9 @@
              return error.InvalidOptions;
          if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
              s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
@@ -2512,7 +2541,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
          const self = try allocator.create(Pool);
          errdefer allocator.destroy(self);
          const staging = try std.posix.mmap(null, @intCast(opt.workers * opt.staging_bytes), .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-@@ -306,8 +353,7 @@
+@@ -306,8 +375,7 @@
          @memset(res, 0);
          @memset(log_arr, 0);
          @memset(published, false);
@@ -2522,7 +2551,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
          var bufs: [max_spec]u64 = undefined;
          var threads: i32 = 0;
          var slot_bytes: u64 = 0;
-@@ -327,6 +373,7 @@
+@@ -327,6 +395,7 @@
              return error.PoolUnavailable;
          if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
          if (c.q3ld_direct_config(@intFromBool(opt.direct)) != 0) return error.PoolUnavailable;
@@ -2530,7 +2559,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
          var ptrs: [max_workers]u64 = undefined;
          for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
          const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
-@@ -334,6 +381,29 @@
+@@ -334,6 +403,29 @@
          if (rc != 0) return if (rc == -1) error.PoolUnavailable else error.PoolStart;
          return self;
      }
@@ -2560,7 +2589,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
      /// After the owned consumers settle: expire unbound reads and wait for the pool's activity to stop.
      /// Ready speculative records and their tags stay intact. A timeout refuses the phase change.
      pub fn quiesce(self: *Pool, timeout_ns: i64) error{ InvalidTimeout, Timeout }!void {
-@@ -433,7 +503,7 @@
+@@ -433,7 +525,7 @@
      }
      pub fn result(self: *const Pool, ticket: u32) Result {
          const w = self.res[@as(usize, ticket) * res_w ..][0..res_w];
@@ -2569,7 +2598,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
      }
      /// Tickets in publication order for log positions [from, to).
      pub fn logOrder(self: *const Pool, from: i64, to: i64, out: []u32) []u32 {
-@@ -481,6 +551,14 @@
+@@ -481,6 +573,14 @@
      return struct {
          /// One record's destinations, a row address per component.
          pub const Rows = [components]u64;
@@ -2584,7 +2613,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
          /// One submit: `rows.len` records, every gate/up span (`gu_offsets`, `gate_up` parts) then every down span, each
          /// part `lens[c]` bytes into `rows[i][c]`, each span a job of its own (idle workers read them side by side, each
          /// its own status). Returns the first of its 2n tickets.
-@@ -519,13 +597,15 @@
+@@ -519,13 +619,15 @@
              const first = pool.claimTickets(lo, hi, next, count);
              var offsets: [2 * max_items]i64 = undefined;
              var row_ptrs: [max_items][*]const u64 = undefined;
@@ -2602,7 +2631,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/io.zig b/sdk/weigh
              try submitted(pool, first, count, c.q3ld_submit(fd.fd, @intCast(fd.size), no_deadline, @intCast(n), gate_up, components - gate_up, &offsets, &row_ptrs, &lens_i, first), next);
              return first;
          }
-@@ -542,17 +622,15 @@
+@@ -542,17 +644,15 @@
          /// Arms the pre-read class with one geometry's component lengths (needs the speculative class). The pool
          /// binds a demand range to a pre-range only at this topology and these lengths.
          pub fn armPreRead(pool: *Pool, lens: *const Rows) !void {
@@ -2927,12 +2956,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/policy.zig b/sdk/w
 diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/weights/streamed/sdk_ext/expert/stream.zig
 --- a/sdk/weights/streamed/sdk_ext/expert/stream.zig
 +++ b/sdk/weights/streamed/sdk_ext/expert/stream.zig
-@@ -7,9 +7,23 @@
- const mlx = @import("sdk").mlx;
- const expert = @import("../expert.zig");
- const expert_io = @import("io.zig");
-+/// The a4k layout's order on disk (`poolDiskOrder`: the read pool's from the bank's).
-+const a4k = @import("../../expert/a4k.zig");
+@@ -10,6 +10,18 @@
  const expert_policy = @import("policy.zig");
  const expert_lookahead = @import("lookahead.zig");
  const expert_routes = @import("routes.zig");
@@ -2951,7 +2975,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
  const log = @import("sdk").log;
  /// The route recorder (`expert.routes`) is a diagnostic: its hooks compile into profile builds (`sdk.plugin_profile`) and
  /// the tests only; a served build has no recorder branch on any route.
-@@ -36,10 +50,24 @@
+@@ -36,10 +48,24 @@
          pub fn miniStride(l: *const Layer) u64 {
              return if (comptime @hasField(Layer, "minis")) l.record_bytes else 0;
          }
@@ -2978,7 +3002,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          /// The most records a routed id may have (a read job holds `expert_io.max_items` records).
          pub const max_minis = expert_io.max_items;
          /// The most records any layer's routed id has.
-@@ -241,6 +269,9 @@
+@@ -241,6 +267,9 @@
              }
          };
          extern fn dsv41_alloc_uninit(out: *mlx.mlx_array, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int;
@@ -2988,7 +3012,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          /// MLX's allocated bytes (MLX slot memory only: the first read creates the Metal device).
          pub fn mlxActive() u64 {
              var n: usize = 0;
-@@ -275,6 +306,18 @@
+@@ -275,6 +304,18 @@
              base: [n_components]u64 = @splat(0),
              row_bytes: [n_components]u64 = @splat(0),
              backing: union(enum) { none, host: HostSlotRows, mlx: LayerSlotBank } = .none,
@@ -3007,7 +3031,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The bytes these rows allocated on `layer`'s geometry (`arrayBytes` per component, the bank's floor
              /// included): what their free returns.
              fn allocBytes(self: *const Rows, layer: *const Layer) u64 {
-@@ -400,12 +443,21 @@
+@@ -400,12 +441,21 @@
              /// A decode plan's transient loads number at most its distinct ids (`LayerPolicy.planWith`), so a caller whose
              /// decode routes never exceed it never writes past the window.
              decode_route_ids: u32 = 0,
@@ -3029,7 +3053,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The pool's staging buffers sized from the bank (`stagingBytes`: its widest gate/up or down span,
              /// page-rounded, plus a page of alignment) in place of `pool.staging_bytes`. A pre-read range must fit one
              /// buffer, so a bank whose spans exceed the pool's default needs it.
-@@ -444,6 +496,9 @@
+@@ -444,6 +494,9 @@
              prompt_relocate: bool = false,
              /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
              tally: ?Tally = null,
@@ -3039,7 +3063,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          };
          /// The rate tally's settings (`expert.tally.Settings`) and the stream's geometry: each stream layer pins at most
          /// floor(`ratio` x its experts) experts, the rate's half-life `window` decode routes of the layer.
-@@ -458,6 +513,189 @@
+@@ -458,6 +511,189 @@
          /// a fill. Exact either way: a row is read only through a slot whose meta says its record landed (`SlotMeta.state`), and
          /// every record lands by its read into the row before that state is set.
          pub const GrowFill = enum { zeros, unfilled };
@@ -3229,7 +3253,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          /// What the reverse phase change (`Stream.shrink`) leaves in the prompt rows for the next prompt: `forget` (no resident,
          /// as at construction) or `keep` (the residents decode left there, their bytes and meta as their reads landed). The
          /// rows themselves are the same either way.
-@@ -483,6 +721,10 @@
+@@ -483,6 +719,10 @@
              tau: f32 = std.math.inf(f32),
              /// Records read ahead per layer call; 2 x budget staging slots.
              budget: u32 = 2,
@@ -3240,7 +3264,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// Chunks per speculative record: 1, 2, 4 or 8.
              chunks: u32 = 4,
              /// Speculative threads >= 1 start a chunk only while at most this many
-@@ -548,6 +790,9 @@
+@@ -548,6 +788,9 @@
              ticket: u32 = 0,
              n_reads: u32 = 0,
              settled: bool = false,
@@ -3250,7 +3274,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
          };
          pub const Route = struct {
              layer: u32 = 0,
-@@ -568,6 +813,11 @@
+@@ -568,6 +811,11 @@
              gates: ?Gates = null,
              /// Its record in the route recorder (`Stream.recorder`).
              rec: u32 = expert_routes.none,
@@ -3262,7 +3286,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              pub fn partsOf(r: *const Route) []const Part {
                  return r.parts[0..r.n_parts];
              }
-@@ -626,6 +876,8 @@
+@@ -626,6 +874,8 @@
              max_route_ids: u32,
              /// Decode's window 0 rows (`Options.decode_route_ids`, resolved): the widest decode route.
              decode_route_ids: u32,
@@ -3271,7 +3295,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              records_per_part: u32,
              wide_depth: u8 = 1,
              phase: Phase = .prefill,
-@@ -664,14 +916,22 @@
+@@ -664,14 +914,22 @@
              /// The lookahead's precision: the records read ahead for the next routed layer (their experts, the top-k
              /// position each was chosen at, the bank layer it is in) until that layer's call routes, then per bank layer
              /// and position the records read ahead and those the call routed (`by_rank`).
@@ -3294,7 +3318,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// Decode layer calls so far; a call's pre-reads and speculative records
              /// carry its tag, settled by its own step.
              clock: i64 = 0,
-@@ -704,6 +964,22 @@
+@@ -704,6 +962,22 @@
              p7: P7 = .{},
              p7_rows: []P7Row = &.{},
              ahead_job: []u8 = &.{},
@@ -3317,7 +3341,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// P1's read-ahead of one layer: `loads[0..n]` (expert, slot) in file order, `reads[i]` false when the
              /// slot still held the record; its pool jobs `parts[0..n_parts]` over them (a Route's tickets).
              const Ahead = struct {
-@@ -722,6 +998,24 @@
+@@ -722,6 +996,24 @@
                  /// Per job: landed (its reads waited, its rows' states set and unpinned).
                  landed: []bool,
              };
@@ -3342,30 +3366,54 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The second geometry's transient scratch: its rows, their meta and the layer whose geometry it has.
              const AltTransient = struct { rows: Rows, meta: []SlotMeta, layer: u32 };
              /// P7 overlap: one prompt call's schedule, from `planCall` to its last group's `releaseP7`.
-@@ -804,7 +1098,7 @@
+@@ -791,32 +1083,40 @@
+                 if (opt.event != null and opt.lookahead == null) return error.InvalidOptions;
+                 if (scatter and (opt.lookahead != null or opt.pool.direct)) return error.InvalidOptions;
+                 if (opt.event) |ev| if (ev.watchdog_ms < 50 or ev.watchdog_ms > 60_000) return error.InvalidOptions;
+-                var pool_opt = opt.pool;
+-                if (opt.staging_from_bank) pool_opt.staging_bytes = stagingBytes(bank);
++                const staging_bytes = if (opt.staging_from_bank) stagingBytes(bank) else opt.pool.staging_bytes;
++                var spec = opt.pool.spec;
+                 if (opt.lookahead) |la| {
+                     if (la.chunks == 0 or la.chunks > 8 or !std.math.isPowerOfTwo(la.chunks) or la.idle_busy > 1 or
+                         la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
+                     const page = std.heap.pageSize();
+                     const record = spanOf(&bank.layers[widest]);
+-                    pool_opt.spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
++                    spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
+                     // A pre-read range is the record's gate/up span or its down span,
+                     // back to back, each no larger than a staging buffer.
                      if (la.preread) for (bank.layers) |l| {
                          var gu: u64 = 0;
                          for (l.segments[0..gu_components]) |sg| gu += sg.length;
 -                        if (l.segments[0].offset != 0 or l.segments[gu_components].offset != gu) return error.MixedGeometry;
+-                        if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
 +                        if (downStart(&l) != guStart(&l) + gu) return error.MixedGeometry;
-                         if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
++                        if (gu > staging_bytes or l.logical_bytes - gu > staging_bytes) return error.InvalidOptions;
                      };
                  }
-@@ -817,6 +1111,13 @@
+                 // Direct reads: the file's block, every record's ranges and (below) every slot row aligned to it, once. A
+                 // pre-range starts before its plan names rows, so it stages: the route needs the pre-read off.
+                 var direct_block: u64 = 0;
+-                if (pool_opt.direct) {
++                if (opt.pool.direct) {
+                     if (opt.lookahead) |la| if (la.preread) return error.InvalidOptions;
+                     direct_block = expert_io.fileBlockSize(bank.sidecar) catch return error.DirectReadsBlock;
                      try expert_io.checkDirectBlock(direct_block, std.heap.pageSize());
                      try checkDirectReads(bank, direct_block);
                  }
 +                // The PARTS route (`Options.direct_parts`): the file's block, for the pool's per-read test of each part
 +                // (its file offset, length and row). Nothing else is checked here: a part off the block stages.
-+                if (opt.direct_parts and !pool_opt.direct) {
++                var parts_block = opt.pool.parts_block;
++                if (opt.direct_parts and !opt.pool.direct) {
 +                    const blk = expert_io.fileBlockSize(bank.sidecar) catch return error.DirectReadsBlock;
 +                    try expert_io.checkDirectBlock(blk, std.heap.pageSize());
-+                    pool_opt.parts_block = blk;
++                    parts_block = blk;
 +                }
                  var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
                  if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
                  errdefer if (selector) |*sel| sel.deinit(a);
-@@ -854,12 +1155,20 @@
+@@ -854,12 +1154,20 @@
                      ls.* = .{ .policy = policy, .base = base, .meta = meta, .lens = lens };
                      n_init += 1;
                  }
@@ -3388,16 +3436,17 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  errdefer if (alt_rows) |*x| x.deinit();
                  const alt_meta: []SlotMeta = if (alt_layer != null) try a.alloc(SlotMeta, opt.transient_rows) else &.{};
                  errdefer a.free(alt_meta);
-@@ -891,6 +1200,8 @@
+@@ -891,7 +1199,8 @@
                  const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts) else &.{};
                  errdefer if (ahead_job.len > 0) a.free(ahead_job);
                  @memset(ahead_job, no_job);
-+                // An a4k bank's records lie on disk in its own order: the pool lays their rows and lengths out in it.
-+                if (a4k.poolDiskOrder(B.Bank, bank, expert_io.max_disk_components)) |order| pool_opt.disk_order = order;
-                 const pool = try expert_io.Pool.start(a, pool_opt);
+-                const pool = try expert_io.Pool.start(a, pool_opt);
++                // The pool's options, whole: the stream's, what it derived, and an a4k bank's order on disk.
++                const pool = try expert_io.Pool.start(a, expert_io.poolOptions(B.Bank, bank, opt.pool, .{ .staging_bytes = staging_bytes, .spec = spec, .parts_block = parts_block }));
                  errdefer pool.stop();
                  if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);
-@@ -919,9 +1230,12 @@
+                 if (opt.event) |ev| {
+@@ -919,9 +1228,12 @@
                      .memory = opt.slot_memory,
                      .max_route_ids = opt.max_route_ids,
                      .decode_route_ids = if (opt.decode_route_ids == 0) opt.max_route_ids else opt.decode_route_ids,
@@ -3410,7 +3459,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      .preread = if (opt.lookahead) |la| la.preread else false,
                      .event_word = word,
                      .gated = opt.event != null,
-@@ -933,6 +1247,7 @@
+@@ -933,6 +1245,7 @@
                      .prompt_relocate = opt.prompt_relocate,
                      .p7_rows = p7_rows,
                      .ahead_job = ahead_job,
@@ -3418,7 +3467,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  };
                  // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
                  if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
-@@ -962,6 +1277,7 @@
+@@ -962,6 +1275,7 @@
                      a.free(x.meta);
                  }
                  a.free(self.geom_of);
@@ -3426,7 +3475,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  if (self.selector) |*sel| sel.deinit(a);
                  if (self.event_word) |w| a.destroy(w);
                  a.free(self.ahead.loads);
-@@ -1147,6 +1463,13 @@
+@@ -1147,6 +1461,13 @@
                      defer c.mutex.unlock(io);
                      while (c.done < seq) c.cond.waitUncancelable(io, &c.mutex);
                  }
@@ -3440,7 +3489,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              };
              /// `copies` (one promotion of `layer`, from the transient slots of `items`) handed to the copier; run here
              /// when it cannot take them.
-@@ -1363,6 +1686,9 @@
+@@ -1363,6 +1684,9 @@
                  const tag = self.clock + 1;
                  if (self.route_preread) try self.preRead(layer, ids, tag);
                  try self.flush();
@@ -3450,7 +3499,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  if (self.n_free == 0) return self.fail(error.RoutesExhausted);
                  self.n_free -= 1;
                  const r = &self.routes[self.free[self.n_free]];
-@@ -1391,7 +1717,13 @@
+@@ -1391,7 +1715,13 @@
                  self.copier.waitFor(self.copier.window_seq[window]);
                  r.* = .{ .layer = layer, .window = window };
                  const ls = &self.layers[layer];
@@ -3465,7 +3514,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  // A persistent load may take a row a promotion of this layer still writes.
                  if (r.plan.n_persistent > 0 and self.copier.thread != null) self.copier.waitFor(self.copier.layer_seq.items[layer]);
                  const plan = &r.plan;
-@@ -1399,14 +1731,20 @@
+@@ -1399,14 +1729,20 @@
                      s.* = ls.policy.slotOf(e).?;
                      self.locate(layer, s.*).meta.pins += 1;
                  }
@@ -3487,7 +3536,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      if (!held) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
                      m.pins = 1;
                  }
-@@ -1444,7 +1782,7 @@
+@@ -1444,7 +1780,7 @@
                  var bases: [expert_lookahead.max_candidates * max_minis]i64 = undefined;
                  var n: usize = 0;
                  for (misses) |e| for (0..minisOf(geom)) |m| {
@@ -3496,7 +3545,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      n += 1;
                  };
                  _ = B.Records.preRead(self.pool, self.bank.sidecar, tag, bases[0..n], &self.layers[layer].lens) catch
-@@ -1473,6 +1811,12 @@
+@@ -1473,6 +1809,12 @@
              pub fn lookaheadByRank(self: *const Stream) ByRank {
                  return self.by_rank;
              }
@@ -3509,7 +3558,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The records just read ahead for routed layer `routed` (`side`: each one's bank layer of it, null = 0).
              fn notePending(self: *Stream, routed: u32, experts: []const u16, ranks: []const u8, side: ?[]const u8) void {
                  self.ahead_pending_layer = routed;
-@@ -1491,7 +1835,11 @@
+@@ -1491,7 +1833,11 @@
                      const sel = &self.selector.?;
                      var chosen: [expert_lookahead.max_budget]u16 = undefined;
                      var ranks: [expert_lookahead.max_budget]u8 = undefined;
@@ -3522,7 +3571,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      if (comptime recording) if (self.recorder) |rec| rec.spec(r.rec, picked);
                      for (picked) |e| {
                          bases[n] = @intCast(self.bank.recordOffset(next, e));
-@@ -1503,6 +1851,13 @@
+@@ -1503,6 +1849,13 @@
                  _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
                      return self.fail(error.SpecRefused);
              }
@@ -3536,7 +3585,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// `speculate` for a bank of several bank layers per routed layer (`B.banks_per_layer`): the next routed
              /// layer's experts over all its bank layers, each checked against its own bank layer's residency, each record
              /// its bank layer's span (one step of records of different lengths).
-@@ -1523,7 +1878,9 @@
+@@ -1523,7 +1876,9 @@
                      }.f;
                      var chosen: [expert_lookahead.max_budget]u16 = undefined;
                      var ranks: [expert_lookahead.max_budget]u8 = undefined;
@@ -3547,7 +3596,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      if (comptime recording) if (self.recorder) |rec| rec.spec(r.rec, picked);
                      var side: [expert_lookahead.max_budget]u8 = undefined;
                      for (picked) |e| {
-@@ -1544,6 +1901,8 @@
+@@ -1544,6 +1899,8 @@
              /// tickets). Null when nothing is read.
              pub fn gate(self: *Stream, r: *Route) Error!?Gates {
                  std.debug.assert(self.gated and r.state == .live and r.gates == null);
@@ -3556,7 +3605,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  const n = r.n_parts;
                  if (n == 0) return null;
                  const lo = self.gate_value;
-@@ -1675,6 +2034,8 @@
+@@ -1675,6 +2032,8 @@
              /// still be reading): the gate/up kernels of its records can run.
              pub fn waitGu(self: *Stream, r: *Route, part: u32) Error!void {
                  const p = &r.parts[part];
@@ -3565,7 +3614,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  if (p.settled) return;
                  self.waitReads(p.ticket, p.n_reads) catch |e| return self.fail(e);
                  for (0..p.n_reads) |i| {
-@@ -1692,6 +2053,8 @@
+@@ -1692,6 +2051,8 @@
                  return self.settle(r, &r.parts[part]);
              }
              fn settle(self: *Stream, r: *Route, p: *Part) Error!void {
@@ -3574,7 +3623,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  if (p.settled) return;
                  const count = 2 * p.n_reads;
                  const waited = self.waitReads(p.ticket, count);
-@@ -1733,14 +2096,29 @@
+@@ -1733,14 +2094,29 @@
              /// the call's plans (`planCall`: `p7Tail`), or for the layer's await (every record then). `whole` and
              /// `whole_trim`: every record now (`whole_trim` withdraws the jobs still queued at the plans: `p7Withdraw`).
              pub fn readAheadSeed(self: *Stream, layer: u32, experts: []const u16) !void {
@@ -3605,7 +3654,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  // The rows live routes of the layer serve from and the deferred base call's are never a read-ahead's victims
                  // (as a plan beside them holds them): their records are being read by a wave.
                  const held_set = &self.held_scratch;
-@@ -1879,6 +2257,537 @@
+@@ -1879,6 +2255,537 @@
                  for (ah.loads[p.first..][0..p.n]) |l| self.locate(ah.layer, l.slot).meta.pins -= 1;
                  if (failure) |e| return self.fail(e);
              }
@@ -4143,7 +4192,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// Whether read-ahead job `j` has landed or its reads have all completed (never blocks).
              fn aheadJobDone(self: *Stream, j: u32) bool {
                  const ah = &self.ahead;
-@@ -2345,6 +3254,14 @@
+@@ -2345,6 +3252,14 @@
                  for (self.layers) |*ls| _ = ls.policy.forgetPrompt();
                  return n;
              }
@@ -4158,7 +4207,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              /// The usage profile's route counting on (`LayerPolicy.count_routes`), once at construction: each decode route
              /// counts its experts into the request's counts even without the rate tally (`addUsage` reads them).
              pub fn countRoutes(self: *Stream) void {
-@@ -2463,11 +3380,18 @@
+@@ -2463,11 +3378,18 @@
                  if (self.failed) return error.StreamFailed;
                  if (self.transient_released) return error.TransientAlreadyReleased;
                  if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
@@ -4177,7 +4226,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  const before = if (self.memory == .mlx) mlxActive() else 0;
                  self.transient.deinit();
                  self.allocator.free(self.transient_meta);
-@@ -2479,7 +3403,7 @@
+@@ -2479,7 +3401,7 @@
                  }
                  self.transient_released = true;
                  self.wide_depth = 1;
@@ -4186,7 +4235,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      self.failed = true;
                      return error.TransientStillReferenced;
                  }
-@@ -2489,6 +3413,22 @@
+@@ -2489,6 +3411,22 @@
              /// `decode_rows` (the added rows empty, residents unmoved); routes are
              /// decode routes from here on. Needs every route released and the scratch released first: decode's window 0
              /// (plus `decode_staging_rows`) is allocated here, before the added rows.
@@ -4209,7 +4258,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              pub fn grow(self: *Stream, decode_rows: []const u32) !void {
                  self.settleCopies();
                  if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
-@@ -2496,7 +3436,14 @@
+@@ -2496,7 +3434,14 @@
                  if (self.failed) return error.StreamFailed;
                  if (self.release_installed and !self.transient_released) return error.TransientNotReleased;
                  if (decode_rows.len != self.layers.len) return error.InvalidRows;
@@ -4224,7 +4273,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  try self.flush();
                  for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
                  if (self.held_base.items.len > 0) return error.RoutesLive;
-@@ -2516,14 +3463,19 @@
+@@ -2516,14 +3461,19 @@
                      w.deinit();
                      a.free(alt_meta0);
                  };
@@ -4247,7 +4296,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                              .zeros => try Rows.init(geom, n0, self.memory),
                              .unfilled => try Rows.initUnfilled(geom, n0, self.memory),
                          };
-@@ -2539,8 +3491,10 @@
+@@ -2539,8 +3489,10 @@
                  defer a.free(exts);
                  @memset(exts, null);
                  errdefer for (exts) |*e| if (e.*) |*rows| rows.deinit();
@@ -4260,7 +4309,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                          .zeros => try Rows.initLazy(geom, rows - ls.policy.capacity, self.memory),
                          .unfilled => try Rows.initUnfilled(geom, rows - ls.policy.capacity, self.memory),
                      };
-@@ -2565,6 +3519,8 @@
+@@ -2565,6 +3517,8 @@
                      ls.ext = e.*;
                      e.* = null;
                      ls.policy.grow(rows) catch unreachable;
@@ -4269,7 +4318,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      // The tally's pins at decode's capacity, once per request (a route never re-ranks them).
                      ls.policy.refreshPins();
                  }
-@@ -2592,13 +3548,15 @@
+@@ -2592,13 +3546,15 @@
                  if (prompt_rows.len != self.layers.len) return error.InvalidRows;
                  for (self.layers, prompt_rows) |*ls, rows| if (rows != ls.base.rows) return error.InvalidRows;
                  try self.settleRoutes();
@@ -4288,7 +4337,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  };
                  const before = if (self.memory == .mlx) mlxActive() else 0;
                  for (self.layers, prompt_rows) |*ls, rows| {
-@@ -2673,7 +3631,8 @@
+@@ -2673,7 +3629,8 @@
                  if (self.phase != .prefill) return error.AlreadyGrown;
                  if (self.failed) return error.StreamFailed;
                  if (!self.transient_released) return error.TransientNotReleased;
@@ -4298,7 +4347,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                  // Until the install below; then the stream owns `t` and `meta`.
                  var installed = false;
                  errdefer if (!installed) t.deinit();
-@@ -2682,7 +3641,7 @@
+@@ -2682,7 +3639,7 @@
                  @memset(meta, .{});
                  var bytes: u64 = 0;
                  if (self.alt) |*x| {
@@ -4307,7 +4356,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
                      errdefer t2.deinit();
                      const meta2 = try self.allocator.alloc(SlotMeta, t2.rows);
                      @memset(meta2, .{});
-@@ -2734,6 +3693,21 @@
+@@ -2734,6 +3691,21 @@
                  self.read_ns += ns;
                  if (res.preadv_calls == 0 and res.payload > 0) self.copy_only_ns += ns;
              }
@@ -4329,7 +4378,7 @@ diff -ruN -x .generated a/sdk/weights/streamed/sdk_ext/expert/stream.zig b/sdk/w
              pub fn stats(self: *Stream) Stats {
                  var s = self.counters;
                  s.expert_read_seconds = @as(f64, @floatFromInt(self.read_ns)) / 1e9;
-@@ -2747,6 +3721,12 @@
+@@ -2747,6 +3719,12 @@
                      .{ "gates", .ev_gates },            .{ "gates_forced", .ev_wd_forced },
                      .{ "spec_expired", .expired },      .{ "spec_abandoned", .abandoned }, .{ "spec_discarded", .discarded },
                      .{ "spec_cancelled", .cancelled_by_demand }, .{ "direct_ranges", .direct_ranges },
