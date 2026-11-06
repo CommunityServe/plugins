@@ -76,8 +76,8 @@ fn wire(b: *std.Build, root: *std.Build.Module, dep: *std.Build.Dependency) void
 /// The tests `mlx-free-test` runs rooted at the plugin, by name: the MTP round's pure parts (src/spec/drafter.zig),
 /// the server's flags as the plugin reads them (src/host_flags.zig), the disk tier's snapshot header
 /// (src/cache/codec.zig), #1005's trunk_quant block lookup (block_test.zig), and the direct model's trellis n-gram
-/// table, its warm and the resident bill (src/direct). The kit's test step runs config.zig's and the EXL3 tests of the
-/// copies that build from there.
+/// table, its warm, the resident bill and the attention kernels' Metal helpers (src/direct). The kit's test step runs
+/// config.zig's and the EXL3 tests of the copies that build from there.
 const mlx_free_filters = [_][]const u8{
     "drafter:",
     "host flags:",
@@ -86,6 +86,7 @@ const mlx_free_filters = [_][]const u8{
     "direct ple:",
     "direct load: an EXL3 trunk pack warms",
     "direct serve:",
+    "direct attn:",
 };
 
 /// The tests `zig build gpu-test` runs, by name: #1005's tests of the EXL3 path the direct model still calls in the

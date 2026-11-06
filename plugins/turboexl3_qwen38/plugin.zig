@@ -526,4 +526,6 @@ test {
     _ = @import("src/direct/ple.zig");
     _ = @import("src/direct/load.zig");
     _ = @import("src/direct/serve.zig");
+    // Each attention kernel's header defines the helpers its source calls (mlx-free-test).
+    _ = @import("src/direct/attn_core.zig");
 }
