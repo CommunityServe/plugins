@@ -54,7 +54,7 @@ const Q8_WM: c_int = 4;
 const Q8_BQ: c_int = 16 * Q8_WM;
 const Q8_BK: c_int = 32;
 
-const ATTN256_KERNEL_HEADER = kernelSource("kernels/attention/attn256_header.metal");
+const ATTN256_KERNEL_HEADER = kernelSource("kernels/attention/attn256_header.metal") ++ kernelSource("kernels/common/pack8.metal");
 const ATTN256_KERNEL_SOURCE = kernelSource("kernels/attention/attn256.metal");
 const ATTN_QSA256_KERNEL_HEADER = ATTN256_KERNEL_HEADER ++ kernelSource("plugins/qwen4_exp/kernels/attn_qsa256_header.metal");
 const ATTN_QSA256_KERNEL_SOURCE = kernelSource("plugins/qwen4_exp/kernels/attn_qsa256.metal");
