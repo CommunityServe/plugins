@@ -2221,12 +2221,18 @@ fn fusedOn(sc: *const Scope, m: *const Model) bool {
     return m.fused and mlx.streamIsGpu(sc.s);
 }
 
+/// A trunk layer's routed experts a row: `prefill_top_k` on prefill-width forwards when set, else the layer's own.
+fn routedK(m: *const Model, li: usize, rows: usize) usize {
+    if (li >= m.cfg.layers or m.cfg.prefill_top_k == 0 or rows <= NARROW_ROWS) return m.layers[li].top_k;
+    return m.cfg.prefill_top_k;
+}
+
 /// The router's picks `idx` (`[L, k]` ids) and their weights `wts` (`[L, k]` f32): sqrt-softplus scores, the f32
 /// bias picks only, normalized, times the routed scale.
 fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix) !kernels.Routes {
     const c = &m.cfg;
     const ly = &m.layers[li];
-    const K = ly.top_k;
+    const K = routedK(m, li, dim(h, 0));
     const norm = c.norm_topk and K > 1;
     // `img` rows pick by the image bias; the kernel reads a `[L, E]` bias row by row.
     const bias = if (img.ctx != null and ly.gate_bias_vl.ctx != null) try sc.where(try sc.expand(img, -1), ly.gate_bias_vl, ly.gate_bias) else ly.gate_bias;
@@ -2323,7 +2329,7 @@ fn ffnDecode(sc: *Scope, m: *const Model, li: usize, h: A, x1: A, mix: *HcMix) !
 fn moeWide(sc: *Scope, m: *const Model, li: usize, h: A, r: kernels.Routes, sy: A) !A {
     const c = &m.cfg;
     const L = dim(h, 0);
-    const k = m.layers[li].top_k;
+    const k = dim(r.idx, 1);
     const n = L * k;
     const lease = try leaseBanks(sc, m, li, r.idx);
     defer releaseBanks(m, li);
