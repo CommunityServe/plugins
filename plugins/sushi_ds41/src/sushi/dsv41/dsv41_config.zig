@@ -97,6 +97,7 @@ pub const Config = struct {
     swiglu_limit: f32 = 0,
     route_scale: f32 = 1,
     norm_topk: bool = true,
+    prefill_top_k: u32 = 0,
 
     rope_theta: f64 = 10000,
     compress_rope_theta: f64 = 10000,
@@ -279,6 +280,11 @@ fn field(obj: std.json.ObjectMap, key: []const u8) ?std.json.Value {
     return if (v == .null) null else v;
 }
 
+fn envU32(name: [*:0]const u8) !u32 {
+    const raw = std.c.getenv(name) orelse return 0;
+    return std.fmt.parseInt(u32, std.mem.span(raw), 10) catch refuse("{s} is not a whole number", .{name});
+}
+
 fn uint(comptime T: type, obj: std.json.ObjectMap, key: []const u8) !T {
     const v = field(obj, key) orelse return refuse("missing {s}", .{key});
     if (v != .integer) return refuse("{s} is not an integer", .{key});
@@ -375,6 +381,7 @@ pub fn parse(text: std.json.ObjectMap, root: std.json.ObjectMap) !Config {
     c.swiglu_limit = @floatCast(try num(text, "swiglu_limit"));
     c.route_scale = @floatCast(try num(text, "routed_scaling_factor"));
     c.norm_topk = if (field(text, "norm_topk_prob")) |v| (v == .bool and v.bool) else true;
+    c.prefill_top_k = try envU32("SUSHI_DS41_PREFILL_TOP_K");
     c.rope_theta = try num(text, "rope_theta");
     c.compress_rope_theta = try num(text, "compress_rope_theta");
     const rs_val = field(text, "rope_scaling") orelse return refuse("missing rope_scaling", .{});
@@ -392,6 +399,7 @@ pub fn parse(text: std.json.ObjectMap, root: std.json.ObjectMap) !Config {
     if ((try uint(u32, text, "n_shared_experts")) != 1) return refuse("n_shared_experts is not 1", .{});
     if ((try uint(u32, text, "num_key_value_heads")) != 1) return refuse("num_key_value_heads is not 1", .{});
     if (field(text, "attention_bias")) |v| if (v == .bool and v.bool) return refuse("attention_bias is on", .{});
+    if (c.prefill_top_k == 1 or c.prefill_top_k > c.experts) return refuse("SUSHI_DS41_PREFILL_TOP_K {d} is outside 2..{d}", .{ c.prefill_top_k, c.experts });
 
     if (c.layers == 0 or c.layers > max_layers or c.dim == 0 or c.heads == 0 or c.head_dim == 0 or
         c.rope_dim == 0 or c.rope_dim > c.head_dim or c.rope_dim % 2 != 0 or c.window == 0 or
