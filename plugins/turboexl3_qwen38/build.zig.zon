@@ -5,10 +5,10 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .mlx_serve_kit = .{ .path = "../../.kit/kit" },
-        // turboexl3 (davidtai/turboexl3): the EXL3 kernels, its plugin-kit launcher and its quant table, at a1a0533 on its main.
+        // turboexl3 (davidtai/turboexl3): the EXL3 kernels, its plugin-kit launcher and its quant table, at c7ce66c on its main.
         .turboexl3 = .{
-            .url = "https://github.com/davidtai/turboexl3/archive/a1a0533e3c43befe7693d6138718f41e55e47dff.tar.gz",
-            .hash = "turboexl3-0.1.0-tZE8b5iUNgFuGKc49cHQE5efYJUVDpSQeP_Y58q3j18j",
+            .url = "https://github.com/davidtai/turboexl3/archive/c7ce66c12f6992eabda5db1d11934a6fe5efec33.tar.gz",
+            .hash = "turboexl3-0.1.0-tZE8b-RXSAGaGiiBTBRCHN-0YwTOn8nsHXaePypJAJh_",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "scripts", "tests", "NOTICE", "README.md" },
