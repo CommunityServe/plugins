@@ -162,8 +162,8 @@ pub const plugin = kit.sdk.Plugin{
 
 /// The built-in's table but for its name, claim and parse, its load (`load`), the drafter (the engine reaches no
 /// outside plugin's module: the stages draft through `NativeDrafter`) and its weights (the plugin reads the shards).
-/// Its forward and resume also keep the drafter's token history (`forward`, `resumePrompt`), and its meters report the
-/// drafter's rounds.
+/// Its forward, resume and prefix-cache restore keep the drafter's token history (`forward`, `resumePrompt`,
+/// `auxBeginPrompt`), and its meters report the drafter's rounds.
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),
     .claims = config.claims,
@@ -185,7 +185,14 @@ pub const table = abi.ModelTable{
 const cache_hooks: abi.CacheHooks = blk: {
     var c = ds.table.cache.*;
     c.resume_prompt = &resumePrompt;
+    c.aux = &aux_hooks;
     break :blk c;
+};
+
+const aux_hooks: abi.AuxHooks = blk: {
+    var a = ds.table.cache.aux.?.*;
+    a.begin_prompt = &auxBeginPrompt;
+    break :blk a;
 };
 
 const Verdict = abi.Verdict;
@@ -634,16 +641,33 @@ var req_kept: usize = 0;
 
 /// The built-in's resume: the drafter's request begins on the prompt prefix the state kept.
 fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
+    beforePrompt();
+    const n = ds.table.cache.resume_prompt.?(mp, slot, prompt, media_rows);
+    beginRequest(prompt.slice(), @intCast(n));
+    return n;
+}
+
+/// The prefix cache's restore (the engine's module path, which never calls `resume_prompt`): the same request start
+/// at the restored boundary.
+fn auxBeginPrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array, restored_at: u64, capture: bool) callconv(.c) Verdict {
+    beforePrompt();
+    const v = ds.table.cache.aux.?.begin_prompt(mp, slot, prompt, media_rows, restored_at, capture);
+    if (v.isOk()) beginRequest(prompt.slice(), @intCast(restored_at));
+    return v;
+}
+
+fn beforePrompt() void {
     // The next request's decode peak taken from its own first round.
     decode_peak_armed = false;
     // a new prompt's state takes no launched draft.
     dropAhead();
-    const n = ds.table.cache.resume_prompt.?(mp, slot, prompt, media_rows);
+}
+
+fn beginRequest(prompt: []const u32, restored: usize) void {
     req_prompt = prompt.len;
-    req_kept = @min(@as(usize, @intCast(n)), prompt.len);
+    req_kept = @min(restored, prompt.len);
     dropPending();
-    if (drafter) |*d| d.begin(prompt.slice()[0..@min(@as(usize, @intCast(n)), prompt.len)]);
-    return n;
+    if (drafter) |*d| d.begin(prompt[0..req_kept]);
 }
 
 var meter_buf: [262144]u8 = undefined;
