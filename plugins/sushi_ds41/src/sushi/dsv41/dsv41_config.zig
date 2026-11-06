@@ -399,7 +399,7 @@ pub fn parse(text: std.json.ObjectMap, root: std.json.ObjectMap) !Config {
     if ((try uint(u32, text, "n_shared_experts")) != 1) return refuse("n_shared_experts is not 1", .{});
     if ((try uint(u32, text, "num_key_value_heads")) != 1) return refuse("num_key_value_heads is not 1", .{});
     if (field(text, "attention_bias")) |v| if (v == .bool and v.bool) return refuse("attention_bias is on", .{});
-    if (c.prefill_top_k > c.experts) return refuse("SUSHI_DS41_PREFILL_TOP_K {d} is past the {d} experts", .{ c.prefill_top_k, c.experts });
+    if (c.prefill_top_k == 1 or c.prefill_top_k > c.experts) return refuse("SUSHI_DS41_PREFILL_TOP_K {d} is outside 2..{d}", .{ c.prefill_top_k, c.experts });
 
     if (c.layers == 0 or c.layers > max_layers or c.dim == 0 or c.heads == 0 or c.head_dim == 0 or
         c.rope_dim == 0 or c.rope_dim > c.head_dim or c.rope_dim % 2 != 0 or c.window == 0 or

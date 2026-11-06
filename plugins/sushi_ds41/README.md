@@ -77,7 +77,7 @@ DSpark on or off.
   (`ane shared: off (...)`). The programs are built and run by the host's Neural Engine runtime (`Host.ane`,
   mlx-serve's `lib/ane`); a host without it serves this plugin on the GPU. M5 Ultra, `=2`: cold prefill x1.037 at 25.6k and x1.042 at 60k, KL 0.0108 against the
   GPU path, peak footprint +3 GB, API KLD to the FP8 teacher 0.1849 (unchanged).
-- Fewer routed experts at prefill, off by default (`SUSHI_DS41_PREFILL_TOP_K=<k>`, `routedK`): a forward wider than
+- Fewer routed experts at prefill, off by default (`SUSHI_DS41_PREFILL_TOP_K=<k>`, 2 or more, `routedK`): a forward wider than
   `narrow_rows` (16) routes each row to `k` experts instead of the pack's 6, renormalized over the `k`; decode and DSpark
   verify keep 6. M5 Ultra, release pack r2.0, `=5`: cold prefill x1.058 at 32k and x1.035 at 8k, TTFT -4 to -5% on
   76k-305k-token agent prompts, API KLD to the FP8 teacher 0.1589 against 0.1596 at 6; DSpark acceptance unchanged.
