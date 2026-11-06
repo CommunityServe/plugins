@@ -54,7 +54,8 @@ const Q8_WM: c_int = 4;
 const Q8_BQ: c_int = 16 * Q8_WM;
 const Q8_BK: c_int = 32;
 
-const ATTN256_KERNEL_HEADER = kernelSource("kernels/attention/attn256_header.metal");
+/// mlx-serve's own at MLX_SERVE_REF (the copy's), so the helpers its kernels call (pack8.metal's since #1042) follow it.
+const ATTN256_KERNEL_HEADER = @import("../mlx_serve/sdk/blocks/attention/attn256.zig").ATTN256_KERNEL_HEADER;
 const ATTN256_KERNEL_SOURCE = kernelSource("kernels/attention/attn256.metal");
 const ATTN_QSA256_KERNEL_HEADER = ATTN256_KERNEL_HEADER ++ kernelSource("plugins/qwen4_exp/kernels/attn_qsa256_header.metal");
 const ATTN_QSA256_KERNEL_SOURCE = kernelSource("plugins/qwen4_exp/kernels/attn_qsa256.metal");
@@ -1170,5 +1171,89 @@ fn launch(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, config: mlx.mlx_
             for (outs[0..i]) |a| _ = mlx.mlx_array_free(a);
             return e;
         };
+    }
+}
+
+// ── tests ──
+
+/// `line` up to its `//` comment.
+fn codeOf(line: []const u8) []const u8 {
+    return line[0 .. std.mem.find(u8, line, "//") orelse line.len];
+}
+
+/// The next `msv_` name in `line` at or after `from` that a `(` follows (a call or a definition): its bounds.
+fn nextMsvCall(line: []const u8, from: usize) ?[2]usize {
+    const ident = struct {
+        fn is(c: u8) bool {
+            return std.ascii.isAlphanumeric(c) or c == '_';
+        }
+    }.is;
+    var i = from;
+    while (std.mem.findPos(u8, line, i, "msv_")) |at| {
+        var end = at + 4;
+        while (end < line.len and ident(line[end])) end += 1;
+        i = end;
+        if (at > 0 and ident(line[at - 1])) continue;
+        var p = end;
+        while (p < line.len and line[p] == ' ') p += 1;
+        if (p < line.len and line[p] == '(') return .{ at, end };
+    }
+    return null;
+}
+
+/// Whether `text` defines the function `name`: a line opening with `inline`, `static`, `METAL_FUNC` or `template`, or
+/// right after a `template` line, whose first `msv_` call-shaped name is `name`.
+fn definesMsv(text: []const u8, name: []const u8) bool {
+    var prev_template = false;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const code = codeOf(raw);
+        var s: usize = 0;
+        while (s < code.len and (code[s] == ' ' or code[s] == '\t')) s += 1;
+        const line = code[s..];
+        const after_template = prev_template;
+        prev_template = std.mem.startsWith(u8, line, "template");
+        const head = after_template or prev_template or std.mem.startsWith(u8, line, "inline ") or
+            std.mem.startsWith(u8, line, "static ") or std.mem.startsWith(u8, line, "METAL_FUNC ");
+        if (!head) continue;
+        if (nextMsvCall(line, 0)) |c| if (std.mem.eql(u8, line[c[0]..c[1]], name)) return true;
+    }
+    return false;
+}
+
+/// The first `msv_` helper `text` (a kernel's header and source) calls and does not define, or null.
+fn undefinedMsvHelper(text: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = codeOf(raw);
+        var i: usize = 0;
+        while (nextMsvCall(line, i)) |c| : (i = c[1]) {
+            if (!definesMsv(text, line[c[0]..c[1]])) return line[c[0]..c[1]];
+        }
+    }
+    return null;
+}
+
+// MLX compiles a kernel from its header and source alone, at its first launch: a helper that neither defines (a
+// mlx-serve ref that moves one into a file the header does not take, as #1042 did with msv_unpack8 and msv_pack8) is a
+// Metal compile error on the first request, which no Zig build sees.
+test "direct attn: each attention kernel's header and source define every msv_ helper they call" {
+    inline for (.{
+        .{ "msv_attn_p256", ATTN256_KERNEL_HEADER, ATTN256_KERNEL_SOURCE },
+        .{ "msv_attn_qsa256", ATTN_QSA256_KERNEL_HEADER, ATTN_QSA256_KERNEL_SOURCE },
+        .{ "msv_qsa_nax_precise", QSA_NAX_HEADER, QSA_NAX_SOURCE },
+        .{ "msv_attn_qsa256_dsplit", ATTN_QSA256_KERNEL_HEADER, QSA_ATTN_D_SOURCE },
+        .{ "msv_attn_qsa256_qsplit", ATTN_QSA256_KERNEL_HEADER, QSA_ATTN_Q_SOURCE },
+        .{ "msv_attn_qsa256_qsplit_slots", ATTN_QSA256_KERNEL_HEADER, QSA_ATTN_SLOTS_SOURCE },
+        .{ "msv_attn_qsa256_qmerge", ATTN_QSA256_KERNEL_HEADER, QSA_ATTN_MERGE_SOURCE },
+        .{ "msv_qsa_dec_parts", QSA_DEC_HEADER, QSA_DEC_PARTS_SOURCE },
+        .{ "msv_qsa_dec_merge", QSA_DEC_HEADER, QSA_DEC_MERGE_SOURCE },
+        .{ "msv_nax_attn_256_q8", NAX_ATTN_HEADER, NAX_ATTN_256Q8_SOURCE },
+        .{ "msv_int8_quant_rows", "", INT8_QUANT_ROWS_SOURCE },
+    }) |k| {
+        if (undefinedMsvHelper(k[1] ++ "\n" ++ k[2])) |name| {
+            std.debug.print("{s}: calls {s}, which neither its header nor its source defines\n", .{ k[0], name });
+            return error.UndefinedMetalHelper;
+        }
     }
 }
