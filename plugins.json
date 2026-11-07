@@ -10,7 +10,9 @@
         "deepseek_v41 with expert_quant.format stq (beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw)"
       ],
       "requires_mlx_serve": ">=26.11.1",
-      "fixture": "none"
+      "fixture": "none",
+      "homepage": "https://github.com/beamivalice/sushi",
+      "icon": "plugins/sushi_ds41/icon.png"
     },
     {
       "name": "turboexl3_ds41",
@@ -21,7 +23,9 @@
         "deepseek_v41 with an exllamav3 quantization_config and an experts.bin bank (OpensourceWTF/DeepSeek-V4.1-Flash-1017-streaming-repack-exl3@2.81bpw)"
       ],
       "requires_mlx_serve": ">=26.11.1",
-      "fixture": "none"
+      "fixture": "none",
+      "homepage": "https://github.com/davidtai/turboexl3",
+      "icon": "plugins/turboexl3_ds41/icon.png"
     },
     {
       "name": "turboexl3_qwen38",
@@ -35,7 +39,9 @@
         "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3@5.05bpw)"
       ],
       "requires_mlx_serve": ">=26.11.1",
-      "fixture": "none"
+      "fixture": "none",
+      "homepage": "https://github.com/davidtai/turboexl3",
+      "icon": "plugins/turboexl3_qwen38/icon.png"
     }
   ]
 }

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3a3a3c"/>
+      <stop offset="1" stop-color="#0e0e10"/>
+    </linearGradient>
+    <linearGradient id="silver" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f2f2f4"/>
+      <stop offset="1" stop-color="#b9b9bd"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#2fd5a5"/>
+      <stop offset="1" stop-color="#4aa8ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <polygon points="40,58 92,58 150,128 92,198 40,198 98,128" fill="url(#silver)"/>
+  <polygon points="140,148 160,124 220,198 180,198" fill="url(#silver)"/>
+  <polygon points="150,96 182,58 222,58 172,118" fill="url(#accent)"/>
+  <rect x="188" y="36" width="8" height="26" rx="3" fill="#4aa8ff" transform="rotate(40 192 58)"/>
+  <rect x="206" y="36" width="8" height="26" rx="3" fill="#4aa8ff" transform="rotate(40 210 58)"/>
+</svg>

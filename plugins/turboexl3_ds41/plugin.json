@@ -12,5 +12,7 @@
   "test_step": "test",
   "prepare": "scripts/prepare.sh",
   "maintainers": ["davidtai"],
-  "license": "MIT"
+  "license": "MIT",
+  "homepage": "https://github.com/davidtai/turboexl3",
+  "icon": "icon.png"
 }

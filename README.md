@@ -1,3 +1,4 @@
+<p align="center"><img src="docs/assets/logo.png" alt="" width="112"></p>
 <h1 align="center">MLX-Serve Plugins</h1>
 <p align="center"><b>Teach <a href="https://github.com/ddalcu/mlx-serve">mlx-serve</a> and sushi a new model, a new format, a new backend. No server rebuild.</b></p>
 

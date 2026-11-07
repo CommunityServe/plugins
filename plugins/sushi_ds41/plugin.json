@@ -9,5 +9,7 @@
   "fixture_reason": "An STQ pack has no small form: the conformance suite needs a tiny pack the plugin can load.",
   "test_step": "claims",
   "maintainers": ["ddalcu"],
-  "license": "MIT"
+  "license": "MIT",
+  "homepage": "https://github.com/beamivalice/sushi",
+  "icon": "icon.png"
 }
