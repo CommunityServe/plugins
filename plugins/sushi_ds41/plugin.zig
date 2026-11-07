@@ -283,7 +283,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         log.warn("[sushi_ds41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
     };
     _ = mlx.mlx_clear_cache();
-    if (tp.on() and tp.rank != 0) (try std.Thread.spawn(.{}, followLoop, .{m})).detach();
+    // MLX streams belong to the thread that made them, so a follower replays rank 0 on this one and never returns.
+    if (tp.on() and tp.rank != 0) return followLoop(m);
     return m;
 }
 
@@ -354,7 +355,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
-    if (served(m)) |refused| return refused;
+    if (served()) |refused| return refused;
     if (f.mode == .verify or f.mode == .batched_rows) return Verdict.refuse(.unsupported, "sushi_ds41: no speculative verify or batched rows");
     if (f.capture_layers.len > 0 or f.want_hidden) return Verdict.refuse(.unsupported, "sushi_ds41: no layer capture or hidden rows (not an embedding model)");
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "sushi_ds41: one slot's rows at a time");
@@ -533,7 +534,6 @@ fn poolForRows(m: *Model, rows: usize) void {
 
 fn stateBytes(mp: *anyopaque) callconv(.c) u64 {
     const m: *Model = @ptrCast(@alignCast(mp));
-    if (tp.on() and tp.rank != 0) return 0;
     return if (m.mdl.dec_state) |*st| dsv.stateBytes(st) else 0;
 }
 
@@ -649,7 +649,7 @@ fn keyOf(m: *const Model, ids: []const u32, rows: abi.Array) !u64 {
 
 fn auxBeginPrompt(mp: *anyopaque, _: u32, prompt: abi.Span(u32), media: abi.Array, restored_at: u64, capture_on: bool) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
-    if (served(m)) |refused| return refused;
+    if (served()) |refused| return refused;
     if (prompt.len == 0) return Verdict.refuse(.failed, "sushi_ds41: an empty prompt");
     // The restore point covers all but the last token; its rows are lent to this call only, so the key is taken now.
     const ids = prompt.slice()[0 .. prompt.len - 1];
@@ -859,7 +859,7 @@ fn now() std.Io.Timestamp {
 
 /// Checks shared by the round's entry points; the state the round starts from.
 fn roundEntry(m: *Model, f: *const abi.Forward, out: *const abi.ForwardOut) ?Verdict {
-    if (served(m)) |refused| return refused;
+    if (served()) |refused| return refused;
     if (out.size < @sizeOf(abi.ForwardOut)) return Verdict.refuse(.unsupported, "sushi_ds41: the host's ForwardOut has no round");
     if (m.mdl.dspark == null) return Verdict.refuse(.unsupported, "sushi_ds41: the DSpark stages are not loaded");
     if (f.tokens.len != 1) return Verdict.refuse(.unsupported, "sushi_ds41: a round starts from one committed token");
@@ -918,7 +918,7 @@ fn nativeVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) cal
 
 fn nativeFinish(mp: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
-    if (served(m)) |refused| return refused;
+    if (served()) |refused| return refused;
     var open = m.open orelse return Verdict.refuse(.failed, "sushi_ds41: no verify is open");
     m.open = null;
     if (accepted >= open.rows) return Verdict.refuse(.failed, "sushi_ds41: more drafts accepted than verified");
@@ -1047,12 +1047,8 @@ fn argmaxRows(m: *Model, logits: mlx.mlx_array, suppress: ?mlx.mlx_array, rows: 
 
 // ── tensor parallel: rank 0 leads, the other ranks replay its calls ──
 
-/// The refusal for a call this rank must not serve: every rank but 0 only replays rank 0's calls, and a lost stream
-/// serves nothing.
-fn served(m: *const Model) ?Verdict {
-    _ = m;
-    if (!tp.on()) return null;
-    if (tp.rank != 0) return Verdict.refuse(.unsupported, "sushi_ds41: this tensor parallel rank follows rank 0; send requests to rank 0");
+/// The refusal once a call failed after the other ranks were told to run it: their states may differ.
+fn served() ?Verdict {
     if (tp.lost) return Verdict.refuse(.failed, "sushi_ds41: tensor parallel lost sync; restart every rank");
     return null;
 }
@@ -1127,7 +1123,8 @@ fn verifyRows(m: *Model, ids: []const u32) !mlx.mlx_array {
     return logits;
 }
 
-fn followLoop(m: *Model) void {
+/// Replays rank 0's calls until the stream breaks, which ends the load (and so this rank's process) with the error.
+fn followLoop(m: *Model) !*Model {
     log.info("[sushi_ds41] tensor parallel: rank {d} replays rank 0's calls\n", .{tp.rank});
     while (true) {
         const call = tp.follow() catch |e| return followLost(e);
@@ -1136,9 +1133,10 @@ fn followLoop(m: *Model) void {
     }
 }
 
-fn followLost(e: anyerror) void {
+fn followLost(e: anyerror) anyerror {
     tp.lost = true;
     log.err("[sushi_ds41] tensor parallel lost sync on rank {d}: {s}; restart every rank\n", .{ tp.rank, @errorName(e) });
+    return e;
 }
 
 fn followCall(m: *Model, call: tp.Call) !void {
