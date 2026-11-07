@@ -377,8 +377,9 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     // A host older than `Forward.progress` passes a shorter struct.
     const progress: ?*u64 = if (f.size >= @offsetOf(abi.Forward, "progress") + @sizeOf(?*u64)) f.progress else null;
     // The tap records prompt passes only, never a one-token decode forward.
+    const before = tp.sent();
     const logits = leadPrefill(m, host.ids, want, rows, progress, ablation.tapsMode(f.mode)) catch |e| {
-        loseSync();
+        loseSync(before);
         log.err("[sushi_ds41] forward failed: {s}\n", .{@errorName(e)});
         return Verdict.refuse(.failed, "sushi_ds41: the forward failed");
     };
@@ -438,7 +439,7 @@ fn startCopies(m: *Model) void {
 }
 
 fn reset(m: *Model) void {
-    tp.queue(.reset, .{ 0, 0, 0, 0 }) catch loseSync();
+    tp.queue(.reset, .{ 0, 0, 0, 0 }) catch queueFailed();
     startCopies(m);
     dsv.resetState(m.mdl);
     m.open = null;
@@ -662,7 +663,7 @@ fn auxBeginPrompt(mp: *anyopaque, _: u32, prompt: abi.Span(u32), media: abi.Arra
             return Verdict.refuse(.failed, "sushi_ds41: the restored position differs from the prompt boundary");
     }
     armPrompt(m, .{ .target = prompt.len - 1, .capture = capture_on, .vision_key = key });
-    tp.queue(.arm, .{ @intCast(prompt.len - 1), @intFromBool(capture_on), @truncate(key), @truncate(key >> 32) }) catch loseSync();
+    tp.queue(.arm, .{ @intCast(prompt.len - 1), @intFromBool(capture_on), @truncate(key), @truncate(key >> 32) }) catch queueFailed();
     return .ok;
 }
 
@@ -679,7 +680,7 @@ fn auxSnapshot(mp: *anyopaque, _: u32, out: *abi.Handle) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (m.snap) |sn| {
         sn.id = nextSnapId();
-        tp.queue(.snap_take, .{ sn.id, 0, 0, 0 }) catch loseSync();
+        tp.queue(.snap_take, .{ sn.id, 0, 0, 0 }) catch queueFailed();
     }
     out.* = m.snap;
     m.snap = null;
@@ -691,7 +692,7 @@ fn auxRestoreAt(mp: *anyopaque, _: u32, h: abi.Handle, pos: u64) callconv(.c) Ve
     const sn = snapOf(h) orelse return Verdict.refuse(.unsupported, "sushi_ds41: no snapshot to restore");
     if (pos != sn.n) return Verdict.refuse(.unsupported, "sushi_ds41: restore needs the snapshot's exact position");
     restoreSnap(m, sn) catch |e| return Verdict.named(.failed, @errorName(e));
-    tp.queue(.restore, .{ sn.id, 0, 0, 0 }) catch loseSync();
+    tp.queue(.restore, .{ sn.id, 0, 0, 0 }) catch queueFailed();
     return .ok;
 }
 
@@ -711,7 +712,7 @@ fn auxSlice(_: *anyopaque, h: abi.Handle, len: u64, out: *abi.Handle) callconv(.
     if (len != sn.n) return Verdict.refuse(.unsupported, "sushi_ds41: a snapshot cannot be shortened through its rings");
     const copy = copySnap(sn) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
     copy.id = nextSnapId();
-    tp.queue(.snap_slice, .{ sn.id, copy.id, 0, 0 }) catch loseSync();
+    tp.queue(.snap_slice, .{ sn.id, copy.id, 0, 0 }) catch queueFailed();
     out.* = copy;
     return .ok;
 }
@@ -737,7 +738,7 @@ fn auxHandoff(_: *anyopaque, _: u32, _: u32) callconv(.c) Verdict {
 
 fn auxFree(_: *anyopaque, h: abi.Handle) callconv(.c) void {
     const sn = snapOf(h) orelse return;
-    tp.queue(.snap_free, .{ sn.id, 0, 0, 0 }) catch loseSync();
+    tp.queue(.snap_free, .{ sn.id, 0, 0, 0 }) catch queueFailed();
     freeSnap(sn);
 }
 
@@ -867,7 +868,8 @@ fn roundEntry(m: *Model, f: *const abi.Forward, out: *const abi.ForwardOut) ?Ver
     // stale request.
     if (m.open != null) {
         m.open = null;
-        leadCall(m, .finish, .{ .arg = 0 }, &.{}) catch |e| return roundFailed(e);
+        const before = tp.sent();
+        leadCall(m, .finish, .{ .arg = 0 }, &.{}) catch |e| return roundFailed(e, before);
         dsv.finishVerify(m.mdl, 0) catch {};
     }
     const st = dsv.ensureState(m.mdl) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
@@ -876,8 +878,8 @@ fn roundEntry(m: *Model, f: *const abi.Forward, out: *const abi.ForwardOut) ?Ver
     return null;
 }
 
-fn roundFailed(e: anyerror) Verdict {
-    loseSync();
+fn roundFailed(e: anyerror, before: ?u32) Verdict {
+    loseSync(before);
     log.err("[sushi_ds41] draft round failed: {s}\n", .{@errorName(e)});
     return Verdict.refuse(.failed, "sushi_ds41: the draft round failed");
 }
@@ -887,16 +889,17 @@ fn roundFailed(e: anyerror) Verdict {
 fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (roundEntry(m, f, out)) |refused| return refused;
+    const before = tp.sent();
     if (armAblation(m, f)) |refused| return refused;
     defer ablation.disarm(m.mdl);
     const suppress: ?mlx.mlx_array = if (f.suppress_mask.ctx != null) .{ .ctx = f.suppress_mask.ctx } else null;
-    var open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e);
+    var open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e, before);
     defer _ = mlx.mlx_array_free(open.logits);
-    const best = argmaxRows(m, open.logits, suppress, open.rows) catch |e| return roundFailed(e);
+    const best = argmaxRows(m, open.logits, suppress, open.rows) catch |e| return roundFailed(e, before);
     defer gpa.free(best);
     var accepted: usize = 0;
     while (accepted + 1 < open.rows and best[accepted] == open.ids[1 + accepted]) accepted += 1;
-    closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e);
+    closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e, before);
     out.round.next_token = best[accepted];
     return .ok;
 }
@@ -905,9 +908,10 @@ fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callc
 fn nativeVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (roundEntry(m, f, out)) |refused| return refused;
+    const before = tp.sent();
     if (armAblation(m, f)) |refused| return refused;
     defer ablation.disarm(m.mdl);
-    const open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e);
+    const open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e, before);
     out.logits = .{ .ctx = open.logits.ctx };
     out.round.n = @intCast(open.rows);
     out.round.rows = @intCast(open.rows);
@@ -922,8 +926,9 @@ fn nativeFinish(mp: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c
     var open = m.open orelse return Verdict.refuse(.failed, "sushi_ds41: no verify is open");
     m.open = null;
     if (accepted >= open.rows) return Verdict.refuse(.failed, "sushi_ds41: more drafts accepted than verified");
-    // The logits were handed to the engine in `nativeVerify`.
-    closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e);
+    // The logits were handed to the engine in `nativeVerify`. Every rank holds this verify open, so any failure loses
+    // the stream.
+    closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e, null);
     return .ok;
 }
 
@@ -1053,10 +1058,20 @@ fn served() ?Verdict {
     return null;
 }
 
-fn loseSync() void {
+/// Marks the stream lost when a call failed after rank 0 told the other ranks to run something (`tp.sent` moved
+/// since `before`, or null: they were already mid-call); a refusal before that leaves them in step.
+fn loseSync(before: ?u32) void {
     if (!tp.on() or tp.lost) return;
+    if (before) |b| if (tp.sent() == b) return;
     tp.lost = true;
     log.err("[sushi_ds41] tensor parallel lost sync on rank {d}: a call failed after the other ranks were told to run it; restart every rank\n", .{tp.rank});
+}
+
+/// A bookkeeping entry rank 0 could not queue: the other ranks would miss it, so the stream is lost.
+fn queueFailed() void {
+    if (!tp.on() or tp.lost) return;
+    tp.lost = true;
+    log.err("[sushi_ds41] tensor parallel lost sync: rank 0 could not queue bookkeeping; restart every rank\n", .{});
 }
 
 var snap_ids: u32 = 0;
@@ -1084,9 +1099,9 @@ fn leadCall(m: *Model, op: tp.Op, c: CallSpec, ids: []const u32) !void {
     }
     if (c.media) |v| {
         const shape = mlx.getShape(v.rows);
-        if (shape.len != 2) return error.SushiTpMediaShape;
-        h.media_rows = @intCast(shape[0]);
-        h.media_cols = @intCast(shape[1]);
+        if (shape.len == 0 or shape.len > h.media_shape.len) return error.SushiTpMediaShape;
+        h.media_ndim = @intCast(shape.len);
+        for (shape, h.media_shape[0..shape.len]) |d, *o| o.* = @intCast(d);
         h.media_dtype = @intCast(@intFromEnum(mlx.mlx_array_dtype(v.rows)));
         h.media_offset = @intCast(v.offset);
         try appendWords(m, &payload, v.rows);
@@ -1187,16 +1202,21 @@ fn armWords(m: *Model, words: []const u32, strength: f32) !void {
     try ablation.arm(m.mdl, .{ .directions = .{ .ctx = d.ctx }, .strength = strength }, m.cfg.dim, m.s);
 }
 
-/// The image rows rank 0 sent, in their own dtype; null without any.
+/// The image rows rank 0 sent, in their own dtype and shape; null without any.
 fn mediaOf(m: *const Model, h: tp.Header, words: []const u32) !?dsv.VisionRows {
-    if (h.media_rows == 0) return null;
-    const shape = [_]c_int{ @intCast(h.media_rows), @intCast(words.len / h.media_rows) };
-    const w = mlx.mlx_array_new_data(words.ptr, &shape, 2, .uint32);
+    if (h.media_ndim == 0) return null;
+    const n = h.media_ndim;
+    var shape: [3]c_int = undefined;
+    var lead_elems: usize = 1;
+    for (h.media_shape[0..n], shape[0..n]) |d, *o| o.* = @intCast(d);
+    for (h.media_shape[0 .. n - 1]) |d| lead_elems *= d;
+    shape[n - 1] = @intCast(words.len / lead_elems);
+    const w = mlx.mlx_array_new_data(words.ptr, &shape, @intCast(n), .uint32);
     defer _ = mlx.mlx_array_free(w);
     var rows = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(rows);
     try mlx.check(mlx.mlx_view(&rows, w, @enumFromInt(h.media_dtype), m.s));
-    if (mlx.getShape(rows)[1] != h.media_cols) return error.SushiTpMediaShape;
+    if (mlx.getShape(rows)[n - 1] != h.media_shape[n - 1]) return error.SushiTpMediaShape;
     return .{ .rows = rows, .offset = h.media_offset };
 }
 

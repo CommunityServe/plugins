@@ -94,11 +94,10 @@ pub const Header = extern struct {
     want_all: u32 = 0,
     ablate: u32 = 0,
     strength_bits: u32 = 0,
-    media_rows: u32 = 0,
-    media_cols: u32 = 0,
+    media_ndim: u32 = 0,
+    media_shape: [3]u32 = .{ 0, 0, 0 },
     media_dtype: u32 = 0,
     media_offset: u32 = 0,
-    reserved: [2]u32 = .{ 0, 0 },
 
     const words = @sizeOf(Header) / 4;
 };
@@ -121,6 +120,11 @@ pub fn queue(kind: Book, args: [4]u32) !void {
     defer _ = std.c.pthread_mutex_unlock(&book_mu);
     try book.append(std.heap.c_allocator, @intFromEnum(kind));
     try book.appendSlice(std.heap.c_allocator, &args);
+}
+
+/// Calls sent (rank 0) or received so far: a failure after this moved has left the other ranks mid-call.
+pub fn sent() u32 {
+    return seq;
 }
 
 /// Rank 0: sends `h` (its sequence and the queued bookkeeping filled in), then the bookkeeping and `payload`.
