@@ -48,7 +48,8 @@ pub fn init() !void {
     rank = @intCast(mlx_distributed_group_rank(g));
     size = @intCast(mlx_distributed_group_size(g));
     cpu = mlx.mlx_default_cpu_stream_new();
-    log.info("[sushi_ds41] tensor parallel: rank {d} of {d} over {s}\n", .{ rank, size, backend });
+    try readSumPlace();
+    log.info("[sushi_ds41] tensor parallel: rank {d} of {d} over {s}, layer sums on {s}\n", .{ rank, size, backend, @tagName(sum_place) });
 }
 
 /// A peer can still be reading its weights (the host reads the whole pack before the plugin loads, minutes from a cold
@@ -69,12 +70,27 @@ fn joinGroup(g: *Group, backend: [*:0]const u8) !void {
 const join_pause_s = 5;
 const join_budget_s = 1200;
 
-/// `x` summed over every rank: lazy, on the CPU stream, owned by `sc`. `x` itself when tensor parallel is off.
+/// Where a layer's partial sums meet (`SUSHI_DS41_TP_SUM`): `cpu` (default) runs the all-reduce on the CPU stream,
+/// `gpu` on the GPU stream, `off` skips it, which is wrong output and only for timing the compute alone.
+const SumPlace = enum { cpu, gpu, off };
+var sum_place: SumPlace = .cpu;
+
+fn readSumPlace() !void {
+    const raw = std.c.getenv("SUSHI_DS41_TP_SUM") orelse return;
+    sum_place = std.meta.stringToEnum(SumPlace, std.mem.span(raw)) orelse {
+        log.err("[sushi_ds41] SUSHI_DS41_TP_SUM=\"{s}\": use cpu, gpu or off\n", .{raw});
+        return error.SushiTpSum;
+    };
+    if (sum_place == .off) log.warn("[sushi_ds41] tensor parallel: layer sums OFF, output is wrong (timing only)\n", .{});
+}
+
+/// `x` summed over every rank: lazy, owned by `sc`. `x` itself when tensor parallel is off.
 pub fn sum(sc: *sc_mod.Scope, x: A) !A {
-    if (!on()) return x;
+    if (!on() or sum_place == .off) return x;
     sums += 1;
     var o = mlx.mlx_array_new();
-    return sc.res(mlx_distributed_all_sum(&o, x, group, cpu), &o);
+    const s = if (sum_place == .gpu) sc.s else cpu;
+    return sc.res(mlx_distributed_all_sum(&o, x, group, s), &o);
 }
 
 /// Rank 0's `words` on every rank, in place: the others contribute zeros, and an integer sum with zeros is exact.
