@@ -31,11 +31,24 @@ for d in sorted((root / "plugins").glob("*/")):
         bad.append(f"plugins/{n}/plugin.json: name must equal the folder")
     if p.get("kind") not in ("model", "media", "quant"):
         bad.append(f"plugins/{n}/plugin.json: kind is model, media or quant")
-    for k in ("version", "summary", "models", "requires_mlx_serve", "fixture", "license", "maintainers"):
+    for k in ("title", "version", "summary", "models", "requires_mlx_serve", "fixture", "license", "maintainers"):
         if k not in p:
             bad.append(f"plugins/{n}/plugin.json: missing {k}")
     if p.get("fixture") == "none" and not p.get("fixture_reason"):
         bad.append(f"plugins/{n}/plugin.json: fixture none needs a fixture_reason")
+    title = p.get("title")
+    if title is not None and not (isinstance(title, str) and 0 < len(title.strip()) <= 60):
+        bad.append(f"plugins/{n}/plugin.json: title is the name people read, 1 to 60 characters")
+    home = p.get("homepage")
+    if home is not None and not re.fullmatch(r"https://[^\s/]+(/\S*)?", home):
+        bad.append(f"plugins/{n}/plugin.json: homepage must be an https URL")
+    icon = p.get("icon")
+    if icon is not None:
+        f = d / str(icon)
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*\.png", str(icon)) or not f.is_file():
+            bad.append(f"plugins/{n}/plugin.json: icon must name a .png in the plugin folder")
+        elif f.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n" or f.stat().st_size > 256 * 1024:
+            bad.append(f"plugins/{n}/{icon}: icon must be a PNG of at most 256 KB")
     if not re.fullmatch(r"[a-z0-9_]{1,64}", n):
         bad.append(f"plugins/{n}: folder name must be [a-z0-9_]")
     zon = d / "build.zig.zon"
