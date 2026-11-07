@@ -23,6 +23,7 @@ var cpu: mlx.mlx_stream = .{};
 pub var rank: u32 = 0;
 pub var size: u32 = 1;
 pub var sums: u64 = 0;
+pub var disagreements: u64 = 0;
 
 pub fn on() bool {
     return size > 1;
@@ -54,4 +55,20 @@ pub fn sum(sc: *sc_mod.Scope, x: A) !A {
     sums += 1;
     var o = mlx.mlx_array_new();
     return sc.res(mlx_distributed_all_sum(&o, x, group, cpu), &o);
+}
+
+/// Rank 0's `vals` on every rank, in place: the ranks' wall clocks differ, so anything a rank decides from its own
+/// timing (DSpark's verify width, the copy arm's backoff) would pick a different forward shape on each rank.
+pub fn agree(vals: []f32) !void {
+    if (!on()) return;
+    if (rank != 0) @memset(vals, 0);
+    const shape = [_]c_int{@intCast(vals.len)};
+    const x = mlx.mlx_array_new_data(vals.ptr, &shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx_distributed_all_sum(&o, x, group, cpu));
+    try mlx.check(mlx.mlx_array_eval(o));
+    const data = mlx.mlx_array_data_float32(o) orelse return error.SushiTpAgree;
+    @memcpy(vals, data[0..vals.len]);
 }

@@ -923,6 +923,7 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
         o.drafted = true;
         o.copied = true;
         o.draft_ms = nanosSince(draft_start);
+        try agreeRound(&o);
         return verifyOpen(m, o);
     }
     const plain = m.policy.next() == .plain;
@@ -938,7 +939,34 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
     const wanted: usize = if (plain) 1 else m.policy.rows(o.conf[0 .. o.block_len - 1]);
     const rows = std.math.clamp(wanted, 1, @min(@as(usize, cap) + 1, max_verify_rows));
     o.rows = @min(rows, o.block_len);
+    try agreeRound(&o);
     return verifyOpen(m, o);
+}
+
+/// Under tensor parallel every rank verifies rank 0's round: a different width or id would desynchronize the ranks'
+/// collectives. The ranks compute the same round from the same state, so a difference is logged as a bug.
+fn agreeRound(o: *Open) !void {
+    if (!tp.on()) return;
+    const n_ids = max_drafts + 1;
+    var v: [4 + n_ids + max_drafts]f32 = undefined;
+    v[0] = @floatFromInt(@intFromBool(o.copied));
+    v[1] = @floatFromInt(@intFromBool(o.drafted));
+    v[2] = @floatFromInt(o.rows);
+    v[3] = @floatFromInt(o.block_len);
+    for (o.ids[0..n_ids], v[4 .. 4 + n_ids], 0..) |id, *x, i| x.* = if (i < o.block_len) @floatFromInt(id) else 0;
+    @memcpy(v[4 + n_ids ..], &o.conf);
+    const mine = v;
+    try tp.agree(&v);
+    if (!std.mem.eql(f32, &mine, &v)) {
+        tp.disagreements += 1;
+        log.warn("[sushi_ds41] tensor parallel: rank {d}'s round (rows {d:.0}, copied {d:.0}) differs from rank 0's (rows {d:.0}, copied {d:.0}); following rank 0 ({d} so far)\n", .{ tp.rank, mine[2], mine[0], v[2], v[0], tp.disagreements });
+    }
+    o.copied = v[0] != 0;
+    o.drafted = v[1] != 0;
+    o.rows = @intFromFloat(v[2]);
+    o.block_len = @intFromFloat(v[3]);
+    for (v[4 .. 4 + n_ids], o.ids[0..n_ids]) |x, *id| id.* = @intFromFloat(x);
+    @memcpy(&o.conf, v[4 + n_ids ..]);
 }
 
 /// The copy arm: writes the context's continuation after `t1` to `drafts` and returns its length, or null for a stage
@@ -970,7 +998,10 @@ fn verifyOpen(m: *Model, open: Open) !Open {
 /// Keeps `t1` and `accepted` drafts, teaches the policy what the round bought, and fills the round's tokens and position.
 fn closeRound(m: *Model, o: *const Open, accepted: usize, r: *abi.Round) !void {
     try dsv.finishVerify(m.mdl, accepted);
-    const verify_ms = nanosSince(o.verify_start);
+    var ms = [2]f32{ o.draft_ms, nanosSince(o.verify_start) };
+    try tp.agree(&ms);
+    const draft_ms = ms[0];
+    const verify_ms = ms[1];
     try m.ids.appendSlice(gpa, o.ids[0 .. 1 + accepted]);
     if (o.copied) {
         // The stage policy learns from stage blocks only: a copy round's wide verify would move its fitted row price,
@@ -978,10 +1009,10 @@ fn closeRound(m: *Model, o: *const Open, accepted: usize, r: *abi.Round) !void {
         m.copy.rounds += 1;
         m.copy.drafted += o.rows - 1;
         m.copy.accepted += accepted;
-        m.copy_backoff.observeCopy(o.rows - 1, accepted, o.draft_ms + verify_ms);
+        m.copy_backoff.observeCopy(o.rows - 1, accepted, draft_ms + verify_ms);
     } else {
-        if (!o.drafted) m.policy.observePlain(verify_ms) else m.policy.observeRound(o.conf[0 .. o.block_len - 1], @intCast(o.rows), @intCast(accepted), o.draft_ms, verify_ms);
-        m.copy_backoff.observeStage(1 + accepted, o.draft_ms + verify_ms);
+        if (!o.drafted) m.policy.observePlain(verify_ms) else m.policy.observeRound(o.conf[0 .. o.block_len - 1], @intCast(o.rows), @intCast(accepted), draft_ms, verify_ms);
+        m.copy_backoff.observeStage(1 + accepted, draft_ms + verify_ms);
     }
     r.n = @intCast(1 + accepted);
     r.accepted = @intCast(accepted);
