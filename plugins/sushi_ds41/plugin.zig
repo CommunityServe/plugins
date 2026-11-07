@@ -30,6 +30,7 @@ const copy_lookup = @import("src/copy_lookup.zig");
 const ablation = @import("src/ablation.zig");
 const ane_shared = @import("src/ane_shared.zig");
 const tap_files = @import("src/tap.zig");
+const tp = @import("src/tp.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.2.0";
@@ -210,6 +211,11 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.engine.warmCache() catch |e| log.warn("[sushi_ds41] expert cache warm failed: {s}\n", .{@errorName(e)});
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
+    try tp.init();
+    if (tp.on()) {
+        m.mdl.route_spec = false;
+        log.info("[sushi_ds41] tensor parallel: {d} heads, MoE width {d} on this rank; route speculation and the folded hc expand off\n", .{ c.heads, c.moe_inter });
+    }
     // As sushi's server does: each matrix-unit arm (the wide-span attention, the decode index scan) serves only if its
     // load-time trial agrees with the SIMD kernel; each logs which kernel serves.
     dsv.setAttnNax(m.mdl, kernels.attn_nax_bar);

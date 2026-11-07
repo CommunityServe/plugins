@@ -21,6 +21,7 @@ const exl3 = @import("sushi_exl3");
 const expert_usage = @import("expert_usage.zig");
 const transient_peak = @import("transient_peak.zig");
 const ane_mod = @import("../../ane_shared.zig");
+const tp = @import("../../tp.zig");
 
 const A = sc_mod.A;
 const S = sc_mod.S;
@@ -2308,7 +2309,7 @@ fn sharedQuant(ly: *const Layer) ?kernels.SharedLins {
 /// into `x1` by `sf`): the new stream, or null where they do not apply.
 fn ffnDecode(sc: *Scope, m: *const Model, li: usize, h: A, x1: A, mix: *HcMix) !?A {
     const c = &m.cfg;
-    if (c.expert_dec != null or m.tap != null or !fusedOn(sc, m) or dim(h, 0) != 1 or !kernels.moeDecodeFits(c.dim, c.moe_inter)) return null;
+    if (tp.on() or c.expert_dec != null or m.tap != null or !fusedOn(sc, m) or dim(h, 0) != 1 or !kernels.moeDecodeFits(c.dim, c.moe_inter)) return null;
     const sh = sharedQuant(&m.layers[li]) orelse return null;
     const r = try router(sc, m, li, h, none, mix);
     const sf = try mix.splitOnce(sc, m);
@@ -2597,7 +2598,7 @@ pub fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h:
 /// layer of the backbone at decode width, where `hcExpand` is the kernel and nothing reads the sum.
 fn foldsExpand(m: *const Model, sh: *const Shared, li: usize, x1: A) bool {
     const rows = dim(x1, 0);
-    return m.fused and mlx.streamIsGpu(m.s) and sh.spec_on and sh.img.ctx == null and m.experts == .hook and m.cfg.expert_dec != null and
+    return !tp.on() and m.fused and mlx.streamIsGpu(m.s) and sh.spec_on and sh.img.ctx == null and m.experts == .hook and m.cfg.expert_dec != null and
         li < m.cfg.layers and rows <= exl3.kernels.DECODE_ROWS_MAX and m.trace == null and m.tap == null and m.ablation == null and prof(m, rows) == null and
         kernels.hcExpandServes(x1) and mlx.mlx_array_dtype(x1) == m.act;
 }
@@ -2791,7 +2792,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         var asc = Scope.init(sc.a, sc.s);
         defer asc.deinit();
         const o = if (ds) |d| try dsparkAttention(&asc, m, li, h, d, p0) else try attention(&asc, m, st, li, h, p0, sh, span);
-        break :blk try ablate(sc, m, try sc.keep(asc.out(o)));
+        break :blk try ablate(sc, m, try tp.sum(sc, try sc.keep(asc.out(o))));
     };
     if (m.trace) |t| try t.put("attn_{d}", .{li}, a);
     if (width_probe) |t| try t.put("attn_{d}", .{li}, a);
@@ -2817,7 +2818,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         const expand: ?Expand = if (folded) .{ .x = x1, .post = sf.post, .comb = sf.comb } else null;
         const out = try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh, r, &.{ sf.pre, sf.post, sf.comb }, expand)));
         // A folded expand is the new stream, not the FFN output; `foldsExpand` keeps it off while an ablation is armed.
-        break :blk if (folded) out else try ablate(sc, m, out);
+        break :blk if (folded) out else try ablate(sc, m, try tp.sum(sc, out));
     };
     if (sh.spec) |*u| {
         u.x1 = sc.out(x1);
