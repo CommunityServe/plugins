@@ -1,12 +1,20 @@
 diff -ruN -x .generated a/plugins/deepseek_v41/plugin.zig b/plugins/deepseek_v41/plugin.zig
 --- a/plugins/deepseek_v41/plugin.zig
 +++ b/plugins/deepseek_v41/plugin.zig
-@@ -569,7 +569,7 @@
+@@ -569,7 +569,15 @@
  };
  fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
      const m: *Model = @ptrCast(@alignCast(mp));
 -    return !m.cfg.dsv41_streamed and m.bank == null and m.mdl.streamed == null and m.mdl.pair == null;
-+    return m.mdl.pair == null;
++    return m.mdl.pair == null and !bankStreams(m);
++}
++fn bankStreams(m: *const Model) bool {
++    if (comptime !build_options.mlx_stream) return false;
++    const b = m.bank orelse return false;
++    return switch (b) {
++        .exl3 => |x| @min(x.bill.rows.prompt, x.bill.rows.decode) < m.cfg.num_experts,
++        .pack => true,
++    };
  }
  fn liveState(m: *Model, slot: u32) ?*dsv41.State {
      if (slot == m.owner) return if (m.mdl.dec_state) |*st| st else null;
