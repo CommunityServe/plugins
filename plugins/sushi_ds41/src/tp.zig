@@ -43,13 +43,26 @@ pub fn init() !void {
         return error.SushiTpBackend;
     }
     var g = mlx_distributed_group_new();
-    try mlx.check(mlx_distributed_init(&g, true, raw));
+    try joinGroup(&g, raw);
     group = g;
     rank = @intCast(mlx_distributed_group_rank(g));
     size = @intCast(mlx_distributed_group_size(g));
     cpu = mlx.mlx_default_cpu_stream_new();
     log.info("[sushi_ds41] tensor parallel: rank {d} of {d} over {s}\n", .{ rank, size, backend });
 }
+
+/// MLX gives up on a peer after about 15 s; a peer still starting gets `join_tries` of those.
+fn joinGroup(g: *Group, backend: [*:0]const u8) !void {
+    var tries: u32 = 1;
+    while (true) : (tries += 1) {
+        if (mlx_distributed_init(g, true, backend) == 0) return;
+        if (tries == join_tries) return error.SushiTpJoin;
+        log.warn("[sushi_ds41] tensor parallel: no peer yet (try {d} of {d})\n", .{ tries, join_tries });
+        mlx.dropLatchedErrorUnless(false);
+    }
+}
+
+const join_tries = 20;
 
 /// `x` summed over every rank: lazy, on the CPU stream, owned by `sc`. `x` itself when tensor parallel is off.
 pub fn sum(sc: *sc_mod.Scope, x: A) !A {

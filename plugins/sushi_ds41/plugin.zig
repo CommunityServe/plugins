@@ -174,6 +174,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     const s: mlx.mlx_stream = .{ .ctx = ctx.stream.ctx };
     if (!mlx.streamIsGpu(s)) return error.MetalOnly;
+    // The ranks join before either reads its weights, so one rank's slower load cannot run out the other's connect.
+    try tp.init();
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = ctx.model_dir.slice();
     const priv = config.private(ctx.parsed);
@@ -214,7 +216,6 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.engine.warmCache() catch |e| log.warn("[sushi_ds41] expert cache warm failed: {s}\n", .{@errorName(e)});
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
-    try tp.init();
     if (tp.on()) {
         m.mdl.route_spec = false;
         log.info("[sushi_ds41] tensor parallel: {d} heads, MoE width {d} on this rank; route speculation and the folded hc expand off\n", .{ c.heads, c.moe_inter });
