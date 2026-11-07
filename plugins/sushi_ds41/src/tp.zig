@@ -70,15 +70,16 @@ fn joinGroup(g: *Group, backend: [*:0]const u8) !void {
 const join_pause_s = 5;
 const join_budget_s = 1200;
 
-/// Where a layer's partial sums meet (`SUSHI_DS41_TP_SUM`): `cpu` (default) runs the all-reduce on the CPU stream,
-/// `gpu` on the GPU stream, `off` skips it, which is wrong output and only for timing the compute alone.
-const SumPlace = enum { cpu, gpu, off };
+/// Whether a layer's partial sums meet (`SUSHI_DS41_TP_SUM`): `cpu` (default) runs the all-reduce on the CPU stream, the
+/// only one MLX 0.32 implements it on (a GPU stream fails with "AllReduce::eval_gpu has no GPU implementation"); `off`
+/// skips it, which is wrong output and only for timing the compute alone.
+const SumPlace = enum { cpu, off };
 var sum_place: SumPlace = .cpu;
 
 fn readSumPlace() !void {
     const raw = std.c.getenv("SUSHI_DS41_TP_SUM") orelse return;
     sum_place = std.meta.stringToEnum(SumPlace, std.mem.span(raw)) orelse {
-        log.err("[sushi_ds41] SUSHI_DS41_TP_SUM=\"{s}\": use cpu, gpu or off\n", .{raw});
+        log.err("[sushi_ds41] SUSHI_DS41_TP_SUM=\"{s}\": use cpu or off\n", .{raw});
         return error.SushiTpSum;
     };
     if (sum_place == .off) log.warn("[sushi_ds41] tensor parallel: layer sums OFF, output is wrong (timing only)\n", .{});
@@ -89,8 +90,7 @@ pub fn sum(sc: *sc_mod.Scope, x: A) !A {
     if (!on() or sum_place == .off) return x;
     sums += 1;
     var o = mlx.mlx_array_new();
-    const s = if (sum_place == .gpu) sc.s else cpu;
-    return sc.res(mlx_distributed_all_sum(&o, x, group, s), &o);
+    return sc.res(mlx_distributed_all_sum(&o, x, group, cpu), &o);
 }
 
 /// Rank 0's `words` on every rank, in place: the others contribute zeros, and an integer sum with zeros is exact.
