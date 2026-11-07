@@ -51,18 +51,23 @@ pub fn init() !void {
     log.info("[sushi_ds41] tensor parallel: rank {d} of {d} over {s}\n", .{ rank, size, backend });
 }
 
-/// MLX gives up on a peer after about 15 s; a peer still starting gets `join_tries` of those.
+/// A peer can still be reading its weights (the host reads the whole pack before the plugin loads, minutes from a cold
+/// page cache), so the join keeps trying every `join_pause_s` for up to `join_budget_s`.
 fn joinGroup(g: *Group, backend: [*:0]const u8) !void {
-    var tries: u32 = 1;
-    while (true) : (tries += 1) {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tries = join_budget_s / join_pause_s;
+    var t: u32 = 1;
+    while (true) : (t += 1) {
         if (mlx_distributed_init(g, true, backend) == 0) return;
-        if (tries == join_tries) return error.SushiTpJoin;
-        log.warn("[sushi_ds41] tensor parallel: no peer yet (try {d} of {d})\n", .{ tries, join_tries });
         mlx.dropLatchedErrorUnless(false);
+        if (t == tries) return error.SushiTpJoin;
+        if (t % 6 == 1) log.warn("[sushi_ds41] tensor parallel: no peer yet ({d} s of {d})\n", .{ t * join_pause_s, join_budget_s });
+        std.Io.sleep(io, .fromMilliseconds(join_pause_s * 1000), .real) catch {};
     }
 }
 
-const join_tries = 20;
+const join_pause_s = 5;
+const join_budget_s = 1200;
 
 /// `x` summed over every rank: lazy, on the CPU stream, owned by `sc`. `x` itself when tensor parallel is off.
 pub fn sum(sc: *sc_mod.Scope, x: A) !A {
