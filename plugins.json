@@ -3,6 +3,7 @@
   "plugins": [
     {
       "name": "sushi_ds41",
+      "title": "Sushi - DeepSeek 4.1 Flash",
       "kind": "model",
       "version": "0.2.0",
       "summary": "DeepSeek-V4.1-Flash STQ packs on sushi's own model code: DSpark, prefix cache, images.",
@@ -16,6 +17,7 @@
     },
     {
       "name": "turboexl3_ds41",
+      "title": "TurboEXL3 - DeepSeek 4.1 Flash",
       "kind": "model",
       "version": "0.1.0",
       "summary": "DeepSeek-V4.1-Flash EXL3 packs streamed from SSD: mlx-serve's own DeepSeek-V4.1 model and expert streamer, the EXL3 math in turboexl3, on M5-class Macs (NAX).",
@@ -29,6 +31,7 @@
     },
     {
       "name": "turboexl3_qwen38",
+      "title": "TurboEXL3 - Qwen 3.8 Flash",
       "kind": "model",
       "version": "0.1.0",
       "summary": "turboderp's fully EXL3 Qwen3.8-Flash packs (K2 to K5) through turboexl3, on M5-class Macs (NAX).",

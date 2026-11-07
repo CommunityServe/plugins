@@ -1,5 +1,6 @@
 {
   "name": "sushi_ds41",
+  "title": "Sushi - DeepSeek 4.1 Flash",
   "kind": "model",
   "version": "0.2.0",
   "summary": "DeepSeek-V4.1-Flash STQ packs on sushi's own model code: DSpark, prefix cache, images.",

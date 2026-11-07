@@ -29,6 +29,7 @@ Z
 cat > "$dest/plugin.json" <<J
 {
   "name": "$name",
+  "title": "Project - Model it serves",
   "kind": "$kind",
   "version": "0.1.0",
   "summary": "One line: what this plugin serves.",

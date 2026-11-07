@@ -10,7 +10,7 @@ plugins = []
 for f in sorted((root / "plugins").glob("*/plugin.json")):
     p = json.loads(f.read_text())
     assert f.parent.name == p["name"], f"{f}: name must equal its folder"
-    entry = {k: p[k] for k in ("name", "kind", "version", "summary", "models", "requires_mlx_serve", "fixture", "homepage") if k in p}
+    entry = {k: p[k] for k in ("name", "title", "kind", "version", "summary", "models", "requires_mlx_serve", "fixture", "homepage") if k in p}
     if "icon" in p:
         entry["icon"] = f"plugins/{p['name']}/{p['icon']}"
     plugins.append(entry)
