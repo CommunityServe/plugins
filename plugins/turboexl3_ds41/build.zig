@@ -1,171 +1,24 @@
-//! Builds this plugin with the mlx-serve plugin kit. The root module (plugin.zig) holds the generated copy of mlx-serve's
-//! DeepSeek-V4.1 model (src/mlx_serve, scripts/prepare.sh); the expert streamer is a module of its own (`mlx_stream`, over
-//! its own `sdk`), and turboexl3 (build.zig.zon, pinned by URL and hash) runs the EXL3 math over this plugin's `sdk` for it
-//! (src/turboexl3_sdk.zig). Each reaches the plugin's root as `mlx_host`, so no file is in two modules. `zig build test`
-//! runs config.zig's MLX-free tests (plugin.json's test_step).
+//! Builds this plugin with the mlx-serve plugin kit, with turboexl3 (build.zig.zon, pinned by URL and hash) over this
+//! plugin's `sdk` for it (src/turboexl3_sdk.zig), and the EXL3 lane over the kit's expert stream (`kit.streamed`) as a
+//! module of its own (`mlx_stream`, src/stream.zig, over its own `sdk` in src/streamed/sdk/), the kit's read pool C
+//! compiled in. `zig build test` runs config.zig's MLX-free tests and the lane's (src/*_test.zig).
 
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // src/mlx_serve is generated (scripts/prepare.sh): no build goes on with a tree other than the reviewed one.
-    _ = b.run(&.{ "bash", b.root.joinString(b.allocator, "scripts/check-mlx-serve.sh") catch @panic("OOM") });
-    const lib = @import("mlx_serve_kit").plugin(b, .{ .name = "turboexl3_ds41" });
+    const kit_build = @import("mlx_serve_kit");
+    const lib = kit_build.plugin(b, .{ .name = "turboexl3_ds41" });
     const root = lib.root_module.import_table.get("plugin").?;
     const target = root.resolved_target.?;
     const optimize = root.optimize.?;
     const kit = root.import_table.get("mlx_serve").?;
-    // What the copies read from mlx-serve's build: the streamer is built in, no slow tests.
-    const opts = b.addOptions();
-    opts.addOption(bool, "mlx_stream", true);
-    opts.addOption(bool, "slow_tests", false);
-    root.addOptions("build_options", opts);
-    // MLX's steel headers as the kit ships them (lane_qmm's tile matmul, turboexl3's prefill GEMMs): the kit module's own
-    // import, so the file is in one module.
     const steel = kit.import_table.get("mlx_steel_sources").?;
-    root.addImport("mlx_steel_sources", steel);
-    // The expert streamer and its own `sdk`, as mlx-serve's build.zig makes them (build/libs.zig mlxStreamPkg): the read
-    // pool is C; MLX's event and alloc shims are this plugin's, over the host's GPU table (src/host_shims.zig).
-    const csrc = "src/mlx_serve/sdk/weights/streamed/csrc";
-    const ssdk = b.createModule(.{
-        .root_source_file = b.path("src/mlx_serve/sdk/weights/streamed/sdk/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{.{ .name = "mlx_host", .module = root }},
-    });
-    const stream = b.createModule(.{
-        .root_source_file = b.path("src/mlx_stream.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{ .{ .name = "mlx_host", .module = root }, .{ .name = "sdk", .module = ssdk } },
-    });
-    stream.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" } });
-    stream.addIncludePath(b.path(csrc));
-    root.addImport("mlx_stream", stream);
-    // turboexl3: its library and its plugin-kit launcher over this plugin's `sdk` for them.
     const dep = b.dependency("turboexl3", .{ .target = target, .optimize = optimize });
-    // MLX_SERVE_DSV41_FRAC (src/frac.zig): its MLX-free switch, width rules, load line and parked ring; and its tile
-    // gate: turboexl3's reference decode of real turboderp n 40 / n 24 tiles (and n 32 / 48 controls) against exllamav3
-    // frac.cu's rule (src/frac_test.zig, src/frac_tiles.json), turboexl3's MLX-free src/core/format.zig as a module of its
-    // own.
-    const format = b.createModule(.{ .root_source_file = dep.path("src/core/format.zig"), .target = target, .optimize = optimize });
-    const frac_sw = b.addTest(.{ .name = "frac", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/frac.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(frac_sw).step);
-    const frac_tiles = b.addTest(.{ .name = "frac_tiles", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/frac_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "turboexl3_format", .module = format }},
-    }) });
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(frac_tiles).step);
-    // Free seed rows on the streamer's own policy, MLX-free: src/seed_free_test.zig as a test of its own (the policy is
-    // the `mlx_stream` module's file, never the plugin root's).
-    const free = b.addTest(.{ .name = "seed_free", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/seed_free_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(free).step);
-    // Staging's transient rows on the same policy (`PlanOpts.held_rows`): src/stage_test.zig, likewise.
-    const stage_rows = b.addTest(.{ .name = "stage_rows", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/stage_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(stage_rows).step);
-    // MLX_SERVE_DSV41_FLASH_ATTN's MLX-free parts (the setting, the kernel's heads-region twin):
-    // src/flash_plan.zig as a test of its own.
-    const flash_plan = b.addTest(.{ .name = "flash_plan", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/flash_plan.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(flash_plan).step);
-    // A wide index layer's indexer spans in groups (src/idx_group.zig, patches/turboexl3-model.patch): the
-    // grouping, the cuts, and the selection grouped and ungrouped on a synthetic case, MLX-free.
-    const idx_group = b.addTest(.{ .name = "idx_group", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/idx_group.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(idx_group).step);
-    // A wide KV-source layer's compressor for every span first (src/comp_once.zig, patches/turboexl3-model.patch):
-    // the view arithmetic, and every span's rows the same as per span with no whole-cache copy, MLX-free.
-    const comp_once = b.addTest(.{ .name = "comp_once", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/comp_once.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(comp_once).step);
-    // Whether a chunk's logits go through the LM head (src/head_logits.zig, patches/turboexl3-model.patch): an EXL3 head
-    // (no `w`) is applied, only a head with neither is a tensor rank's, MLX-free.
-    const head_logits = b.addTest(.{ .name = "head_logits", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/head_logits.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(head_logits).step);
-    // The streamed bank's bill calibrated against the box's measured peaks (src/bill_cal.zig,
-    // patches/turboexl3-model.patch): the setting, the measured conditions, the tables' points and interpolation, and
-    // the 2.81 pack's rows at the 16K and 256K cells against the calibration model, MLX-free.
-    const bill_cal = b.addTest(.{ .name = "bill_cal", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/bill_cal.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(bill_cal).step);
-    // The direct parts route's byte gate: the copied read pool's C file alone (no MLX) reading the pack's record layout
-    // through the PARTS route and the staging route, the same slot bytes (src/direct_parts_test.zig).
-    const parts_gate = b.addTest(.{ .name = "direct_parts", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/direct_parts_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    }) });
-    parts_gate.root_module.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" } });
-    parts_gate.root_module.addIncludePath(b.path(csrc));
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(parts_gate).step);
-    // The a4k record layout's byte gate (zzzzt): the copied read pool's C file alone (no MLX) reading the same records laid
-    // out classic and a4k (src/mlx_serve/sdk/weights/streamed/expert/a4k.zig) through the staging, PARTS, speculative and
-    // pre-read routes, the same slot bytes (src/a4k_test.zig); A4K_GATE_PACKS=<classic>:<a4k> adds two real packs.
-    const a4k_gate = b.addTest(.{ .name = "a4k", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/a4k_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    }) });
-    a4k_gate.root_module.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" } });
-    a4k_gate.root_module.addIncludePath(b.path(csrc));
-    const a4k_run = b.addRunArtifact(a4k_gate);
-    // -Da4k-gate=<classic pack>:<a4k pack>: the real-file gate reads both packs' experts.bin (always run when given).
-    if (b.option([]const u8, "a4k-gate", "Two pack dirs <classic>:<a4k>: src/a4k_test.zig's real-file gate reads both experts.bin")) |packs| {
-        a4k_run.setEnvironmentVariable("A4K_GATE_PACKS", packs);
-        a4k_run.has_side_effects = true;
-    }
-    b.top_level_steps.get("test").?.step.dependOn(&a4k_run.step);
-    // The demand-first order's byte gate (df1): the copied read pool's C file alone (no MLX), with its test hooks
-    // (-DQ3LD_INJECT: scripted per-offset faults and sleeps, delays before the lookahead's reads and the demand
-    // ranges), reading a temp file's records through the lookahead and the demand at each mode, every slot row the
-    // file's bytes (src/demand_first_test.zig).
-    const df_gate = b.addTest(.{ .name = "demand_first", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/demand_first_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    }) });
-    df_gate.root_module.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" } });
-    df_gate.root_module.addIncludePath(b.path(csrc));
-    b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(df_gate).step);
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/turboexl3_sdk.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "mlx_host", .module = root }, .{ .name = "mlx_serve", .module = kit }, .{ .name = "mlx_steel_sources", .module = steel } },
+        .imports = &.{ .{ .name = "mlx_serve", .module = kit }, .{ .name = "mlx_steel_sources", .module = steel } },
     });
     const tkit = b.createModule(.{
         .root_source_file = dep.path("kit/root.zig"),
@@ -184,4 +37,36 @@ pub fn build(b: *std.Build) void {
     });
     root.addImport("turboexl3", t3);
     root.addImport("turboexl3_kit", tkit);
+
+    // The EXL3 lane over the kit's expert stream: its own `sdk`, the module, and the kit's read pool C. The stream's MLX
+    // internals (events, aliases, the launch cache) are this plugin's C symbols over the host's table (src/host_shims.zig).
+    const ssdk = b.createModule(.{
+        .root_source_file = b.path("src/streamed/sdk/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_serve", .module = kit }},
+    });
+    const stream = b.createModule(.{
+        .root_source_file = b.path("src/stream.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "sdk", .module = ssdk }, .{ .name = "mlx_serve", .module = kit }, .{ .name = "turboexl3", .module = t3 } },
+    });
+    kit_build.streamSources(b, stream, false);
+    root.addImport("mlx_stream", stream);
+
+    // The lane's MLX-free tests (src/*_test.zig), each a root of its own: the a4k record layout through the kit's read
+    // pool, the half-integer-rate tiles against turboexl3's format.
+    const format = b.createModule(.{ .root_source_file = dep.path("src/core/format.zig"), .target = target, .optimize = optimize });
+    for ([_][]const u8{ "frac", "a4k" }) |name| {
+        const m = b.createModule(.{ .root_source_file = b.path(b.fmt("src/{s}_test.zig", .{name})), .target = target, .optimize = optimize, .link_libc = true });
+        if (std.mem.eql(u8, name, "frac")) m.addImport("turboexl3_format", format);
+        if (std.mem.eql(u8, name, "a4k")) {
+            m.addImport("mlx_serve", kit);
+            kit_build.streamSources(b, m, false);
+        }
+        b.top_level_steps.get("test").?.step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = name, .root_module = m })).step);
+    }
 }

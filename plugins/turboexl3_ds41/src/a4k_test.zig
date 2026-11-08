@@ -1,6 +1,6 @@
-//! The a4k record layout's byte gate (zzzzt), a test of its own in `zig build test` (build.zig), MLX-free: the copied read
+//! The a4k record layout's byte gate (zzzzt), a test of its own in `zig build test` (build.zig), MLX-free: the read
 //! pool (its C file alone, no MLX, no stream) reads the same records' parts from a classic file and from an a4k one
-//! (expert/a4k.zig's geometry), each record's rows and lengths handed to it in the file's order on disk as the patched
+//! (expert/a4k.zig's geometry), each record's rows and lengths handed to it in the file's order on disk as the
 //! `expert.io.Records` hands them (`a4k.toDisk`), DeepSeek-V4.1's K = 3 and K = 2 records (two layers of two experts):
 //! through the staging route, through the PARTS route (every a4k code read straight into its row: three parts a record
 //! against the classic layout's gate code alone), from a speculative record read whole (the record's extent) and
@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const testing = std.testing;
-const a4k = @import("mlx_serve/sdk/weights/streamed/expert/a4k.zig");
-const io = @import("mlx_serve/sdk/weights/streamed/sdk_ext/expert/io.zig");
+const a4k = @import("streamed/expert/a4k.zig");
+const io = @import("mlx_serve").streamed.expert.io;
 
 // a4k.zig's own tests (its geometry at DeepSeek-V4.1's records, the order's permutation) run with these.
 test {
@@ -38,7 +38,7 @@ extern fn q3ld_stop() c_int;
 /// dq1b: the gate/up split (0 off, 1 on), set after `q3ld_start` by `run` when `split_mode` is set.
 extern fn q3ld_gu_split(mode: i32) c_int;
 
-/// The pool's Metal event backend (src/host_shims.zig in the plugin): never armed here, every gate off.
+/// The pool's Metal event backend (host_shims.zig): never armed here, every gate off.
 export fn q3ld_mtl_signal(event: ?*anyopaque, value: u64) void {
     _ = event;
     _ = value;

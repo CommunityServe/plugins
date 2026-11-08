@@ -5,15 +5,11 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .mlx_serve_kit = .{ .path = "../../.kit/kit" },
-        // turboexl3 (davidtai/turboexl3): the EXL3 kernels and its plugin-kit launcher, at c7ce66c on turboexl3 main
-        // (#8's merge: the tree organized by model, src/* under src/core/ and src/models/<model>/). The DeepSeek-V4.1
-        // kernels this plugin runs are #3's (c3bb0e2): the banked decode (moeClampedBanked, Config.banked_group 4, the
-        // skip id, banked_m3, banked_variant_gu / banked_variant_dn), pgemm (pg2) and the shared expert's finish (F3:
-        // sharedSwiglu, shfin).
+        // turboexl3 (davidtai/turboexl3): the EXL3 kernels and its plugin-kit launcher, at c7ce66c on turboexl3 main.
         .turboexl3 = .{
             .url = "https://github.com/davidtai/turboexl3/archive/c7ce66c12f6992eabda5db1d11934a6fe5efec33.tar.gz",
             .hash = "turboexl3-0.1.0-tZE8b-RXSAGaGiiBTBRCHN-0YwTOn8nsHXaePypJAJh_",
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "scripts", "patches", "tests", "NOTICE", "README.md" },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "tests", "NOTICE", "README.md" },
 }
