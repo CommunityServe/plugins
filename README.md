@@ -27,6 +27,7 @@ log says `[plugin] sushi_ds41 serves ...`. Details: [docs/using-plugins.md](docs
 
 | Plugin | Kind | Serves | Needs mlx-serve |
 |---|---|---|---|
+| [`hy_mt2_sherry`](plugins/hy_mt2_sherry) | model | Hy-MT2-1.8B 1.25-bit translation packs: `hunyuan_v1_dense` with Sherry/STQ1_0 projections and a 6-bit affine embedding | see [`plugins.json`](plugins.json) |
 | [`sushi_ds41`](plugins/sushi_ds41) | model | DeepSeek-V4.1-Flash STQ packs on sushi's model code: DSpark (greedy and sampled), prefix cache, images | see [`plugins.json`](plugins.json) |
 
 `plugins.json` is the machine-readable index (generated from each plugin's `plugin.json`).
