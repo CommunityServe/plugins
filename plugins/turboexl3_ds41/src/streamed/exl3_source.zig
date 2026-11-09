@@ -12,9 +12,8 @@ const xp = @import("experts.zig");
 const expert_bank = @import("expert/bank.zig");
 const expert_stream = @import("expert/stream.zig");
 const sdk_ext = @import("sdk_ext.zig");
-/// mlx-serve's expert usage profile (`expert-usage-v1.json`): the resident seed at the load and the record
-/// expert_usage_cfg.zig sets them (`TURBOEXL3_DS41_RESIDENT_SEED`, `TURBOEXL3_DS41_EXPERT_USAGE_DIR`,
-/// `_RECORD`, `_LABEL`).
+/// mlx-serve's expert usage profile (`expert-usage-v1.json`): the resident seed at the load
+/// (expert_usage_cfg.zig: `TURBOEXL3_DS41_RESIDENT_SEED`, `TURBOEXL3_DS41_EXPERT_USAGE_DIR`).
 const expert_usage = sdk_ext.expert.usage;
 const usage_mod = @import("../bank/expert_usage_cfg.zig");
 /// The plugin's scratch_waves.zig: the prefill waves' per-prompt regions.
@@ -166,8 +165,6 @@ pub const Source = struct {
     phase: Phase = .prompt,
     released: bool = false,
 
-    /// `expert_usage_record`'s recorder: each request's routed experts counted, its file written at the request's end.
-    usage_rec: ?*expert_usage.Recorder = null,
     /// JOINLESS's combine, built and compiled at the load.
     jl: ?Combine = null,
     /// The bank in `dir` at the rows `budget` holds, streamed on `s` (the trunk's stream). `gates`: every routed layer's
@@ -182,7 +179,6 @@ pub const Source = struct {
         errdefer a.destroy(self);
         self.a = a;
         self.phase = .prompt;
-        self.usage_rec = null;
         self.released = false;
         self.jl = null;
         self.bank = try expert_bank.Bank.open(a, io, dir, implementedOf(geo), null);
@@ -282,16 +278,8 @@ pub const Source = struct {
         }
         errdefer a.free(self.gates_t3);
         errdefer self.hook.deinit();
-        // The usage record's counting, then the resident seed (the prompt rows still empty: nothing has routed).
-        const layers: u32 = @intCast(self.stream.layers.len);
-        const experts = self.stream.bank.n_experts;
-        if (usage_mod.ps().setting.recordPath()) |path| {
-            self.usage_rec = try expert_usage.Recorder.init(a, io, path, usage_arch, usage_mod.ps().setting.label(), layers, experts);
-            self.stream.countRoutes();
-            std.log.info("streamed exl3: expert usage recorded to {s} (prompt set {s}), each request's routed experts counted", .{ path, usage_mod.ps().setting.label() });
-        }
-        errdefer if (self.usage_rec) |r| r.deinit();
-        try self.seedUsage(a, io, dir, layers, experts);
+        // The resident seed (the prompt rows still empty: nothing has routed).
+        try self.seedUsage(a, io, dir, @intCast(self.stream.layers.len), self.stream.bank.n_experts);
         return self;
     }
 
@@ -334,15 +322,6 @@ pub const Source = struct {
         std.log.info("streamed exl3: {s}", .{expert_usage.seedLine(&buf, usage_arch, &d, seeded, records * (self.bill.row_bytes / layers), ms)});
         std.log.info("streamed exl3: {d} seeded rows free until a route uses them: the prompt's read-ahead may take them", .{self.stream.freeSeed()});
     }
-    /// `expert_usage_record`, at a request's end: its routed experts (the prompt pass's and the decode routes') added to
-    /// the record and the file written; the prompt counts zeroed after, since a next request with its prompt cached runs
-    /// no prompt pass, whose phase change zeroes them.
-    pub fn usageEnd(self: *Source, io: std.Io, prompt_tokens: u64, decode_tokens: u64) !void {
-        const r = self.usage_rec orelse return;
-        self.stream.addUsage(r.counts);
-        for (self.stream.layers) |*ls| @memset(ls.policy.prefill_freq, 0);
-        try r.endRequest(io, prompt_tokens, decode_tokens);
-    }
     pub fn deinit(self: *Source) void {
         _ = mlx.mlx_synchronize(self.g.s);
         scratch_waves.releaseAll();
@@ -360,9 +339,11 @@ pub const Source = struct {
         self.a.free(self.gates);
         self.a.free(self.prompt_rows);
         self.a.free(self.decode_rows);
-        if (self.usage_rec) |r| r.deinit();
         self.a.destroy(self);
         if (comptime expert_stream.uses_reader) sdk_ext.expert.giveReader();
+        // MLX's settings the phases changed (decode's cache cap, the prompt's buffer split) back for the next model.
+        decode_stop.enterPrompt();
+        buffer_mb.enterDecode();
     }
 
     /// Model layer `layer`'s routed sum `[n, hidden]` f32 for the normed MoE input `x` `[n, hidden]`, the routes `idx`

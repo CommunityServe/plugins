@@ -19,10 +19,11 @@ kernels, and streams the routed experts from the repack's `experts.bin` (a4k lay
   exllamav3's half-integer rates on turboexl3's MoE. MLX's internals the stream needs (events, buffer aliases, the
   launch cache, the command-buffer split) come through the host table (`src/host_shims.zig`).
 
-The bank's prompt lane needs an M5-class GPU (NAX; elsewhere the bank is refused by name). Images are not served on
-these packs yet (the vision tower is EXL3 too). The bank reads `TURBOEXL3_DS41_FRAC`, `TURBOEXL3_DS41_RESIDENT_SEED`,
-`TURBOEXL3_DS41_EXPERT_USAGE_{DIR,RECORD,LABEL}` (its options: the app's Models ▸ Plugins page sets them) and
-`MLX_MAX_MB_PER_BUFFER` at its open.
+The bank's prompt lane needs an M5-class GPU (NAX; elsewhere the bank is refused by name). Only the mul1 codebook is
+served (an mcg pack is refused by name). Images are not served on these packs yet (the vision tower is EXL3 too). The
+bank reads `TURBOEXL3_DS41_FRAC`, `TURBOEXL3_DS41_RESIDENT_SEED`, `TURBOEXL3_DS41_EXPERT_USAGE_DIR` (its options: the
+app's Models ▸ Plugins page sets them) and `MLX_MAX_MB_PER_BUFFER` at its open; the old `MLX_SERVE_DSV41_*` names are
+not read (a warning names any that is set).
 
     scripts/build.sh turboexl3_ds41                    # from the repo root: tests, then ReleaseFast
     scripts/install.sh turboexl3_ds41 --home ~/tmp/h   # under a throwaway HOME

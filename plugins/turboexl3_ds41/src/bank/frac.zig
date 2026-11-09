@@ -156,3 +156,57 @@ pub fn Parked(comptime Proj: type) type {
         }
     };
 }
+
+const testing = std.testing;
+
+test "frac: the switch" {
+    try testing.expectEqual(Mode.on, try parse(null));
+    try testing.expectEqual(Mode.on, try parse(""));
+    try testing.expectEqual(Mode.on, try parse("1"));
+    try testing.expectEqual(Mode.off, try parse("0"));
+    for ([_][]const u8{ "2", "on", "check", "Check", " 1" }) |v| try testing.expectError(error.FracSetting, parse(v));
+    try configure(null);
+    try testing.expect(on() and served(40) and served(24) and !served(32) and !served(48) and !served(56));
+    try configure("0");
+    try testing.expect(!on() and !served(40) and admitted().len == 0);
+    try configure(null);
+}
+
+test "frac: K to halfwords a tile" {
+    try testing.expectEqual(@as(?u32, 48), nOfK(3));
+    try testing.expectEqual(@as(?u32, 32), nOfK(2));
+    try testing.expectEqual(@as(?u32, 40), nOfK(2.5));
+    try testing.expectEqual(@as(?u32, 24), nOfK(1.5));
+    try testing.expectEqual(@as(?u32, 16), nOfK(1));
+    try testing.expectEqual(@as(?u32, 128), nOfK(8));
+    try testing.expectEqual(@as(?u32, 36), nOfK(2.25));
+    for ([_]f64{ 0, 0.5, 8.5, 9, 2.3, 2.0625, -2, std.math.nan(f64), std.math.inf(f64) }) |k| try testing.expectEqual(@as(?u32, null), nOfK(k));
+    try testing.expect(isDigx(32) and isDigx(48) and !isDigx(40) and !isDigx(24));
+}
+
+test "frac: the load line names the fractional runs" {
+    try configure(null);
+    var w: [40]u32 = @splat(32);
+    for (0..6) |l| w[l] = 40;
+    for (35..40) |l| w[l] = 40;
+    var buf: [512]u8 = undefined;
+    const line = loadLine(&buf, &w);
+    try testing.expect(std.mem.indexOf(u8, line, "n40 (K 2.5) at layers 0-5,35-39 on turboexl3") != null);
+    var z: [40]u32 = @splat(48);
+    z[23] = 32;
+    try testing.expect(std.mem.indexOf(u8, loadLine(&buf, &z), "no fractional layer") != null);
+}
+
+test "frac: the parked gate|up ring" {
+    const P = struct { id: u32 };
+    var r: Parked(P) = .{};
+    var a: u8 = 0;
+    var b: u8 = 0;
+    r.put(&a, .{ .id = 1 }, .{ .id = 2 });
+    r.put(&b, .{ .id = 3 }, .{ .id = 4 });
+    const got = r.take(&a).?;
+    try testing.expectEqual(@as(u32, 1), got.gate.id);
+    try testing.expectEqual(@as(u32, 2), got.up.id);
+    try testing.expect(r.take(&a) == null);
+    try testing.expectEqual(@as(u32, 4), r.take(&b).?.up.id);
+}

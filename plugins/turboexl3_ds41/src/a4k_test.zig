@@ -613,7 +613,7 @@ test "a4k real-file gate (A4K_GATE_PACKS=<classic pack>:<a4k pack>): the two pac
     try testing.expect(n_records >= 2 * ne);
 }
 
-// The read pool's order on disk from the bank (`a4k.poolDiskOrder`, through `io.poolOptions`, whose value the stream's
+// The read pool's order on disk from the bank (the kit's `io.poolDiskOrder`, through `io.poolOptions`, whose value the stream's
 // `Stream.init` starts its pool on): an a4k bank hands the pool its components in their file order, so
 // `Records.onDisk` lays each record's rows and lengths out as the file holds them; without it every a4k record's parts
 // land in the wrong slot rows.
@@ -628,14 +628,13 @@ const ClassicBank = struct {
     }
 };
 const HooklessBank = struct {};
-const max_disk_components = 16;
 
 test "a4k: an a4k bank's order on disk reaches the read pool's options; a classic bank's, and a bank without the hook, none" {
-    const got = a4k.poolDiskOrder(A4kBank, &.{}, max_disk_components) orelse return error.TestExpectedOrder;
+    const got = io.poolDiskOrder(A4kBank, &.{}) orelse return error.TestExpectedOrder;
     try testing.expectEqualSlices(u8, &a4k.disk_order, got[0..a4k.n_components]);
     for (got[a4k.n_components..]) |x| try testing.expectEqual(@as(u8, 0), x);
-    try testing.expect(a4k.poolDiskOrder(ClassicBank, &.{}, max_disk_components) == null);
-    try testing.expect(a4k.poolDiskOrder(HooklessBank, &.{}, max_disk_components) == null);
+    try testing.expect(io.poolDiskOrder(ClassicBank, &.{}) == null);
+    try testing.expect(io.poolDiskOrder(HooklessBank, &.{}) == null);
 }
 
 test "a4k: the read pool's options for a bank: an a4k bank's order on disk, a classic bank's none, the rest as given" {

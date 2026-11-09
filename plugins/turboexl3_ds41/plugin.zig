@@ -23,8 +23,6 @@ pub const plugin = kit.sdk.Plugin{ .name = "turboexl3_ds41", .kind = .quant, .op
     .{ .name = "TURBOEXL3_DS41_FRAC", .kind = .bool, .default = "1", .help = "Serve layers at a half-integer rate (off: a pack with them is refused)" },
     .{ .name = "TURBOEXL3_DS41_RESIDENT_SEED", .kind = .text, .help = "usage: fill the prompt rows with each layer's most used experts at load; none: no seed. Empty: by the pack" },
     .{ .name = "TURBOEXL3_DS41_EXPERT_USAGE_DIR", .kind = .text, .help = "The folder the seed reads expert-usage-v1.json from (absolute). Empty: the pack's" },
-    .{ .name = "TURBOEXL3_DS41_EXPERT_USAGE_RECORD", .kind = .text, .help = "Count each request's routed experts into this file (absolute path)" },
-    .{ .name = "TURBOEXL3_DS41_EXPERT_USAGE_LABEL", .kind = .text, .help = "The recorded prompt set's name (needs the record)" },
 } };
 
 pub const table = abi.QuantTable{
@@ -47,12 +45,13 @@ pub const table = abi.QuantTable{
 const Verdict = abi.Verdict;
 const A = mlx.mlx_array;
 const gpa = std.heap.c_allocator;
-const decodes = [_]t3.format.Decode{ .mul1, .mcg };
+/// The one codebook `validate` admits.
+const dec: t3.format.Decode = .mul1;
 const missing = Verdict.refuse(.failed, "MissingWeight");
 
 fn open(ctx: *abi.LoadCtx) callconv(.c) Verdict {
     const h = kit.host.Host.of(ctx.host) catch |e| return Verdict.named(.unsupported, @errorName(e));
-    const cb = config.codebookOf(ctx.block_json.slice()) orelse return Verdict.refuse(.unsupported, "turboexl3_ds41: not an exllamav3 block");
+    _ = config.codebookOf(ctx.block_json.slice()) orelse return Verdict.refuse(.unsupported, "turboexl3_ds41: not an exllamav3 mul1 block");
     // Kernels from the server's cache, launched through its launcher; MLX's matrix units only where its NAX gate holds.
     tkit.bind(h.t);
     // The streamer's events, slot buffers and launches, and its log lines, through the server's table.
@@ -77,27 +76,30 @@ fn open(ctx: *abi.LoadCtx) callconv(.c) Verdict {
         t3.pgemm.warm(s, .bfloat16, null) catch |e| return Verdict.named(.failed, @errorName(e));
         t3.pgemm.warm(s, .float32, .{ 5120, 512 }) catch |e| return Verdict.named(.failed, @errorName(e));
     }
-    ctx.state = @ptrCast(@constCast(&decodes[@intFromEnum(cb)]));
     return .ok;
 }
 
-fn close(ctx: *abi.LoadCtx) callconv(.c) void {
-    ctx.state = null;
-}
-
-fn layoutOf(ctx: *const abi.LoadCtx) u8 {
-    const d: *const t3.format.Decode = @ptrCast(@alignCast(ctx.state.?));
-    return @intCast(d - &decodes[0]);
-}
+fn close(_: *abi.LoadCtx) callconv(.c) void {}
 
 /// `<base>.trellis` (I16 [in/16, out/16, n]) beside `<base>.suh` (f16 [in]) and `<base>.svh` (f16 [out]), as exllamav3
 /// stores a linear; a grouped one (`wo_a`) as its slices `<base>.slice.<g>`, stacked (`grouped` set).
 fn loadTensor(ctx: *const abi.LoadCtx, name: abi.Str, in_dim: u32, out: *abi.Weight) callconv(.c) Verdict {
     const p = (partsOf(ctx, name.slice()) catch return Verdict.refuse(.failed, "turboexl3_ds41: a name too long")) orelse return loadGroups(ctx, name.slice(), in_dim, out);
-    const sh = mlx.getShape(p[0]);
-    if (sh.len != 3 or (in_dim != 0 and sh[0] * 16 != in_dim)) return Verdict.refuse(.unsupported, "turboexl3_ds41: an EXL3 linear of another input width");
-    out.* = .{ .w = share(p[0]), .scales = share(p[1]), .biases = share(p[2]), .layout = layoutOf(ctx) };
+    if (!shaped(p, in_dim)) return not_shaped;
+    out.* = .{ .w = share(p[0]), .scales = share(p[1]), .biases = share(p[2]) };
     return .ok;
+}
+
+const not_shaped = Verdict.refuse(.unsupported, "turboexl3_ds41: not an EXL3 linear of the expected input width (trellis [in/16, out/16, n], suh f16 [in], svh f16 [out])");
+
+/// `p` (trellis, suh, svh) as exllamav3 stores a linear of `in_dim` inputs (0: any).
+fn shaped(p: [3]A, in_dim: u32) bool {
+    const t = mlx.getShape(p[0]);
+    const u = mlx.getShape(p[1]);
+    const v = mlx.getShape(p[2]);
+    if (t.len != 3 or u.len != 1 or v.len != 1 or u[0] != t[0] * 16 or v[0] != t[1] * 16) return false;
+    if (in_dim != 0 and u[0] != in_dim) return false;
+    return mlx.mlx_array_dtype(p[1]) == .float16 and mlx.mlx_array_dtype(p[2]) == .float16;
 }
 
 /// `Weight.flags`: a grouped linear (its x is [rows, groups, in]).
@@ -110,7 +112,10 @@ fn loadGroups(ctx: *const abi.LoadCtx, base: []const u8, in_dim: u32, out: *abi.
     if (!v.isOk()) return v;
     out.flags = grouped;
     // The joined run's kernels compiled at the first grouped linear's load, for the trunk's bf16 rows.
-    if (!woa_warmed) woaj.warm(.{ .ctx = ctx.stream.ctx }, projOf(out), .bfloat16) catch |e| return Verdict.named(.failed, @errorName(e));
+    if (!woa_warmed) woaj.warm(.{ .ctx = ctx.stream.ctx }, projOf(out), .bfloat16) catch |e| {
+        release(out);
+        return Verdict.named(.failed, @errorName(e));
+    };
     woa_warmed = true;
     return .ok;
 }
@@ -122,7 +127,27 @@ var woa_warmed = false;
 fn loadBank(ctx: *const abi.LoadCtx, name: abi.Str, in_dim: u32, out: *abi.Weight) callconv(.c) Verdict {
     const full = name.slice();
     const dot = std.mem.lastIndexOfScalar(u8, full, '.') orelse return missing;
-    return stackParts(ctx, full[0..dot], full[dot..], in_dim, true, out);
+    const v = stackParts(ctx, full[0..dot], full[dot..], in_dim, true, out);
+    if (!v.isOk()) return v;
+    // Every expert the layer's router scores (`<layer>.ffn.gate.weight` [experts, hidden]): an expert missing from the
+    // pack would end the stack early, and a route past its end reads another tensor's bytes.
+    const routed = routerRows(ctx, full[0..dot]);
+    if (routed == null or routed.? != mlx.getShape(arr(out.w))[0]) {
+        release(out);
+        return Verdict.refuse(.unsupported, "turboexl3_ds41: the bank holds another count of experts than its router scores");
+    }
+    return .ok;
+}
+
+/// The experts the router beside `<layer>.ffn.experts` scores; null without one.
+fn routerRows(ctx: *const abi.LoadCtx, experts: []const u8) ?c_int {
+    if (!std.mem.endsWith(u8, experts, ".experts")) return null;
+    var buf: [192]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "{s}.gate.weight", .{experts[0 .. experts.len - ".experts".len]}) catch return null;
+    const g: A = .{ .ctx = ctx.source.tensor(name).ctx };
+    if (g.ctx == null) return null;
+    const sh = mlx.getShape(g);
+    return if (sh.len == 2) sh[0] else null;
 }
 
 /// The linears `<prefix>.<i><suffix>` for i = 0.. stacked on a new first axis, the trellis viewed as u16 on `u16`.
@@ -134,7 +159,7 @@ fn stackParts(ctx: *const abi.LoadCtx, prefix: []const u8, suffix: []const u8, i
         var buf: [192]u8 = undefined;
         const each = std.fmt.bufPrint(&buf, "{s}.{d}{s}", .{ prefix, e, suffix }) catch return Verdict.refuse(.failed, "turboexl3_ds41: a name too long");
         const p = (partsOf(ctx, each) catch return Verdict.refuse(.failed, "turboexl3_ds41: a name too long")) orelse break;
-        if (in_dim != 0 and mlx.getShape(p[0])[0] * 16 != in_dim) return Verdict.refuse(.unsupported, "turboexl3_ds41: an EXL3 linear of another input width");
+        if (!shaped(p, in_dim)) return not_shaped;
         for (&parts, p) |*l, a| l.append(gpa, a) catch return oom;
     }
     if (e == 0) return missing;
@@ -155,7 +180,7 @@ fn stackParts(ctx: *const abi.LoadCtx, prefix: []const u8, suffix: []const u8, i
             return Verdict.refuse(.failed, "turboexl3_ds41: the bank's trellis does not view as u16");
         }
     }
-    out.* = .{ .w = .{ .ctx = stacked[0].ctx }, .scales = .{ .ctx = stacked[1].ctx }, .biases = .{ .ctx = stacked[2].ctx }, .layout = layoutOf(ctx) };
+    out.* = .{ .w = .{ .ctx = stacked[0].ctx }, .scales = .{ .ctx = stacked[1].ctx }, .biases = .{ .ctx = stacked[2].ctx } };
     return .ok;
 }
 
@@ -217,7 +242,7 @@ fn arr(a: abi.Array) A {
 
 fn matmul(w: *const abi.Weight, x: abi.Array, s: abi.Stream, out: *abi.Array) callconv(.c) Verdict {
     const st: mlx.mlx_stream = .{ .ctx = s.ctx };
-    const y = (if (w.flags & grouped != 0) groupedMatmul(w, arr(x), st) else t3.linear(st, arr(x), arr(w.w), arr(w.scales), arr(w.biases), decodes[w.layout])) catch |e| return Verdict.named(.failed, @errorName(e));
+    const y = (if (w.flags & grouped != 0) groupedMatmul(w, arr(x), st) else t3.linear(st, arr(x), arr(w.w), arr(w.scales), arr(w.biases), dec)) catch |e| return Verdict.named(.failed, @errorName(e));
     out.* = .{ .ctx = y.ctx };
     return .ok;
 }
@@ -232,7 +257,7 @@ fn groupedMatmul(w: *const abi.Weight, x: A, s: mlx.mlx_stream) !A {
         }
         if (try woaj.run(s, x, projOf(w), &hats)) |y| return y;
     } else if (hats_of != null) dropHats();
-    return t3.linearGrouped(s, x, projOf(w), decodes[w.layout]);
+    return t3.linearGrouped(s, x, projOf(w), dec);
 }
 
 fn moe(_: *const abi.Weight, _: abi.Array, _: abi.Array, _: abi.Array, _: bool, _: abi.Stream, _: *abi.Array) callconv(.c) Verdict {
@@ -249,7 +274,6 @@ fn swiglu(gate: *const abi.Weight, up: *const abi.Weight, down: *const abi.Weigh
         out.* = .{ .ctx = y.ctx };
         return .ok;
     }
-    const dec = decodes[gate.layout];
     const y = (if (opts.limit > 0)
         t3.moeClamped(st, arr(x), bank, arr(inds), arr(scores), dec, opts.limit)
     else
@@ -296,8 +320,12 @@ fn bankRows(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.B
 fn configureBank() !void {
     stream.buffer_mb.configure(env("MLX_MAX_MB_PER_BUFFER"));
     try stream.frac.configure(env("TURBOEXL3_DS41_FRAC"));
-    stream.expert_usage_cfg.ps().setting = try stream.expert_usage_cfg.parse(env("TURBOEXL3_DS41_RESIDENT_SEED"), env("TURBOEXL3_DS41_EXPERT_USAGE_DIR"), env("TURBOEXL3_DS41_EXPERT_USAGE_RECORD"), env("TURBOEXL3_DS41_EXPERT_USAGE_LABEL"));
+    stream.expert_usage_cfg.ps().setting = try stream.expert_usage_cfg.parse(env("TURBOEXL3_DS41_RESIDENT_SEED"), env("TURBOEXL3_DS41_EXPERT_USAGE_DIR"));
+    for (old_names) |n| if (std.c.getenv(n) != null) std.log.warn("turboexl3_ds41: {s} is no longer read: the settings are this plugin's options (TURBOEXL3_DS41_*)", .{n});
 }
+
+/// The names the settings had in mlx-serve.
+const old_names = [_][:0]const u8{ "MLX_SERVE_DSV41_FRAC", "MLX_SERVE_DSV41_RESIDENT_SEED", "MLX_SERVE_DSV41_EXPERT_USAGE_DIR", "MLX_SERVE_DSV41_EXPERT_USAGE_RECORD", "MLX_SERVE_DSV41_EXPERT_USAGE_LABEL" };
 
 fn env(comptime name: [:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;

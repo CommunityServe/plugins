@@ -62,7 +62,10 @@ pub fn build(b: *std.Build) void {
     const format = b.createModule(.{ .root_source_file = dep.path("src/core/format.zig"), .target = target, .optimize = optimize });
     for ([_][]const u8{ "frac", "a4k" }) |name| {
         const m = b.createModule(.{ .root_source_file = b.path(b.fmt("src/{s}_test.zig", .{name})), .target = target, .optimize = optimize, .link_libc = true });
-        if (std.mem.eql(u8, name, "frac")) m.addImport("turboexl3_format", format);
+        if (std.mem.eql(u8, name, "frac")) {
+            m.addImport("turboexl3_format", format);
+            m.addImport("sdk", ssdk);
+        }
         if (std.mem.eql(u8, name, "a4k")) {
             m.addImport("mlx_serve", kit);
             kit_build.streamSources(b, m, false);

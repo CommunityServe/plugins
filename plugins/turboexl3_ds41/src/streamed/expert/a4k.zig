@@ -18,18 +18,6 @@ pub const disk_order = [n_components]u8{ 1, 2, 4, 5, 0, 3, 6, 7, 8 };
 /// The components' own order: a classic bank's order on disk.
 pub const identity = [n_components]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8 };
 
-/// The read pool's order on disk for `bank` (`expert_io.Options.disk_order`, `max` components, the rest 0): the bank's
-/// own (`Bank.diskOrder`: an a4k bank's `disk_order`), or null (a classic bank, or a bank type without the hook) for the
-/// components' order. The stream's `Stream.init` sets its pool options from it, so `Records.onDisk` lays each record's
-/// rows and lengths out in the file's order.
-pub fn poolDiskOrder(comptime Bank: type, bank: *const Bank, comptime max: usize) ?[max]u8 {
-    if (comptime !@hasDecl(Bank, "diskOrder")) return null;
-    const d = bank.diskOrder() orelse return null;
-    var order: [max]u8 = @splat(0);
-    @memcpy(order[0..d.len], &d);
-    return order;
-}
-
 pub const Geometry = struct {
     /// Each component's offset in its record (component order).
     offsets: [n_components]u64,
@@ -72,4 +60,44 @@ const testing = std.testing;
 fn dsv41Lengths(k: u64) [n_components]u64 {
     const code = (5120 / 16) * (2304 / 16) * 16 * k * 2;
     return .{ code, 2304 * 2, 5120 * 2, code, 2304 * 2, 5120 * 2, code, 5120 * 2, 2304 * 2 };
+}
+
+test "a4k puts every code of DeepSeek-V4.1's K = 3 and K = 2 records on the block, the spans contiguous, 4 KiB more a record" {
+    for ([_]u64{ 3, 2 }) |k| {
+        const lens = dsv41Lengths(k);
+        const g = geometry(lens).?;
+        try testing.expectEqual(@as(u64, 3072), g.lead);
+        for ([_]usize{ 0, 3, 6 }) |c| try testing.expectEqual(@as(u64, 0), g.offsets[c] % block);
+        // the gate/up span: its parts back to back from the lead, in disk order; the down span right after it
+        var at = g.lead;
+        for (disk_order) |c| {
+            try testing.expectEqual(at, g.offsets[c]);
+            at += lens[c];
+        }
+        try testing.expectEqual(at, g.extent);
+        var logical: u64 = 0;
+        for (lens) |n| logical += n;
+        try testing.expectEqual(std.mem.alignForward(u64, logical, block) + block, g.record_bytes);
+        // the six gate/up components first on disk, the three down ones after
+        for (disk_order[0..gu_components]) |c| try testing.expect(c < gu_components);
+        for (disk_order[gu_components..]) |c| try testing.expect(c >= gu_components);
+    }
+    try testing.expectEqual(@as(u64, 13_320_192), geometry(dsv41Lengths(3)).?.record_bytes);
+    try testing.expectEqual(@as(u64, 8_896_512), geometry(dsv41Lengths(2)).?.record_bytes);
+    // a code off the block has no a4k geometry
+    var odd = dsv41Lengths(3);
+    odd[3] += 2;
+    try testing.expect(geometry(odd) == null);
+}
+
+test "a4k toDisk reorders one record's values and the identity order keeps them" {
+    const x = [n_components]u64{ 10, 11, 12, 13, 14, 15, 16, 17, 18 };
+    try testing.expectEqualSlices(u64, &.{ 11, 12, 14, 15, 10, 13, 16, 17, 18 }, &toDisk(u64, n_components, &x, &disk_order));
+    try testing.expectEqualSlices(u64, &x, &toDisk(u64, n_components, &x, &identity));
+    // a permutation: every component once
+    var seen: [n_components]bool = @splat(false);
+    for (disk_order) |c| {
+        try testing.expect(!seen[c]);
+        seen[c] = true;
+    }
 }

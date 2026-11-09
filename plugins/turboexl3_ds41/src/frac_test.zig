@@ -13,6 +13,11 @@ const testing = std.testing;
 
 const fixture = @embedFile("frac_tiles.json");
 
+// The switch's own tests (bank/frac.zig: its parse, the K to n map, the load line, the parked ring) run with these.
+test {
+    _ = @import("bank/frac.zig");
+}
+
 const Tile = struct { src: []const u8, n: u32, words: []const u16, expect: []const u16 };
 
 test "frac: turboexl3's tile decode is exllamav3 frac.cu's rule on turboderp's tiles, n 40 and n 24 (n 32 / 48 too)" {

@@ -7,13 +7,13 @@ https://github.com/ddalcu/mlx-serve
 Copyright (c) 2026 David Dalcu
 Licensed under the MIT License.
 
-src/streamed/, src/exl3/ and src/bank/ are mlx-serve's DeepSeek-V4.1 EXL3 lane (its bank, source and waves, from
-src/sdk/weights/streamed/ and src/sdk/quant/exl3/stream/) and DeepSeek-V4.1's parts of the expert streamer, moved out
-of mlx-serve into this plugin at ddalcu/mlx-serve 72e87026 with the in-file tests taken out, the imports pointed at
-this plugin's files and the kit, and this plugin's own edits since; the stream itself is the kit's
-(`kit.streamed`). src/streamed/sdk/{env,log,shared}.zig and src/host_shims.zig are this
-plugin's code standing in for mlx-serve's registry, log, unit globals and C++ shims over MLX's private headers. The
-src/*_test.zig gates are this plugin's.
+src/streamed/ and src/exl3/ are mlx-serve's DeepSeek-V4.1 EXL3 lane (its bank, source and waves, from
+src/sdk/weights/streamed/ and src/sdk/quant/exl3/stream/), moved out of mlx-serve into this plugin at ddalcu/mlx-serve
+72e87026 with the imports pointed at this plugin's files and the kit, and this plugin's own edits since; the stream
+itself is the kit's (`kit.streamed`). src/bank/ (DeepSeek-V4.1's schedule over the stream) is this plugin's own code,
+back from mlx-serve, which carried it for a while. src/streamed/sdk/{env,log,shared}.zig and src/host_shims.zig are
+this plugin's code standing in for mlx-serve's registry, log, unit globals and C++ shims over MLX's private headers.
+The src/*_test.zig gates are this plugin's.
 
 --------------------------------------------------------------------------------
 mlx-stream

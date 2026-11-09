@@ -274,6 +274,12 @@ pub fn bankArraysOf(x: [n_components]mlx.mlx_array) BankArrays {
     return .{ .gate = .{ .code = x[0], .rout = x[1], .rin = x[2] }, .up = .{ .code = x[3], .rout = x[4], .rin = x[5] }, .down = .{ .code = x[6], .rout = x[7], .rin = x[8] } };
 }
 
+// The kit's read pool finds an a4k bank's order on disk by this name (`expert.io.poolDiskOrder`): renamed, an a4k bank
+// reads in the classic order, the wrong weights and no error.
+comptime {
+    if (!@hasDecl(Bank, "diskOrder")) @compileError("expert/bank.zig: Bank.diskOrder is the read pool's hook for the a4k order");
+}
+
 pub const Bank = struct {
     allocator: std.mem.Allocator,
     hidden: u64 = 0,
