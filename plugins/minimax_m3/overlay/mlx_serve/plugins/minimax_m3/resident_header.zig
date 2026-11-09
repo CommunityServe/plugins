@@ -1,0 +1,119 @@
+//! copied_from: src/plugins/minimax_m3/resident_header.zig@9df2c52b504cce5bbf22f074dab168fd8584f961
+//! MiniMax prepared pack resident-header check, before MLX loads the tensors.
+const std = @import("std");
+const io_util = @import("mlx_stream").sdk.io_util;
+/// A bounded preflight ceiling for resident tensor payloads.
+pub const resident_limit: u64 = 64 << 30;
+const header_limit = 8 << 20;
+fn residentName(name: []const u8) bool {
+    if (std.mem.indexOf(u8, name, ".switch_mlp.") != null or std.mem.indexOf(u8, name, ".experts.") != null) return false;
+    return std.mem.startsWith(u8, name, "model.layers.") or
+        std.mem.startsWith(u8, name, "model.embed_tokens.") or
+        std.mem.startsWith(u8, name, "model.norm.") or
+        std.mem.startsWith(u8, name, "lm_head.");
+}
+/// Validates the actual files selected by the host loader, not just the index's tensor list.
+/// No tensor payload is read. All header metadata is bounded and rejected before MLX sees it.
+pub fn residentBytes(a: std.mem.Allocator, io: std.Io, model_dir: []const u8) !u64 {
+    return residentBytesBound(a, io, model_dir, resident_limit);
+}
+/// Resident-header check with an architecture-specific payload ceiling.
+pub fn residentBytesBound(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, payload_limit: u64) !u64 {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+    defer dir.close(io);
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(header_limit)) catch return error.MiniMaxResidentIndexInvalid;
+    defer a.free(raw);
+    const index = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch return error.MiniMaxResidentIndexInvalid;
+    defer index.deinit();
+    if (index.value != .object) return error.MiniMaxResidentIndexInvalid;
+    const wm = index.value.object.get("weight_map") orelse return error.MiniMaxResidentIndexInvalid;
+    if (wm != .object or wm.object.count() == 0) return error.MiniMaxResidentIndexInvalid;
+    var shards: std.StringHashMapUnmanaged(void) = .empty;
+    defer shards.deinit(a);
+    var it = wm.object.iterator();
+    while (it.next()) |entry| {
+        const v = entry.value_ptr.*;
+        if (!residentName(entry.key_ptr.*) or v != .string or
+            !std.mem.endsWith(u8, v.string, ".safetensors") or
+            std.mem.indexOfAny(u8, v.string, "/\\") != null or std.mem.indexOfScalar(u8, v.string, 0) != null)
+            return error.MiniMaxResidentIndexInvalid;
+        try shards.put(a, v.string, {});
+    }
+    var total: u64 = 0;
+    var found: usize = 0;
+    var names = shards.keyIterator();
+    while (names.next()) |shard| {
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ model_dir, shard.* }, 0);
+        defer a.free(path);
+        const fd = try io_util.openNoCache(path.ptr, .{});
+        defer _ = std.c.close(fd);
+        const size_i = std.c.lseek(fd, 0, std.c.SEEK.END);
+        if (size_i < 8) return error.MiniMaxResidentShardInvalid;
+        const size: u64 = @intCast(size_i);
+        if (size > payload_limit +| (header_limit + 8)) return error.MiniMaxResidentShardInvalid;
+        var prefix: [8]u8 = undefined;
+        try readAt(fd, &prefix, 0);
+        const len = std.mem.readInt(u64, &prefix, .little);
+        if (len < 2 or len > header_limit or len > size - 8) return error.MiniMaxResidentShardInvalid;
+        const header = try a.alloc(u8, @intCast(len));
+        defer a.free(header);
+        try readAt(fd, header, 8);
+        const parsed = std.json.parseFromSlice(std.json.Value, a, header, .{}) catch return error.MiniMaxResidentShardInvalid;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.MiniMaxResidentShardInvalid;
+        var tensors = parsed.value.object.iterator();
+        var payload: u64 = 0;
+        while (tensors.next()) |tensor| {
+            const name = tensor.key_ptr.*;
+            if (std.mem.eql(u8, name, "__metadata__")) continue;
+            const indexed = wm.object.get(name) orelse return error.MiniMaxResidentShardInvalid;
+            if (!residentName(name) or indexed != .string or !std.mem.eql(u8, indexed.string, shard.*)) return error.MiniMaxResidentShardInvalid;
+            const desc = tensor.value_ptr.*;
+            if (desc != .object) return error.MiniMaxResidentShardInvalid;
+            const dtype = desc.object.get("dtype") orelse return error.MiniMaxResidentShardInvalid;
+            const shape = desc.object.get("shape") orelse return error.MiniMaxResidentShardInvalid;
+            const offsets = desc.object.get("data_offsets") orelse return error.MiniMaxResidentShardInvalid;
+            if (dtype != .string or shape != .array or offsets != .array or offsets.array.items.len != 2) return error.MiniMaxResidentShardInvalid;
+            // U8: the fp8res pack's e4m3 codes (config.zig `Storage.fp8`); every tensor's role and dtype are checked again
+            // where it loads (module.zig `QLinear.load`).
+            const width: u64 = if (std.mem.eql(u8, dtype.string, "BF16")) 2 else if (std.mem.eql(u8, dtype.string, "F32") or std.mem.eql(u8, dtype.string, "U32")) 4 else if (std.mem.eql(u8, dtype.string, "U8")) 1 else return error.MiniMaxResidentShardInvalid;
+            var bytes = width;
+            for (shape.array.items) |dim| {
+                if (dim != .integer or dim.integer < 1) return error.MiniMaxResidentShardInvalid;
+                bytes = std.math.mul(u64, bytes, @intCast(dim.integer)) catch return error.MiniMaxResidentShardInvalid;
+            }
+            const start = offsets.array.items[0];
+            const end = offsets.array.items[1];
+            if (start != .integer or end != .integer or start.integer < 0 or end.integer < start.integer) return error.MiniMaxResidentShardInvalid;
+            if (@as(u64, @intCast(end.integer)) > size - 8 - len or end.integer - start.integer != bytes) return error.MiniMaxResidentShardInvalid;
+            payload = std.math.add(u64, payload, bytes) catch return error.MiniMaxResidentShardInvalid;
+            found += 1;
+        }
+        if (payload != size - 8 - len) return error.MiniMaxResidentShardInvalid;
+        total = std.math.add(u64, total, payload) catch return error.MiniMaxResidentShardInvalid;
+        if (total > payload_limit) return error.MiniMaxResidentShardInvalid;
+    }
+    if (found != wm.object.count()) return error.MiniMaxResidentIndexInvalid;
+    return total;
+}
+fn readAt(fd: std.c.fd_t, bytes: []u8, offset: u64) !void {
+    var done: usize = 0;
+    while (done < bytes.len) {
+        const n = std.c.pread(fd, bytes[done..].ptr, bytes.len - done, @intCast(offset + done));
+        if (n < 0 and std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
+        if (n <= 0) return error.MiniMaxResidentShardInvalid;
+        done += @intCast(n);
+    }
+}
+fn writeShardPayload(io: std.Io, dir: std.Io.Dir, header: []const u8, payload: usize) !void {
+    var bytes: [2048]u8 = @splat(0);
+    std.mem.writeInt(u64, bytes[0..8], header.len, .little);
+    @memcpy(bytes[8..][0..header.len], header);
+    try dir.writeFile(io, .{ .sub_path = "resident.safetensors", .data = bytes[0 .. 8 + header.len + payload] });
+}
+fn writeShard(io: std.Io, dir: std.Io.Dir, header: []const u8) !void {
+    var bytes: [2048]u8 = @splat(0);
+    std.mem.writeInt(u64, bytes[0..8], header.len, .little);
+    @memcpy(bytes[8..][0..header.len], header);
+    try dir.writeFile(io, .{ .sub_path = "resident.safetensors", .data = bytes[0 .. 8 + header.len + 4] });
+}
