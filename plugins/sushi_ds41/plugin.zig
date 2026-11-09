@@ -30,6 +30,7 @@ const copy_lookup = @import("src/copy_lookup.zig");
 const ablation = @import("src/ablation.zig");
 const ane_shared = @import("src/ane_shared.zig");
 const tap_files = @import("src/tap.zig");
+const tp = @import("src/tp.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.2.0";
@@ -90,6 +91,9 @@ const Model = struct {
     /// Calibration (`SUSHI_DS41_TAP_DIR`): where each prompt's tap is written, and how many were.
     tap_dir: ?[]const u8 = null,
     tap_seq: u64 = 0,
+    /// A follower's last verify ids, which its `finish` keeps a prefix of, and its restore points by rank 0's id.
+    follow_ids: std.ArrayList(u32) = .empty,
+    follow_snaps: std.AutoHashMapUnmanaged(u32, *Snap) = .empty,
 };
 
 // ── bill ──
@@ -210,6 +214,13 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     m.engine.warmCache() catch |e| log.warn("[sushi_ds41] expert cache warm failed: {s}\n", .{@errorName(e)});
     m.mdl = try dsv.init(gpa, m.cfg, &m.weights, dir, s, .{ .experts = false, .dspark = priv.dspark });
     errdefer m.mdl.deinit();
+    // Joined here, after the experts are resident: joining at the top of the load never completed its TCP handshake
+    // across the cable (SYN_SENT forever, 2026-11-06 23:3x), while this spot joined in every window.
+    try tp.init();
+    if (tp.on()) {
+        m.mdl.route_spec = false;
+        log.info("[sushi_ds41] tensor parallel: {d} heads, MoE width {d} on this rank; route speculation and the folded hc expand off\n", .{ c.heads, c.moe_inter });
+    }
     // As sushi's server does: each matrix-unit arm (the wide-span attention, the decode index scan) serves only if its
     // load-time trial agrees with the SIMD kernel; each logs which kernel serves.
     dsv.setAttnNax(m.mdl, kernels.attn_nax_bar);
@@ -274,6 +285,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         log.warn("[sushi_ds41] kernel warm failed ({s}); requests compile their own\n", .{@errorName(e)});
     };
     _ = mlx.mlx_clear_cache();
+    // MLX streams belong to the thread that made them, so a follower replays rank 0 on this one and never returns.
+    if (tp.on() and tp.rank != 0) return followLoop(m);
     return m;
 }
 
@@ -344,6 +357,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
+    if (served()) |refused| return refused;
     if (f.mode == .verify or f.mode == .batched_rows) return Verdict.refuse(.unsupported, "sushi_ds41: no speculative verify or batched rows");
     if (f.capture_layers.len > 0 or f.want_hidden) return Verdict.refuse(.unsupported, "sushi_ds41: no layer capture or hidden rows (not an embedding model)");
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "sushi_ds41: one slot's rows at a time");
@@ -360,13 +374,14 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     // Every row's logits come from one pass over the whole span (`run` chunks only a prompt that wants the last row's),
     // so refuse a span wider than the widest prefill pass: a DeepSeek-V4.1 pass past 8,192 rows can hang the machine.
     if (f.logits == .all_rows and host.ids.len > sc.prefill_width + sc.tail_merge_rows) return Verdict.refuse(.too_large, "sushi_ds41: every row's logits past one prefill pass");
-    capture(m) catch return Verdict.refuse(.failed, "sushi_ds41: the restore point could not be taken");
     const want: dsv.Want = if (f.logits == .all_rows) .all else .last;
     const rows: ?dsv.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
     // A host older than `Forward.progress` passes a shorter struct.
     const progress: ?*u64 = if (f.size >= @offsetOf(abi.Forward, "progress") + @sizeOf(?*u64)) f.progress else null;
     // The tap records prompt passes only, never a one-token decode forward.
-    const logits = run(m, host.ids, want, rows, progress, ablation.tapsMode(f.mode)) catch |e| {
+    const before = tp.sent();
+    const logits = leadPrefill(m, host.ids, want, rows, progress, ablation.tapsMode(f.mode)) catch |e| {
+        loseSync(before);
         log.err("[sushi_ds41] forward failed: {s}\n", .{@errorName(e)});
         return Verdict.refuse(.failed, "sushi_ds41: the forward failed");
     };
@@ -426,6 +441,7 @@ fn startCopies(m: *Model) void {
 }
 
 fn reset(m: *Model) void {
+    tp.queue(.reset, .{ 0, 0, 0, 0 }) catch queueFailed();
     startCopies(m);
     dsv.resetState(m.mdl);
     m.open = null;
@@ -554,7 +570,7 @@ const Arm = struct { target: usize, capture: bool, vision_key: u64 = 0 };
 
 /// A restore point: the model's whole state at `n` (`dsv.captureState`), the tokens it was built from, and the key of
 /// the image rows those tokens splice in (0 for none), which the host matches beside the ids.
-const Snap = struct { slots: []dsv.Slot, n: usize, ids: []u32, vision_key: u64 = 0 };
+const Snap = struct { slots: []dsv.Slot, n: usize, ids: []u32, vision_key: u64 = 0, id: u32 = 0 };
 
 fn freeSnap(sn: *Snap) void {
     for (sn.slots) |*sl| dsv.freeSlot(sl);
@@ -636,6 +652,7 @@ fn keyOf(m: *const Model, ids: []const u32, rows: abi.Array) !u64 {
 
 fn auxBeginPrompt(mp: *anyopaque, _: u32, prompt: abi.Span(u32), media: abi.Array, restored_at: u64, capture_on: bool) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
+    if (served()) |refused| return refused;
     if (prompt.len == 0) return Verdict.refuse(.failed, "sushi_ds41: an empty prompt");
     // The restore point covers all but the last token; its rows are lent to this call only, so the key is taken now.
     const ids = prompt.slice()[0 .. prompt.len - 1];
@@ -647,16 +664,26 @@ fn auxBeginPrompt(mp: *anyopaque, _: u32, prompt: abi.Span(u32), media: abi.Arra
         if (st.n != restored_at or restored_at >= prompt.len or m.ids.items.len != restored_at)
             return Verdict.refuse(.failed, "sushi_ds41: the restored position differs from the prompt boundary");
     }
+    armPrompt(m, .{ .target = prompt.len - 1, .capture = capture_on, .vision_key = key });
+    tp.queue(.arm, .{ @intCast(prompt.len - 1), @intFromBool(capture_on), @truncate(key), @truncate(key >> 32) }) catch queueFailed();
+    return .ok;
+}
+
+/// A new prompt's restore point replaces any capture the engine never took.
+fn armPrompt(m: *Model, a: Arm) void {
     if (m.snap) |sn| {
         freeSnap(sn);
         m.snap = null;
     }
-    m.arm = .{ .target = prompt.len - 1, .capture = capture_on, .vision_key = key };
-    return .ok;
+    m.arm = a;
 }
 
 fn auxSnapshot(mp: *anyopaque, _: u32, out: *abi.Handle) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
+    if (m.snap) |sn| {
+        sn.id = nextSnapId();
+        tp.queue(.snap_take, .{ sn.id, 0, 0, 0 }) catch queueFailed();
+    }
     out.* = m.snap;
     m.snap = null;
     return .ok;
@@ -666,39 +693,44 @@ fn auxRestoreAt(mp: *anyopaque, _: u32, h: abi.Handle, pos: u64) callconv(.c) Ve
     const m: *Model = @ptrCast(@alignCast(mp));
     const sn = snapOf(h) orelse return Verdict.refuse(.unsupported, "sushi_ds41: no snapshot to restore");
     if (pos != sn.n) return Verdict.refuse(.unsupported, "sushi_ds41: restore needs the snapshot's exact position");
+    restoreSnap(m, sn) catch |e| return Verdict.named(.failed, @errorName(e));
+    tp.queue(.restore, .{ sn.id, 0, 0, 0 }) catch queueFailed();
+    return .ok;
+}
+
+fn restoreSnap(m: *Model, sn: *const Snap) !void {
     startCopies(m);
     clearIds(m);
-    m.ids.appendSlice(gpa, sn.ids) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
+    try m.ids.appendSlice(gpa, sn.ids);
     dsv.restoreState(m.mdl, sn.slots, sn.n, sn.ids) catch |e| {
         clearIds(m);
-        return Verdict.named(.failed, @errorName(e));
+        return e;
     };
-    return .ok;
 }
 
 fn auxSlice(_: *anyopaque, h: abi.Handle, len: u64, out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
     const sn = snapOf(h) orelse return Verdict.refuse(.unsupported, "sushi_ds41: no snapshot to slice");
     if (len != sn.n) return Verdict.refuse(.unsupported, "sushi_ds41: a snapshot cannot be shortened through its rings");
-    const copy = gpa.create(Snap) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
-    copy.n = sn.n;
-    copy.vision_key = sn.vision_key;
-    copy.ids = gpa.dupe(u32, sn.ids) catch {
-        gpa.destroy(copy);
-        return Verdict.refuse(.failed, "sushi_ds41: out of memory");
-    };
-    copy.slots = gpa.alloc(dsv.Slot, sn.slots.len) catch {
-        gpa.free(copy.ids);
-        gpa.destroy(copy);
-        return Verdict.refuse(.failed, "sushi_ds41: out of memory");
-    };
+    const copy = copySnap(sn) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
+    copy.id = nextSnapId();
+    tp.queue(.snap_slice, .{ sn.id, copy.id, 0, 0 }) catch queueFailed();
+    out.* = copy;
+    return .ok;
+}
+
+fn copySnap(sn: *const Snap) !*Snap {
+    const copy = try gpa.create(Snap);
+    errdefer gpa.destroy(copy);
+    copy.* = .{ .n = sn.n, .vision_key = sn.vision_key, .ids = try gpa.dupe(u32, sn.ids), .slots = &.{} };
+    errdefer gpa.free(copy.ids);
+    copy.slots = try gpa.alloc(dsv.Slot, sn.slots.len);
     @memset(copy.slots, dsv.nil_slot);
     for (sn.slots, copy.slots) |from, *to| for (from, 0..) |x, i| if (x.ctx != null) {
         to[i] = mlx.mlx_array_new();
         _ = mlx.mlx_array_set(&to[i], x);
     };
-    out.* = copy;
-    return .ok;
+    return copy;
 }
 
 /// One state and no per-slot identity: a slot's restore point serves whichever slot continues it.
@@ -707,7 +739,9 @@ fn auxHandoff(_: *anyopaque, _: u32, _: u32) callconv(.c) Verdict {
 }
 
 fn auxFree(_: *anyopaque, h: abi.Handle) callconv(.c) void {
-    if (snapOf(h)) |sn| freeSnap(sn);
+    const sn = snapOf(h) orelse return;
+    tp.queue(.snap_free, .{ sn.id, 0, 0, 0 }) catch queueFailed();
+    freeSnap(sn);
 }
 
 fn auxBytes(_: *anyopaque, h: abi.Handle) callconv(.c) u64 {
@@ -828,6 +862,7 @@ fn now() std.Io.Timestamp {
 
 /// Checks shared by the round's entry points; the state the round starts from.
 fn roundEntry(m: *Model, f: *const abi.Forward, out: *const abi.ForwardOut) ?Verdict {
+    if (served()) |refused| return refused;
     if (out.size < @sizeOf(abi.ForwardOut)) return Verdict.refuse(.unsupported, "sushi_ds41: the host's ForwardOut has no round");
     if (m.mdl.dspark == null) return Verdict.refuse(.unsupported, "sushi_ds41: the DSpark stages are not loaded");
     if (f.tokens.len != 1) return Verdict.refuse(.unsupported, "sushi_ds41: a round starts from one committed token");
@@ -835,6 +870,8 @@ fn roundEntry(m: *Model, f: *const abi.Forward, out: *const abi.ForwardOut) ?Ver
     // stale request.
     if (m.open != null) {
         m.open = null;
+        const before = tp.sent();
+        leadCall(m, .finish, .{ .arg = 0 }, &.{}) catch |e| return roundFailed(e, before);
         dsv.finishVerify(m.mdl, 0) catch {};
     }
     const st = dsv.ensureState(m.mdl) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
@@ -843,7 +880,8 @@ fn roundEntry(m: *Model, f: *const abi.Forward, out: *const abi.ForwardOut) ?Ver
     return null;
 }
 
-fn roundFailed(e: anyerror) Verdict {
+fn roundFailed(e: anyerror, before: ?u32) Verdict {
+    loseSync(before);
     log.err("[sushi_ds41] draft round failed: {s}\n", .{@errorName(e)});
     return Verdict.refuse(.failed, "sushi_ds41: the draft round failed");
 }
@@ -853,16 +891,17 @@ fn roundFailed(e: anyerror) Verdict {
 fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (roundEntry(m, f, out)) |refused| return refused;
+    const before = tp.sent();
     if (armAblation(m, f)) |refused| return refused;
     defer ablation.disarm(m.mdl);
     const suppress: ?mlx.mlx_array = if (f.suppress_mask.ctx != null) .{ .ctx = f.suppress_mask.ctx } else null;
-    var open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e);
+    var open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e, before);
     defer _ = mlx.mlx_array_free(open.logits);
-    const best = argmaxRows(m, open.logits, suppress, open.rows) catch |e| return roundFailed(e);
+    const best = argmaxRows(m, open.logits, suppress, open.rows) catch |e| return roundFailed(e, before);
     defer gpa.free(best);
     var accepted: usize = 0;
     while (accepted + 1 < open.rows and best[accepted] == open.ids[1 + accepted]) accepted += 1;
-    closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e);
+    closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e, before);
     out.round.next_token = best[accepted];
     return .ok;
 }
@@ -871,9 +910,10 @@ fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callc
 fn nativeVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (roundEntry(m, f, out)) |refused| return refused;
+    const before = tp.sent();
     if (armAblation(m, f)) |refused| return refused;
     defer ablation.disarm(m.mdl);
-    const open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e);
+    const open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e, before);
     out.logits = .{ .ctx = open.logits.ctx };
     out.round.n = @intCast(open.rows);
     out.round.rows = @intCast(open.rows);
@@ -884,11 +924,13 @@ fn nativeVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) cal
 
 fn nativeFinish(mp: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
+    if (served()) |refused| return refused;
     var open = m.open orelse return Verdict.refuse(.failed, "sushi_ds41: no verify is open");
     m.open = null;
     if (accepted >= open.rows) return Verdict.refuse(.failed, "sushi_ds41: more drafts accepted than verified");
-    // The logits were handed to the engine in `nativeVerify`.
-    closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e);
+    // The logits were handed to the engine in `nativeVerify`. Every rank holds this verify open, so any failure loses
+    // the stream.
+    closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e, null);
     return .ok;
 }
 
@@ -922,6 +964,7 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
     const plain = m.policy.next() == .plain;
     o.drafted = !plain;
     if (!plain) {
+        try leadCall(m, .draft, .{ .arg = t1 }, &.{});
         var block = try dsv.draftHeads(m.mdl, t1, .conf);
         defer block.deinit();
         o.block_len = @min(block.ids.len, max_drafts + 1);
@@ -955,15 +998,16 @@ fn verifyOpen(m: *Model, open: Open) !Open {
         o.rows = 1 + at;
     };
     o.verify_start = now();
-    m.engine.beginForward();
-    o.logits = try dsv.verify(m.mdl, o.ids[0..o.rows]);
-    m.engine.finishForward(o.rows);
+    try leadCall(m, .verify, .{ .rows = @intCast(o.rows) }, o.ids[0..o.rows]);
+    o.logits = try verifyRows(m, o.ids[0..o.rows]);
     return o;
 }
 
 /// Keeps `t1` and `accepted` drafts, teaches the policy what the round bought, and fills the round's tokens and position.
 fn closeRound(m: *Model, o: *const Open, accepted: usize, r: *abi.Round) !void {
+    try leadCall(m, .finish, .{ .rows = 1, .arg = @intCast(accepted) }, &.{});
     try dsv.finishVerify(m.mdl, accepted);
+    const draft_ms = o.draft_ms;
     const verify_ms = nanosSince(o.verify_start);
     try m.ids.appendSlice(gpa, o.ids[0 .. 1 + accepted]);
     if (o.copied) {
@@ -972,10 +1016,10 @@ fn closeRound(m: *Model, o: *const Open, accepted: usize, r: *abi.Round) !void {
         m.copy.rounds += 1;
         m.copy.drafted += o.rows - 1;
         m.copy.accepted += accepted;
-        m.copy_backoff.observeCopy(o.rows - 1, accepted, o.draft_ms + verify_ms);
+        m.copy_backoff.observeCopy(o.rows - 1, accepted, draft_ms + verify_ms);
     } else {
-        if (!o.drafted) m.policy.observePlain(verify_ms) else m.policy.observeRound(o.conf[0 .. o.block_len - 1], @intCast(o.rows), @intCast(accepted), o.draft_ms, verify_ms);
-        m.copy_backoff.observeStage(1 + accepted, o.draft_ms + verify_ms);
+        if (!o.drafted) m.policy.observePlain(verify_ms) else m.policy.observeRound(o.conf[0 .. o.block_len - 1], @intCast(o.rows), @intCast(accepted), draft_ms, verify_ms);
+        m.copy_backoff.observeStage(1 + accepted, draft_ms + verify_ms);
     }
     r.n = @intCast(1 + accepted);
     r.accepted = @intCast(accepted);
@@ -1006,4 +1050,194 @@ fn argmaxRows(m: *Model, logits: mlx.mlx_array, suppress: ?mlx.mlx_array, rows: 
     const data = mlx.mlx_array_data_uint32(flat) orelse return error.InvalidInput;
     if (mlx.mlx_array_size(flat) != rows) return error.InvalidInput;
     return gpa.dupe(u32, data[0..rows]);
+}
+
+// ── tensor parallel: rank 0 leads, the other ranks replay its calls ──
+
+/// The refusal once a call failed after the other ranks were told to run it: their states may differ.
+fn served() ?Verdict {
+    if (tp.lost) return Verdict.refuse(.failed, "sushi_ds41: tensor parallel lost sync; restart every rank");
+    return null;
+}
+
+/// Marks the stream lost when a call failed after rank 0 told the other ranks to run something (`tp.sent` moved
+/// since `before`, or null: they were already mid-call); a refusal before that leaves them in step.
+fn loseSync(before: ?u32) void {
+    if (!tp.on() or tp.lost) return;
+    if (before) |b| if (tp.sent() == b) return;
+    tp.lost = true;
+    log.err("[sushi_ds41] tensor parallel lost sync on rank {d}: a call failed after the other ranks were told to run it; restart every rank\n", .{tp.rank});
+}
+
+/// A bookkeeping entry rank 0 could not queue: the other ranks would miss it, so the stream is lost.
+fn queueFailed() void {
+    if (!tp.on() or tp.lost) return;
+    tp.lost = true;
+    log.err("[sushi_ds41] tensor parallel lost sync: rank 0 could not queue bookkeeping; restart every rank\n", .{});
+}
+
+var snap_ids: u32 = 0;
+
+fn nextSnapId() u32 {
+    snap_ids += 1;
+    return snap_ids;
+}
+
+const CallSpec = struct { rows: u32 = 0, arg: u32 = 0, want_all: bool = false, media: ?dsv.VisionRows = null };
+
+/// Rank 0: tells the other ranks to run the call it is about to run, with the state position they must stand at, the
+/// armed ablation and any image rows.
+fn leadCall(m: *Model, op: tp.Op, c: CallSpec, ids: []const u32) !void {
+    if (!tp.on()) return;
+    var h: tp.Header = .{ .op = @intFromEnum(op), .rows = c.rows, .arg = c.arg, .want_all = @intFromBool(c.want_all), .pos = @intCast((try dsv.ensureState(m.mdl)).n) };
+    var payload: std.ArrayList(u32) = .empty;
+    defer payload.deinit(gpa);
+    try payload.appendSlice(gpa, ids);
+    if (m.mdl.ablation) |ab| {
+        h.ablate = 1;
+        try mlx.check(mlx.mlx_array_eval(ab.s));
+        h.strength_bits = @bitCast((mlx.mlx_array_data_float32(ab.s) orelse return error.SushiTpAblation)[0]);
+        try appendWords(m, &payload, ab.r);
+    }
+    if (c.media) |v| {
+        const shape = mlx.getShape(v.rows);
+        if (shape.len == 0 or shape.len > h.media_shape.len) return error.SushiTpMediaShape;
+        h.media_ndim = @intCast(shape.len);
+        for (shape, h.media_shape[0..shape.len]) |d, *o| o.* = @intCast(d);
+        h.media_dtype = @intCast(@intFromEnum(mlx.mlx_array_dtype(v.rows)));
+        h.media_offset = @intCast(v.offset);
+        try appendWords(m, &payload, v.rows);
+    }
+    try tp.lead(h, payload.items);
+}
+
+/// `x`'s bytes as `uint32` words.
+fn appendWords(m: *const Model, out: *std.ArrayList(u32), x: mlx.mlx_array) !void {
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_view(&w, x, .uint32, m.s));
+    try mlx.check(mlx.mlx_array_eval(w));
+    const data = mlx.mlx_array_data_uint32(w) orelse return error.SushiTpWords;
+    try out.appendSlice(gpa, data[0..mlx.mlx_array_size(w)]);
+}
+
+/// `forward`'s prompt pass, led: the logits are evaluated before the host gets them, so every collective of the pass
+/// runs before the next call's.
+fn leadPrefill(m: *Model, ids: []const u32, want: dsv.Want, media: ?dsv.VisionRows, progress: ?*u64, tapping: bool) !mlx.mlx_array {
+    try leadCall(m, .prefill, .{ .rows = @intCast(ids.len), .want_all = want == .all, .media = media }, ids);
+    try capture(m);
+    const logits = try run(m, ids, want, media, progress, tapping);
+    if (tp.on()) try mlx.check(mlx.mlx_array_eval(logits));
+    return logits;
+}
+
+/// A verify chunk's logits, evaluated under tensor parallel for the same reason as `leadPrefill`'s.
+fn verifyRows(m: *Model, ids: []const u32) !mlx.mlx_array {
+    m.engine.beginForward();
+    const logits = try dsv.verify(m.mdl, ids);
+    m.engine.finishForward(ids.len);
+    if (tp.on()) try mlx.check(mlx.mlx_array_eval(logits));
+    return logits;
+}
+
+/// Replays rank 0's calls until the stream breaks, which ends the load (and so this rank's process) with the error.
+fn followLoop(m: *Model) !*Model {
+    log.info("[sushi_ds41] tensor parallel: rank {d} replays rank 0's calls\n", .{tp.rank});
+    while (true) {
+        const call = tp.follow() catch |e| return followLost(e);
+        defer std.heap.c_allocator.free(call.body);
+        followCall(m, call) catch |e| return followLost(e);
+    }
+}
+
+fn followLost(e: anyerror) anyerror {
+    tp.lost = true;
+    log.err("[sushi_ds41] tensor parallel lost sync on rank {d}: {s}; restart every rank\n", .{ tp.rank, @errorName(e) });
+    return e;
+}
+
+fn followCall(m: *Model, call: tp.Call) !void {
+    const h = call.h;
+    try applyBook(m, call.body[0..h.book_words]);
+    if ((try dsv.ensureState(m.mdl)).n != h.pos) return error.SushiTpPosition;
+    const op = std.enums.fromInt(tp.Op, h.op) orelse return error.SushiTpOp;
+    var rest = call.body[h.book_words..];
+    const id_words: usize = if (op == .prefill or op == .verify) h.rows else 0;
+    const ids = rest[0..id_words];
+    rest = rest[id_words..];
+    if (h.ablate != 0) {
+        try armWords(m, rest[0..m.cfg.dim], @bitCast(h.strength_bits));
+        rest = rest[m.cfg.dim..];
+    }
+    defer ablation.disarm(m.mdl);
+    const media = try mediaOf(m, h, rest);
+    defer if (media) |v| {
+        _ = mlx.mlx_array_free(v.rows);
+    };
+    switch (op) {
+        .prefill => {
+            try capture(m);
+            const logits = try run(m, ids, if (h.want_all != 0) .all else .last, media, null, false);
+            defer _ = mlx.mlx_array_free(logits);
+            try mlx.check(mlx.mlx_array_eval(logits));
+        },
+        .draft => {
+            var block = try dsv.draftHeads(m.mdl, h.arg, .conf);
+            block.deinit();
+        },
+        .verify => {
+            _ = mlx.mlx_array_free(try verifyRows(m, ids));
+            m.follow_ids.clearRetainingCapacity();
+            try m.follow_ids.appendSlice(gpa, ids);
+        },
+        .finish => {
+            try dsv.finishVerify(m.mdl, h.arg);
+            if (h.rows != 0) try m.ids.appendSlice(gpa, m.follow_ids.items[0 .. 1 + h.arg]);
+        },
+    }
+}
+
+fn armWords(m: *Model, words: []const u32, strength: f32) !void {
+    const shape = [_]c_int{ 1, @intCast(m.cfg.dim) };
+    const d = mlx.mlx_array_new_data(words.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(d);
+    try ablation.arm(m.mdl, .{ .directions = .{ .ctx = d.ctx }, .strength = strength }, m.cfg.dim, m.s);
+}
+
+/// The image rows rank 0 sent, in their own dtype and shape; null without any.
+fn mediaOf(m: *const Model, h: tp.Header, words: []const u32) !?dsv.VisionRows {
+    if (h.media_ndim == 0) return null;
+    const n = h.media_ndim;
+    var shape: [3]c_int = undefined;
+    var lead_elems: usize = 1;
+    for (h.media_shape[0..n], shape[0..n]) |d, *o| o.* = @intCast(d);
+    for (h.media_shape[0 .. n - 1]) |d| lead_elems *= d;
+    shape[n - 1] = @intCast(words.len / lead_elems);
+    const w = mlx.mlx_array_new_data(words.ptr, &shape, @intCast(n), .uint32);
+    defer _ = mlx.mlx_array_free(w);
+    var rows = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_view(&rows, w, @enumFromInt(h.media_dtype), m.s));
+    if (mlx.getShape(rows)[n - 1] != h.media_shape[n - 1]) return error.SushiTpMediaShape;
+    return .{ .rows = rows, .offset = h.media_offset };
+}
+
+/// Rank 0's bookkeeping since its last call, in its order.
+fn applyBook(m: *Model, words: []const u32) !void {
+    var at: usize = 0;
+    while (at + tp.record_words <= words.len) : (at += tp.record_words) {
+        const a = words[at + 1 ..][0..4];
+        switch (std.enums.fromInt(tp.Book, words[at]) orelse return error.SushiTpBook) {
+            .reset => reset(m),
+            .arm => armPrompt(m, .{ .target = a[0], .capture = a[1] != 0, .vision_key = @as(u64, a[2]) | (@as(u64, a[3]) << 32) }),
+            .snap_take => {
+                const sn = m.snap orelse return error.SushiTpNoCapture;
+                m.snap = null;
+                try m.follow_snaps.put(gpa, a[0], sn);
+            },
+            .snap_slice => try m.follow_snaps.put(gpa, a[1], try copySnap(m.follow_snaps.get(a[0]) orelse return error.SushiTpNoSnap)),
+            .snap_free => if (m.follow_snaps.fetchRemove(a[0])) |kv| freeSnap(kv.value),
+            .restore => try restoreSnap(m, m.follow_snaps.get(a[0]) orelse return error.SushiTpNoSnap),
+        }
+    }
 }

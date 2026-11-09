@@ -17,8 +17,8 @@ Needs an mlx-serve with the native drafter round (`NativeDrafter.step`, `verify`
 The slice is sushi ec2f5a29 (main, past v1.4.1; NOTICE). The numbers below were measured on the slice of sushi 3fc47d8a
 and later ones. Against the cc1981df slice, ec2f5a29 measured prefill +1.5-2.4% (8k-64k) and decode +1.2-4.6% on an
 M5 Ultra, output byte-identical (https://github.com/CommunityServe/plugins/pull/28). This repo's edits to the slice are `patches/index-nax.patch`,
-`patches/prefill-pipeline.patch`, `patches/shared-expert-ane.patch` and `patches/stream-ablation.patch`, applied in that
-order by `scripts/sync-sushi.sh`.
+`patches/prefill-pipeline.patch`, `patches/shared-expert-ane.patch`, `patches/stream-ablation.patch` and
+`patches/tensor-parallel.patch`, applied in that order by `scripts/sync-sushi.sh`.
 
 Measured on M4 Max 128 GB, Sushi-STQ-1.75bpw, greedy:
 
@@ -88,6 +88,15 @@ DSpark on or off.
   and each Engram value. Armed per call on `forward`, `NativeDrafter.step` and `verify`; a request without one runs
   the graphs unchanged. An armed request does not take the slice's decode fold of the hyper-connection expand, so its
   FFN output is ablated before the expand. The slice edit is `patches/stream-ablation.patch` (applied last).
+- Tensor parallel across Macs, off by default (`SUSHI_DS41_TP=jaccl|ring`, `src/tp.zig`, `patches/tensor-parallel.patch`):
+  rank 0 serves and every other rank replays its model calls. Each rank loads its own pack, cut by
+  `scripts/stq-tp-split.py <pack> <dst> <rank> <size>` in whole grains (attention output groups, 128-wide expert
+  blocks), so nothing is re-quantized. Peers come from MLX's environment: `MLX_RANK`, plus `MLX_IBV_DEVICES` and
+  `MLX_JACCL_COORDINATOR` for jaccl (RDMA over Thunderbolt 5), or `MLX_HOSTFILE` for ring. A layer's partial sums are
+  all-reduced on the CPU stream (`SUSHI_DS41_TP_SUM=cpu`; `off` skips them, for timing only, and the output is wrong).
+  A rank that falls out of step refuses every request until all ranks restart. M5 Ultras on a Thunderbolt 5 mesh,
+  DSpark on, greedy agent requests of 88k-251k tokens against one box: TP2 1.19-1.27x decode, TP4 1.34-1.67x with
+  TTFT -23 to -36%, API KLD 0.0499 against 0.0533. Requests are served one at a time, as on one box.
 - Calibration tap: `SUSHI_DS41_TAP_DIR=<dir>` writes each prompt's stream (the mean of the hc copies entering every
   layer and leaving the last, for the prefix pass's last 4 rows and the last token) as `tap-<seq>.npy` (f32
   `[layers + 1, rows, dim]`) plus a line in `index.jsonl`. Route speculation is off only for the passes it records.
