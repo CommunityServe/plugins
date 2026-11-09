@@ -1,9 +1,9 @@
-//! MLX_SERVE_DSV41_FRAC's tile gate, MLX-free (build.zig adds it to `zig build test`): turboexl3's own reference decode
+//! TURBOEXL3_DS41_FRAC's tile gate, MLX-free (build.zig adds it to `zig build test`): turboexl3's own reference decode
 //! (its src/format.zig, `decodeTile`: the codeword windows its kernels are tested against) of real tiles from
 //! turboderp's DeepSeek-V4.1-Flash-1017 EXL3 branches, at the half-integer rates n 40 (K 2.5) and n 24 (K 1.5) and at
 //! the integer n 32 / n 48 as controls, against exllamav3 1.6.4's rule for them (exllamav3_ext/quant/frac.cu: weight i
 //! takes KA or KA + 1 fresh bits by mask 0xAAAA, its state the 16 ring bits ending at the running sum, MSB-first in
-//! 32-bit words; mul1 after). src/frac_tiles.json holds each tile's stored words and that rule's f16 bits (row-major),
+//! 32-bit words; mul1 after). frac_tiles.json holds each tile's stored words and that rule's f16 bits (row-major),
 //! written by the box tool tools/gen_frac_fixture.py through tools/frac_ref.py from HTTP Range reads of the branches'
 //! shards; its integer controls' states equal the 2.81 pack's converter reference (exl3_ref.dq_states) there.
 
@@ -12,6 +12,11 @@ const format = @import("turboexl3_format");
 const testing = std.testing;
 
 const fixture = @embedFile("frac_tiles.json");
+
+// The switch's own tests (bank/frac.zig: its parse, the K to n map, the load line, the parked ring) run with these.
+test {
+    _ = @import("bank/frac.zig");
+}
 
 const Tile = struct { src: []const u8, n: u32, words: []const u16, expect: []const u16 };
 

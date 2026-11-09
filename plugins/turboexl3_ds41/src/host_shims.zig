@@ -1,9 +1,8 @@
-//! The C symbols the copied expert streamer calls that mlx-serve serves from C++ shims over MLX's private headers
-//! (sdk/weights/streamed/csrc: mlx_event_shim.cpp, mlx_alloc_shim.cpp, mlx_launch_cache.inc, q3_event_shim.mm), as this
-//! plugin's own, each over the server's host table (`abi.host`), which serves them from those same shims
-//! (src/host/plugin_host_impl.zig). The kit ships no MLX headers: a plugin reaches MLX's internals only through the
-//! table. `install` keeps the table at load, before the streamer opens; with none kept, every call refuses (kernels fall
-//! back to mlx-c's own).
+//! The C symbols the expert streamer calls that mlx-serve serves from C++ shims over MLX's private headers (its
+//! sdk/weights/streamed/csrc: mlx_event_shim.cpp, mlx_alloc_shim.cpp, mlx_launch_cache.inc, q3_event_shim.mm), as this
+//! plugin's own, each over the server's host table (`abi.host`), which serves them from those same shims. The kit ships
+//! no MLX headers: a plugin reaches MLX's internals only through the table. `install` keeps the table at load, before
+//! the streamer opens; with none kept, every call refuses (kernels fall back to mlx-c's own).
 
 const std = @import("std");
 const kit = @import("mlx_serve");
@@ -19,13 +18,6 @@ pub fn install(raw: ?*const anyopaque) bool {
     _ = kit.host.Host.of(raw) catch return false;
     table = @ptrCast(@alignCast(raw.?));
     return true;
-}
-
-/// Bytes the plugin may still allocate on the GPU (`Host.memory_ceiling`: the host's ceiling less what is resident);
-/// no limit with no table kept.
-pub fn memoryCeiling() u64 {
-    const t = table orelse return std.math.maxInt(u64);
-    return t.memory_ceiling(t.ctx);
 }
 
 fn gpu() ?*const host.HostGpu {
@@ -53,7 +45,7 @@ fn arrays(xs: [*]const mlx.mlx_array) [*]const common.Array {
 // ── mlx_event_shim.cpp ──
 
 /// The event shim's ABI version: the one these shims implement, which must be the streamer's
-/// (sdk_ext/expert/event.zig `abi_version`), or an mlx-serve bump that changes the contract does not build.
+/// (the kit's `streamed.expert.event` `abi_version`).
 const event_abi = 2026092801;
 comptime {
     if (@import("mlx_stream").event_abi != event_abi) @compileError("the expert streamer's event ABI changed: re-check src/host_shims.zig against mlx-serve's mlx_event_shim.cpp");
@@ -124,44 +116,21 @@ export fn dsv41_alloc_last_error() [*:0]const u8 {
     return &last_error;
 }
 
-/// The bank pool: the host's `HostGpu.alias` (mlx-serve's additive ABI entry, ddalcu/mlx-serve#1065, e5cdd78, in
-/// 26.11.2), read at its offset (src/bank_pool.zig `alias_at`: appended after `buffer_addresses`) when the host's table
-/// holds it, so the plugin builds against a kit without it and loads on a host without it (`hasAlias` false: the load
-/// turns the pool off).
-const AliasFn = *const fn (ctx: ?*anyopaque, base: common.Array, offset: u64, shape: [*]const i32, ndim: usize, dtype: i32, out: *common.Array) callconv(.c) common.Verdict;
-const bank_pool = @import("bank_pool.zig");
-comptime {
-    if (@offsetOf(host.HostGpu, "buffer_addresses") + @sizeOf(usize) != bank_pool.alias_at) @compileError("HostGpu.alias does not follow buffer_addresses at bank_pool.alias_at");
-    if (@hasField(host.HostGpu, "alias") and @offsetOf(host.HostGpu, "alias") != bank_pool.alias_at) @compileError("this kit's HostGpu.alias is not at bank_pool.alias_at");
-}
-fn aliasEntry() ?AliasFn {
-    const g = gpu() orelse return null;
-    if (!bank_pool.hostHasAlias(g.size)) return null;
-    const at: *const AliasFn = @ptrFromInt(@intFromPtr(g) + bank_pool.alias_at);
-    return at.*;
-}
-/// The host's HostGpu bytes (its `size`; 0 with no table kept).
-pub fn gpuBytes() u32 {
-    const g = gpu() orelse return 0;
-    return g.size;
-}
-/// The host's table holds `HostGpu.alias`.
-pub fn hasAlias() bool {
-    return aliasEntry() != null;
-}
-
-/// The bank pool (the copied stream's `BankPool`): `out` an evaluated array of `dtype` over `base`'s bytes from
-/// `offset`, its own buffer (the host's `HostGpu.alias`); refused by name on a host without the entry.
+/// The bank pool (the stream's `BankPool`): `out` an evaluated array of `dtype` over `base`'s bytes from `offset`, its
+/// own buffer (the host's `HostGpu.alias`).
 export fn dsv41_alloc_alias(out: *mlx.mlx_array, base: mlx.mlx_array, offset: u64, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int {
     const g = gpu() orelse return noTable("alloc_alias");
-    const f = aliasEntry() orelse {
-        const text = "alloc_alias: the server's HostGpu has no alias entry (an mlx-serve before 26.11.2, #1065)";
-        @memcpy(last_error[0..text.len], text);
-        last_error[text.len] = 0;
-        return -1;
-    };
-    const v = f(g.ctx, .{ .ctx = base.ctx }, offset, @ptrCast(shape), ndim, @intFromEnum(dtype), @ptrCast(out));
+    const v = g.alias(g.ctx, .{ .ctx = base.ctx }, offset, @ptrCast(shape), ndim, @intFromEnum(dtype), @ptrCast(out));
     return if (v.isOk()) 0 else fail("alloc_alias", v);
+}
+
+/// MLX's command-buffer split (`HostGpu.command_buffer_limits`); refused on a host without the member.
+export fn dsv41_command_buffer_limits(ops: c_int, mb: c_int, prev_ops: *c_int, prev_mb: *c_int) c_int {
+    const t = table orelse return noTable("command_buffer_limits");
+    const g = t.gpu;
+    if (!host.gpuHas(g, "command_buffer_limits")) return noTable("command_buffer_limits");
+    const v = g.command_buffer_limits(g.ctx, ops, mb, prev_ops, prev_mb);
+    return if (v.isOk()) 0 else fail("command_buffer_limits", v);
 }
 
 // ── q3_event_shim.mm ──

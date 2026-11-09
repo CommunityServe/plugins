@@ -1,6 +1,6 @@
-//! The a4k record layout's byte gate (zzzzt), a test of its own in `zig build test` (build.zig), MLX-free: the copied read
+//! The a4k record layout's byte gate (zzzzt), a test of its own in `zig build test` (build.zig), MLX-free: the read
 //! pool (its C file alone, no MLX, no stream) reads the same records' parts from a classic file and from an a4k one
-//! (expert/a4k.zig's geometry), each record's rows and lengths handed to it in the file's order on disk as the patched
+//! (expert/a4k.zig's geometry), each record's rows and lengths handed to it in the file's order on disk as the
 //! `expert.io.Records` hands them (`a4k.toDisk`), DeepSeek-V4.1's K = 3 and K = 2 records (two layers of two experts):
 //! through the staging route, through the PARTS route (every a4k code read straight into its row: three parts a record
 //! against the classic layout's gate code alone), from a speculative record read whole (the record's extent) and
@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const testing = std.testing;
-const a4k = @import("mlx_serve/sdk/weights/streamed/expert/a4k.zig");
-const io = @import("mlx_serve/sdk/weights/streamed/sdk_ext/expert/io.zig");
+const a4k = @import("streamed/expert/a4k.zig");
+const io = @import("mlx_serve").streamed.expert.io;
 
 // a4k.zig's own tests (its geometry at DeepSeek-V4.1's records, the order's permutation) run with these.
 test {
@@ -38,7 +38,7 @@ extern fn q3ld_stop() c_int;
 /// dq1b: the gate/up split (0 off, 1 on), set after `q3ld_start` by `run` when `split_mode` is set.
 extern fn q3ld_gu_split(mode: i32) c_int;
 
-/// The pool's Metal event backend (src/host_shims.zig in the plugin): never armed here, every gate off.
+/// The pool's Metal event backend (host_shims.zig): never armed here, every gate off.
 export fn q3ld_mtl_signal(event: ?*anyopaque, value: u64) void {
     _ = event;
     _ = value;
@@ -613,7 +613,7 @@ test "a4k real-file gate (A4K_GATE_PACKS=<classic pack>:<a4k pack>): the two pac
     try testing.expect(n_records >= 2 * ne);
 }
 
-// The read pool's order on disk from the bank (`a4k.poolDiskOrder`, through `io.poolOptions`, whose value the stream's
+// The read pool's order on disk from the bank (the kit's `io.poolDiskOrder`, through `io.poolOptions`, whose value the stream's
 // `Stream.init` starts its pool on): an a4k bank hands the pool its components in their file order, so
 // `Records.onDisk` lays each record's rows and lengths out as the file holds them; without it every a4k record's parts
 // land in the wrong slot rows.
@@ -628,14 +628,13 @@ const ClassicBank = struct {
     }
 };
 const HooklessBank = struct {};
-const max_disk_components = 16;
 
 test "a4k: an a4k bank's order on disk reaches the read pool's options; a classic bank's, and a bank without the hook, none" {
-    const got = a4k.poolDiskOrder(A4kBank, &.{}, max_disk_components) orelse return error.TestExpectedOrder;
+    const got = io.poolDiskOrder(A4kBank, &.{}) orelse return error.TestExpectedOrder;
     try testing.expectEqualSlices(u8, &a4k.disk_order, got[0..a4k.n_components]);
     for (got[a4k.n_components..]) |x| try testing.expectEqual(@as(u8, 0), x);
-    try testing.expect(a4k.poolDiskOrder(ClassicBank, &.{}, max_disk_components) == null);
-    try testing.expect(a4k.poolDiskOrder(HooklessBank, &.{}, max_disk_components) == null);
+    try testing.expect(io.poolDiskOrder(ClassicBank, &.{}) == null);
+    try testing.expect(io.poolDiskOrder(HooklessBank, &.{}) == null);
 }
 
 test "a4k: the read pool's options for a bank: an a4k bank's order on disk, a classic bank's none, the rest as given" {

@@ -1,33 +1,8 @@
-//! A wide prompt layer's EXL3 `wo_a` run (src/woa_rows.zig's run of spans, read from its run region [rows, og, in],
-//! src/scratch_attn.zig) without turboexl3's per-group copies, launches and decodes.
-//!
-//! turboexl3's grouped linear at prefill rows (root.zig `groupedPrefill`) runs `linear` on each of the og groups: a
-//! strided column slice of the run's rows, which MLX copies whole for the prepare (its input is read row-contiguous);
-//! the prepare; the group's W_hat decoded from its trellis; MLX's matmul; the finish; then one concatenation of the og
-//! outputs. At the pack's shape (og 8, in 4096, out 1024) that is 41 launches a run, every group's rows copied once, and
-//! each of a 16K layer's 4 runs decoding the same 8 W_hat again.
-//!
-//! Here: one prepare launch for every group, reading the run's rows in place (`prep_text`: turboexl3's prep.metal at the
-//! pin, its value statements unchanged, its three index expressions moved to the group's columns, suh range and output
-//! plane); each group's W_hat decoded once a layer by turboexl3's own `Dense.dequantize` (the launch and config the
-//! per-group `linear` uses) and kept across the layer's runs (`Hats`); MLX's matmul of each group on the same operands
-//! (M, N, K and bytes the per-group call's); one finish launch for every group writing straight into the run's
-//! [rows, og out] (`finish_text`: finish.metal, likewise re-addressed). No slice copy, no concatenation: 10 launches a
-//! run, 18 at a layer's first. The same words: every value statement is turboexl3's and every operand the same bytes
-//! (prep and finish have no multiply-add a compiler could contract). A run another path would take (decode or
-//! register-path rows, turboexl3's fused-GEMM arm) keeps the stock call.
-//!
-//! The kept W_hat (heads x head_dim x o_lora halves, 67 MB at the pack's shape) is billed in the prompt term only
-//! (`heldBytes`, the copied model's `prefillBytes`, for calls wider than a span: decode's calls are never wide, so the
-//! decode bill holds none).
-//!
-//! Against the per-group calls (wj1, w-pio-20261102-0405, two binaries: a = ctl26 (2d0a33f, zzz8x), b = this code on
-//! zzz8x, dylib 061842336690): cold 16K a 1409.1/1406.1 -> b 1446.9/1440.6 tok/s
-//! (+2.57%, pairs +2.68% and +2.45%), new text (slice 3) 1496.6/1495.2 -> 1518.5/1536.0 (+2.10%, pairs +1.46% and
-//! +2.73%); 152 prompt rows in every arm; the guard's peak 111.0 GiB. Its bill then also counted the kept W_hat in the
-//! decode term (ws_decode_mb 804 -> 884, decode rows 179 -> 178); billed in the prompt term only here, decode keeps 179.
-//! Exact: the texts the same bytes in every arm, and a word-for-word check of 41 wide layers compared 4,026,531,840
-//! words, none different (max_ulps 0).
+//! A grouped EXL3 linear's prompt rows (DeepSeek-V4.1's `wo_a`: x [rows, og, in], read in place) on one prepare and
+//! one finish launch for every group, each group's W_hat decoded once a layer and kept across its runs (`Hats`, 67 MB
+//! at the pack's shape), MLX's matmul per group between: 10 launches a run where the per-group `linear` took 41. The
+//! same words: every value statement is turboexl3's prep.metal / finish.metal, re-addressed; decode rows keep the stock
+//! call.
 
 const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
