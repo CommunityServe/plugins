@@ -378,7 +378,10 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
 /// is not one this plugin runs.
 fn armAblation(m: *Model, f: *const abi.Forward) ?Verdict {
     const a = (ablation.of(f) catch |e| return switch (e) {
-        error.AblationStrength => Verdict.refuse(.unsupported, "sushi_ds41: ablation strength is not in [0, 1]"),
+        error.AblationStrength => Verdict.refuse(.unsupported, std.fmt.comptimePrint(
+            "sushi_ds41: ablation strength is not in [0, {d}]",
+            .{ablation.max_strength},
+        )),
         error.AblationSlots => Verdict.refuse(.unsupported, "sushi_ds41: one ablation entry per slot"),
     }) orelse return null;
     ablation.arm(m.mdl, a, m.cfg.dim, m.s) catch |e| return switch (e) {

@@ -9,6 +9,10 @@ const dsv = @import("sushi/dsv41/dsv41_model.zig");
 
 pub const Refusal = error{ AblationStrength, AblationSlots };
 
+/// The strongest strength the host takes (`max_strength` in mlx-serve's `sdk/request/ablation.zig`): above 1 the
+/// projection overrides a behaviour the model holds strongly.
+pub const max_strength: f32 = 30;
+
 /// Whether the kit this plugin is built against has `Forward.ablation`; without it the plugin serves none.
 pub const supported = @hasField(abi.Forward, "ablation");
 
@@ -23,7 +27,7 @@ pub fn of(f: *const abi.Forward) Refusal!?Spec {
         const a = f.ablation orelse return null;
         if (a.strengths.len != 1 or a.strengths.len != f.slots.len) return error.AblationSlots;
         const s = a.strengths.slice()[0];
-        if (!(s >= 0 and s <= 1)) return error.AblationStrength;
+        if (!(s >= 0 and s <= max_strength)) return error.AblationStrength;
         return if (s == 0) null else .{ .directions = a.directions, .strength = s };
     }
 }
@@ -76,8 +80,12 @@ fn ofCases() !void {
     var half = [_]f32{0.5};
     ab.strengths = .of(&half);
     try std.testing.expectEqual(@as(f32, 0.5), (try of(&f)).?.strength);
-    var big = [_]f32{1.5};
-    ab.strengths = .of(&big);
+    // Above 1 the host calls the strength a refusal override: taken at the cap, refused past it.
+    var strong = [_]f32{4};
+    ab.strengths = .of(&strong);
+    try std.testing.expectEqual(@as(f32, 4), (try of(&f)).?.strength);
+    var past_cap = [_]f32{max_strength + 1};
+    ab.strengths = .of(&past_cap);
     try std.testing.expectError(error.AblationStrength, of(&f));
     var two = [_]f32{ 1, 1 };
     ab.strengths = .of(&two);
