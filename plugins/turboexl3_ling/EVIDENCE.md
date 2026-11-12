@@ -3,15 +3,15 @@
 This file holds the evidence behind the turboexl3_ling [README](README.md). It gives the receipts, the A/B tables with
 each run, the gate logs' results and the parity record. It also gives the bill's derivations, RQ's plans, the KV growth
 replay, the rules table and the gaps for a merge. We, the plugin's maintainers (davidtai, plugin.json), wrote it on
-2026-11-10 and 2026-11-11, and times are in UTC. The source is `plugins/turboexl3_ling` on our unpushed branch
-`turboexl3_ling-rq` of CommunityServe/plugins. Since 08:08:00Z on 2026-11-11 we serve dylib 4856f028, built from commit
-fb966cc with turboexl3 4bf2df8 and a kit from mlx-serve 66aad949. Before that we served 01ca9769, built from bd00b1a.
-Read the README first. It says what the plugin serves and how to run it.
+2026-11-10 and 2026-11-11, and added "The served build, 87046444" on 2026-11-12. Times are in UTC. Since 01:02:51Z on
+2026-11-12 we serve dylib 87046444, built from commit b59e046 (this folder's code) with turboexl3 4bf2df8, on mlx-serve
+9a173773 and its kit. The sections after "The served build, 87046444" record the earlier builds, 4856f028 (fb966cc,
+on mlx-serve 66aad949) and before it. Read the README first. It says what the plugin serves and how to run it.
 
 How to read this file:
 
-- Code is cited by symbol and commit, for example src/bill.zig `echoIdle` at fb966cc. A plugin path with no commit is at
-  fb966cc, the served dylib's commit. A citation of 01ca9769's code names bd00b1a. An mlx-serve path with no commit is
+- Code is cited by symbol and commit, for example src/bill.zig `echoIdle` at fb966cc. In "The served build, 87046444"
+  a plugin path with no commit is at b59e046, this folder's code. Elsewhere a plugin path with no commit is at fb966cc. A citation of 01ca9769's code names bd00b1a. An mlx-serve path with no commit is
   at 66aad949, and an MLX path is at c69303b0.
 - A run record keeps its path. A line number points into a run record, such as a log or a script kept as it ran. A run
   record does not change.
@@ -23,6 +23,8 @@ How to read this file:
 
 ## Contents
 
+- [The served build, 87046444](#the-served-build-87046444): the large-context changes, the gates, the pin, the standard
+  test, the memory checks and the sweep.
 - [Builds](#builds): the dylibs that the README and this file name.
 - [The copy of mlx-serve's code](#the-copy-of-mlx-serves-code): the layer-major pass and the plugin's parts.
 - [Memory](#memory): the bill's terms, RQ's plans for each request, the 32K checks, the KV past the bill's term, the
@@ -35,6 +37,133 @@ How to read this file:
 - [Gaps for a merge](#gaps-for-a-merge): what a merge needs, the repo's rules one by one, and the smaller gaps.
 - [Receipts](#receipts): the record of each number.
 - [Terms](#terms)
+
+## The served build, 87046444
+
+Since 2026-11-12 01:02:51Z we serve dylib 87046444. It is the large-context build: commit b59e046 of our branch
+turboexl3_ling-ctxpass, built with turboexl3 4bf2df8 against mlx-serve 9a173773's kit, and installed in a stock mlx-serve
+9a173773 server with `mlx-serve plugin install`. This folder's code is b59e046's, byte for byte. Only build.zig.zon's
+turboexl3 pin, this file and the README differ. The builds before it, in order:
+
+| Dylib | Commit | Host | What it added |
+|---|---|---|---|
+| 4856f028 | fb966cc | mlx-serve 66aad949 | RQ built in ("RQ"); served from 08:08:00Z on 2026-11-11 |
+| ac0d03c1 | 4b52949 (D2) | mlx-serve 66aad949 | D2: an MLA layer's prompt spans from position 24,576 on append in one call, so whole prompts up to 32,768 tokens are served |
+| f03b37e9 | 8e8bfc3 (the port) | mlx-serve 9a173773 | the port to stock mlx-serve 9a173773 through the plugin system; served from 17:13:36Z on 2026-11-11 |
+| 87046444 | b59e046 | mlx-serve 9a173773 | the large-context changes below; served from 01:02:51Z on 2026-11-12 |
+
+The sections after this one ("Builds" to "Gaps for a merge") record the earlier builds' evidence as we wrote it on
+2026-11-10 and 2026-11-11. Where they say that the plugin refuses a prompt over 32,000 or 32,768 tokens, or that the
+bill holds a fixed 32,768-token context, the large-context build replaced that ("The large-context changes").
+
+### The large-context changes
+
+We scoped the work for a 1K-128K sweep on 2026-11-11 as six changes, C1 to C6, and built five of them.
+
+- **C1, the context from `--ctx-size`.** mlx-serve 9a173773 writes the load's context into the settings it hands the
+  plugin (`ctx_size`). The bill and RQ hold that context's longest whole prompt (src/bill.zig `contextOf`, plugin.zig
+  `prefillAt`). With no `ctx_size`, or 0, the bill holds 32,768 tokens, and config.zig caps mlx-serve's auto-sized
+  context there. A `ctx_size` that is not a whole number from 0 to 2^24 is refused by name (`LingCtxSizeUnreadable`).
+- **C2, the pass's working set at the context.** The bill's W is the layer-major pass's working set, fitted to measured
+  peaks, at its most over every whole prompt up to the context (src/bill.zig `passWorkBill`). It replaced the fixed
+  layer-major term and MEM_REFIT's 989 MiB pass part. The server's 544 MiB part stays.
+- **C3, a KV reserve at the first append: not built.** mlx-serve 9a173773 reserves no KV for a whole-prompt prefill.
+  The plugin could write the reserve only into a host struct whose layout the ABI does not fix, which could corrupt host
+  memory silently. So the bill carries the last growth's copy, and RQ trims decode's rows. The fix is an mlx-serve
+  change (README, "Gaps").
+- **C4, the pass in segments.** A prompt of more than 32,768 tokens runs in segments of up to 32,768 rows, cut at the
+  pass's routed-call boundaries, and a last piece under 8,192 rows joins the segment before it (src/ling_segments.zig).
+  Each segment runs through every layer before the next, and files its checkpoints when it ends. The MTP head's history
+  runs in forwards of at most 4,096 rows. The bill's pass model cuts every whole prompt into the same segments, which
+  an MLX-free test checks for every prompt from 2 to 150,999 tokens.
+- **C5, an over-plan refused by name.** RQ refuses a prompt plan under the bank's base. It refuses a decode or trim plan
+  more than 12 rows under the base, the rows that the 4 GiB of free RAM covers. A plan within those 12 rows keeps the
+  base with a warning (src/ling_rq.zig `overVerdict`).
+- **C6, the rope-once fallback refused past its point.** A trunk MLA call of 2 to 16 rows that is not an exact verify's
+  rebuilds the expanded key, 24 KiB a cached token. That fits the pass's 2 GiB idle working set up to 87,381 cached
+  tokens. A forward with such a call past that point is refused by name before any append (src/ling_rope1_spike.zig).
+  No whole prompt from position 0 is refused: an MLX-free test checks every one from 2 to 150,999 tokens.
+
+### Gates
+
+On 2026-11-11 at 23:02:02Z, b59e046 passed our gates on m5-max-eigen, our M5 Max (measured):
+
+- two red builds failed as designed: 7a9ce93 (the segment tie test against a stub without the tail rule) in 9 test names
+  with 26 error records, 212 of 238 passing, and 2f8885d (C6's decision stubbed) in 3 names with 3 records, 235 of 238;
+- the MLX-free tests passed 238 of 238, as many as scripts/test_reach.py counts;
+- the ReleaseFast dylib, 87046444, 4,837,592 B;
+- the GPU byte tests passed 53 of 53, and the restore check's part A 95 of 95, with part B's 24 checks `BYTES_OK`;
+- C4's GPU byte test at 52,000 tokens passed its 11 lines: over mlx-serve's 14 spans, one pass (arm A) against 3
+  segments (arm B), with 0 differing words in each span's hidden rows, the joined hidden rows, layer 7's K and V, every KDA layer's states at all
+  13 checkpoints and the MTP history's cache rows. Its 3 planted errors failed as they must.
+
+### The pin, checked on 2026-11-12
+
+This folder pins turboexl3 by URL to 4bf2df8, the head of davidtai/turboexl3's branch ling-3.1-flash. On 2026-11-12 we
+checked on m5-max-eigen that the pin builds the same code (measured):
+
+- the 613 files of the fetched package are byte for byte the files of the turboexl3 tree that the gates built with
+  (sha256 of each file); that tree is `git archive 4bf2df8`'s 620 files, and the 7 that the package leaves out are
+  outside turboexl3's build.zig.zon `.paths` (`.gitignore` and the 6 files of turboexl3's own quant-plugin folder,
+  `plugin/`);
+- from a new clone of this branch with no `--fork`, with `MLX_SERVE_KIT` set to mlx-serve 9a173773's kit,
+  `scripts/setup.sh`, `scripts/lint.sh`, `scripts/build.sh turboexl3_ling` and `scripts/check.sh turboexl3_ling --model
+  <pack>` all passed, and `zig build test` passed 238 of 238. `scripts/build.sh --all` then built all four of the
+  repo's plugins.
+
+The dylib that build made is 4,837,576 B, 16 B less than 87046444. Our builds of the same code can differ in hash and
+size, so we serve the gated build.
+
+### The standard test
+
+The A/B test on 2026-11-11 ran from about 23:02Z to 23:37:20Z: arm A was f03b37e9 and arm B 87046444, each at
+`--ctx-size 32768`, on the 18,380-token coding prompt, greedy, 8 runs in the order A B B A then B A A B (measured):
+
+| Run | Arm | Seed | Prefill tok/s | Decode tok/s | TTFT s | Wall s | MTP acceptance | Peak footprint GB |
+|---|---|---|---|---|---|---|---|---|
+| 1 | A | 1234 | 702.0 | 25.80 | 26.20 | 65.96 | 453 / 738 = 61.4% | 108.4 |
+| 2 | B | 1234 | 701.7 | 25.80 | 26.21 | 65.96 | 449 / 734 = 61.2% | 110.4 |
+| 3 | B | 4321 | 699.4 | 26.00 | 26.29 | 65.82 | 446 / 726 = 61.4% | 110.4 |
+| 4 | A | 4321 | 699.7 | 25.70 | 26.28 | 66.24 | 448 / 742 = 60.4% | 108.3 |
+| 5 | B | 1234 | 701.4 | 25.90 | 26.22 | 65.96 | 450 / 736 = 61.1% | 110.5 |
+| 6 | A | 1234 | 700.3 | 25.60 | 26.28 | 66.43 | 467 / 754 = 61.9% | 108.3 |
+| 7 | A | 4321 | 701.3 | 25.90 | 26.22 | 65.88 | 451 / 736 = 61.3% | 108.5 |
+| 8 | B | 4321 | 701.2 | 25.90 | 26.23 | 65.87 | 451 / 738 = 61.1% | 110.4 |
+
+| Mean | Prefill tok/s | Decode tok/s | TTFT s | Wall s | MTP acceptance | Peak footprint GB |
+|---|---|---|---|---|---|---|
+| A, f03b37e9 | 700.825 | 25.750 | 26.245 | 66.127 | 1,819 / 2,970 = 61.2% | 108.375 |
+| B, 87046444 | 700.925 | 25.900 | 26.238 | 65.903 | 1,796 / 2,934 = 61.2% | 110.425 |
+
+Both arms decoded 09571f6a at both seeds. Each B log has RQ's prompt-plan line, and no A log has it. At this context
+B's bill is 1,841 MiB smaller than A's, because its fitted W replaced A's layer-major term and MEM_REFIT's pass part
+(rooms 86,574 and 84,733 MiB in the load lines). So B's bank held 220 prompt slot rows and A's 214. B's MLX prompt peaks were 96,618 to 96,782 MiB and A's 94,693 to 94,857: 1,925 MiB more at
+each end of the range, the size of B's 6 extra rows. B's measured W stayed under its billed W in all 4 runs (remainders -1,631 to -1,467 MiB). Every B
+run paged out more than every A run (B 152 to 220 pageouts, A 76 to 141), with no compressor growth in any run.
+
+### The 32K check and the memory checks
+
+- **32K check, 2026-11-12 00:00:20Z.** A warm-up and 4 greedy runs at 31,652 tokens, `--ctx-size 32768`: MLX's prompt
+  peak was 101,347 MiB in all 4, 168 MiB under the bill's terms (101,515 MiB: trunk 14,734, prompt rows 70,585, KV
+  9,070, `prompt_work` 2,048, the layer-major part of W 3,945, read windows 1,132). Memory pressure stayed normal, swap
+  stayed flat and the memory guard stopped no run. The text was 919cf0fb in all 4.
+- **Memory checks at 32K, 64K and 128K, 00:28Z to 01:02:40Z.** Each ran one greedy request under the memory guard in
+  kill mode, which stops the server at critical memory pressure or 1 GB of new swap:
+
+| Prompt tokens | `--ctx-size` | Measured W MiB | Billed W MiB | Segments | Rows (prompt / RQ decode) | Peak footprint GB | Least free RAM GB | Prefill tok/s | Decode tok/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 33,591 | 49,975 | 4,783.0 | 7,177 | 2 | 200 / 219 | 114.11 | 0.28 | 617.4 | 20.5 |
+| 67,310 | 83,694 | 6,418.2 | 10,273 | 3 | 161 / 182 | 112.09 | 1.16 | 518.5 | 13.7 |
+| 134,615 | 150,999 | 11,610.0 | 13,920 | 4 | 90 / 115 | 110.61 | 3.113 | 379.1 | 8.8 |
+
+  Memory pressure stayed normal in every reading, swap stayed at 0.127 GB, RQ made no trim and the guard stopped no run.
+
+### The sweep
+
+From 01:02:51Z to 12:45:02Z on 2026-11-12, 87046444 ran the README's sweep: 8 prompt sizes, greedy and card, 4 runs
+each, 64 runs and 16 warm-ups. The README gives every size's means and memory. The per-run tables are in the sweep's
+report, `sweep-report.md`, beside the charts on the `pr-charts` branch of github.com/davidtai/plugins
+(`turboexl3_ling/`). No run made an over-plan or a refusal, and 16 runs trimmed decode's rows once.
 
 ## Builds
 
@@ -751,10 +880,8 @@ all 144 MLX-free and 53 GPU byte tests (measured). 01ca9769 passed its own on 20
 with changed code also passes our 32K check ("Memory"). A change to the decoded text also needs a parity test
 ("Parity").
 
-With the pull request checked out, you can run the MLX-free tests with step 3's kit and no turboexl3 clone (build.zig
-`build`: the `test` step's binaries take no turboexl3 module). We ran them that way at ecc4a1c. Run step 4's commands
-from `git clone .../plugins` through `zig build --fetch`. Then run `../../.zig-toolchain/zig build test` with no
-`--fork`.
+With the pull request checked out and `MLX_SERVE_KIT` set (README, step 3), `scripts/build.sh turboexl3_ling` runs the
+MLX-free tests and then the ReleaseFast build. We ran it that way on 2026-11-12 ("The pin, checked on 2026-11-12").
 
 Commits 7178ba2 and af601d8, merged as 1dffdcd, change only tests. 7178ba2 takes out four test blocks that no test
 binary ran. One is plugin.zig's `test { _ = config; }`. The other three are the unnamed tests of three copies:
@@ -776,17 +903,17 @@ as planned at 44ba83b: 138 of 144 passed, with 6 error records under 3 names (me
 
 
 
-Without a fork, `zig build --fetch` still downloads the turboexl3 pin (the `b.dependency("turboexl3", ...)` call in
-build.zig `build`). At ecc4a1c, scripts/build.sh ran the MLX-free tests that way and then failed in the ReleaseFast
-build, with 7 errors on the c7ce66c pin (measured, `~/lingp/logs/portcs-cs1.log`). It starts that build only after the
-tests pass (scripts/build.sh, whose ReleaseFast build follows the test step after `&&`).
+Until 2026-11-12 build.zig.zon pinned turboexl3 main c7ce66c, which has no Ling kernels, and our builds took turboexl3
+from a local tree with `--fork`. At ecc4a1c, scripts/build.sh failed in the ReleaseFast build on that pin, with 7 errors
+(measured, `~/lingp/logs/portcs-cs1.log`). The pin is now 4bf2df8, and scripts/build.sh passes with no `--fork` ("The
+pin, checked on 2026-11-12").
 
 Our gates run both before we serve any dylib. Run the GPU byte tests after a kernel or forward-path change, and the
-restore check after a cache-layout change. They need turboexl3's Ling branch, and some of them need a pack. The GPU byte
+restore check after a cache-layout change. They build with the pinned turboexl3, and some of them need a pack. The GPU byte
 tests run on an M5-class Mac. `<dir>` is the serving mlx-serve build's lib/mlx/lib, which holds libmlxc, libmlx and
 mlx.metallib. From plugins/turboexl3_ling:
 
-    MLX_SERVE_LING_GPU_TESTS=1 ../../.zig-toolchain/zig build gpu-test -Dmlx-lib=<dir> --fork=<turboexl3 clone>
+    MLX_SERVE_LING_GPU_TESTS=1 ../../.zig-toolchain/zig build gpu-test -Dmlx-lib=<dir>
 
 Without the variable, every GPU byte test skips. At bd00b1a the GPU byte tests passed 52 of 52, with 653 PASS lines and
 no FAIL line (measured, dylib 01ca9769). At fb966cc they passed 53 of 53, with 653 PASS lines and no FAIL line
@@ -800,7 +927,7 @@ commits them through mlx-serve's own cache code and restores them from the SSD t
 compares them with part A's, bit for bit.
 
 1. Part A (src/ling_restore_test.zig) builds with the GPU byte tests.
-   - Build it with `../../.zig-toolchain/zig build gpu-test-build -Dmlx-lib=<dir> --fork=<turboexl3 clone>`.
+   - Build it with `../../.zig-toolchain/zig build gpu-test-build -Dmlx-lib=<dir>`.
    - Run `MLX_SERVE_LING_GPU_TESTS=1 MLX_SERVE_LING_PACK=<pack> MLX_SERVE_LING_RESTORE_OUT=<file>
      zig-out/tests/ling_restore_gpu`.
    - It runs two prompts through the plugin's MLA layers: 16,700 tokens for the flush, and their first 9,000 for the
@@ -1351,79 +1478,58 @@ ceiling, 101,856 MiB, not with this total.
 
 ## Gaps for a merge
 
-Before a merge, we must fix the first six items below, and a reviewer must rule on the last five.
+As of 2026-11-12, the items that we had to fix before a merge are done: turboexl3's Ling kernels are on
+github.com/davidtai/turboexl3 (branch ling-3.1-flash, pinned at 4bf2df8), and the converter's Ling script is on
+github.com/OpenSourceWTF/qwen38-exl3-mlx-serve-converter. The open items:
 
-- build.zig.zon pins turboexl3 main (c7ce66c), which has no Ling kernels, so the ReleaseFast build fails (measured). The
-  fix is to publish turboexl3's Ling kernels before the merge and pin 4bf2df8.
-- No one else can make a pack until we publish our converter's Ling script (README, "Requirements"). The fix is to
-  publish it before the merge.
-- CI's kit, built from the repo's MLX_SERVE_REF (mlx-serve bc6c5f2c), is too old for the plugin (config.zig `kitGap` and
-  the comptime check that calls it). The fix is the 26.11.3 release kit, or the repo's MLX_SERVE_REF moved to 66aad949
-  or later.
-- Under AGENTS.md's rule 7, each bill term must be a measured upper bound. The bill's load-time KV term holds 32,768
-  tokens. On 01ca9769 a KV grow step could go past it by up to 2,104 MiB ("The KV past the bill's term"). RQ, served
-  since 08:08:00Z on 2026-11-11, bills each request's KV at the capacity that mlx-serve allocates, growth included. It
-  refuses by name a prompt forward that would grow mlx-serve's KV past 32,000 tokens ("RQ"). Two long requests at once
-  are not tested: RQ counts another live request's KV as it is, not its growth. The fix is a test of two long requests
-  at once.
-- mlx-serve takes a `--ctx-size` above 32,768 as given, but the bill's load-time KV term holds 32,768 tokens. RQ refuses
-  a prompt whose KV would pass 32,000 tokens at any `--ctx-size`. But its decode rows never go under the base, and we
-  have not measured decode past 32,768 tokens. The fix refuses a larger value at load, or measures it.
-- A 4- or 8-bit KV, from `--kv-quant`, model-settings.json or a request's `kv_quant`, gets no refusal. mlx-serve never
-  tells the plugin the scheme at load, so the plugin cannot refuse it there ("The quantized KV"). Each MLA layer then
-  reads a dense copy of its KV that no bill term holds, about 1.0 GiB a call at 32,768 tokens. The quantized cache takes
-  about 53% (8-bit) or 28% (4-bit) of the KV term (all calculated). We have not measured whether these stay within the
-  term, or the text that a lossy KV decodes. Since fb966cc the plugin logs one warning a load, but it refuses nothing.
-  The fix is an mlx-serve change, not yet made, that refuses the scheme by name at load and before mlx-serve creates a
-  request's cache.
-- RQ's stage 1 keeps the prompt pass at the bank's 214-row base. Near 32,000 tokens its plan holds 211 slot rows, so the
-  bank stays 3 rows over the plan, and RQ logs `RQ over plan`. MLX's peak stayed 426 MiB under the plan's ceiling at
-  31,652 tokens on 4856f028, and 538 MiB under it at 32,000 tokens on 89be02b1 (measured). A reviewer must rule on this
-  case, or ask for a streamer that can shrink the prompt pass's rows under its base.
-- Our patches and cut-down MLX kernels need a ruling under rule 9, on edits to third-party code (rules table below).
-- Four other rule 7 choices need a ruling (rules table below).
-- Parity's four-statistic bar needs a ruling, or we must serve without MLA_FLASH ("Parity").
-- The parity test needs a ruling in place of the pull-request template's greedy diff against `--no-plugins`, because
-  mlx-serve's own Ling model cannot read EXL3.
-
-A reviewer must also rule on four smaller points in the rules table below. They are step 4's manual install, our staged
-kit, the copied parse's checks and exllamav3's tensor names.
+- No mlx-serve release has the kit that `KIT_VERSION` names (26.11.3). We build against a kit staged from mlx-serve
+  9a173773 (`MLX_SERVE_KIT`), as AGENTS.md allows. CI's kit, built from the repo's MLX_SERVE_REF (bc6c5f2c), has no span
+  fields, so CI's build of this plugin stops at config.zig's kit check (`kitGap`). The fix is the 26.11.3 release kit,
+  or the repo's MLX_SERVE_REF moved to 9a173773 or later.
+- mlx-serve reserves no KV for a whole-prompt prefill, so each KV grows in copies, and RQ trims decode's rows when decode
+  passes its plan. The bill carries the last growth's copy ("The large-context changes", C3). The fix is an mlx-serve
+  change that reserves a request's KV at its first append.
+- Two long requests at once are not tested. RQ counts another live request's KV as it is, not its growth. The fix is a
+  test of two long requests at once.
+- A 4- or 8-bit KV gets no refusal, because mlx-serve never tells the plugin the scheme at load ("The quantized KV").
+  The plugin logs one warning a load. The fix is an mlx-serve change that tells the plugin the scheme, or refuses it.
+- A reviewer must rule on our patches and cut-down MLX kernels under rule 9, on four other rule 7 choices, on parity's
+  four-statistic bar, and on the parity test in place of the template's greedy diff against `--no-plugins` (mlx-serve's
+  own Ling model cannot read EXL3). The rules table below gives each one.
 
 ### AGENTS.md's rules, one by one
 
 | Rule | Status | Evidence | For the reviewer |
 |---|---|---|---|
-| 1. Every plugin compiles | not met | build.zig.zon pins turboexl3 main c7ce66c, and its comment names an older branch (ling, d5f9989). The ReleaseFast build fails on that pin (measured; "Tests"). CI's kit from MLX_SERVE_REF bc6c5f2c has no span fields, so CI's `zig build test` stops at config.zig's comptime kit check (`kitGap`) before the ReleaseFast build (the CI workflow's steps "Pinned toolchain and kit" and "Every plugin compiles and passes its tests" in .github/workflows/ci.yml; scripts/build.sh). | The pull request stays a draft until the pin and CI's kit move ("Gaps for a merge"). |
-| 2. Compile from source | met, except for scripts/install.sh | No prebuilt dylib: step 4 builds the source. scripts/install.sh does not fit yet, because it uses the mlx-serve on your PATH and builds without `--fork`. | Accept step 4's manual install until the pin moves and 26.11.3 is on PATH. |
-| 3. Pinned toolchain only | met, with a staged kit | scripts/setup.sh stages the pinned Zig. The kit comes from `MLX_SERVE_KIT`, as AGENTS.md allows while the release has no kit asset. Our kit, built from 66aad949, names itself 26.11.1 (step 3). | Accept a kit staged from 66aad949 in place of the 26.11.3 release kit. The pull request must say that the kit is staged. |
+| 1. Every plugin compiles | met with a staged kit; not in CI yet | build.zig.zon pins turboexl3 4bf2df8 by URL. From a new clone, `scripts/build.sh turboexl3_ling` passed with mlx-serve 9a173773's kit (measured, 2026-11-12; "The pin, checked on 2026-11-12"). CI's kit from MLX_SERVE_REF bc6c5f2c has no span fields, so CI's `zig build test` stops at config.zig's comptime kit check (`kitGap`) (.github/workflows/ci.yml; scripts/build.sh). In the same clone, `scripts/build.sh --all` built all four plugins (measured, 2026-11-12). | CI passes once the 26.11.3 kit is released or the repo's MLX_SERVE_REF moves ("Gaps for a merge"). |
+| 2. Compile from source | met | No prebuilt dylib. README step 4 runs scripts/install.sh, which builds the source with the mlx-serve 9a173773 server first on PATH. | None. |
+| 3. Pinned toolchain only | met, with a staged kit | scripts/setup.sh stages the pinned Zig. The kit comes from `MLX_SERVE_KIT`, as AGENTS.md allows while the release has no kit asset. Our kit, built from 9a173773, names itself 26.11.1 (README, step 3). | Accept a kit staged from 9a173773 in place of the 26.11.3 release kit. The pull request says that the kit is staged. |
 | 4. One plugin per PR | met | Outside the plugin's folder, the branch adds only the catalog row in README.md, the plugins.json entry and docs/assets/icons/turboexl3_ling.svg (`git diff --stat cfc3704`). | A fix that moves the repo's MLX_SERVE_REF ("Gaps for a merge") changes a shared file. |
 | 5. Narrow claim, MLX-free parse | met | The plugin claims by marker, exllamav3's `quantization_config` (config.zig `claims`). Its claims and parse are MLX-free (config.zig's file comment). | None. |
 | 6. Refuse by name | partly met; not met for a quantized KV | Every refusal is named (README, "Logs"). The plugin bounds-checks `num_hidden_layers` (1 to 512) and the clamp lists (config.zig `checkPack`). The copied built-in parse reads the other fields (config.zig `parse`). A 4- or 8-bit KV scheme gets no refusal, and the request runs. Since fb966cc the plugin logs one warning a load. mlx-serve never tells the plugin the scheme at load ("The quantized KV"). | Decide whether the copied parse's checks are enough. A quantized KV needs a host change, not yet made, that refuses the scheme by name at load ("Gaps for a merge"). |
-| 7. Bill what you allocate | met for one request at a time; two long requests at once not tested; stage 1 and four decisions need a ruling | The bill's load-time KV term holds 32,768 tokens, and on 01ca9769 a KV grow step could go past it by up to 2,104 MiB (calculated; "The KV past the bill's term"). RQ bills each request's KV at the capacity that mlx-serve allocates, growth included, and refuses by name a prompt forward that would grow it past 32,000 tokens ("RQ"). Stage 1 keeps the prompt pass at the 214-row base: near 32,000 tokens the plan holds 211 slot rows, and MLX's peak stayed 426 MiB under the plan's ceiling at 31,652 tokens on 4856f028 and 538 MiB under it at 32,000 tokens on 89be02b1 (measured). Two long requests at once are not tested: RQ counts another live request's KV as it is, not its growth. mlx-serve also takes a `--ctx-size` above 32,768 as given (66aad949 src/engines/mlx/admission/context.zig `getEffectiveContextLength`), and decode past 32,768 tokens is not measured. The KV term and the layer-major term are calculated, and the 4 GiB reserve is a setting. `prompt_work` bounds the 1.2 to 2.0 GiB measured at 4,096-token chunks (src/bill.zig `prompt_work`). MEM_REFIT is fitted to measured peaks. Since 0ebec77 it is fitted to 13 runs at 31,652 tokens. The 32K checks of 01ca9769 and 4856f028 peaked 426 MiB under the plan's ceiling there ("Memory"). In decode the bank also takes MEM_REFIT's 544 MiB server part (plugin.zig `openBank`). Our A/Bs served it ("Measured"). The bill holds no term for the prompt log-probability step, the plugin's own 2 B for each entry included, and the refusal replaces that term (src/bill.zig `headRowsJoined`). | A test of two long requests at once must pass first. Rule on stage 1's case near 32,000 tokens, or ask for a streamer that can shrink the prompt pass's rows under its base. A larger `--ctx-size` needs a refusal at load, or a measured run. Then accept the four decisions, or ask for their fixes: a measured term for each part of the bill, and mlx-serve's row-sliced step from our issue draft ("Gaps for a merge"). |
+| 7. Bill what you allocate | met for one request at a time; two long requests at once not tested; four decisions need a ruling | The bill holds the KV of the served context's longest whole prompt, W at its most up to that context, 4 GiB of free RAM and the server's 544 MiB ("The large-context changes"). RQ bills each request's KV at the capacity that mlx-serve allocates, growth included, and refuses by name a plan it cannot hold. At 31,652 tokens MLX's prompt peak stayed 168 MiB under the bill's terms, and at 33,591, 67,310 and 134,615 tokens the measured W stayed 2,310 to 3,855 MiB under the billed W (measured, "The 32K check and the memory checks"). Two long requests at once are not tested. `prompt_work` bounds the 1.2 to 2.0 GiB measured at 4,096-token chunks, and the 4 GiB reserve is a setting. The bill holds no term for the prompt log-probability step, and the refusal replaces that term (src/bill.zig `echoRefusalAt`). | A test of two long requests at once must pass first. Then accept the four decisions, or ask for their fixes: a measured term for each part of the bill, and mlx-serve's row-sliced step from our issue draft. |
 | 8. Tests for behaviour that can regress | met | The MLX-free tests, the GPU byte tests and the restore check ("Tests"). Rule 7's tests failed before their code (`~/lingp/logs/portgpu-r7red.log`, `~/lingp/logs/portgpu-r7cred.log`). The re-fit's tests failed before its constant (`~/lingp/logs/portgpu-r8cared.log`), and the room's tests before 165d8ca's code (`~/lingp/logs/portgpu-r7ered.log`). EMBED_ROWS', KDA_GATE_EPI's, KDA_NORM_PREP's and the DFlash refusal's tests failed before their code too (`~/lingp/logs/portgpu-m1hred.log`; our port notes). RQ's built-in tests failed at 44ba83b, before fb966cc (our results folder `gates-4856f028/portgpu-rqhred.log`). scripts/test_reach.py names any test block that no test binary reaches, and the gates check each binary's test count against it ("Tests"). | None. |
 | 9. Third-party code unchanged | not met as written | The copy is generated and untracked (.gitignore's `src/mlx_serve/` line), and prepare.sh applies the patches right after the sync script (scripts/prepare.sh). So a reviewer may count them as the sync step's edits. They are still separate patch files: four, editing 14 copied mlx-serve files, with 2,883 lines added and 148 removed at fb966cc, and 2,843 and 148 at bd00b1a (calculated). The five MLX kernels, overlay/mlx_serve/kernels/mla/ling_verify_mla_*.metal, are edited copies committed in overlay/ (NOTICE's MLX section). | Accept both kinds of edit, or ask us to move them into sync scripts ("Gaps for a merge"). |
 | 10. Numbers are measured | met | We mark each number's kind where the text does not make it clear, and "Receipts" gives its record. Decode comes before prefill, and "Smaller gaps" lists what we have not measured. The measured records are on our Mac and are not published ("Receipts"). | Note that the records are not published, so you cannot check the measured numbers against them. |
 | 11. Leave the user's mlx-serve alone | met | Step 4 installs under a throwaway HOME, and each of our runs used one server. | None. |
-| 12. Public text is short and plain | met for the README's main text | The README's main text is 2,399 words by `wc -w`, counted over the lines outside `<details>` blocks and before "## Terms", with commands and tables included, within the 2,400-word budget. The whole README is 6,792 words, and this file 33,209. The evidence is in this file, such as "Receipts" and the per-run tables. The pull-request body is not written yet. | Read the pull-request body when it is open. |
+| 12. Public text is short and plain | see the README | The README's main text is counted again for each revision (the pull-request body gives the count). The evidence is in this file. | Read the pull-request body. |
 | 13. Open the PR only when asked | not applicable | The rule governs the agent that opens the pull request. | None. |
 | "Create a plugin": weight names and config keys follow mlx-lm | not met | The pack keeps exllamav3's tensor names (`.trellis`, `.suh`, `.svh`) and puts the routed experts in experts.bin, so other engines need a new reader for it. | Accept exllamav3's names, or ask for a renaming step in the converter. |
-| PR steps: branch `add-<name>` | not met yet | The work is on `turboexl3_ling-rq`. | A fix is to push it as `add-turboexl3_ling` when the pull request opens. |
-| PR template: `scripts/lint.sh` and `scripts/gen-index.sh` | met at ecc4a1c; run again at the PR head before the PR opens | lint printed "lint: ok", and gen-index left plugins.json unchanged (measured, `~/lingp/logs/portcs-cs1.log`). | None. |
+| PR steps: branch `add-<name>` | met | The pull request's branch is `add-turboexl3_ling` on github.com/davidtai/plugins. | None. |
+| PR template: `scripts/lint.sh` and `scripts/gen-index.sh` | met | lint printed "lint: ok", and gen-index left plugins.json unchanged, at the pull request's head (2026-11-12). | None. |
 | PR template: `scripts/check.sh` | met by its exception | `"fixture": "none"` with a `fixture_reason` (plugin.json's `fixture` and `fixture_reason`). So `scripts/check.sh` needs `--model` ("Smaller gaps"). | None. |
 
 ### Smaller gaps
 
-- Without `--ctx-size`, mlx-serve picks at most 32,768 tokens, and it can pick fewer. Its auto-sizer prices a token at
+- Without `--ctx-size`, mlx-serve picks a context, which config.zig caps at 32,768 tokens, and it can pick fewer. Its auto-sizer prices a token at
   368,640 B, its own count for the MLA cache, against the plugin's 297,216 B (both calculated). A fix needs the
   auto-sizer to read the plugin's bill.
 - Without `--prefill-chunk`, mlx-serve sizes the chunk from the memory left after the load, so the text can depend on
   the bank's size. A fix is for the plugin to cut the prompt at a fixed width itself. The prefix cache's snapshots then
   need a new check.
 - We have not measured a Mac with less memory, the macOS default GPU wired limit, or the 2.10bpw pack on this build. Nor
-  have we measured a long output after a shorter prompt or `--prefix-cache-disk`. A prompt over 32,000 tokens is refused
-  ("RQ"). The ladder stopped 92 tokens short of the 32,768-token context. RQ's safety test filled it on 89be02b1, with a
-  32,000-token prompt and 768 decoded tokens, but it measured no speed. Each one needs a measured run before the README
-  can claim it.
+  have we measured `--prefix-cache-disk`, or a `--ctx-size` above 150,999. Each one needs a measured run before the
+  README can claim it.
 - config.zig declares no batched decode, and the layer-major pass refuses a prompt from more than one slot. So mlx-serve
   interleaves a second request's forward passes with the first's and never batches them (66aad949
   src/host/http/server.zig `serve`, its concurrency line). Serving several requests at once needs batched decode in the
@@ -1432,8 +1538,8 @@ kit, the copied parse's checks and exllamav3's tensor names.
 - mlx-serve keeps no prefix between requests (README, "What it serves"), about 26 s for each turn at 18,380 tokens. Its
   RAM tier gets no memory beside the bank (`mem-cap=0.0 MB`), and step 6 sets no SSD tier. A fix needs a measured
   `--prefix-cache-disk` setting, or RAM for the prefix cache.
-- plugin.json asks for mlx-serve 26.11.3 or later (`requires_mlx_serve`). A server built at 66aad949 reports 26.11.1, so
-  the app's plugin catalog finds that the plugin does not run on it (66aad949
+- plugin.json asks for mlx-serve 26.11.3 or later (`requires_mlx_serve`). A server built at 9a173773 reports 26.11.1, as
+  one built at 66aad949 does, so the app's plugin catalog finds that the plugin does not run on it (66aad949
   app/Sources/MLXServe/Services/PluginCatalog.swift `PluginCatalog.runs(on:requirement:)`). A server of the 26.11.3
   release passes the check.
 - The plugin has no conformance fixture (`"fixture": "none"` in plugin.json). So `scripts/check.sh` needs `--model`,
