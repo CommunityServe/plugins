@@ -601,7 +601,7 @@ pub const SlotTable = struct {
 const testing = std.testing;
 const mib: u64 = 1 << 20;
 
-// The served plan's terms (the 2.60 pack on m5-max-eigen, dylib 01ca9769; its load lines): the bank's budgets as
+// The served plan's terms (the 2.60 pack on our M5 Max, dylib 01ca9769; its load lines): the bank's budgets as
 // logged, prompt 69,998 MiB and decode 76,329 MiB, `frac` bytes past the MiB the log rounds to; 68 routed layers of
 // 4,947,456 B a record (336,427,008 B a row of every layer), 5 prompt windows of 48 records and 1 at decode,
 // 118,489,088 B of staging (src/bill.zig's MEM_REFIT test); the rope-once trunk's 9 MLA layers and the MTP head's

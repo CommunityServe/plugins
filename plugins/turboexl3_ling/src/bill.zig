@@ -5,7 +5,7 @@
 //! `Bill.prefill_bytes`). Both reserves hold the KV of the served context's longest whole prompt (C1: `contextOf`, the
 //! load's `--ctx-size`; src/ling_rq.zig `promptCapacityMax`), a pass's working set past its KV and `free_ram`, so a
 //! request at the full context still leaves the box free memory. Fitted on
-//! m5-max-eigen (2026-11-06, the standard test: 18,380 + 1,024 tokens, 8 GiB prompt / 2 GiB decode reserves): the
+//! our M5 Max (2026-11-06, the standard test: 18,380 + 1,024 tokens, 8 GiB prompt / 2 GiB decode reserves): the
 //! prompt pass peaked 7.5-8.3 GiB past the trunk and the bank's rows with 6.3 GiB of KV, and the decode steps 4.2 GiB
 //! past them; the box's free RAM fell to 0.15-2.6 GB.
 
@@ -57,13 +57,13 @@ pub const decode_work: u64 = 2 << 30;
 pub const free_ram: u64 = 4 << 30;
 /// MEM_REFIT (the bill before C2; C2's `passWork` folds its pass part into the fitted W, and plugin.zig `promptOnlyBytes`
 /// keeps its server part): a layer-major prompt pass's peak past that bill's terms, and the server's own memory past
-/// MLX's counters, both measured. Fitted on m5-max-eigen (2026-11-10, the 2.60
-/// pack) at 31,652 prompt tokens (`--ctx-size 32768`, max_tokens 1,024) on memfit v3 (~/lingc/bin/memfit.py), whose terms
+/// MLX's counters, both measured. Fitted on our M5 Max (2026-11-10, the 2.60
+/// pack) at 31,652 prompt tokens (`--ctx-size 32768`, max_tokens 1,024) on memfit v3 (records/bin/memfit.py), whose terms
 /// are the trunk, the bank's rows and its prompt windows (the host stream's transient scratch, MLX memory until the phase
 /// change), the KV mlx-serve allocated (32,000 tokens), `prompt_work` and the layer-major term. The runs: the context
 /// ladder at c8d54a83 (8 runs, MLX prompt peak 98,807 MiB on 202 rows, 987 MiB past the terms;
-/// ~/lingp/ladder-c8d54a83), and R8b's verification at 901a8e4a (a pre-warm and 4 runs at 100,091 to 100,092 MiB on
-/// 206 rows, 988 to 989 MiB past; ~/lingp/ladder-rf). The pass part is the worst remainder, 989 MiB. When a prompt
+/// records/ladder-c8d54a83), and R8b's verification at 901a8e4a (a pre-warm and 4 runs at 100,091 to 100,092 MiB on
+/// 206 rows, 988 to 989 MiB past; records/ladder-rf). The pass part is the worst remainder, 989 MiB. When a prompt
 /// pass peaks below the warm-up's decode peak, its `[mem] a prompt pass ends` line shows that decode peak, not its own.
 /// mlx-serve grows its KV lazily, and an append a span would take it 25,600 -> 32,000 -> 40,192 tokens, past this bill's
 /// 32,768-token term inside the pass, for a prompt over 32,000 tokens. D2 (src/ling_rq.zig `d2_from`) appends each MLA
@@ -338,10 +338,10 @@ pub fn headRowsJoined(rows: u64, vocab: u64) u64 {
 /// sampling/logprobs.zig `rowLogprobs`). A whole-prompt prefill runs the step over every row of its one forward
 /// (generate/init.zig, after the forward). The chunk loop runs it one chunk at a time, 256 rows for an echo request
 /// (prefill_interleave.zig `PROMPT_LOGPROBS_CHUNK`).
-/// Measured, rounded up: 31.6 B. That is test 3 on m5-max-eigen, 2026-11-09, at R7b 9700aa6
-/// (~/lingp/ladder-r7/ladder-r7echo.234907). Before a 4,171-token echo request MLX held 82,174 MiB active, and at its peak
+/// Measured, rounded up: 31.6 B. That is test 3 on our M5 Max, 2026-11-09, at R7b 9700aa6
+/// (records/ladder-r7/ladder-r7echo.234907). Before a 4,171-token echo request MLX held 82,174 MiB active, and at its peak
 /// 103,094 MiB. Less the request's 1,182 MiB of KV, the step took 19,738 MiB over 4,171 x 157,184 entries. The re-run at
-/// R7c 0e1f5c0 (~/lingp/ladder-r7/ladder-r7echo) measured 30.48 B at 2,940 rows, from /props before and after.
+/// R7c 0e1f5c0 (records/ladder-r7/ladder-r7echo) measured 30.48 B at 2,940 rows, from /props before and after.
 /// The host's own account (rowLogprobs' comment) is 22 B: the bf16 logits it holds through the step and five 4-byte
 /// arrays. MLX 0.32.5 (c69303b0) holds six. ArgPartition allocates its output (mlx/backend/metal/sort.cpp:348) beside the
 /// f32 input and the multi-block sort's four scratch arrays (sort.cpp:142-146), so the account is 26 B. 2 B more are this
@@ -415,7 +415,7 @@ test "Ling's reserves hold the full context's KV, the measured working set and t
 }
 
 test "the standard test's load: the bank gives up the reserve the old 8 GiB bill did not hold" {
-    // m5-max-eigen, 2.60: a 96 GiB room under the old 8 GiB reserve (the static ceiling less it and the 8 GiB margin),
+    // our M5 Max, 2.60: a 96 GiB room under the old 8 GiB reserve (the static ceiling less it and the 8 GiB margin),
     // 23,783 MiB resident.
     const ceiling_less_margin: u64 = (98304 << 20) + (8 << 30);
     const in_use: u64 = 23783 << 20;
@@ -441,7 +441,7 @@ test "a prompt-only reserve (the layer-major pass's) comes out of the prompt row
 }
 
 test "the MTP head alone on the latent cache: 1,244 MiB less KV at the full context, 3.9 rows: 4 more prompt and decode rows at the zhl A/B's bank line" {
-    // m5-max-eigen, 2.60, the control (2026-11-07, e10 kept): room 82,754 MiB, 16,844 MiB in use, the layer-major
+    // our M5 Max, 2.60, the control (2026-11-07, e10 kept): room 82,754 MiB, 16,844 MiB in use, the layer-major
     // pass's 4,797 MiB back to the decode rows: prompt 65,909 MiB, decode 70,707 MiB (201 / 219 rows of 336,427,008 B).
     // 9 MLA layers and the NextN head's, expanded, against the 9 expanded and the head's latent.
     const row: u64 = 336_427_008;
@@ -461,7 +461,7 @@ test "the MTP head alone on the latent cache: 1,244 MiB less KV at the full cont
     try std.testing.expectEqual(e.prompt + (prompt(ex_kv, default_context) - prompt(hl, default_context)), h.prompt);
     try std.testing.expectEqual(e.decode + (decode(ex_kv, default_context) - decode(hl, default_context)), h.decode);
     // 1,244 MiB is 3.88 rows. A phase's slot rows are its budget's whole rows, so the bank gains 3 or 4 as the budget's
-    // fraction of a row falls; here both phases sit at about .4 of a row and each gains 4 (the zhl A/B, m5-max-eigen
+    // fraction of a row falls; here both phases sit at about .4 of a row and each gains 4 (the zhl A/B, our M5 Max
     // 2026-11-07: 201 prompt / 219 decode rows without the head's latent cache, 205 / 223 with it).
     try std.testing.expectEqual(@as(u64, 3), (h.prompt - e.prompt) / row);
     try std.testing.expectEqual(@as(u64, 3), (h.decode - e.decode) / row);
@@ -481,7 +481,7 @@ test "the rope-once cache: 2,268 MiB less KV at the full context over the 9 MLA 
     const hr = headLatentKv(9, r1, 512, 64);
     try std.testing.expectEqual(@as(u64, 297_216), hr);
     try std.testing.expectEqual(@as(u64, 2268 << 20), (hl - hr) * default_context);
-    // The zhl A/B's bank line (m5-max-eigen, 2026-11-07), the head's latent on: both phases' rows take the whole
+    // The zhl A/B's bank line (our M5 Max, 2026-11-07), the head's latent on: both phases' rows take the whole
     // difference, 7.07 rows of 336,427,008 B.
     const lm: u64 = 4797 << 20;
     const in_use: u64 = 16844 << 20;
@@ -510,7 +510,7 @@ test "the rope-once fallback's spike: the rebuilt key, 768 MiB at the full conte
 }
 
 test "the 4-bit draft readout: its 882 MiB go to both phases' rows, at least 2 more rows of each at today's bank line" {
-    // Ling-3.1-flash's head: 157,184 x 4,096. The control (m5-max-eigen, 2.60, 2026-11-07): room 82,754 MiB, 16,844 MiB
+    // Ling-3.1-flash's head: 157,184 x 4,096. The control (our M5 Max, 2.60, 2026-11-07): room 82,754 MiB, 16,844 MiB
     // held when the bank opens, the dense readout among it (201 prompt / 219 decode rows of 336,427,008 B).
     const vocab: u64 = 157184;
     const hidden: u64 = 4096;
@@ -580,9 +580,9 @@ test "the all-rows head (prompt log-probabilities): every span's logits and thei
 }
 
 test "MEM_REFIT: every control prompt peak at 31,652 tokens, the bank's windows counted, fits the re-fit's bill; the prompt rows grow from 202 to 210, decode keeps its 233, and at 32,000 prompt tokens the peak stays under the bill's line; with D2 no whole prompt up to the bill's 32,768-token context passes its KV term" {
-    // m5-max-eigen, the 2.60 pack, 31,652-token prompts (mlx-serve allocated KV for 32,000), every measured control run:
-    // the context ladder at c8d54a83 (PORTR7C, 2026-11-10: 4 greedy, 4 at the card's sampling; ~/lingp/ladder-c8d54a83)
-    // on 202 prompt rows, and R8b's verification at 901a8e4a (a pre-warm and 4 greedy runs; ~/lingp/ladder-rf) on 206.
+    // our M5 Max, the 2.60 pack, 31,652-token prompts (mlx-serve allocated KV for 32,000), every measured control run:
+    // the context ladder at c8d54a83 (PORTR7C, 2026-11-10: 4 greedy, 4 at the card's sampling; records/ladder-c8d54a83)
+    // on 202 prompt rows, and R8b's verification at 901a8e4a (a pre-warm and 4 greedy runs; records/ladder-rf) on 206.
     // The ladder's bank line: room 82,116 MiB, 15,962 MiB in use, prompt 66,153 MiB / decode 75,101 MiB, 202 / 233 rows
     // of 336,427,008 B. Its KV a token: the rope-once trunk and the MTP head's latent cache.
     const mib: u64 = 1 << 20;
@@ -617,7 +617,7 @@ test "MEM_REFIT: every control prompt peak at 31,652 tokens, the bank's windows 
         try std.testing.expectEqual(@as(u64, 210), (66153 * mib + frac + (extra_c - mem_refit_extra) - (5 * window + staging)) / row);
         try std.testing.expectEqual(@as(u64, 233), (75101 * mib + frac - (window + staging)) / row);
     }
-    // The fit, memfit v3 (~/lingc/bin/memfit.py): the terms are the trunk, the bank's rows, its prompt windows (the host
+    // The fit, memfit v3 (records/bin/memfit.py): the terms are the trunk, the bank's rows, its prompt windows (the host
     // stream's transient scratch, MLX memory from `Stream.init` until the phase change; the staging is the read pool's
     // host memory, inside the server's 544 MiB), the KV mlx-serve allocated, prompt_work and the layer-major term, rounded
     // to the MiB. The ladder's 8 runs peaked at 98,807 MiB on 202 rows, 987 MiB past 97,820. R8b's verification (the
@@ -844,7 +844,7 @@ fn wMeasured(peak_mib: u64, n: u64) u64 {
     return ((peak_mib + 1) << 20) -| ((14734 << 20) + 214 * row + 5 * 48 * (row / 68) + ling_rq.wholePromptCapacity(n) * 297_216);
 }
 
-/// RQ's terms at a load on m5-max-eigen as plugin.zig `openBank` makes them (C1, C2, C5), at a served context of `ctx`
+/// RQ's terms at a load on our M5 Max as plugin.zig `openBank` makes them (C1, C2, C5), at a served context of `ctx`
 /// tokens with the pass's bill `w` (`passWorkBill` at the context): the host's ceiling less its wired margin, 104 GiB
 /// (the port's room, 84,733 MiB, under f03b37e9's reserve at 32,768 tokens), less the context's reserve; 14,734 MiB in
 /// use and `uf` B past it (the MiB the bank line rounds to); the bank's rows at the budgets.
