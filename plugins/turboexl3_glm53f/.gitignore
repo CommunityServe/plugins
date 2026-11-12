@@ -1,0 +1,4 @@
+src/mlx_serve/
+.zig-cache/
+zig-out/
+zig-pkg/

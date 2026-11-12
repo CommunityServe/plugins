@@ -1,0 +1,423 @@
+diff -ruN -x .generated a/sdk/bases/blocks/linear.zig b/sdk/bases/blocks/linear.zig
+--- a/sdk/bases/blocks/linear.zig
++++ b/sdk/bases/blocks/linear.zig
+@@ -10,6 +10,8 @@
+ const qmv_nax2 = @import("../../blocks/qmm/qmv_nax2.zig");
+ const qmm_int8 = @import("../../blocks/qmm/qmm_int8.zig");
+ const rht = @import("../../quant/hadamard/rht.zig");
++/// turboexl3_glm53f: an exllamav3 pack's EXL3 linears run on turboexl3.
++const t3 = @import("turboexl3");
+ const Array = ops.Array;
+ const Graph = ops.Graph;
+ /// `x @ w^T` (+ an additive `bias`). A dense `w` is stored pre-transposed `[in, out]` with null scales.
+@@ -28,6 +30,9 @@
+     /// `H_block(signs * x)` through the registry's memo (`signs` pooled there; null = an unrotated weight).
+     rht: ?*rht.Registry = null,
+     signs: Array = .{},
++    /// turboexl3_glm53f: an exllamav3 linear (trellis, suh, svh as stored), run by turboexl3's `linear` in x's dtype; `w` is
++    /// then its trellis, so a check for a present weight holds, and `s` stays unset.
++    x3: ?t3.Proj = null,
+     pub fn forward(l: *const Linear, g: *Graph, x: Array) !Array {
+         if (l.bias.ctx == null) return g.adopt(try l.matmul(g, x));
+         var t = g.scope();
+@@ -35,6 +40,7 @@
+         return g.keep(try t.add(try t.adopt(try l.matmul(g, x)), l.bias));
+     }
+     fn matmul(l: *const Linear, g: *Graph, x: Array) !Array {
++        if (l.x3) |p| return t3.linear(g.s, x, p.trellis, p.suh, p.svh, .mul1);
+         if (l.rht) |reg| return l.rotated(reg, x, g.s);
+         if (l.ternary) {
+             if (try qmv_nax2.qmm(x, l.w, l.s, l.b, l.bits, l.group_size, g.s)) |y| return y;
+diff -ruN -x .generated a/sdk/bases/blocks/moe.zig b/sdk/bases/blocks/moe.zig
+--- a/sdk/bases/blocks/moe.zig
++++ b/sdk/bases/blocks/moe.zig
+@@ -35,8 +35,17 @@
+ const sigmoidTable = @import("../../blocks/hc/hc_prefill.zig").sigmoidTable;
+ const routed = @import("../../weights/routed.zig");
+ const HiddenAct = @import("../../blocks/mlp/activations.zig").HiddenAct;
++/// turboexl3_glm53f: a resident EXL3 bank (the MTP layer's experts) on turboexl3's clamped routed MoE.
++const t3 = @import("turboexl3");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_ROUTER, a decode call's router in two launches (src/fused_router.zig).
++const fused_router = @import("../../../../fused_router.zig");
+ const Array = ops.Array;
+ const Graph = ops.Graph;
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE (src/smallop.zig): set around one `mlp` call (glm5_next/moe.zig
++/// `forwardPair`). Where `mlp`'s last op is the routed sum plus an ungated shared expert, the shared expert's output is
++/// stored here (a reference the caller's Graph owns) and `mlp` returns the routed sum alone: the caller adds the two as
++/// that `add` does. Null: `mlp` adds them.
++pub var pair_slot: ?*?Array = null;
+ const Ctx = block.Ctx;
+ const Linear = linear.Linear;
+ /// An expert bank `[E, out, in]` and its quant geometry.
+@@ -110,6 +119,9 @@
+         route_scale: Array = .{ .ctx = null },
+         /// A model's own kernel for the routed and shared experts together; tried before the block's arms.
+         fused: ?Fused = null,
++        /// turboexl3_glm53f: the experts are one resident EXL3 bank (trellis U16 [E, in/16, out/16, n], suh and svh f16),
++        /// run by turboexl3's `moeClamped` at `clamp` (`gate`/`up`/`down` unread).
++        x3: ?t3.Bank = null,
+     };
+     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+         return mlp(w, c.g, x);
+@@ -205,18 +217,23 @@
+     var t = parent.scope();
+     defer t.deinit();
+     const g = &t;
+-    const logits = try routerLogits(w, g, x);
+-    // At one row the shared expert's gate logit rides the softmax router kernel.
+-    const fold: ?router_kernel.RouterGate = blk: {
+-        const se = w.shared orelse break :blk null;
+-        if (w.route != .softmax or !se.gated() or se.gate_vec.ctx == null) break :blk null;
+-        const lsh = ops.shape(logits);
+-        var rows: usize = 1;
+-        for (lsh[0 .. lsh.len - 1]) |d| rows *= @intCast(d);
+-        if (rows != 1 or mlx.mlx_array_size(x) != mlx.mlx_array_size(se.gate_vec)) break :blk null;
+-        break :blk .{ .x = x, .w = se.gate_vec };
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_ROUTER: a 2- to 4-row call's routes in two launches, the stock route's bit for
++    // bit (src/fused_router.zig); null (off, or a call it does not take) routes as before
++    const fused: ?Routed = if (try fused_router.route(g.s, w, x)) |f| try adoptRouting(g, f) else null;
++    var r = fused orelse stock: {
++        const logits = try routerLogits(w, g, x);
++        // At one row the shared expert's gate logit rides the softmax router kernel.
++        const fold: ?router_kernel.RouterGate = blk: {
++            const se = w.shared orelse break :blk null;
++            if (w.route != .softmax or !se.gated() or se.gate_vec.ctx == null) break :blk null;
++            const lsh = ops.shape(logits);
++            var rows: usize = 1;
++            for (lsh[0 .. lsh.len - 1]) |d| rows *= @intCast(d);
++            if (rows != 1 or mlx.mlx_array_size(x) != mlx.mlx_array_size(se.gate_vec)) break :blk null;
++            break :blk .{ .x = x, .w = se.gate_vec };
++        };
++        break :stock try route(w, g, logits, fold);
+     };
+-    var r = try route(w, g, logits, fold);
+     const shared_down: ?Array = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x) else null;
+     // The group-limited chain hands its weights back in f32; they land in the activation dtype.
+     if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
+@@ -225,26 +242,165 @@
+         const xs = ops.shape(x);
+         if (xs[0] * xs[1] <= f.rows) if (try f.run(f, w, g.s, x, r.inds, r.scores)) |y| return parent.keep(try g.adopt(y));
+     }
+-    const y = try routedExperts(w, g, x, r, shared_down, null);
++    // turboexl3_glm53f: SHARED_HOIST: a decode-width call's ungated shared expert built before the routed call and handed
++    // to the streamed source as its hoist (committed behind the call's hit wave when it misses); the same ops, the same add
++    const hoist: ?Array = if (hoistsShared(w, x)) try sharedDown(w, g, &w.shared.?, x) else null;
++    const y = try routedExperts(w, g, x, r, shared_down, null, hoist);
+     if (y.shared_fused) return parent.keep(y.sum);
+     const se = w.shared orelse return parent.keep(y.sum);
+-    if (!se.gated()) return parent.keep(try g.add(y.sum, try sharedDown(w, g, &se, x)));
++    if (!se.gated()) {
++        const sd = hoist orelse try sharedDown(w, g, &se, x);
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: the add's two terms to the caller
++        if (pair_slot) |slot| {
++            slot.* = try parent.keep(sd);
++            return parent.keep(y.sum);
++        }
++        return parent.keep(try g.add(y.sum, sd));
++    }
+     const down = shared_down orelse try sharedDown(w, g, &se, x);
+     const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
+     return parent.keep(try g.add(y.sum, try g.mul(try g.sigmoid(logit), down)));
+ }
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_HEAD_LAST_ROW (src/draft_step.zig): `mlp`'s output at `x`'s last row alone, for a
++/// call whose other rows' outputs are never read (the MTP head's merged first draft step: the committed rows' history
++/// and the draft row in one forward). The routing and the ungated shared expert run over every row as `mlp` runs them
++/// (the same launches over the same rows); the resident EXL3 bank's routed experts (`x3`, turboexl3's `moeClamped`)
++/// run over the last row only, whose bytes are that row's in the whole call (turboexl3's decode kernels: a row's
++/// summation order never depends on how many rows share the call); then `mlp`'s add. x [1, S, D] with S >= 2 gives
++/// [1, 1, D]; null where `mlp` takes another arm (no x3 bank; a fused, streamed or format arm; a gated shared expert;
++/// routing scales) or where the whole call would take turboexl3's prefill chain (more rows than its decode form takes),
++/// whose bytes are not the decode form's, and the caller runs `mlp`.
++pub fn mlpLastRow(w: *const Moe.Weights, parent: *Graph, x: Array) !?Array {
++    const bank = w.x3 orelse return null;
++    if (w.fused != null or w.streamed != null or w.format_banks != null or w.route_scale.ctx != null) return null;
++    const se = w.shared orelse return null;
++    if (se.gated()) return null;
++    const limit = w.clamp orelse return null;
++    const xs = ops.shape(x);
++    if (xs.len != 3 or xs[0] != 1 or xs[1] < 2) return null;
++    if (t3.kernels.usesPrefillArm(@intCast(xs[1]))) return null;
++    var t = parent.scope();
++    defer t.deinit();
++    const g = &t;
++    // `mlp`'s routing over every row (an ungated shared expert takes no fold)
++    const fused: ?Routed = if (try fused_router.route(g.s, w, x)) |f| try adoptRouting(g, f) else null;
++    var r = fused orelse try route(w, g, try routerLogits(w, g, x), null);
++    if (r.gate_logit != null) return null;
++    if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
++    const s = xs[1];
++    const routed1 = try g.adopt(try t3.moeClamped(g.s, try g.sliceAxis(x, 1, s - 1, s), bank, try g.sliceAxis(r.inds, 1, s - 1, s), try g.sliceAxis(r.scores, 1, s - 1, s), .mul1, @intCast(limit)));
++    const sd = try sharedDown(w, g, &se, x);
++    return try parent.keep(try g.add(routed1, try g.sliceAxis(sd, 1, s - 1, s)));
++}
++/// turboexl3_glm53f: whether `mlp` takes the streamed bank's `.source` arm for both spans of a split prompt forward
++/// (`rows_a`, `rows_b` rows) and the `fused` arm for neither (`routedExperts`: no resident EXL3 bank, no format banks, a
++/// bank whose source runs the routed math; more rows than `fused` takes): what `mlpSplit` serves. MLX-free: the caller
++/// checks every layer before a split forward runs one.
++pub fn splitServes(w: *const Moe.Weights, rows_a: c_int, rows_b: c_int) bool {
++    if (rows_a < 1 or rows_b < 1) return false;
++    if (w.x3 != null or w.format_banks != null) return false;
++    const st = w.streamed orelse return false;
++    if (st.routed.math != .source) return false;
++    if (w.fused) |f| if (rows_a <= f.rows or rows_b <= f.rows) return false;
++    return true;
++}
++/// turboexl3_glm53f: `mlp` over a split prompt forward's two spans, `x_a` `[1, nA, D]` then `x_b` `[1, nB, D]`: each
++/// output is `mlp`'s for that span alone. Each span's router, route, weights and shared expert are `mlp`'s over its own
++/// rows (a router's bytes depend on its rows: never one call); the routed experts of both run in ONE call of the bank's
++/// source over their rows, A's first, split back as `streamedRouted`'s `.source` arm returns a span's. The source runs
++/// each routed row by itself (its prompt lane: every row through turboexl3's prefill GEMM, whose row bytes do not
++/// depend on the call's other rows) and sums each row's routes in router order, so each span's rows are its own call's.
++/// `splitServes` must hold.
++pub fn mlpSplit(w: *const Moe.Weights, parent: *Graph, x_a: Array, x_b: Array) ![2]Array {
++    const xs = [2]Array{ x_a, x_b };
++    var dims: [2][3]c_int = undefined;
++    for (xs, &dims) |x, *d| {
++        const sh = ops.shape(x);
++        if (sh.len != 3) return error.MoeSplitShape;
++        d.* = .{ sh[0], sh[1], sh[2] };
++    }
++    if (!splitServes(w, dims[0][0] * dims[0][1], dims[1][0] * dims[1][1])) return error.MoeSplitArm;
++    var t = parent.scope();
++    defer t.deinit();
++    const g = &t;
++    var rs: [2]Routed = undefined;
++    var shared_downs: [2]?Array = .{ null, null };
++    // `mlp` up to its routed experts, per span.
++    for (xs, &rs, &shared_downs) |x, *r, *sd| {
++        const logits = try routerLogits(w, g, x);
++        const fold: ?router_kernel.RouterGate = blk: {
++            const se = w.shared orelse break :blk null;
++            if (w.route != .softmax or !se.gated() or se.gate_vec.ctx == null) break :blk null;
++            const lsh = ops.shape(logits);
++            var rows: usize = 1;
++            for (lsh[0 .. lsh.len - 1]) |d| rows *= @intCast(d);
++            if (rows != 1 or mlx.mlx_array_size(x) != mlx.mlx_array_size(se.gate_vec)) break :blk null;
++            break :blk .{ .x = x, .w = se.gate_vec };
++        };
++        r.* = try route(w, g, logits, fold);
++        sd.* = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x) else null;
++        if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
++        if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
++    }
++    // `streamedRouted`'s `.source` arm over both spans' rows: x [nA + nB, D], the routes and their weights [nA + nB, K].
++    const K = ops.shape(rs[0].inds)[ops.shape(rs[0].inds).len - 1];
++    if (ops.shape(rs[1].inds)[ops.shape(rs[1].inds).len - 1] != K or dims[1][2] != dims[0][2] or ops.dtype(x_b) != ops.dtype(x_a) or
++        ops.dtype(rs[1].inds) != ops.dtype(rs[0].inds) or ops.dtype(rs[1].scores) != ops.dtype(rs[0].scores)) return error.MoeSplitSpans;
++    var rows_x: [2]Array = undefined;
++    var rows_inds: [2]Array = undefined;
++    var rows_scores: [2]Array = undefined;
++    for (xs, rs, dims, &rows_x, &rows_inds, &rows_scores) |x, r, d, *rx, *ri, *rsc| {
++        rx.* = try g.reshape(x, &.{ d[0] * d[1], d[2] });
++        ri.* = try g.reshape(r.inds, &.{ d[0] * d[1], K });
++        rsc.* = try g.reshape(r.scores, &.{ d[0] * d[1], K });
++    }
++    const st = &w.streamed.?;
++    const f = st.routed.math.source;
++    const y = try g.adopt(try f(st.routed.ctx, st.layer, try g.concat(&rows_x, 0), try g.concat(&rows_inds, 0), try g.concat(&rows_scores, 0)).get());
++    var out: [2]Array = undefined;
++    var lo: c_int = 0;
++    for (xs, rs, shared_downs, dims, &out) |x, r, sd, d, *o| {
++        const n = d[0] * d[1];
++        const sum = try g.reshape(try g.astype(try g.sliceAxis(y, 0, lo, lo + n), ops.dtype(x)), &.{ d[0], d[1], d[2] });
++        lo += n;
++        // `mlp`'s shared expert over the span's own rows
++        o.* = try parent.keep(blk: {
++            const se = w.shared orelse break :blk sum;
++            if (!se.gated()) break :blk try g.add(sum, try sharedDown(w, g, &se, x));
++            const down = sd orelse try sharedDown(w, g, &se, x);
++            const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
++            break :blk try g.add(sum, try g.mul(try g.sigmoid(logit), down));
++        });
++    }
++    return out;
++}
+ /// The routed experts' weighted sum `[B, S, D]` for routes `inds` and their weights `scores` (in `x`'s dtype), no
+ /// shared expert: `mlp`'s arms, as the Routed hook's contract reads them.
+ pub fn routedSum(w: *const Moe.Weights, parent: *Graph, x: Array, inds: Array, scores: Array) !Array {
+     var t = parent.scope();
+     defer t.deinit();
+-    return parent.keep((try routedExperts(w, &t, x, .{ .inds = inds, .scores = scores }, null, null)).sum);
++    return parent.keep((try routedExperts(w, &t, x, .{ .inds = inds, .scores = scores }, null, null, null)).sum);
+ }
+ const Summed = struct { sum: Array, shared_fused: bool };
+ /// The routed experts' sum; `shared_fused` when the kernel added the shared expert (`shared_down`) itself. `slots`: `w`'s
+ /// banks hold a streamed call's experts, whose sorted arm runs on the call's slot banks (`sortedSlots`).
+-fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_down: ?Array, slots: ?SlotCall) anyerror!Summed {
++/// turboexl3_glm53f: SHARED_HOIST: the rows a call has at most to hand the streamed source its shared expert (a decode or
++/// verify window; prompt chunks keep the shared expert after the call).
++pub const hoist_max_rows: c_int = 8;
++/// turboexl3_glm53f: SHARED_HOIST: whether `mlp` builds `x`'s shared expert before the routed call and hands it to the
++/// streamed source (`Routed.source_hoist`): an ungated shared expert, a source that takes a hoist, a decode-width call.
++fn hoistsShared(w: *const Moe.Weights, x: Array) bool {
++    const st = w.streamed orelse return false;
++    if (st.routed.source_hoist == null or st.routed.math != .source) return false;
++    const se = w.shared orelse return false;
++    if (se.gated()) return false;
+     const xs = ops.shape(x);
++    var rows: c_int = 1;
++    for (xs[0 .. xs.len - 1]) |d| rows *= d;
++    return rows <= hoist_max_rows;
++}
++fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_down: ?Array, slots: ?SlotCall, hoist: ?Array) anyerror!Summed {
++    const xs = ops.shape(x);
+     const B = xs[0];
+     const S = xs[1];
+     const D = xs[xs.len - 1];
+@@ -261,11 +417,14 @@
+     const ungated_a4: ?moe_affine4.Ungated = if (B * S != 1) null else ungatedA4(w, gq.bits, gq.group_size);
+     const fp4_shared: ?moe_affine4.Shared = if (B * S == 1) if (shared_down) |sd| .{ .down = sd, .logit = r.gate_logit.? } else null else null;
+     const cuda_fmt = if (mlx.cudaAvailable()) gather_qmv_rows.moeCudaFormat(B * S, gq.mode, uq.mode, dq.mode, true, false, w.up.expert_scale.ctx != null, w.clamp_limit > 0) else null;
+-    if (w.format_banks) |fb| {
++    if (w.x3) |b| {
++        out = try g.adopt(try t3.moeClamped(g.s, x, b, r.inds, r.scores, .mul1, @intCast(w.clamp orelse return error.QuantFormatClampUnsupported)));
++        reduced = true;
++    } else if (w.format_banks) |fb| {
+         out = try formatSwiglu(w, &fb, g, x, r);
+         reduced = true;
+     } else if (w.streamed) |*st| {
+-        const y = try streamedRouted(w, st, g, x, r, shared_down, fp4_shared, cuda_fmt != null);
++        const y = try streamedRouted(w, st, g, x, r, shared_down, fp4_shared, cuda_fmt != null, hoist);
+         out = y.out;
+         reduced = y.reduced;
+         shared_fused = y.shared_fused;
+@@ -610,7 +769,7 @@
+ /// slots, so each pair's rows and the k-sum's order are the arm's over the in-memory banks: one token and the rows arm
+ /// on one bank holding the call's experts (`slotArms`), the sorted gathers on the slot banks a group of experts at a
+ /// time (`sortedGroups`).
+-fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r: Routed, shared_down: ?Array, fp4_shared: ?moe_affine4.Shared, cuda: bool) anyerror!Sorted {
++fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r: Routed, shared_down: ?Array, fp4_shared: ?moe_affine4.Shared, cuda: bool, hoist: ?Array) anyerror!Sorted {
+     const xs = ops.shape(x);
+     const B = xs[0];
+     const S = xs[1];
+@@ -618,7 +777,8 @@
+     const K = ops.shape(r.inds)[ops.shape(r.inds).len - 1];
+     switch (st.routed.math) {
+         .source => |f| {
+-            const y = try g.adopt(try f(st.routed.ctx, st.layer, try g.reshape(x, &.{ B * S, D }), try g.reshape(r.inds, &.{ B * S, K }), try g.reshape(r.scores, &.{ B * S, K })).get());
++            // turboexl3_glm53f: SHARED_HOIST: the call's shared expert handed to a source that takes it
++            const y = try g.adopt(try (if (hoist) |h| st.routed.source_hoist.?(st.routed.ctx, st.layer, try g.reshape(x, &.{ B * S, D }), try g.reshape(r.inds, &.{ B * S, K }), try g.reshape(r.scores, &.{ B * S, K }), h) else f(st.routed.ctx, st.layer, try g.reshape(x, &.{ B * S, D }), try g.reshape(r.inds, &.{ B * S, K }), try g.reshape(r.scores, &.{ B * S, K }))).get());
+             return .{ .out = try g.reshape(try g.astype(y, ops.dtype(x)), &.{ B, S, D }), .reduced = true };
+         },
+         .trunk => {},
+@@ -660,7 +820,7 @@
+             .scores = try g.sliceAxis(r.scores, 1, lo, hi),
+             .gate_logit = if (r.gate_logit) |gl| try g.sliceAxis(gl, 1, lo, hi) else null,
+         };
+-        const y = try streamedRouted(w, st, g, try g.sliceAxis(x, 1, lo, hi), rc, null, null, false);
++        const y = try streamedRouted(w, st, g, try g.sliceAxis(x, 1, lo, hi), rc, null, null, false, null);
+         try outs.append(g.a, if (y.reduced) y.out else try g.sum(try g.mul(y.out, try g.expandDims(rc.scores, -1)), -2, false));
+     }
+     return .{ .out = try g.concat(outs.items, 1), .reduced = true };
+@@ -676,7 +836,7 @@
+     wv.down = cb.banks[2];
+     wv.bank_views = null;
+     wv.streamed = null;
+-    const y = try routedExperts(&wv, g, x, .{ .inds = cb.inds, .scores = r.scores, .gate_logit = r.gate_logit }, shared_down, .{ .sl = sl, .n = n });
++    const y = try routedExperts(&wv, g, x, .{ .inds = cb.inds, .scores = r.scores, .gate_logit = r.gate_logit }, shared_down, .{ .sl = sl, .n = n }, null);
+     return .{ .out = y.sum, .reduced = true, .shared_fused = y.shared_fused };
+ }
+ /// One bank holding the call's experts and each pair's row in it (`shape`: the routes'): the slot bank itself when
+diff -ruN -x .generated a/sdk/blocks/mlp/fused_activations.zig b/sdk/blocks/mlp/fused_activations.zig
+--- a/sdk/blocks/mlp/fused_activations.zig
++++ b/sdk/blocks/mlp/fused_activations.zig
+@@ -9,6 +9,8 @@
+ const scalarOf = @import("../../../mlx/array.zig").scalarOf;
+ const cachedScalarInt = @import("../linear/verify_qmm.zig").cachedScalarInt;
+ const ShapeKey = @import("../moe/router_kernel.zig").ShapeKey;
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_CACHED_SCALARS (src/cached_scalars.zig): the clamped SwiGLU's limit made once.
++const cached_scalars = @import("../../../../cached_scalars.zig");
+ // ── Fused SwiGLU: silu(gate) * up in one dispatch ──
+ //
+ // `computeGeglu` only had a fused path for `gelu_approx`, so every SILU model —
+@@ -307,6 +309,9 @@
+     const dt = mlx.mlx_array_dtype(gate);
+     if (dt != .bfloat16 and dt != .float16) return null;
+     const sigtab = try swigluSigTable(s, dt, std.heap.c_allocator);
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_CACHED_SCALARS: the limit made once a device, dtype and value and kept (the same
++    // scalar, no astype launch a call); null makes it here
++    if (try cached_scalars.of(s, limit, dt)) |kept| return tableGateMul(s, .silu_clamp, gate, up, sigtab, kept);
+     const lim = try scalarOf(limit, dt, s);
+     defer _ = mlx.mlx_array_free(lim);
+     return tableGateMul(s, .silu_clamp, gate, up, sigtab, lim);
+diff -ruN -x .generated a/sdk/util/shared.zig b/sdk/util/shared.zig
+--- a/sdk/util/shared.zig
++++ b/sdk/util/shared.zig
+@@ -10,7 +10,8 @@
+     return struct {
+         var storage: T = init;
+         var cached: ?*T = null;
+-        const sym = "mlx_serve_shared_" ++ name;
++        // turboexl3_glm53f: this plugin's copies export under their own prefix, never the server's storage.
++        const sym = "turboexl3_glm53f_shared_" ++ name;
+         fn addr() callconv(.c) *anyopaque {
+             return &storage;
+         }
+@@ -32,7 +33,7 @@
+ pub fn SharedThreadLocal(comptime T: type, comptime name: []const u8, comptime init: T) type {
+     return struct {
+         threadlocal var storage: T = init;
+-        const sym = "mlx_serve_shared_tls_" ++ name;
++        const sym = "turboexl3_glm53f_shared_tls_" ++ name;
+         fn addr() callconv(.c) *anyopaque {
+             return @ptrCast(&storage);
+         }
+diff -ruN -x .generated a/sdk/weights/load.zig b/sdk/weights/load.zig
+--- a/sdk/weights/load.zig
++++ b/sdk/weights/load.zig
+@@ -198,6 +198,8 @@
+ /// below any quant noise floor.
+ pub fn narrowsLoadedF16(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool {
+     if (dtype != .float16) return false;
++    // turboexl3_glm53f: an EXL3 linear's sign-and-scale vectors stay f16 (turboexl3 reads them so).
++    if (std.mem.endsWith(u8, key, ".suh") or std.mem.endsWith(u8, key, ".svh")) return false;
+     if (std.mem.endsWith(u8, key, ".scales") or std.mem.endsWith(u8, key, ".biases")) return true;
+     return ndim == 1;
+ }
+diff -ruN -x .generated a/sdk/weights/routed.zig b/sdk/weights/routed.zig
+--- a/sdk/weights/routed.zig
++++ b/sdk/weights/routed.zig
+@@ -31,6 +31,16 @@
+     phase_fn: ?*const fn (*anyopaque, bool) Ret(void) = null,
+     /// A prompt pass's predicted routes of model layer `layer` (every row's ids), read while its attention runs.
+     read_ahead_fn: ?*const fn (*anyopaque, u32, []const u16) Ret(void) = null,
++    /// turboexl3_glm53f: SHARED_HOIST (`TURBOEXL3_GLM53F_SHARED_HOIST`): `source` with a hoist, an array the source commits
++    /// behind a decode call's hit wave and ahead of its miss waves when the call misses (the MoE's shared expert, built
++    /// before the call); null: the trunk builds the shared expert after the call, as before.
++    source_hoist: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
++    /// turboexl3_glm53f: READ_AHEAD3 (`TURBOEXL3_GLM53F_READ_AHEAD3`): a decode window's first routed layer read ahead
++    /// from the dense layers. `ahead_score_fn`: the last dense layer's MLP input `x` `[.., rows, hidden]`; the source
++    /// scores the first routed layer's router on it and commits the scores (no host wait). `ahead_issue_fn`: the scores
++    /// read back and that layer's likely records read ahead before its route. Null: none.
++    ahead_score_fn: ?*const fn (*anyopaque, mlx.mlx_array) Ret(void) = null,
++    ahead_issue_fn: ?*const fn (*anyopaque) Ret(void) = null,
+     /// Routed ids a decode-phase call takes: a wider call is a prompt pass, which a source refuses in decode.
+     decode_ids: usize = max_call_ids,
+     pub fn settle(r: Routed) !void {
+diff -ruN -x .generated a/sdk/weights/streamed.zig b/sdk/weights/streamed.zig
+--- a/sdk/weights/streamed.zig
++++ b/sdk/weights/streamed.zig
+@@ -90,8 +90,22 @@
+             const s: *Glm5n.Source = @ptrCast(@alignCast(ctx));
+             return .of(s.readAhead(layer, experts));
+         }
++        fn rowsHoist(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array, hoist: mlx.mlx_array) routed.Ret(mlx.mlx_array) {
++            const s: *Glm5n.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.rowsHoist(layer, x, idx, wts, hoist));
++        }
++        fn aheadScore(ctx: *anyopaque, x: mlx.mlx_array) routed.Ret(void) {
++            const s: *Glm5n.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.aheadScore(x));
++        }
++        fn aheadIssue(ctx: *anyopaque) routed.Ret(void) {
++            const s: *Glm5n.Source = @ptrCast(@alignCast(ctx));
++            return .of(s.aheadIssue());
++        }
+     };
+-    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead };
++    // turboexl3_glm53f: SHARED_HOIST (`Glm5n.shared_hoist`): the decode calls take the shared expert as their hoist;
++    // READ_AHEAD3 (`Glm5n.read_ahead3`): the trunk's dense layers score and read ahead the first routed layer
++    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead, .source_hoist = if (Glm5n.shared_hoist) C.rowsHoist else null, .ahead_score_fn = if (Glm5n.read_ahead3) C.aheadScore else null, .ahead_issue_fn = if (Glm5n.read_ahead3) C.aheadIssue else null };
+ }
+ pub const Streamed = struct {
+     pub const refusal = abi.Verdict.refuse(.unsupported, "streamed weights: no expert bank, or a build without mlx-stream");

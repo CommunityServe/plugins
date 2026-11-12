@@ -1,0 +1,1770 @@
+diff -ruN -x .generated a/plugins/glm5_next/dsa_nax.zig b/plugins/glm5_next/dsa_nax.zig
+--- a/plugins/glm5_next/dsa_nax.zig
++++ b/plugins/glm5_next/dsa_nax.zig
+@@ -81,21 +81,29 @@
+ var sparse_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
+ var sparse_engaged = false;
+ var sparse_rope_engaged = false;
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_ONEP (src/dsa_prompt.zig): the plain form with P as one fp16 piece.
++var sparse_onep_kernel: ?mlx.mlx_fast_metal_kernel = null;
++var sparse_onep_engaged = false;
+ /// `sparseLatentAttention` (glm5_next) on the tensor units, for queries at the LAST rows of
+ /// `latent`: `q_abs` [1, H, L, 512], `latent` [1, 1, K, 512], `idx` int32 [1, L, W]. An unused
+ /// slot is -1 and unused pools sort last, so whole tiles skip. Null off the GPU or outside the
+ /// shape; the caller checks the device has NAX.
+ pub fn sparseLatent(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
+-    return sparse(s, q_abs, null, latent, null, idx, scale);
++    return sparse(s, q_abs, null, latent, null, idx, scale, false);
+ }
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_ONEP: `sparseLatent` with P meeting the values as one fp16 piece (the roped
++/// form's PV, without its roped part): half the PV MMAs, and P rounded once to fp16 (not bitwise `sparseLatent`).
++pub fn sparseLatentOneP(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
++    return sparse(s, q_abs, null, latent, null, idx, scale, true);
++}
+ /// `sparseLatent` with a roped part (DeepSeek-V3.2's MLA, GLM-5.3): each score adds the
+ /// query's roped part against the selected row's roped key, `q_lat . kv + q_pe . k_pe`, the
+ /// values the latent rows. `q_pe` [1, H, L, 64], `k_pe` [1, 1, K, 64]. P meets the values as
+ /// one fp16 piece.
+ pub fn sparseLatentRope(s: mlx.mlx_stream, q_lat: mlx.mlx_array, q_pe: mlx.mlx_array, latent: mlx.mlx_array, k_pe: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
+-    return sparse(s, q_lat, q_pe, latent, k_pe, idx, scale);
++    return sparse(s, q_lat, q_pe, latent, k_pe, idx, scale, false);
+ }
+-fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent: mlx.mlx_array, k_pe: ?mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
++fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent: mlx.mlx_array, k_pe: ?mlx.mlx_array, idx: mlx.mlx_array, scale: f32, one_p: bool) !?mlx.mlx_array {
+     if (!mlx.streamIsGpu(s)) return null;
+     const qs = mlx.getShape(q_abs);
+     const ls = mlx.getShape(latent);
+@@ -118,7 +126,7 @@
+         if (ks.len != 4 or ks[0] != 1 or ks[1] != 1 or ks[2] != k or ks[3] != 64) return null;
+         if (mlx.mlx_array_dtype(q_pe.?) != dt or mlx.mlx_array_dtype(k_pe.?) != dt) return null;
+     }
+-    const slot = if (rope) &sparse_rope_kernel else &sparse_kernel;
++    const slot = if (rope) &sparse_rope_kernel else if (one_p) &sparse_onep_kernel else &sparse_kernel;
+     const kern = slot.* orelse blk: {
+         const ins_plain = [_][*:0]const u8{ "q", "kv", "idx", "params", "scale" };
+         const ins_rope = [_][*:0]const u8{ "q", "qpe", "kv", "pe", "idx", "params", "scale" };
+@@ -130,6 +138,8 @@
+         defer _ = mlx.mlx_vector_string_free(ov);
+         const kn = if (rope)
+             mlx.mlx_fast_metal_kernel_new("msv_dsa_sparse_mla_rope_nax", iv, ov, "#define MSV_DSA_ROPE\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false)
++        else if (one_p)
++            mlx.mlx_fast_metal_kernel_new("msv_glm5_sparse_mla_nax_onep", iv, ov, SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false)
+         else
+             mlx.mlx_fast_metal_kernel_new("msv_glm5_sparse_mla_nax", iv, ov, "#define MSV_DSA_TWO_P\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false);
+         if (kn.ctx == null) return error.MetalKernelCompileFailed;
+@@ -172,10 +182,10 @@
+     var out = mlx.mlx_array_new();
+     errdefer _ = mlx.mlx_array_free(out);
+     try mlx.check(mlx.mlx_reshape(&out, o3, &[_]c_int{ 1, h, l, 512 }, 4, s));
+-    const engaged = if (rope) &sparse_rope_engaged else &sparse_engaged;
++    const engaged = if (rope) &sparse_rope_engaged else if (one_p) &sparse_onep_engaged else &sparse_engaged;
+     if (!engaged.*) {
+         engaged.* = true;
+-        log.info("[dsa] NAX sparse latent attention{s} engaged\n", .{if (rope) " (roped part)" else ""});
++        log.info("[dsa] NAX sparse latent attention{s} engaged\n", .{if (rope) " (roped part)" else if (one_p) " (one P piece)" else ""});
+     }
+     return out;
+ }
+diff -ruN -x .generated a/plugins/glm5_next/glm5_next.zig b/plugins/glm5_next/glm5_next.zig
+--- a/plugins/glm5_next/glm5_next.zig
++++ b/plugins/glm5_next/glm5_next.zig
+@@ -8,6 +8,12 @@
+ const kernelSource = @import("../../mlx/kernels.zig").source;
+ const mlx = @import("mlx_serve").mlx;
+ const dsa = @import("dsa_nax.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_ONEP (src/dsa_prompt.zig).
++const dsa_prompt = @import("../../../dsa_prompt.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_VSEL (src/dsa_verify.zig).
++const dsa_verify = @import("../../../dsa_verify.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_GLM (src/dsa_glm.zig).
++const dsa_glm = @import("../../../dsa_glm.zig");
+ const Scope = @import("../../mlx/scope.zig").Scope;
+ pub const HC: c_int = 4;
+ const MIX: c_int = (2 + HC) * HC;
+@@ -198,9 +204,21 @@
+ // element with its own, and the tail loads two elements per atomic.
+ const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ kernelSource("plugins/glm5_next/kernels/hc_pre_defer_defines.metal") ++ HC_PRE_BODY;
+ const HC_MATERIALIZE_SOURCE = HC_DEFER_HVAL ++ kernelSource("plugins/glm5_next/kernels/hc_materialize.metal");
++// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: the deferred expand of a MoE sublayer's two terms (`Deferred.y2`):
++// the same texts with each stream element read through `msv_hc_hval2` (the terms added in T, then the same expand)
++const HC_DEFER_HVAL2 = "#define HVAL(k) msv_hc_hval2<T, HC, D>((k), y + row * D, y2 + row * D, post_in + row * HC, comb_in + row * HC * HC, h_in + row * HC * D)\n";
++const HC_PRE_DEFER2_SOURCE = HC_DEFER_HVAL2 ++ kernelSource("plugins/glm5_next/kernels/hc_pre_defer_defines.metal") ++ HC_PRE_BODY;
++const HC_MATERIALIZE2_SOURCE = HC_DEFER_HVAL2 ++ kernelSource("plugins/glm5_next/kernels/hc_materialize.metal");
++const GATES2_HEADER = GATES_HEADER ++ kernelSource("plugins/glm5_next/kernels/hc_hval2_header.metal");
+ var hc_pre_kernel: ?mlx.mlx_fast_metal_kernel = null;
+ var hc_pre_defer_kernel: ?mlx.mlx_fast_metal_kernel = null;
+ var hc_materialize_kernel: ?mlx.mlx_fast_metal_kernel = null;
++var hc_pre_defer2_kernel: ?mlx.mlx_fast_metal_kernel = null;
++var hc_materialize2_kernel: ?mlx.mlx_fast_metal_kernel = null;
++/// turboexl3_glm53f: whether the defer2 text runs at the threadgroup the defer text runs at (its reductions' order is
++/// the threadgroup's: at another it would not be the defer text's bits); null = not launched yet, false = it does not,
++/// and a `Deferred` with `y2` takes the stock add and the defer text.
++pub var hc_pre2_ok: ?bool = null;
+ /// A sublayer's expand not applied yet: the stream is `expand(y, h)` under post/comb.
+ pub const Deferred = struct {
+     /// [1, R, D] the sublayer's output.
+@@ -210,14 +228,19 @@
+     comb: mlx.mlx_array,
+     /// [1, R, HC, D] the sublayer's input stream.
+     h: mlx.mlx_array,
++    /// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: a MoE sublayer's shared expert [1, R, D] when `y` is its routed
++    /// sum alone (the output is `y + y2`, added in T where the expand reads it); null otherwise.
++    y2: mlx.mlx_array = .{ .ctx = null },
+     pub fn deinit(self: *Deferred) void {
+         inline for (.{ self.y, self.post, self.comb, self.h }) |a| _ = mlx.mlx_array_free(a);
++        if (self.y2.ctx != null) _ = mlx.mlx_array_free(self.y2);
+     }
+     /// The [1, R, HC, D] stream this stands for, as `expand` writes it.
+     pub fn materialize(self: *const Deferred, s: mlx.mlx_stream) !mlx.mlx_array {
+         const d = mlx.getShape(self.y)[2];
+         const rows = mlx.getShape(self.y)[1];
+         const dt = mlx.mlx_array_dtype(self.y);
++        if (self.y2.ctx != null) return self.materialize2(s, d, rows, dt);
+         const kern = try hcKernel(&hc_materialize_kernel, "glm5_hc_materialize", &.{ "y", "post_in", "comb_in", "h_in" }, &.{"h"}, HC_MATERIALIZE_SOURCE);
+         const cfg = mlx.mlx_fast_metal_kernel_config_new();
+         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+@@ -238,6 +261,40 @@
+         try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
+         return out;
+     }
++    /// turboexl3_glm53f: `materialize` of a MoE sublayer's two terms (`y2`): the same grid and threadgroup, each element
++    /// read through `msv_hc_hval2`.
++    fn materialize2(self: *const Deferred, s: mlx.mlx_stream, d: c_int, rows: c_int, dt: mlx.mlx_dtype) !mlx.mlx_array {
++        const kern = try hcKernelH(&hc_materialize2_kernel, "glm5_hc_materialize2", &.{ "y", "y2", "post_in", "comb_in", "h_in" }, &.{"h"}, HC_MATERIALIZE2_SOURCE, GATES2_HEADER);
++        const cfg = mlx.mlx_fast_metal_kernel_config_new();
++        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, HC, d }, 4, dt));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, HC * d, rows, 1));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", HC));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", d));
++        const ins = [_]mlx.mlx_array{ self.y, self.y2, self.post, self.comb, self.h };
++        const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
++        defer _ = mlx.mlx_vector_array_free(iv);
++        var ov = mlx.mlx_vector_array_new();
++        defer _ = mlx.mlx_vector_array_free(ov);
++        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
++        var out = mlx.mlx_array_new();
++        errdefer _ = mlx.mlx_array_free(out);
++        try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
++        return out;
++    }
++    /// turboexl3_glm53f: this deferral with its two terms added as `mlx_add` adds them (`y` becomes their sum, `y2` none):
++    /// the stock deferral, for the hcPre call the defer2 text does not take.
++    fn joinedStock(self: *const Deferred, s: mlx.mlx_stream) !Deferred {
++        var out: Deferred = .{ .y = mlx.mlx_array_new(), .post = mlx.mlx_array_new(), .comb = mlx.mlx_array_new(), .h = mlx.mlx_array_new() };
++        errdefer out.deinit();
++        try mlx.check(mlx.mlx_add(&out.y, self.y, self.y2, s));
++        _ = mlx.mlx_array_set(&out.post, self.post);
++        _ = mlx.mlx_array_set(&out.comb, self.comb);
++        _ = mlx.mlx_array_set(&out.h, self.h);
++        return out;
++    }
+ };
+ pub const Pre = struct {
+     /// [1, R, D] the sublayer's normed input.
+@@ -259,6 +316,14 @@
+         _ = mlx.mlx_array_set(&out.h, h);
+         return out;
+     }
++    /// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: the `Deferred` of a MoE sublayer whose output is `y + y2` (its
++    /// routed sum and its shared expert), left unadded for the next `hcPre`.
++    pub fn defer2_(self: *const Pre, y: mlx.mlx_array, y2: mlx.mlx_array, h: mlx.mlx_array) Deferred {
++        var out = self.defer_(y, h);
++        out.y2 = mlx.mlx_array_new();
++        _ = mlx.mlx_array_set(&out.y2, y2);
++        return out;
++    }
+ };
+ /// Whether `hcPre` serves a [1, R, HC, d] stream, R up to `HC_PRE_MAX_ROWS`.
+ pub fn hcRowsServes(s: mlx.mlx_stream, sh: []const c_int, dt: mlx.mlx_dtype, fn_rows: mlx.mlx_array, norm_w: mlx.mlx_array) bool {
+@@ -267,12 +332,16 @@
+         mlx.mlx_array_dtype(norm_w) == dt and mlx.mlx_array_dtype(fn_rows) == .float32;
+ }
+ fn hcKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, src: [:0]const u8) !mlx.mlx_fast_metal_kernel {
++    return hcKernelH(slot, name, ins, outs, src, GATES_HEADER);
++}
++/// turboexl3_glm53f: `hcKernel` over another header (the defer2 texts' `GATES2_HEADER`)
++fn hcKernelH(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, src: [:0]const u8, header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
+     if (slot.*) |k| return k;
+     const iv = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
+     defer _ = mlx.mlx_vector_string_free(iv);
+     const ov = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
+     defer _ = mlx.mlx_vector_string_free(ov);
+-    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, src, GATES_HEADER, true, false);
++    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, src, header, true, false);
+     if (k.ctx == null) return error.MetalKernelCompileFailed;
+     slot.* = k;
+     return k;
+@@ -280,7 +349,17 @@
+ /// The normed sublayer input and gates of R rows, from their stream `x` [1, R, HC, D] or
+ /// from the previous sublayer's `Deferred` (then `Pre.h` is the stream). Callers check
+ /// `hcRowsServes` first.
+-pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred: ?*const Deferred, fn_rows: mlx.mlx_array, scale: mlx.mlx_array, base: mlx.mlx_array, norm_w: mlx.mlx_array, iters: u32, hc_eps: f32, norm_eps: f32, rms_eps: f32) !Pre {
++pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred_in: ?*const Deferred, fn_rows: mlx.mlx_array, scale: mlx.mlx_array, base: mlx.mlx_array, norm_w: mlx.mlx_array, iters: u32, hc_eps: f32, norm_eps: f32, rms_eps: f32) !Pre {
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: a deferral of two terms (`Deferred.y2`) in the defer2 text where
++    // it runs at the defer text's threadgroup, else the two added as `mlx_add` adds them and the defer text
++    var joined: ?Deferred = null;
++    defer if (joined) |*j| j.deinit();
++    var deferred = deferred_in;
++    if (deferred_in) |df| if (df.y2.ctx != null) {
++        if (try hcPre2(s, df, fn_rows, scale, base, norm_w, iters, hc_eps, norm_eps, rms_eps)) |p| return p;
++        joined = try df.joinedStock(s);
++        deferred = &joined.?;
++    };
+     const d = mlx.getShape(norm_w)[0];
+     const dt = mlx.mlx_array_dtype(norm_w);
+     // Rows ride the grid's y: each has its own K-slices, counter word and gates.
+@@ -347,6 +426,63 @@
+         return out;
+     }
+ }
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: `hcPre` of a deferral of two terms in the defer2 text: the defer
++/// text's launch (its grid, its threadgroup `hc_pre_tpg` once the stock texts' first launches settled it, its outputs)
++/// with each stream element read through `msv_hc_hval2`. Null where it does not run (the stock texts not launched yet,
++/// or Metal caps it below `hc_pre_tpg`: then for the process): the caller adds the two and takes the defer text.
++fn hcPre2(s: mlx.mlx_stream, df: *const Deferred, fn_rows: mlx.mlx_array, scale: mlx.mlx_array, base: mlx.mlx_array, norm_w: mlx.mlx_array, iters: u32, hc_eps: f32, norm_eps: f32, rms_eps: f32) !?Pre {
++    if (hc_pre2_ok) |ok| if (!ok) return null;
++    if (!hc_pre_probed[0] or !hc_pre_probed[1]) return null;
++    const d = mlx.getShape(norm_w)[0];
++    const dt = mlx.mlx_array_dtype(norm_w);
++    const rows: c_int = mlx.getShape(df.y)[1];
++    if (rows < 1 or rows > HC_PRE_MAX_ROWS) return error.Glm5HcShape;
++    const kern = try hcKernelH(&hc_pre_defer2_kernel, "glm5_hc_pre_defer2", &.{ "y", "y2", "post_in", "comb_in", "h_in", "fn", "scale", "base", "nw", "eps", "counter" }, &.{ "normed", "post", "comb", "parts", "h" }, HC_PRE_DEFER2_SOURCE, GATES2_HEADER);
++    const zero_words: [HC_PRE_MAX_ROWS]u32 = @splat(0);
++    const counter = mlx.mlx_array_new_data(&zero_words, &[_]c_int{HC_PRE_MAX_ROWS}, 1, .uint32);
++    defer _ = mlx.mlx_array_free(counter);
++    const ev = [2]f32{ norm_eps, rms_eps };
++    const eps = mlx.mlx_array_new_data(&ev, &[_]c_int{2}, 1, .float32);
++    defer _ = mlx.mlx_array_free(eps);
++    const ins = [_]mlx.mlx_array{ df.y, df.y2, df.post, df.comb, df.h, fn_rows, scale, base, norm_w, eps, counter };
++    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
++    defer _ = mlx.mlx_vector_array_free(iv);
++    const tpg = hc_pre_tpg;
++    const cfg = mlx.mlx_fast_metal_kernel_config_new();
++    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, d }, 3, dt));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, HC }, 3, .float32));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, HC, HC }, 4, .float32));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows * HC_PRE_NT, MIX + 1 }, 2, .float32));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, HC, d }, 4, dt));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, tpg * HC_PRE_NT, rows, 1));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tpg, 1, 1));
++    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
++    inline for (.{ .{ "HC", HC }, .{ "D", d }, .{ "NT", HC_PRE_NT }, .{ "TPG", tpg }, .{ "ITERS", @as(c_int, @intCast(iters)) }, .{ "EPS_INT", @as(c_int, @intFromFloat(@round(hc_eps / 1e-9))) } }) |kv| {
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
++    }
++    var ov = mlx.mlx_vector_array_new();
++    defer _ = mlx.mlx_vector_array_free(ov);
++    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
++    var out: Pre = .{ .normed = mlx.mlx_array_new(), .post = mlx.mlx_array_new(), .comb = mlx.mlx_array_new(), .h = mlx.mlx_array_new() };
++    errdefer out.deinit();
++    try mlx.check(mlx.mlx_vector_array_get(&out.normed, ov, 0));
++    try mlx.check(mlx.mlx_vector_array_get(&out.post, ov, 1));
++    try mlx.check(mlx.mlx_vector_array_get(&out.comb, ov, 2));
++    try mlx.check(mlx.mlx_vector_array_get(&out.h, ov, 4));
++    if (hc_pre2_ok != null) return out;
++    // First launch: where Metal caps this text's threadgroup below the defer text's, it declines (the stock texts' bits
++    // are their threadgroup's; `hc_pre_tpg` stays theirs).
++    mlx.check(mlx.mlx_array_eval(out.normed)) catch |e| {
++        if (e != error.MlxError or !mlx.takeErrorIf("Thread group size")) return e;
++        out.deinit();
++        hc_pre2_ok = false;
++        @import("../../sdk/util/log.zig").info("[glm5] hcPre: the defer2 text does not run at {d} threads per threadgroup: the stock add and defer text\n", .{tpg});
++        return null;
++    };
++    hc_pre2_ok = true;
++    return out;
++}
+ /// `post * x + comb^T @ stream` in f32, one thread per 4 columns of a row (all HC streams).
+ const EXPAND_SOURCE = kernelSource("plugins/glm5_next/kernels/expand.metal");
+ var expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
+@@ -760,6 +896,9 @@
+         var ws = mlx.mlx_array_new();
+         defer _ = mlx.mlx_array_free(ws);
+         try mlx.check(mlx.mlx_multiply(&ws, w, scale, s));
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_VSEL: every row's scores in one launch and their top-k in one (the
++        // texts below with the row in the grid: the same tokens)
++        if (try dsa_verify.selectRows(s, q_idx, ws, idx_cache, q_start, p, select_k, ix.kpool, ix.topk, ix.head_dim, DEC_SCORE_SGS, DEC_SCORE_PPS)) |sel_tokens| return sel_tokens;
+         const qsh = mlx.getShape(q_idx);
+         var rows_out: [HC_PRE_MAX_ROWS]mlx.mlx_array = undefined;
+         var n: usize = 0;
+@@ -783,6 +922,9 @@
+         try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+         return out;
+     } else {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_GLM: the scores, their top-k and its expansion as one GLM-5.3-Flash
++        // launch where it serves (the NAX scores' bits, the same tokens)
++        if (try dsa_glm.selectRows(s, q_idx, w, idx_cache, q_start, p, select_k, ix.kpool, ix.topk, ix.heads, ix.head_dim)) |sel_tokens| return sel_tokens;
+         // Scores: sum_h w_h * relu(q_h . pool_key) * Dh^-0.5, f32; pools a query cannot see lose.
+         const pk = try storedPoolKeys(s, idx_cache, p, ix);
+         defer _ = mlx.mlx_array_free(pk);
+@@ -951,6 +1093,10 @@
+     try mlx.check(mlx.mlx_reshape(&out, o, &[_]c_int{ n, h, 1, r }, 4, s));
+     return out;
+ }
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_VATTN (src/dsa_vattn.zig).
++const dsa_vattn = @import("../../../dsa_vattn.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_LFUSE (src/dsa_lfuse.zig).
++const dsa_lfuse = @import("../../../dsa_lfuse.zig");
+ /// Attention of absorbed queries over the latent rows each query selects.
+ /// `q_abs` [B, H, S, R], `latent` [B, 1, T, R], `idx` int32 [B, S, W] (-1 = unused).
+ /// Returns [B, H, S, R]. Rows are processed `chunk` queries at a time so the
+@@ -1015,7 +1161,13 @@
+         var mask = mlx.mlx_array_new(); // [B*n, 1, W]
+         defer _ = mlx.mlx_array_free(mask);
+         try mlx.check(mlx.mlx_reshape(&mask, valid, &[_]c_int{ b * n, 1, wdt }, 3, s));
+-        const o = try latentAttendFolded(s, q4, keys, mask, scale); // [B*n, H, 1, R]
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_VATTN: the two matmuls read the latent at the selected rows (the
++        // gather above never runs: nothing reads its keys)
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_LFUSE: a window of one chunk in two launches, from q_abs itself (the
++        // copy into q4, the mask and the gather above never run: nothing reads them); DSA_VATTN where it declines
++        const lfuse = if (b == 1 and n == sq) try dsa_lfuse.attend(s, q_abs, lat2, ic, scale) else null;
++        const vattn = if (lfuse == null and b == 1) try dsa_vattn.attend(s, q4, lat2, ic, mask, scale) else null;
++        const o = lfuse orelse vattn orelse try latentAttendFolded(s, q4, keys, mask, scale); // [B*n, H, 1, R]
+         defer _ = mlx.mlx_array_free(o);
+         var o4 = mlx.mlx_array_new(); // [B, n, H, R]
+         defer _ = mlx.mlx_array_free(o4);
+diff -ruN -x .generated a/plugins/glm5_next/head.zig b/plugins/glm5_next/head.zig
+--- a/plugins/glm5_next/head.zig
++++ b/plugins/glm5_next/head.zig
+@@ -13,6 +13,19 @@
+ const table_forward = @import("table_forward.zig");
+ const glm_moe = @import("moe.zig");
+ const Slots = @import("slots.zig").Slots;
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE (src/smallop.zig): a one-row draft step's front, residuals and last
++/// norm merged.
++const smallop = @import("../../../smallop.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_HEAD_LAST_ROW (src/draft_step.zig): a merged draft step's routed experts for its
++/// last row alone.
++const draft_step = @import("../../../draft_step.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_TAILS (src/dsa_tails.zig): a step's DSA layer's indexer tail rows read before
++/// it, in a command buffer of their own.
++const dsa_tails = @import("../../../dsa_tails.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DRAFT_S0 (src/draft_s0.zig): step 0's (2 to 4 rows) front, first residual and post-norm
++/// and last residual on SMALLOP's texts.
++const draft_s0 = @import("../../../draft_s0.zig");
++const add_norm = @import("../../sdk/blocks/norms/add_norm.zig");
+ const Array = mlx.mlx_array;
+ const Verdict = abi.Verdict;
+ fn load(mp: *anyopaque, _: *const abi.LoadCtx) callconv(.c) Verdict {
+@@ -40,6 +53,98 @@
+     // The legacy head attends at its cache's own length, never the trunk's position.
+     const pos = [_]u32{@intCast(ops.len(f.caches.slice()[0], 0))};
+     const sl: Slots = .{ .ops = ops, .caches = f.caches.slice(), .positions = &pos };
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_TAILS: the step's DSA layer's indexer tail rows read first, in a command
++    // buffer of their own (its cache append then reuses its buffer), dropped at the step's end
++    try dsa_tails.begin(s, sl, false, mlx.getShape(ids), &.{0});
++    defer dsa_tails.end();
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: a one-row step's embedding row, both norms and their
++    // concatenation in one launch (null: the stock ops)
++    const one = smallop.on and n == 1;
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_DRAFT_S0: step 0 (2 to 4 rows) on the same texts, each piece null off its shapes
++    const s0 = draft_s0.on and smallop.on and n >= draft_s0.min_rows and n <= draft_s0.max_rows;
++    const cat = (if (one) try smallop.front(s, m.embed.w, m.embed.s.ctx != null, ids, .{ .ctx = f.hidden_in.ctx }, h.enorm, h.hnorm, m.rms_eps) else if (s0) try draft_s0.front(s, m.embed.w, m.embed.s.ctx != null, ids, .{ .ctx = f.hidden_in.ctx }, h.enorm, h.hnorm, m.rms_eps) else null) orelse try front(m, h, f, ids);
++    defer _ = mlx.mlx_array_free(cat);
++    const x = try m.mm(&h.eh_proj, cat);
++    defer _ = mlx.mlx_array_free(x);
++    const a_in = try m.rmsNorm(x, h.input_norm);
++    defer _ = mlx.mlx_array_free(a_in);
++    const attn = try table_forward.dsaAttn(m, sl, 0, a_in, &h.dsa, 0, 1, n);
++    defer _ = mlx.mlx_array_free(attn);
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: the residual add and the post-norm in one launch (the kit's
++    // addNorm: `add` then `fast::rms_norm`'s bits)
++    const r1 = (if (one) try m.narrowAddNorm(x, attn, h.post_norm) else if (s0) try postS0(m, x, attn, h.post_norm) else null) orelse try addThenNorm(m, x, attn, h.post_norm);
++    defer {
++        _ = mlx.mlx_array_free(r1.h);
++        _ = mlx.mlx_array_free(r1.normed);
++    }
++    const x1 = r1.h;
++    const m_in = r1.normed;
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: the MoE's two terms, the residual and the last norm in one launch
++    if (one) switch (try glm_moe.forwardPair(&h.moe, s, m_in)) {
++        .pair => |p| {
++            defer for (p) |a| {
++                _ = mlx.mlx_array_free(a);
++            };
++            if (try smallop.add2Norm(s, x1, p[0], p[1], h.norm, m.rms_eps)) |out| return out;
++            var mlp = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(mlp);
++            try mlx.check(mlx.mlx_add(&mlp, p[0], p[1], s));
++            return tail(m, h, x1, mlp);
++        },
++        .one => |mlp| {
++            defer _ = mlx.mlx_array_free(mlp);
++            if (try m.narrowAddNorm(x1, mlp, h.norm)) |r2| {
++                _ = mlx.mlx_array_free(r2.h);
++                return r2.normed;
++            }
++            return tail(m, h, x1, mlp);
++        },
++    };
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_HEAD_LAST_ROW (src/draft_step.zig): a merged draft step's routed experts for its
++    // last row alone, the only row read (null: the block takes another arm, and the step runs as before). A history
++    // append's output is never read: it runs as before.
++    if (draft_step.last_row and n > 1 and f.want_hidden) {
++        if (try glm_moe.forwardLastRow(&h.moe, s, m_in)) |mlp1| {
++            defer _ = mlx.mlx_array_free(mlp1);
++            draft_step.last_rows += 1;
++            // turboexl3_glm53f: TURBOEXL3_GLM53F_DRAFT_S0: `tailLast` in one launch
++            if (s0) if (try draft_s0.addNormLast(s, x1, mlp1, h.norm, m.rms_eps)) |out| return out;
++            return tailLast(m, h, x1, mlp1);
++        }
++        draft_step.declined += 1;
++    }
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_DRAFT_S0: the MoE's two terms, the residual and the last norm at the last row
++    // in one launch (the step returns that row; a history append's output is never read: it runs as before)
++    if (s0 and f.want_hidden) switch (try glm_moe.forwardPair(&h.moe, s, m_in)) {
++        .pair => |p| {
++            defer for (p) |a| {
++                _ = mlx.mlx_array_free(a);
++            };
++            if (try draft_s0.add2NormLast(s, x1, p[0], p[1], h.norm, m.rms_eps)) |out| return out;
++            var sum = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(sum);
++            try mlx.check(mlx.mlx_add(&sum, p[0], p[1], s));
++            return tail(m, h, x1, sum);
++        },
++        .one => |y| {
++            defer _ = mlx.mlx_array_free(y);
++            return tail(m, h, x1, y);
++        },
++    };
++    const mlp = try glm_moe.forward(&h.moe, s, m_in);
++    defer _ = mlx.mlx_array_free(mlp);
++    return tail(m, h, x1, mlp);
++}
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DRAFT_S0: step 0's first residual and post-norm through the kit's addNorm (null:
++/// the stock ops), counted.
++fn postS0(m: *host.Model, x: Array, attn: Array, w: Array) !?add_norm.Out {
++    const r = (try m.narrowAddNorm(x, attn, w)) orelse return null;
++    draft_s0.posts += 1;
++    return r;
++}
++/// The step's `cat[enorm(embed(ids)), hnorm(hidden)]` as the stock ops make it.
++fn front(m: *host.Model, h: *const trunk.Head, f: *const abi.Forward, ids: Array) !Array {
++    const s = m.s;
+     const emb = try m.embedding(ids);
+     defer _ = mlx.mlx_array_free(emb);
+     const en = try m.rmsNorm(emb, h.enorm);
+@@ -50,25 +155,22 @@
+     const hn = try m.rmsNorm(hid, h.hnorm);
+     defer _ = mlx.mlx_array_free(hn);
+     var cat = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(cat);
+-    {
+-        const vec = mlx.mlx_vector_array_new_data(&[_]Array{ en, hn }, 2);
+-        defer _ = mlx.mlx_vector_array_free(vec);
+-        try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 2, s));
+-    }
+-    const x = try m.mm(&h.eh_proj, cat);
+-    defer _ = mlx.mlx_array_free(x);
+-    const a_in = try m.rmsNorm(x, h.input_norm);
+-    defer _ = mlx.mlx_array_free(a_in);
+-    const attn = try table_forward.dsaAttn(m, sl, 0, a_in, &h.dsa, 0, 1, n);
+-    defer _ = mlx.mlx_array_free(attn);
++    errdefer _ = mlx.mlx_array_free(cat);
++    const vec = mlx.mlx_vector_array_new_data(&[_]Array{ en, hn }, 2);
++    defer _ = mlx.mlx_vector_array_free(vec);
++    try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 2, s));
++    return cat;
++}
++/// `x + attn` and its post-norm as the stock ops make them.
++fn addThenNorm(m: *host.Model, x: Array, attn: Array, w: Array) !add_norm.Out {
+     var x1 = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(x1);
+-    try mlx.check(mlx.mlx_add(&x1, x, attn, s));
+-    const m_in = try m.rmsNorm(x1, h.post_norm);
+-    defer _ = mlx.mlx_array_free(m_in);
+-    const mlp = try glm_moe.forward(&h.moe, s, m_in);
+-    defer _ = mlx.mlx_array_free(mlp);
++    errdefer _ = mlx.mlx_array_free(x1);
++    try mlx.check(mlx.mlx_add(&x1, x, attn, m.s));
++    return .{ .h = x1, .normed = try m.rmsNorm(x1, w) };
++}
++/// The step's last row of `x1 + mlp` under the final norm, as the stock ops make it.
++fn tail(m: *host.Model, h: *const trunk.Head, x1: Array, mlp: Array) !Array {
++    const s = m.s;
+     var y = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(y);
+     try mlx.check(mlx.mlx_add(&y, x1, mlp, s));
+@@ -77,6 +179,19 @@
+     const sh = mlx.getShape(y);
+     try mlx.check(mlx.mlx_slice(&last, y, &[_]c_int{ 0, sh[1] - 1, 0 }, 3, &[_]c_int{ 1, sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+     return m.rmsNorm(last, h.norm);
++}
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_HEAD_LAST_ROW: `tail` over the MoE's last row alone (`mlp1` [1, 1, D]): `x1`'s last
++/// row plus it under the final norm, the bits `tail` makes for that row (the add is elementwise, the norm a row's).
++fn tailLast(m: *host.Model, h: *const trunk.Head, x1: Array, mlp1: Array) !Array {
++    const s = m.s;
++    var last = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(last);
++    const sh = mlx.getShape(x1);
++    try mlx.check(mlx.mlx_slice(&last, x1, &[_]c_int{ 0, sh[1] - 1, 0 }, 3, &[_]c_int{ 1, sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
++    var y = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(y);
++    try mlx.check(mlx.mlx_add(&y, last, mlp1, s));
++    return m.rmsNorm(y, h.norm);
+ }
+ fn noop(_: *anyopaque, _: u32) callconv(.c) Verdict {
+     return .ok;
+diff -ruN -x .generated a/plugins/glm5_next/host.zig b/plugins/glm5_next/host.zig
+--- a/plugins/glm5_next/host.zig
++++ b/plugins/glm5_next/host.zig
+@@ -8,6 +8,7 @@
+ const quant_abi = @import("mlx_serve").abi.quant;
+ const Layout = @import("../../sdk/quant/native.zig").Layout;
+ const trunk = @import("trunk.zig");
++const log = @import("../../sdk/util/log.zig");
+ const gpa = std.heap.c_allocator;
+ const Array = mlx.mlx_array;
+ pub const Model = trunk.Model;
+@@ -104,8 +105,23 @@
+         a.* = .{};
+     };
+ }
++/// turboexl3_glm53f: a split prompt forward's fields (`Forward.split_rows`, `Forward.split_states`): span A is the
++/// forward's first `rows_a` rows, span B the rest; `states` is the cache that takes span A's recurrent states. Null on
++/// an ordinary forward (`split_rows` 0), with a kit whose `Forward` has no such fields, or from a host whose `Forward`
++/// ends before them (`size`).
++pub const Split = struct { rows_a: u32, states: abi.Handle };
++pub fn splitOf(f: *const abi.Forward) ?Split {
++    if (@hasField(abi.Forward, "split_rows") and @hasField(abi.Forward, "split_states")) {
++        const end = @max(@offsetOf(abi.Forward, "split_rows") + @sizeOf(@FieldType(abi.Forward, "split_rows")), @offsetOf(abi.Forward, "split_states") + @sizeOf(abi.Handle));
++        if (f.size < end or f.split_rows == 0) return null;
++        return .{ .rows_a = f.split_rows, .states = f.split_states };
++    }
++    return null;
++}
+ /// One slot's rows through `fwd.hidden` (a table forward module), its head and captures into `out`.
+ pub fn forwardOne(comptime name: []const u8, comptime fwd: type, m: *Model, ops: *const abi.CacheOps, f: *const abi.Forward, out: *abi.ForwardOut) abi.Verdict {
++    // turboexl3_glm53f: a split prompt forward (`splitOf`)
++    if (splitOf(f)) |sp| return forwardSplit(name, fwd, m, ops, f, sp, out);
+     if (f.caches.len != 1 or f.positions.len != 1) return abi.Verdict.refuse(.unsupported, name ++ ": one slot's rows at a time");
+     if (f.capture_layers.len > 0 and out.captured == null) return abi.Verdict.refuse(.failed, name ++ ": capture layers without an output");
+     if (f.media.ctx != null and !@hasField(fwd.Step, "media")) return abi.Verdict.refuse(.unsupported, name ++ ": no media rows");
+@@ -143,4 +159,83 @@
+         _ = mlx.mlx_array_set(&r, c);
+         out.captured.?[i] = .{ .ctx = r.ctx };
+     }
++}
++/// turboexl3_glm53f: why a split prompt forward (`splitOf`) is refused, by name and logged, before any cache is
++/// touched; null when it is served or the forward is not split. A caller with per-forward bookkeeping asks this first.
++pub fn splitRefusal(comptime name: []const u8, comptime fwd: type, m: *const Model, f: *const abi.Forward) ?abi.Verdict {
++    const sp = splitOf(f) orelse return null;
++    if (comptime !@hasDecl(fwd, "hiddenSplit")) {
++        return abi.Verdict.refuse(.unsupported, name ++ ": no split prompt forward");
++    } else {
++        _ = splitSpansOf(name, fwd, m, f, sp) catch |e| return abi.Verdict.named(.unsupported, @errorName(e));
++        return null;
++    }
++}
++/// turboexl3_glm53f: the split's spans (`fwd.splitSpans` over `fwd.splitServes`), or its refusal, logged.
++fn splitSpansOf(comptime name: []const u8, comptime fwd: type, m: *const Model, f: *const abi.Forward, sp: Split) fwd.SplitRefusal!fwd.Spans {
++    const rows_b = f.rows -| sp.rows_a;
++    return fwd.splitSpans(f, sp.rows_a, sp.states != null, fwd.splitServes(m, sp.rows_a, rows_b)) catch |e| {
++        log.err("[" ++ name ++ "] a split prompt forward of {d} + {d} rows is refused: {s}\n", .{ sp.rows_a, rows_b, @errorName(e) });
++        return e;
++    };
++}
++/// turboexl3_glm53f: a split prompt forward: span A's rows then span B's on the one slot's caches through
++/// `fwd.hiddenSplit` (layer by layer, both spans' routed experts in one streamed call a layer, span A's recurrent states
++/// into `sp.states`); `out.logits` what a forward of span B alone returns, `out.hidden` span A's rows then span B's, each
++/// as its own forward returns them. Refused by name before any cache is touched where the spans would not be their own
++/// forwards' (`splitSpansOf`).
++fn forwardSplit(comptime name: []const u8, comptime fwd: type, m: *Model, ops: *const abi.CacheOps, f: *const abi.Forward, sp: Split, out: *abi.ForwardOut) abi.Verdict {
++    if (comptime !@hasDecl(fwd, "hiddenSplit")) {
++        return abi.Verdict.refuse(.unsupported, name ++ ": no split prompt forward");
++    } else {
++        const spans = splitSpansOf(name, fwd, m, f, sp) catch |e| return abi.Verdict.named(.unsupported, @errorName(e));
++        splitOne(fwd, m, ops, f, spans, sp.states, out) catch |e| {
++            clear(out, 0);
++            return abi.Verdict.named(.failed, @errorName(e));
++        };
++        return .ok;
++    }
++}
++fn splitOne(comptime fwd: type, m: *Model, ops: *const abi.CacheOps, f: *const abi.Forward, sp: fwd.Spans, states: abi.Handle, out: *abi.ForwardOut) !void {
++    const ids_a = try spanIds(m, f, 0, sp.a);
++    defer _ = mlx.mlx_array_free(ids_a);
++    const ids_b = try spanIds(m, f, sp.a, sp.a + sp.b);
++    defer _ = mlx.mlx_array_free(ids_b);
++    // Each span's step as `one` makes its forward's (a prompt's: no capture), span B's from span A's end.
++    const pos_a = [1]u32{sp.pos_a};
++    const pos_b = [1]u32{sp.pos_b};
++    const st_a: fwd.Step = .{ .slots = .{ .ops = ops, .caches = f.caches.slice(), .positions = &pos_a }, .eval_every = f.eval_every };
++    const st_b: fwd.Step = .{ .slots = .{ .ops = ops, .caches = f.caches.slice(), .positions = &pos_b }, .eval_every = f.eval_every };
++    const h = try fwd.hiddenSplit(m, &st_a, &st_b, ids_a, ids_b, states);
++    try finishSplit(m, f, h[0], h[1], out);
++}
++/// turboexl3_glm53f: rows `lo..hi` of a forward's token ids `[1, hi - lo]`: the host tokens as `hostIds` makes a
++/// forward's, or a view of the engine's device ids `[1, rows]`.
++fn spanIds(m: *const Model, f: *const abi.Forward, lo: u32, hi: u32) !Array {
++    if (f.ids.ctx == null) return hostIds(f.tokens.slice()[lo..hi]);
++    var r = mlx.mlx_array_new();
++    errdefer _ = mlx.mlx_array_free(r);
++    try mlx.check(mlx.mlx_slice(&r, .{ .ctx = f.ids.ctx }, &[_]c_int{ 0, @intCast(lo) }, 2, &[_]c_int{ 1, @intCast(hi) }, 2, &[_]c_int{ 1, 1 }, 2, m.s));
++    return r;
++}
++/// turboexl3_glm53f: `out` of a split forward from both spans' final-normed hiddens (consumed): the logits `finish`
++/// gives a forward of span B alone over span B's, and, when asked, the hidden of span A's rows then span B's.
++fn finishSplit(m: *Model, f: *const abi.Forward, hidden_a: Array, hidden_b: Array, out: *abi.ForwardOut) !void {
++    defer _ = mlx.mlx_array_free(hidden_a);
++    if (f.want_hidden) {
++        const parts = [_]Array{ hidden_a, hidden_b };
++        const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
++        defer _ = mlx.mlx_vector_array_free(vec);
++        var h = mlx.mlx_array_new();
++        mlx.check(mlx.mlx_concatenate_axis(&h, vec, 1, m.s)) catch |e| {
++            _ = mlx.mlx_array_free(h);
++            _ = mlx.mlx_array_free(hidden_b);
++            return e;
++        };
++        out.hidden = .{ .ctx = h.ctx };
++    }
++    // `finish` reads the forward's `logits` and `want_hidden` only: span B's forward, its hidden already in `out`.
++    var fb = f.*;
++    fb.want_hidden = false;
++    try finish(m, &fb, hidden_b, out);
+ }
+diff -ruN -x .generated a/plugins/glm5_next/kda.zig b/plugins/glm5_next/kda.zig
+--- a/plugins/glm5_next/kda.zig
++++ b/plugins/glm5_next/kda.zig
+@@ -17,6 +17,22 @@
+ const gdn_decode = @import("../../sdk/blocks/gdn/decode.zig");
+ const decode_fused = @import("../../sdk/blocks/gdn/decode_fused.zig");
+ const kernels = @import("../../sdk/blocks/gdn/kernels.zig");
++/// turboexl3_glm53f: the KDA prompt texts (src/kda_prompt.zig: TURBOEXL3_GLM53F_KDA_PROLOGUE, _KDA_NORMGATE) and the
++/// per-core route at two threadgroups a core (_KDA_PERCORE).
++const kda_prompt = @import("../../../kda_prompt.zig");
++/// turboexl3_glm53f: a verify's KDA texts (src/kda_verify.zig: TURBOEXL3_GLM53F_KDA_VERIFY).
++const kda_verify = @import("../../../kda_verify.zig");
++/// turboexl3_glm53f: a prompt forward as row spans, each span's qkv linear on a side stream (src/kda_pipe.zig:
++/// TURBOEXL3_GLM53F_KDA_PIPE).
++const kda_pipe = @import("../../../kda_pipe.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_LAZY_SEQ (src/kda_lazy.zig): a verify's per-row states as a launch of their own
++/// that runs only when a rollback reads them.
++const kda_lazy = @import("../../../kda_lazy.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_EXPSIG (src/kda_trim.zig): a verify's beta sigmoid made in its capture launch.
++const kda_trim = @import("../../../kda_trim.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_OPREP (src/dec_prep.zig): a verify's gated norm writing the out projection's
++/// prepared input, DEC-ONE's GEMV alone after it.
++const dec_prep = @import("../../../dec_prep.zig");
+ const sliceQkvPart = @import("../../sdk/blocks/linear/fused_rows.zig").sliceQkvPart;
+ const trunk = @import("trunk.zig");
+ const Array = mlx.mlx_array;
+@@ -82,6 +98,9 @@
+     const conv_dim: c_int = key_dim * 2 + value_dim;
+     const kernel: c_int = @intCast(c.linear_conv_kernel_dim);
+     const bounded = c.kda_gate_lower_bound != 0.0;
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_PIPE: a prompt forward the spans take leaves qkv to them (below).
++    const pipe = is_prefill and !capture and batch == 1 and bounded and kda_pipe.wants(la, seq_len) and
++        !kda_recurrence.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(x), m.ssmStateDtype());
+     // Null until assigned: an early error return frees what the defers below see.
+     var qkv: Array = .{ .ctx = null };
+     var z_proj: Array = .{ .ctx = null };
+@@ -107,7 +126,7 @@
+         try sliceQkvPart(&a_proj, all, w[0] + w[1], w[2], s);
+         try sliceQkvPart(&b_proj, all, w[0] + w[1] + w[2], w[3], s);
+     } else {
+-        qkv = try qkvProj(m, la, x);
++        if (!pipe) qkv = try qkvProj(m, la, x);
+         z_proj = try m.mm(&la.z, x);
+         a_proj = try m.mm(&la.a, x);
+         b_proj = try m.mm(&la.b, x);
+@@ -160,11 +179,15 @@
+     }
+     if (m.kda.q_scale.ctx == null) {
+         const inv: f32 = 1.0 / @as(f32, @floatFromInt(c.linear_key_head_dim));
+-        m.kda.q_scale = try scalarOf(inv, mlx.mlx_array_dtype(qkv), s);
+-        m.kda.k_scale = try scalarOf(@sqrt(inv), mlx.mlx_array_dtype(qkv), s);
++        m.kda.q_scale = try scalarOf(inv, mlx.mlx_array_dtype(if (pipe) x else qkv), s);
++        m.kda.k_scale = try scalarOf(@sqrt(inv), mlx.mlx_array_dtype(if (pipe) x else qkv), s);
+     }
+     const inv_scale_sq = m.kda.q_scale;
+     const inv_sqrt_sc = m.kda.k_scale;
++    if (pipe) {
++        if (try kda_pipe.forward(m, la, x, e, z_proj, a_proj, b_proj, inv_scale_sq, inv_sqrt_sc, qkNormEps(m))) |out| return out;
++        qkv = try qkvProj(m, la, x);
++    }
+     var q_scaled = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(q_scaled);
+     var k_scaled = mlx.mlx_array_new();
+@@ -232,7 +255,50 @@
+         _ = mlx.mlx_array_free(pre.g);
+         beta_fused = pre.beta;
+     }
+-    if (!fused_prework) {
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_PROLOGUE: in a prompt pass, the op chain below as one text where it serves
++    // (the same q, k, v and conv window).
++    var text_prologue = false;
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_FOLD: in a prompt pass on the chunkwise route, that text folded into the
++    // route's launch where it serves (the same conv window; the launch reads qkv and the window before it, never q, k
++    // and v).
++    var fold_before: Array = .{ .ctx = null };
++    defer free(fold_before);
++    if (!kda_fused and bounded and is_prefill and !capture) if (try kda_prompt.foldWindow(s, qkv, if (e.initialized) e.conv_state else null, la.conv_w, inv_scale_sq, inv_sqrt_sc, num_k_heads, dk, num_v_heads, dv, kernel, m.ssmStateDtype(), la.a_log_h, la.dt_f32)) |fw| {
++        fold_before = fw.before;
++        free(e.conv_state);
++        e.conv_state = fw.window;
++        e.initialized = true;
++        text_prologue = true;
++    };
++    if (!fused_prework and !text_prologue and is_prefill and !capture) if (try kda_prompt.prologue(s, qkv, if (e.initialized) e.conv_state else null, la.conv_w, inv_scale_sq, inv_sqrt_sc, qkNormEps(m), num_k_heads, dk, num_v_heads, dv, kernel)) |p| {
++        free(e.conv_state);
++        e.conv_state = p.window;
++        e.initialized = true;
++        _ = mlx.mlx_array_free(q_scaled);
++        _ = mlx.mlx_array_free(k_scaled);
++        _ = mlx.mlx_array_free(v_heads);
++        q_scaled = p.q;
++        k_scaled = p.k;
++        v_heads = p.v;
++        text_prologue = true;
++    };
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_VERIFY: in a verify (capture), the same text for the op chain below, and the
++    // chain's conv input kept for the rollback.
++    if (!fused_prework and capture and !text_prologue) if (try kda_verify.prologue(s, qkv, if (e.initialized) e.conv_state else null, la.conv_w, inv_scale_sq, inv_sqrt_sc, qkNormEps(m), num_k_heads, dk, num_v_heads, dv, kernel)) |p| {
++        free(e.spec_conv_input);
++        e.spec_conv_input = p.input;
++        free(e.conv_state);
++        e.conv_state = p.window;
++        e.initialized = true;
++        _ = mlx.mlx_array_free(q_scaled);
++        _ = mlx.mlx_array_free(k_scaled);
++        _ = mlx.mlx_array_free(v_heads);
++        q_scaled = p.q;
++        k_scaled = p.k;
++        v_heads = p.v;
++        text_prologue = true;
++    };
++    if (!fused_prework and !text_prologue) {
+         var g = ops.Graph.init(std.heap.c_allocator, s);
+         defer g.deinit();
+         const conv = try conv1d.run(&g, qkv, if (e.initialized) e.conv_state else null, la.conv_w, null, batch, conv_dim, kernel, true);
+@@ -266,14 +332,23 @@
+         try mlx.check(mlx.mlx_fast_rms_norm(&k_norm, k_heads, m.kda.ones, qkNormEps(m), s));
+         try mlx.check(mlx.mlx_multiply(&k_scaled, k_norm, inv_sqrt_sc, s));
+     }
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_PERCORE: in a prompt pass, the per-core recurrence with its gate built in
++    // (rounding-class), where the copy's own per-core route declined (its plan stops at one threadgroup a core).
++    const percore = !kda_fused and bounded and is_prefill and !capture and
++        kda_prompt.percoreServes(num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype(), la.a_log_h, la.dt_f32);
+     // One gate value per key channel: the bounded sigmoid where the config bounds it (fla's two arms), else the
+     // softplus chain over `A_log` expanded per channel. The per-core recurrence builds the gate itself.
+-    const g = if (kda_fused) Array{ .ctx = null } else if (bounded)
+-        try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s)
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_VERIFY: in a verify, kdaGateChain as one text where it serves.
++    const g = if (kda_fused or percore) Array{ .ctx = null } else if (bounded)
++        (if (capture) try kda_verify.gate(s, a_proj, la.dt_bias, la.A_log, c.kda_gate_lower_bound) else null) orelse
++            try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s)
+     else
+         try softplusGate(m, la.A_log, a_proj, la.dt_bias);
+     defer free(g);
+-    const beta = beta_fused orelse blk: {
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_EXPSIG: in a verify, beta's sigmoid made in the capture recurrence's launch
++    // from b at its bits (src/kda_trim.zig: MLX's own sigmoid tabulated, the table borrowed); null runs MLX's sigmoid
++    const bsig: ?Array = if (capture and beta_fused == null) try kda_trim.betaTable(s, b_proj, batch, seq_len, num_v_heads) else null;
++    const beta = beta_fused orelse if (bsig != null) Array{ .ctx = null } else blk: {
+         var bt = mlx.mlx_array_new();
+         try mlx.check(mlx.mlx_sigmoid(&bt, b_proj, s));
+         break :blk bt;
+@@ -287,7 +362,7 @@
+     defer _ = mlx.mlx_array_free(T_scalar);
+     const y_shape = [_]c_int{ batch, seq_len, num_v_heads, dv };
+     // The kernels specialize on the actual widths: y in the activation dtype, the state in its own.
+-    const in_dtype = mlx.mlx_array_dtype(q_scaled);
++    const in_dtype = mlx.mlx_array_dtype(if (fold_before.ctx != null) qkv else q_scaled);
+     const state_dtype = mlx.mlx_array_dtype(e.ssm_state);
+     const out_dtype: mlx.mlx_dtype = if (in_dtype == .float16) .float16 else .bfloat16;
+     const kcfg = mlx.mlx_fast_metal_kernel_config_new();
+@@ -306,6 +381,61 @@
+             free(e.spec_state_seq);
+             e.spec_state_seq = r.state_seq;
+         }
++    } else if (bsig) |tab| {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_EXPSIG: the capture launch below (beside KDA_LAZY_SEQ its branch's two
++        // launches) with beta's sigmoid made in it from b (src/kda_trim.zig `captureRecur`): the same y, state and per-row
++        // state bits
++        const r = try kda_trim.captureRecur(s, q_scaled, k_scaled, v_heads, g, b_proj, tab, e.ssm_state, in_dtype, out_dtype, num_k_heads, num_v_heads, dk, dv, batch, seq_len, kda_lazy.on);
++        _ = mlx.mlx_array_free(y_bthd);
++        y_bthd = r.y;
++        free(e.spec_state_seq);
++        e.spec_state_seq = r.state_seq;
++        _ = mlx.mlx_array_free(e.ssm_state);
++        e.ssm_state = r.state;
++        if (kda_lazy.on) kda_lazy.verifies += 1;
++    } else if (capture and kda_lazy.on) {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_LAZY_SEQ: the verify's output and state from the stock launch below (the
++        // capture launch's text but for its per-row stores: the same y and state bits), and the per-row states from
++        // the capture launch of the branch after this one, its own primitive over the same inputs and state, which MLX
++        // runs only when a partial accept's rollback reads them (a full accept never does)
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(kcfg, &[_]c_int{ batch, num_v_heads, dv, dk }, 4, state_dtype));
++        try kernels.gdnSetGrid(kcfg, .stock, dv, num_v_heads, batch);
++        try templateArgs(kcfg, in_dtype, state_dtype, out_dtype, dk, dv, num_k_heads, num_v_heads);
++        const inputs = [_]Array{ q_scaled, k_scaled, v_heads, g, beta, e.ssm_state, T_scalar };
++        const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
++        defer _ = mlx.mlx_vector_array_free(in_vec);
++        var out_vec = mlx.mlx_vector_array_new();
++        defer _ = mlx.mlx_vector_array_free(out_vec);
++        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&out_vec, try kernels.gdnRouteKernel(.stock, 0, true), in_vec, kcfg, s));
++        if (mlx.mlx_vector_array_size(out_vec) != 2) return error.MetalKernelBadOutputCount;
++        try mlx.check(mlx.mlx_vector_array_get(&y_bthd, out_vec, 0));
++        var new_state = mlx.mlx_array_new();
++        errdefer _ = mlx.mlx_array_free(new_state);
++        try mlx.check(mlx.mlx_vector_array_get(&new_state, out_vec, 1));
++        const scfg = mlx.mlx_fast_metal_kernel_config_new();
++        defer _ = mlx.mlx_fast_metal_kernel_config_free(scfg);
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(scfg, &y_shape, 4, out_dtype));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(scfg, &[_]c_int{ seq_len, batch, num_v_heads, dv, dk }, 5, state_dtype));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(scfg, &[_]c_int{ batch, num_v_heads, dv, dk }, 4, state_dtype));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(scfg, 32, dv, batch * num_v_heads));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(scfg, 32, 4, 1));
++        try templateArgs(scfg, in_dtype, state_dtype, out_dtype, dk, dv, num_k_heads, num_v_heads);
++        const seq_stride = mlx.mlx_array_new_int(batch * num_v_heads * dv * dk);
++        defer _ = mlx.mlx_array_free(seq_stride);
++        const seq_inputs = [_]Array{ q_scaled, k_scaled, v_heads, g, beta, e.ssm_state, T_scalar, seq_stride };
++        const seq_in_vec = mlx.mlx_vector_array_new_data(&seq_inputs, seq_inputs.len);
++        defer _ = mlx.mlx_vector_array_free(seq_in_vec);
++        var seq_out_vec = mlx.mlx_vector_array_new();
++        defer _ = mlx.mlx_vector_array_free(seq_out_vec);
++        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&seq_out_vec, try kernels.getGdnKernelSeq(true), seq_in_vec, scfg, s));
++        if (mlx.mlx_vector_array_size(seq_out_vec) != 3) return error.MetalKernelBadOutputCount;
++        var state_seq = mlx.mlx_array_new();
++        try mlx.check(mlx.mlx_vector_array_get(&state_seq, seq_out_vec, 1));
++        free(e.spec_state_seq);
++        e.spec_state_seq = state_seq;
++        _ = mlx.mlx_array_free(e.ssm_state);
++        e.ssm_state = new_state;
++        kda_lazy.verifies += 1;
+     } else if (capture) {
+         // Per-row states for rollback: state_seq [T, B, Hv, Dv, Dk] (its last row unwritten), the final state its
+         // own output.
+@@ -338,6 +468,20 @@
+         y_bthd = r.y;
+         _ = mlx.mlx_array_free(e.ssm_state);
+         e.ssm_state = r.state;
++    } else if (fold_before.ctx != null) {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_FOLD: the chunkwise route's launch with the prologue text folded in.
++        const r = try kda_prompt.foldRecur(s, qkv, fold_before, la.conv_w, inv_scale_sq, inv_sqrt_sc, qkNormEps(m), a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state);
++        _ = mlx.mlx_array_free(y_bthd);
++        y_bthd = r.y;
++        _ = mlx.mlx_array_free(e.ssm_state);
++        e.ssm_state = r.state;
++    } else if (percore) {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_PERCORE: the copy's per-core kernel at two threadgroups a core.
++        const r = try kda_prompt.percoreRecur(s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state);
++        _ = mlx.mlx_array_free(y_bthd);
++        y_bthd = r.y;
++        _ = mlx.mlx_array_free(e.ssm_state);
++        e.ssm_state = r.state;
+     } else {
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(kcfg, &[_]c_int{ batch, num_v_heads, dv, dk }, 4, state_dtype));
+         // A per-channel gate is another indexing contract than the blocked kernel's per-head one: stock kernel.
+@@ -364,6 +508,20 @@
+             return m.mm(&la.out, flat);
+         }
+     }
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_NORMGATE: in a prompt pass, the gated norm below as one text where it
++    // serves (the same out projection input).
++    if (is_prefill and !capture) if (try kda_prompt.normGate(s, y_bthd, z_proj, la.norm_w, c.rms_norm_eps, num_v_heads, dv)) |flat| {
++        defer _ = mlx.mlx_array_free(flat);
++        return m.mm(&la.out, flat);
++    };
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_OPREP: in a verify, the gated norm below writing the out projection's
++    // prepared input and DEC-ONE's GEMV over it (null: as before)
++    if (capture) if (try dec_prep.kdaOut(s, y_bthd, z_proj, la.norm_w, c.rms_norm_eps, num_v_heads, dv, la.out.x3)) |y| return y;
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_KDA_VERIFY: the same text in a verify.
++    if (capture) if (try kda_verify.normGate(s, y_bthd, z_proj, la.norm_w, c.rms_norm_eps, num_v_heads, dv)) |flat| {
++        defer _ = mlx.mlx_array_free(flat);
++        return m.mm(&la.out, flat);
++    };
+     var z_heads = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(z_heads);
+     try mlx.check(mlx.mlx_reshape(&z_heads, z_proj, &y_shape, 4, s));
+diff -ruN -x .generated a/plugins/glm5_next/kernels/hc_hval2_header.metal b/plugins/glm5_next/kernels/hc_hval2_header.metal
+--- a/plugins/glm5_next/kernels/hc_hval2_header.metal
++++ b/plugins/glm5_next/kernels/hc_hval2_header.metal
+@@ -0,0 +1,12 @@
++
++// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: stream element k of `expand(y + y2, h)`: a MoE sublayer's output as
++// its two terms (the routed sum y, the shared expert y2), added in T as `mlx_add` rounds them, then `msv_hc_hval`'s
++// expand of that sum, rounded where `expand` rounds it.
++template <typename T, int HC, int D, typename Y, typename P, typename C, typename H>
++inline float msv_hc_hval2(int k, Y y, Y y2, P post, C comb, H h) {
++    const int i = k / D;
++    const int d = k - i * D;
++    float acc = 0.0f;
++    for (int j = 0; j < HC; ++j) acc = fma(comb[j * HC + i], float(h[j * D + d]), acc);
++    return float(T(fma(post[i], float(T(float(y[d]) + float(y2[d]))), acc)));
++}
+diff -ruN -x .generated a/plugins/glm5_next/moe.zig b/plugins/glm5_next/moe.zig
+--- a/plugins/glm5_next/moe.zig
++++ b/plugins/glm5_next/moe.zig
+@@ -44,3 +44,39 @@
+     defer g.deinit();
+     return g.escape(try moe.mlp(w, &g, x));
+ }
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_HEAD_LAST_ROW: `forward`'s output at `x`'s last row alone (`moe.mlpLastRow`), or
++/// null where the block takes another arm (the caller runs `forward`). Owned by the caller.
++pub fn forwardLastRow(w: *const moe.Moe.Weights, s: mlx.mlx_stream, x: Array) !?Array {
++    var g = ops.Graph.init(std.heap.c_allocator, s);
++    defer g.deinit();
++    const y = (try moe.mlpLastRow(w, &g, x)) orelse return null;
++    return g.escape(y);
++}
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE (src/smallop.zig): `forward`'s output, or its last add's two terms
++/// where its last op is the routed sum plus an ungated shared expert (`moe.pair_slot`) of one dtype and shape: `.pair` =
++/// {the routed sum, the shared expert}, whose `mlx_add` is `forward`'s output. Owned by the caller.
++pub const PairOut = union(enum) { one: Array, pair: [2]Array };
++pub fn forwardPair(w: *const moe.Moe.Weights, s: mlx.mlx_stream, x: Array) !PairOut {
++    var g = ops.Graph.init(std.heap.c_allocator, s);
++    defer g.deinit();
++    var shared: ?Array = null;
++    moe.pair_slot = &shared;
++    defer moe.pair_slot = null;
++    const y = try moe.mlp(w, &g, x);
++    const sd = shared orelse return .{ .one = g.escape(y) };
++    // terms of two dtypes or shapes: `mlp`'s own add (the type it promotes to, the shape it broadcasts to)
++    if (mlx.mlx_array_dtype(y) != mlx.mlx_array_dtype(sd) or !std.mem.eql(c_int, mlx.getShape(y), mlx.getShape(sd)))
++        return .{ .one = g.escape(try g.add(y, sd)) };
++    return .{ .pair = .{ g.escape(y), g.escape(sd) } };
++}
++/// turboexl3_glm53f: whether `forwardSplit` serves a layer's spans of `rows_a` and `rows_b` rows (`moe.splitServes`).
++pub const splitServes = moe.splitServes;
++/// turboexl3_glm53f: the block over a split prompt forward's two spans, `x_a` then `x_b` (`moe.mlpSplit`: their routed
++/// experts in one call of the streamed bank's source), each output as `forward` gives it for that span alone (both
++/// owned by the caller).
++pub fn forwardSplit(w: *const moe.Moe.Weights, s: mlx.mlx_stream, x_a: Array, x_b: Array) ![2]Array {
++    var g = ops.Graph.init(std.heap.c_allocator, s);
++    defer g.deinit();
++    const ys = try moe.mlpSplit(w, &g, x_a, x_b);
++    return .{ g.escape(ys[0]), g.escape(ys[1]) };
++}
+diff -ruN -x .generated a/plugins/glm5_next/slots.zig b/plugins/glm5_next/slots.zig
+--- a/plugins/glm5_next/slots.zig
++++ b/plugins/glm5_next/slots.zig
+@@ -54,8 +54,16 @@
+     pub fn setState(self: Slots, i: usize, layer: u32, which: abi.StateSlot, value: Array) !void {
+         try ok(self.ops.set_state(self.caches[i], layer, which, ab(value)));
+     }
+-    /// Evaluates `h` with every recurrent state the slots hold (a prompt chunk's memory bound).
+-    pub fn evalWith(self: Slots, h: Array, layers: u32) !void {
++    /// turboexl3_glm53f: the state `which` of `layer` in slot `i` written to the cache `dst` (which takes its own
++    /// reference): a split prompt forward's span A states (`Forward.split_states`). Refused when the slot holds none.
++    pub fn copyState(self: Slots, i: usize, layer: u32, which: abi.StateSlot, dst: abi.Handle) !void {
++        const v = self.ops.state(self.caches[i], layer, which);
++        if (v.ctx == null) return error.Glm53fSplitNoState;
++        try ok(self.ops.set_state(dst, layer, which, v));
++    }
++    /// Evaluates `h` with every recurrent state the slots hold (a prompt chunk's memory bound). turboexl3_glm53f:
++    /// TURBOEXL3_GLM53F_ASYNC_EVAL: with `async_eval`, the same arrays handed to the GPU without the host's wait.
++    pub fn evalWith(self: Slots, h: Array, layers: u32, async_eval: bool) !void {
+         const vec = mlx.mlx_vector_array_new();
+         defer _ = mlx.mlx_vector_array_free(vec);
+         _ = mlx.mlx_vector_array_append_value(vec, h);
+@@ -63,7 +71,7 @@
+             const c = self.state(i, @intCast(li), .conv);
+             if (c.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, c);
+         };
+-        try mlx.check(mlx.mlx_eval(vec));
++        try mlx.check(if (async_eval) mlx.mlx_async_eval(vec) else mlx.mlx_eval(vec));
+     }
+ };
+ fn takeRef(a: Array) Array {
+@@ -77,6 +85,9 @@
+     const ssm = sl.state(i, layer, .ssm);
+     return .{ .conv_state = takeRef(conv), .ssm_state = takeRef(ssm), .initialized = conv.ctx != null or ssm.ctx != null };
+ }
++/// turboexl3_glm53f: the states a KDA layer's prompt rows leave in the cache (`putEntry` without a verify's capture):
++/// what a split prompt forward hands the host for span A (`Forward.split_states`).
++pub const prompt_state_slots = [_]abi.StateSlot{ .conv, .ssm };
+ /// Writes the entry's state (and a verify's per-row capture) back to slot `i`, then frees the entry.
+ pub fn putEntry(sl: Slots, i: usize, layer: u32, e: *kda_mod.Entry) !void {
+     defer e.deinit();
+diff -ruN -x .generated a/plugins/glm5_next/table_forward.zig b/plugins/glm5_next/table_forward.zig
+--- a/plugins/glm5_next/table_forward.zig
++++ b/plugins/glm5_next/table_forward.zig
+@@ -5,6 +5,7 @@
+ //! copied_from: plugins/glm5_next/forward.zig (`forwardGlm5With`, `glmSublayer`, `glmBranch`, `glmBranchSlots`,
+ //! `glmKdaSlots`, `glmDsaAttn`, `forwardGlmBatchedDecode`), the ForwardCtx reads replaced by `Slots`.
+ const std = @import("std");
++const abi = @import("mlx_serve").abi.plugin;
+ const mlx = @import("mlx_serve").mlx;
+ const glm5 = @import("glm5_next.zig");
+ const slots_mod = @import("slots.zig");
+@@ -15,6 +16,60 @@
+ const axisView = @import("../../mlx/array.zig").axisView;
+ const concatAxis1 = @import("../../mlx/array.zig").concatAxis1;
+ const glm_moe = @import("moe.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_ONEP (src/dsa_prompt.zig).
++const dsa_prompt = @import("../../../dsa_prompt.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_HC_FUSE (src/hc_fuse.zig): a prompt sublayer's expand and the next sublayer's
++/// collapse as one text.
++const hc_fuse = @import("../../../hc_fuse.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_ASYNC_EVAL (src/async_eval.zig): a prompt forward's cadence eval without the host's
++/// wait.
++const async_eval = @import("../../../async_eval.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_PF_REUSE (src/pf_reuse.zig): a prompt forward's KDA runs hold their buffers in
++/// MLX's cache, the limit set before each layer's attention and put back at the forward's end.
++const pf_reuse = @import("../../../pf_reuse.zig");
++/// turboexl3_glm53f: READ_AHEAD3: the streamed source's hooks (`Routed.ahead_score_fn`, `ahead_issue_fn`).
++const routed_hooks = @import("../../sdk/weights/routed.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_GLM (src/dsa_glm.zig): `dsaAttn`'s dense and sparse rows' outputs in the
++/// output projection's row order in one copy.
++const dsa_glm = @import("../../../dsa_glm.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_TAILS (src/dsa_tails.zig): a decode or verify window's DSA layers' indexer
++/// tail rows read before the forward, in a command buffer of their own.
++const dsa_tails = @import("../../../dsa_tails.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_ROWS (src/dsa_rows.zig): a window's indexer rows assembled by the pooled-keys
++/// launch from the key and the f32 gate.
++const dsa_rows = @import("../../../dsa_rows.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_WFOLD (src/dsa_wfold.zig): a window's selection reads the head-weight
++/// projection as it is.
++const dsa_wfold = @import("../../../dsa_wfold.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_TAILS: the trunk's DSA layers in order, in `buf` (none if it is too short).
++fn trunkDsaLayers(m: *const Model, buf: []u32) []const u32 {
++    var n: usize = 0;
++    for (m.layers[0..@min(m.layers.len, @as(usize, m.c.num_hidden_layers))], 0..) |*lw, li| if (lw.mixer == .dsa) {
++        if (n == buf.len) return buf[0..0];
++        buf[n] = @intCast(li);
++        n += 1;
++    };
++    return buf[0..n];
++}
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE (src/smallop.zig): a decode or verify MoE sublayer's shared-expert
++/// add inside the next hcPre, a DSA layer's q_a and kv_a in one launch and its two norms in one launch.
++const smallop = @import("../../../smallop.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_OPREP (src/dec_prep.zig): a verify's DSA layer writing the out projection's
++/// prepared input where the stock forward runs prep_sc's launch.
++const dec_prep = @import("../../../dec_prep.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_HOLD (src/dsa_hold.zig): a prompt span's DSA layer keeps its q_abs and o_lat for
++/// its next DSA layer, released into MLX's cache just before that layer allocates its own.
++const dsa_hold = @import("../../../dsa_hold.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_PF_TAIL_EVAL (src/tail_eval.zig): a prompt layer's tail handed to the GPU at the
++/// layer's end where the cadence's eval is not due.
++const tail_eval = @import("../../../tail_eval.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_HOLD: the trunk's next DSA layer after `layer`, if any.
++fn nextDsa(m: *const Model, layer: u32) ?u32 {
++    const n = @min(m.layers.len, @as(usize, m.c.num_hidden_layers));
++    var nl: usize = @as(usize, layer) + 1;
++    while (nl < n) : (nl += 1) if (m.layers[nl].mixer == .dsa) return @as(u32, @intCast(nl));
++    return null;
++}
+ const Array = mlx.mlx_array;
+ const Slots = slots_mod.Slots;
+ const Model = trunk.Model;
+@@ -41,6 +96,11 @@
+ pub fn hidden(m: *Model, st: *const Step, token_ids: Array) !Array {
+     const cfg = m.c;
+     const s = m.s;
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_TAILS: a decode or verify window's DSA layers' indexer tail rows read first,
++    // in a command buffer of their own (each layer's cache append then reuses its buffer), dropped at the forward's end
++    var dsa_buf: [64]u32 = undefined;
++    try dsa_tails.begin(s, st.slots, st.batched, mlx.getShape(token_ids), if (dsa_tails.on) trunkDsaLayers(m, &dsa_buf) else &[_]u32{});
++    defer dsa_tails.end();
+     var emb = try m.embedding(token_ids);
+     {
+         errdefer _ = mlx.mlx_array_free(emb);
+@@ -53,6 +113,10 @@
+     const batch: c_int = x_shape[0];
+     const seq_len: c_int = x_shape[1];
+     const is_prefill = seq_len > 1 and !st.batched;
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_PF_REUSE: a prompt forward's buffers held through its KDA runs, the limit put
++    // back at its end (an error's too)
++    pf_reuse.begin(is_prefill and !st.capture, @as(u64, @intCast(batch)) * @as(u64, @intCast(seq_len)));
++    defer pf_reuse.end();
+     var stream = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(stream);
+     {
+@@ -64,9 +128,14 @@
+     const n_layers = cfg.num_hidden_layers;
+     var deferred: ?glm5.Deferred = null;
+     defer if (deferred) |*df| df.deinit();
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_HC_FUSE: the next sublayer's collapse, made with the expand before it
++    var ahead: ?glm5.Collapsed = null;
++    defer if (ahead) |*p| p.deinit();
+     for (m.layers[0..n_layers], 0..) |*lw, li| {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_PF_REUSE: before the layer's attention, its KDA run's cache limit
++        pf_reuse.layer(li, lw.mixer == .kda, li + 1 < n_layers and m.layers[li + 1].mixer == .kda);
+         for ([_]bool{ true, false }) |attn| {
+-            try sublayer(m, st, &stream, &deferred, lw, attn, li, batch, seq_len, is_prefill);
++            try sublayer(m, st, &stream, &deferred, &ahead, lw, attn, li, batch, seq_len, is_prefill);
+         }
+         // DFlash taps the MEAN of the layer's hyper-connection streams (SGLang's `hc_contract`).
+         for (st.capture_ids, st.capture_out) |cid, *slot| if (cid == li) {
+@@ -82,8 +151,11 @@
+             _ = mlx.mlx_array_set(slot, mean);
+         };
+         if (is_prefill and st.eval_every > 0 and ((li + 1) % st.eval_every == 0 or li + 1 == n_layers)) {
+-            try st.slots.evalWith(stream, @intCast(li + 1));
++            try st.slots.evalWith(stream, @intCast(li + 1), async_eval.take());
+         }
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_PF_TAIL_EVAL: where the cadence's eval is not due, the layer's tail (its MoE
++        // combine, shared expert and stream update) handed to the GPU without the host's wait
++        if (is_prefill and tail_eval.due(st.eval_every, li, n_layers)) try tail_eval.commit(stream);
+     }
+     if (deferred) |*df| {
+         _ = mlx.mlx_array_free(stream);
+@@ -94,9 +166,187 @@
+     try mlx.check(mlx.mlx_mean_axis(&mean, stream, 2, false, m.s));
+     return m.rmsNorm(mean, m.final_norm);
+ }
++/// turboexl3_glm53f: a split prompt forward's spans (`Forward.split_rows`): span A, `a` rows from position `pos_a`, then
++/// span B, `b` rows from `pos_b` = `pos_a + a`.
++pub const Spans = struct { a: u32, b: u32, pos_a: u32, pos_b: u32 };
++/// turboexl3_glm53f: why a split prompt forward is refused, before any cache is touched.
++pub const SplitRefusal = error{ Glm53fSplitMode, Glm53fSplitSlots, Glm53fSplitCapture, Glm53fSplitMedia, Glm53fSplitStates, Glm53fSplitRows, Glm53fSplitShortSpan, Glm53fSplitRoutedPath };
++/// turboexl3_glm53f: the spans of a split forward of `f` whose span A is its first `rows_a` rows, or the refusal by name
++/// (MLX-free). Served: one slot's prompt rows (host tokens, or the engine's ids) without captures or media rows, a cache
++/// for span A's states (`has_states`), and two spans of more than `glm5.HC_PRE_MAX_ROWS` rows each: at that many rows or
++/// fewer a sublayer's hyper-connection takes `hcPre`'s one-dispatch arm and defers its expand (`sublayer`), at more it
++/// collapses and expands in place, so both spans take the arm their own forwards take. `routed_source`: every MoE
++/// layer runs both spans' routed experts in one call of the streamed bank's source (`splitServes`).
++pub fn splitSpans(f: *const abi.Forward, rows_a: u32, has_states: bool, routed_source: bool) SplitRefusal!Spans {
++    if (f.mode != .prefill) return error.Glm53fSplitMode;
++    if (f.caches.len != 1 or f.positions.len != 1) return error.Glm53fSplitSlots;
++    if (f.capture_layers.len > 0) return error.Glm53fSplitCapture;
++    if (f.media.ctx != null) return error.Glm53fSplitMedia;
++    if (!has_states) return error.Glm53fSplitStates;
++    if (rows_a >= f.rows or (f.ids.ctx == null and f.tokens.len != f.rows)) return error.Glm53fSplitRows;
++    const b = f.rows - rows_a;
++    const pos_a = f.positions.slice()[0];
++    const pos_b = std.math.add(u32, pos_a, rows_a) catch return error.Glm53fSplitRows;
++    const short: u32 = glm5.HC_PRE_MAX_ROWS;
++    if (rows_a <= short or b <= short) return error.Glm53fSplitShortSpan;
++    if (!routed_source) return error.Glm53fSplitRoutedPath;
++    return .{ .a = rows_a, .b = b, .pos_a = pos_a, .pos_b = pos_b };
++}
++/// turboexl3_glm53f: whether every MoE layer of `m` runs a split forward's spans of `rows_a` and `rows_b` rows in one
++/// call of the streamed bank's source (`glm_moe.splitServes`), checked before the forward runs any layer.
++pub fn splitServes(m: *const Model, rows_a: u32, rows_b: u32) bool {
++    const ra = std.math.cast(c_int, rows_a) orelse return false;
++    const rb = std.math.cast(c_int, rows_b) orelse return false;
++    for (m.layers[0..m.c.num_hidden_layers]) |*lw| switch (lw.mlp) {
++        .moe => |*mw| if (!glm_moe.splitServes(mw, ra, rb)) return false,
++        .dense => {},
++    };
++    return true;
++}
++/// turboexl3_glm53f: a split prompt forward's two spans on one slot's caches (`Forward.split_rows`): span A's rows
++/// (`st_a`, `ids_a`), then span B's (`st_b`, `ids_b`, positioned from A's end); each span's final-normed hidden `[1, S, H]`
++/// is what `hidden` returns for that span's own forward. Layer by layer: span A's attention sublayer, span A's recurrent
++/// states of the layer written to `states` (a KDA layer's `slots.prompt_state_slots`: the states the host snapshots at
++/// A's end) before span B's attention sublayer reads and replaces them in the slot's cache, then both spans' MLP
++/// sublayers, a MoE layer's routed experts in one streamed call over both spans' rows (`mlpSublayerSplit`), then each
++/// span's evaluation at `hidden`'s cadence. Each layer's KV and states are the layer's own (`CacheOps`, per layer), so A
++/// then B at every layer leaves the caches as A's forward then B's. Every op of a span reads that span's rows and those
++/// caches only, but the routed call, whose rows the bank's source runs each by itself. The caller refuses what this does
++/// not serve (`splitSpans`, `splitServes`).
++pub fn hiddenSplit(m: *Model, st_a: *const Step, st_b: *const Step, ids_a: Array, ids_b: Array, states: abi.Handle) ![2]Array {
++    const cfg = m.c;
++    const steps = [2]*const Step{ st_a, st_b };
++    const ids = [2]Array{ ids_a, ids_b };
++    for (steps) |st| if (st.batched or st.capture or st.capture_ids.len > 0 or st.media.ctx != null) return error.Glm53fSplitStep;
++    var streams: [2]Array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
++    defer for (streams) |x| {
++        _ = mlx.mlx_array_free(x);
++    };
++    var batch: [2]c_int = undefined;
++    var seq_len: [2]c_int = undefined;
++    var is_prefill: [2]bool = undefined;
++    // Each span's [B, S, HC, D] stream, as `hidden` builds it.
++    for (steps, ids, &streams, &batch, &seq_len, &is_prefill) |st, token_ids, *stream, *bt, *sl, *pf| {
++        const emb = try m.embedding(token_ids);
++        defer _ = mlx.mlx_array_free(emb);
++        const x_shape = mlx.getShape(emb);
++        bt.* = x_shape[0];
++        sl.* = x_shape[1];
++        pf.* = sl.* > 1 and !st.batched;
++        var e4 = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(e4);
++        try mlx.check(mlx.mlx_expand_dims(&e4, emb, 2, m.s));
++        try mlx.check(mlx.mlx_broadcast_to(stream, e4, &[_]c_int{ bt.*, sl.*, glm5.HC, x_shape[2] }, 4, m.s));
++    }
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_PF_REUSE: both spans' rows one prompt forward's, the limit put back at its end
++    pf_reuse.begin(is_prefill[0], @as(u64, @intCast(batch[0])) * @as(u64, @intCast(seq_len[0])) + @as(u64, @intCast(batch[1])) * @as(u64, @intCast(seq_len[1])));
++    defer pf_reuse.end();
++    const n_layers = cfg.num_hidden_layers;
++    var deferred: [2]?glm5.Deferred = .{ null, null };
++    defer for (&deferred) |*d| if (d.*) |*df| df.deinit();
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_HC_FUSE: each span's next collapse, made with the expand before it
++    var ahead: [2]?glm5.Collapsed = .{ null, null };
++    defer for (&ahead) |*p| if (p.*) |*c| c.deinit();
++    for (m.layers[0..n_layers], 0..) |*lw, li| {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_PF_REUSE: before the layer's attention (span A's, then span B's), its KDA
++        // run's cache limit
++        pf_reuse.layer(li, lw.mixer == .kda, li + 1 < n_layers and m.layers[li + 1].mixer == .kda);
++        try sublayer(m, st_a, &streams[0], &deferred[0], &ahead[0], lw, true, li, batch[0], seq_len[0], is_prefill[0]);
++        if (lw.mixer == .kda) for (slots_mod.prompt_state_slots) |which| try st_a.slots.copyState(0, @intCast(li), which, states);
++        try sublayer(m, st_b, &streams[1], &deferred[1], &ahead[1], lw, true, li, batch[1], seq_len[1], is_prefill[1]);
++        try mlpSublayerSplit(m, &streams, &deferred, &ahead, lw, li);
++        for (steps, streams, is_prefill) |st, stream, pf| {
++            if (pf and st.eval_every > 0 and ((li + 1) % st.eval_every == 0 or li + 1 == n_layers)) {
++                try st.slots.evalWith(stream, @intCast(li + 1), async_eval.take());
++            }
++            // turboexl3_glm53f: TURBOEXL3_GLM53F_PF_TAIL_EVAL: where the cadence's eval is not due, each span's layer
++            // tail (the routed call's combine, the shared expert and the stream update) handed to the GPU
++            if (pf and tail_eval.due(st.eval_every, li, n_layers)) try tail_eval.commit(stream);
++        }
++    }
++    var out: [2]Array = undefined;
++    var made: usize = 0;
++    errdefer for (out[0..made]) |a| {
++        _ = mlx.mlx_array_free(a);
++    };
++    for (&streams, &deferred, &out) |*stream, *d, *o| {
++        if (d.*) |*df| {
++            _ = mlx.mlx_array_free(stream.*);
++            stream.* = try df.materialize(m.s);
++        }
++        var mean = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(mean);
++        try mlx.check(mlx.mlx_mean_axis(&mean, stream.*, 2, false, m.s));
++        o.* = try m.rmsNorm(mean, m.final_norm);
++        made += 1;
++    }
++    return out;
++}
++/// turboexl3_glm53f: both spans' MLP sublayers of a split forward, each inside its hyper-connection as `sublayer` runs
++/// it (`attn` false), but a MoE layer's routed experts, which run in one call over both spans' rows
++/// (`glm_moe.forwardSplit`); a dense layer's MLP runs per span. `sublayer`'s one-token arm (`hcPre`, its expand
++/// deferred: spans of `glm5.HC_PRE_MAX_ROWS` rows or fewer) is not taken here: a split refuses such spans (`splitSpans`).
++fn mlpSublayerSplit(m: *Model, streams: *[2]Array, deferred: *[2]?glm5.Deferred, ahead: *[2]?glm5.Collapsed, lw: *const Layer, li: usize) !void {
++    const cfg = m.c;
++    const w = lw.ffn_hc.?;
++    const norm_w = lw.post_norm;
++    var cs: [2]glm5.Collapsed = undefined;
++    var made: usize = 0;
++    defer for (cs[0..made]) |*c| c.deinit();
++    var normed: [2]Array = .{ .{ .ctx = null }, .{ .ctx = null } };
++    defer for (normed) |a| if (a.ctx != null) {
++        _ = mlx.mlx_array_free(a);
++    };
++    for (streams, deferred, ahead, &cs, &normed) |*stream, *d, *p, *c, *nrm| {
++        if (glm5.hcRowsServes(m.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w)) return error.Glm53fSplitShortSpan;
++        if (d.*) |*df| {
++            _ = mlx.mlx_array_free(stream.*);
++            stream.* = try df.materialize(m.s);
++            df.deinit();
++            d.* = null;
++        }
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_HC_FUSE: the collapse the attention's expand made, else the copy's
++        c.* = if (p.*) |made_ahead| made_ahead else try glm5.collapse(m.s, stream.*, w.fn_rows, w.scale, w.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps);
++        p.* = null;
++        made += 1;
++        nrm.* = try m.rmsNorm(c.x, norm_w);
++    }
++    var outs: [2]Array = .{ .{ .ctx = null }, .{ .ctx = null } };
++    defer for (outs) |a| if (a.ctx != null) {
++        _ = mlx.mlx_array_free(a);
++    };
++    switch (lw.mlp) {
++        .moe => |*mw| {
++            outs = try glm_moe.forwardSplit(mw, m.s, normed[0], normed[1]);
++        },
++        .dense => |*dw| {
++            for (normed, &outs) |x, *o| o.* = try m.denseMlp(dw, x);
++        },
++    }
++    const next = nextHc(m, li, false);
++    for (streams, ahead, &cs, outs) |*stream, *p, *c, o| {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_HC_FUSE: the expand and the next layer's attention collapse as one text
++        if (next) |nw| if (try hc_fuse.expandCollapse(m.s, o, stream.*, c, nw.fn_rows, nw.scale, nw.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps)) |r| {
++            _ = mlx.mlx_array_free(stream.*);
++            stream.* = r.stream;
++            p.* = r.next;
++            continue;
++        };
++        const res = try glm5.expand(m.s, o, stream.*, c);
++        _ = mlx.mlx_array_free(stream.*);
++        stream.* = res;
++    }
++}
++/// turboexl3_glm53f: the hyper-connection of the sublayer after layer `li`'s attention (`attn`) or MLP: the layer's MLP's,
++/// the next layer's attention's, none after the last layer (TURBOEXL3_GLM53F_HC_FUSE makes its collapse with the expand).
++fn nextHc(m: *const Model, li: usize, attn: bool) ?trunk.Mhc {
++    if (attn) return m.layers[li].ffn_hc;
++    if (li + 1 >= m.c.num_hidden_layers) return null;
++    return m.layers[li + 1].attn_hc;
++}
+ /// One sublayer (attention when `attn`, else the MLP) inside its hyper-connection. For one token the expand stays
+ /// in `deferred` (then `stream` is stale until the forward materializes it).
+-fn sublayer(m: *Model, st: *const Step, stream: *Array, deferred: *?glm5.Deferred, lw: *const Layer, attn: bool, li: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !void {
++fn sublayer(m: *Model, st: *const Step, stream: *Array, deferred: *?glm5.Deferred, ahead: *?glm5.Collapsed, lw: *const Layer, attn: bool, li: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !void {
+     const cfg = m.c;
+     const w = if (attn) lw.attn_hc.? else lw.ffn_hc.?;
+     const norm_w = if (attn) lw.input_norm else lw.post_norm;
+@@ -107,39 +357,97 @@
+         df.deinit();
+         deferred.* = null;
+     };
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_HC_FUSE makes a collapse ahead for prompt rows only (the stream is current)
++    if (one) if (ahead.*) |*p| {
++        p.deinit();
++        ahead.* = null;
++    };
+     if (one) {
+         var pre = try glm5.hcPre(m.s, if (deferred.* == null) stream.* else null, if (deferred.*) |*df| df else null, w.fn_rows, w.scale, w.base, norm_w, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps, cfg.rms_norm_eps);
+         defer pre.deinit();
+-        const out = try branch(m, st, pre.normed, lw, attn, li, batch, seq_len, is_prefill);
+-        defer _ = mlx.mlx_array_free(out);
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: a MoE sublayer's routed sum and shared expert left unadded,
++        // for the next hcPre's defer2 text (`branch`'s MoE arm: no read-ahead hook runs at a MoE layer's MLP)
++        const po: glm_moe.PairOut = if (!attn and smallop.on and lw.mlp == .moe)
++            try glm_moe.forwardPair(&lw.mlp.moe, m.s, pre.normed)
++        else
++            .{ .one = try branch(m, st, pre.normed, lw, attn, li, batch, seq_len, is_prefill) };
++        defer switch (po) {
++            .one => |o| _ = mlx.mlx_array_free(o),
++            .pair => |p| for (p) |a| {
++                _ = mlx.mlx_array_free(a);
++            },
++        };
+         if (deferred.*) |*df| {
+             _ = mlx.mlx_array_set(stream, pre.h);
+             df.deinit();
+         }
+-        deferred.* = pre.defer_(out, stream.*);
++        deferred.* = switch (po) {
++            .one => |o| pre.defer_(o, stream.*),
++            .pair => |p| two: {
++                smallop.hc_pairs += 1;
++                break :two pre.defer2_(p[0], p[1], stream.*);
++            },
++        };
+         return;
+     }
+-    var c = try glm5.collapse(m.s, stream.*, w.fn_rows, w.scale, w.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps);
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_HC_FUSE: the collapse the expand before this sublayer made, else the copy's
++    var c = if (ahead.*) |made_ahead| made_ahead else try glm5.collapse(m.s, stream.*, w.fn_rows, w.scale, w.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps);
++    ahead.* = null;
+     defer c.deinit();
+     const normed = try m.rmsNorm(c.x, norm_w);
+     defer _ = mlx.mlx_array_free(normed);
+     const out = try branch(m, st, normed, lw, attn, li, batch, seq_len, is_prefill);
+     defer _ = mlx.mlx_array_free(out);
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_HC_FUSE: the expand and the next sublayer's collapse as one text where it serves
++    if (nextHc(m, li, attn)) |nw| if (try hc_fuse.expandCollapse(m.s, out, stream.*, &c, nw.fn_rows, nw.scale, nw.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps)) |r| {
++        _ = mlx.mlx_array_free(stream.*);
++        stream.* = r.stream;
++        ahead.* = r.next;
++        return;
++    };
+     const res = try glm5.expand(m.s, out, stream.*, &c);
+     _ = mlx.mlx_array_free(stream.*);
+     stream.* = res;
+ }
+ fn branch(m: *Model, st: *const Step, normed: Array, lw: *const Layer, attn: bool, li: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !Array {
+     if (st.batched) return branchSlots(m, st.slots, normed, lw, attn, li);
+-    return if (attn) switch (lw.mixer) {
++    // turboexl3_glm53f: READ_AHEAD3: a decode window's first routed layer scored on the last dense layer's MLP input and
++    // committed; read back once that layer's attention is committed behind the scores, and its likely records read ahead
++    // before its route. Only reads move: the routes, the ops and the outputs are the same.
++    // (a decode or verify window: `is_prefill` holds for a verify's rows too, so the window's rows decide)
++    const first: usize = m.c.first_k_dense_replace;
++    const window = @as(usize, @intCast(batch)) * @as(usize, @intCast(seq_len)) <= ahead_max_rows;
++    const ahead: ?routed_hooks.Routed = if (window and first > 0 and first < m.layers.len and (li + 1 == first or li == first)) aheadRouted(&m.layers[first]) else null;
++    if (ahead) |r| if (!attn and li + 1 == first) if (r.ahead_score_fn) |f| try f(r.ctx, normed).get();
++    const out = if (attn) switch (lw.mixer) {
+         .kda => |*la| try slots_mod.kda(m, st.slots, 0, normed, la, @intCast(li), batch, seq_len, is_prefill, st.capture),
+         .dsa => |*d| try dsaAttn(m, st.slots, 0, normed, d, @intCast(li), batch, seq_len),
+-        .mla => error.GlmLayerIsMla,
++        .mla => return error.GlmLayerIsMla,
+     } else switch (lw.mlp) {
+         .moe => |*mw| try glm_moe.forward(mw, m.s, normed),
+         .dense => |*dw| try m.denseMlp(dw, normed),
+     };
++    if (ahead) |r| if (attn and li == first) if (r.ahead_issue_fn) |f| {
++        try commitArrays(&.{out});
++        try f(r.ctx).get();
++    };
++    return out;
+ }
++/// turboexl3_glm53f: READ_AHEAD3: the rows a decode or verify window has at most (a prompt chunk has more).
++const ahead_max_rows: usize = 8;
++/// turboexl3_glm53f: READ_AHEAD3: a routed layer's streamed source hooks (null: a dense layer or no streamed bank).
++fn aheadRouted(lw: *const Layer) ?routed_hooks.Routed {
++    return switch (lw.mlp) {
++        .moe => |*mw| if (mw.streamed) |s| s.routed else null,
++        .dense => null,
++    };
++}
++/// turboexl3_glm53f: READ_AHEAD3: `arrays` committed with their pending work (an async eval: no host wait).
++fn commitArrays(arrays: []const Array) !void {
++    const vec = mlx.mlx_vector_array_new_data(arrays.ptr, arrays.len);
++    defer _ = mlx.mlx_vector_array_free(vec);
++    try mlx.check(mlx.mlx_async_eval(vec));
++}
+ /// One batched tick's branch: `normed` `[1, N, H]` holds N slots' next-token rows. The MLP and the projections read
+ /// their weights once for all N rows; a slot's own state (its KDA recurrence, its DSA cache) is advanced by its call.
+ fn branchSlots(m: *Model, sl: Slots, normed: Array, lw: *const Layer, attn: bool, li: usize) !Array {
+@@ -216,6 +524,8 @@
+ /// picks every earlier token the attention is plain causal and prefill runs it on lifted keys.
+ pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trunk.Dsa, layer: u32, batch: c_int, seq_len: c_int) !Array {
+     const cfg = m.c;
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_HOLD: a decode or verify forward drops what a prompt pass left held
++    if (seq_len <= glm5.HC_PRE_MAX_ROWS) dsa_hold.idle();
+     const s = m.s;
+     const offset: usize = sl.positions[slot];
+     const heads: c_int = @intCast(cfg.num_attention_heads);
+@@ -223,12 +533,22 @@
+     const r: c_int = @intCast(cfg.dsa_kv_lora_rank);
+     const ihd: c_int = @intCast(cfg.dsa_index_head_dim);
+     const ih: c_int = @intCast(cfg.dsa_index_heads);
+-    const q_a = try m.mm(&d.q_a, x);
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: q_a and kv_a in one launch at decode and verify rows, each at its
++    // own K split (turboexl3's glm53f.pair_ks)
++    const qkv: ?[2]Array = try smallop.dsaQkv(s, d.q_a.x3, d.kv_a.x3, x);
++    const q_a = if (qkv) |p| p[0] else try m.mm(&d.q_a, x);
+     defer _ = mlx.mlx_array_free(q_a);
+-    const kv_a = try m.mm(&d.kv_a, x);
++    const kv_a = if (qkv) |p| p[1] else try m.mm(&d.kv_a, x);
+     defer _ = mlx.mlx_array_free(kv_a);
+-    const q_resid = try m.rmsNorm(q_a, d.q_a_norm);
+-    defer _ = mlx.mlx_array_free(q_resid);
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: q_a's and kv_a's norms in one launch at decode and verify rows
++    const pn: ?[2]Array = try smallop.normPair(s, q_a, d.q_a_norm, kv_a, d.kv_a_norm, m.rms_eps);
++    defer if (pn) |p| for (p) |a| {
++        _ = mlx.mlx_array_free(a);
++    };
++    const q_resid = if (pn) |p| p[0] else try m.rmsNorm(q_a, d.q_a_norm);
++    defer if (pn == null) {
++        _ = mlx.mlx_array_free(q_resid);
++    };
+     const q_flat = try m.mm(&d.q_b, q_resid);
+     defer _ = mlx.mlx_array_free(q_flat);
+     var q4 = mlx.mlx_array_new();
+@@ -237,8 +557,10 @@
+     var qh = mlx.mlx_array_new(); // [B, H, S, hd]
+     defer _ = mlx.mlx_array_free(qh);
+     try mlx.check(mlx.mlx_transpose_axes(&qh, q4, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+-    const lat = try m.rmsNorm(kv_a, d.kv_a_norm);
+-    defer _ = mlx.mlx_array_free(lat);
++    const lat = if (pn) |p| p[1] else try m.rmsNorm(kv_a, d.kv_a_norm);
++    defer if (pn == null) {
++        _ = mlx.mlx_array_free(lat);
++    };
+     var lat4 = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(lat4);
+     try mlx.check(mlx.mlx_reshape(&lat4, lat, &[_]c_int{ batch, 1, seq_len, r }, 4, s));
+@@ -277,7 +599,11 @@
+         const n_prev: c_int = @min(@as(c_int, @intCast(offset)), kpool - 1);
+         var prev = mlx.mlx_array_new();
+         defer _ = mlx.mlx_array_free(prev);
+-        if (n_prev > 0) {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_TAILS: the rows the forward read at its start (null: the cache view's)
++        const early: ?Array = if (n_prev > 0) dsa_tails.take(sl, slot, layer, n_prev) else null;
++        if (early) |tail_rows| {
++            _ = mlx.mlx_array_set(&prev, tail_rows);
++        } else if (n_prev > 0) {
+             var cached = try sl.view(slot, layer, s);
+             defer cached.deinit();
+             const vsh = mlx.getShape(cached.v);
+@@ -286,7 +612,10 @@
+             try mlx.check(mlx.mlx_slice(&tail, cached.v, &[_]c_int{ 0, 0, vsh[2] - n_prev, 0 }, 4, &[_]c_int{ vsh[0], vsh[1], vsh[2], vsh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+             try mlx.check(mlx.mlx_reshape(&prev, tail, &[_]c_int{ batch, n_prev, 2 * ihd }, 3, s));
+         } else _ = mlx.mlx_array_set(&prev, rows3);
+-        const pooled = try glm5.withPooledKeys(s, prev, rows3, d.idx_ape, @intCast(offset), .{ .topk = @intCast(cfg.dsa_index_topk), .kpool = kpool, .heads = ih, .head_dim = ihd });
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_ROWS: the rows assembled by the pooled-keys launch from the key and the f32
++        // gate (no cached row to read: the key in `prev`'s place); null: the stock rows above, their cast and concatenate
++        const pooled = (try dsa_rows.pooled(s, if (n_prev > 0) prev else ikn, n_prev, ikn, gate, d.idx_ape, @intCast(offset))) orelse
++            try glm5.withPooledKeys(s, prev, rows3, d.idx_ape, @intCast(offset), .{ .topk = @intCast(cfg.dsa_index_topk), .kpool = kpool, .heads = ih, .head_dim = ihd });
+         defer _ = mlx.mlx_array_free(pooled);
+         var r4 = mlx.mlx_array_new();
+         try mlx.check(mlx.mlx_reshape(&r4, pooled, &[_]c_int{ batch, 1, seq_len, 2 * ihd }, 4, s));
+@@ -339,6 +668,13 @@
+             break :blk try m.headMm(qh_s, &d.embed_q, true);
+         };
+         defer _ = mlx.mlx_array_free(q_abs);
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_HOLD: a trunk layer's prompt span (not the MTP head's) releases what its
++        // previous DSA layer kept into MLX's cache under the limit in force raised by its bytes, then evaluates q_abs (its
++        // allocation now)
++        const trunk_span = batch == 1 and seq_len > glm5.HC_PRE_MAX_ROWS and layer < m.layers.len and m.layers[layer].mixer == .dsa and &m.layers[layer].mixer.dsa == d;
++        var hold = dsa_hold.release(trunk_span, layer, rows, dsa_hold.bytesOf(q_abs));
++        defer dsa_hold.restore(&hold);
++        try dsa_hold.settle(&hold, q_abs);
+         var o_lat = mlx.mlx_array_new();
+         defer _ = mlx.mlx_array_free(o_lat);
+         if (glm5.selectsAll(t, ix) and rows <= glm5.HC_PRE_MAX_ROWS and batch == 1) {
+@@ -386,27 +722,50 @@
+             var idx_cache = mlx.mlx_array_new();
+             defer _ = mlx.mlx_array_free(idx_cache);
+             try mlx.check(mlx.mlx_reshape(&idx_cache, view.v, &[_]c_int{ batch, t, 2 * ihd }, 3, s));
+-            const sel = try glm5.selectTokens(s, q_idx, wts, idx_cache, ix);
++            // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_WFOLD: a window's selection from the projection as it is (null: the stock
++            // chain, which runs the cast and both scale multiplies above)
++            const sel = (try dsa_wfold.select(s, q_idx, wp, idx_cache)) orelse try glm5.selectTokens(s, q_idx, wts, idx_cache, ix);
+             defer _ = mlx.mlx_array_free(sel);
+-            const nax = if (rows > 8) try glm5.sparseLatentNax(s, q_abs, view.k, sel, q_scale orelse 1.0) else null;
++            // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_ONEP: a prompt pass's rows on the one-P form where it serves
++            const nax = if (rows > 8) (if (seq_len > glm5.HC_PRE_MAX_ROWS) try dsa_prompt.sparseOneP(s, q_abs, view.k, sel, q_scale orelse 1.0) else null) orelse
++                try glm5.sparseLatentNax(s, q_abs, view.k, sel, q_scale orelse 1.0) else null;
+             const lat_out = nax orelse try glm5.sparseLatentAttention(s, q_abs, view.k, sel, q_scale, 64);
+             _ = mlx.mlx_array_free(o_lat);
+             o_lat = lat_out;
++            // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_HOLD: o_lat evaluated now (its allocation under the raised limit), the
++            // limit back, and both kept for the forward's next trunk DSA layer
++            try dsa_hold.settle(&hold, o_lat);
++            dsa_hold.restore(&hold);
++            dsa_hold.keep(trunk_span, nextDsa(m, layer), rows, q_abs, o_lat);
+         }
+         parts[1] = try m.headMm(o_lat, &d.unembed, true);
+     }
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_OPREP: a verify's per-head values read where they lie as the out projection's
++    // prepared input, DEC-ONE's GEMV over it, the cache row its dependency as below (null: the copy below)
++    if (parts[0].ctx == null and parts[1].ctx != null) if (try dec_prep.dsaOut(s, parts[1], d.o.x3)) |y| {
++        defer _ = mlx.mlx_array_free(y);
++        return glm5.withDependency(y, view.v);
++    };
+     var o = mlx.mlx_array_new(); // [B, H, S, hd]
+     defer _ = mlx.mlx_array_free(o);
++    // turboexl3_glm53f: TURBOEXL3_GLM53F_DSA_GLM: both parts in the output's row order in one copy (o [B, S, H, hd]:
++    // no transpose below)
++    var rows_first = false;
+     if (parts[0].ctx != null and parts[1].ctx != null) {
+-        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+-        defer _ = mlx.mlx_vector_array_free(vec);
+-        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 2, s));
++        rows_first = try dsa_glm.assemble(&o, s, parts[0], parts[1]);
++        if (!rows_first) {
++            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
++            defer _ = mlx.mlx_vector_array_free(vec);
++            try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 2, s));
++        }
+     } else {
+         try mlx.check(mlx.mlx_array_set(&o, if (parts[0].ctx != null) parts[0] else parts[1]));
+     }
+     var ot = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(ot);
+-    try mlx.check(mlx.mlx_transpose_axes(&ot, o, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
++    if (rows_first) {
++        try mlx.check(mlx.mlx_array_set(&ot, o));
++    } else try mlx.check(mlx.mlx_transpose_axes(&ot, o, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+     var flat = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(flat);
+     try mlx.check(mlx.mlx_reshape(&flat, ot, &[_]c_int{ batch, seq_len, heads * hd }, 3, s));
+diff -ruN -x .generated a/plugins/glm5_next/trunk.zig b/plugins/glm5_next/trunk.zig
+--- a/plugins/glm5_next/trunk.zig
++++ b/plugins/glm5_next/trunk.zig
+@@ -30,6 +30,14 @@
+ const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
+ const config = @import("config.zig");
+ const glm5 = @import("glm5_next.zig");
++/// turboexl3_glm53f: an exllamav3 pack's EXL3 linears (trellis, suh, svh) run on turboexl3.
++const t3 = @import("turboexl3");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE (src/smallop.zig): a dense layer's gate and up in one launch at
++/// decode and verify rows.
++const smallop = @import("../../../smallop.zig");
++/// turboexl3_glm53f: TURBOEXL3_GLM53F_TRUNK_F16_FREE (src/f16_free.zig): a plain f16 matrix's source let go once its bf16
++/// cast is evaluated.
++const f16_free = @import("../../../f16_free.zig");
+ const Array = mlx.mlx_array;
+ pub const Linear = linear.Linear;
+ const build_options = @import("build_options");
+@@ -128,6 +136,9 @@
+     eh_proj: Linear,
+     dsa: Dsa,
+     moe: moe.Moe.Weights,
++    /// turboexl3_glm53f: TURBOEXL3_GLM53F_MTP_ROUTER (src/fused_router.zig): a streamed pack's head router as stored (bf16
++    /// `[experts, hidden]`), loaded only with the switch, for ROUTER's plan.
++    router_raw: Array = .{},
+ };
+ /// The KDA layers' constants, built on first use in the projections' dtype (the legacy `gdn_*` caches).
+ pub const KdaConsts = struct {
+@@ -173,6 +184,7 @@
+     }
+     /// `x @ l^T` at `l`'s own quant geometry.
+     pub fn mm(m: *const Model, l: *const Linear, x: Array) !Array {
++        if (l.x3) |p| return t3.linear(m.s, x, p.trellis, p.suh, p.svh, .mul1);
+         return qmatmulBits(x, l.w, l.s, l.b, l.bits, l.group_size, l.mode, m.s);
+     }
+     pub fn rmsNorm(m: *const Model, x: Array, w: Array) !Array {
+@@ -220,7 +232,7 @@
+     /// The logits of `x`: a dense head `[vocab, hidden]` is read through a transposed view (the embedding it may
+     /// alias stays `[vocab, hidden]`).
+     pub fn lmHead(m: *const Model, x: Array) !Array {
+-        if (m.head.s.ctx != null) return m.mm(&m.head, x);
++        if (m.head.s.ctx != null or m.head.x3 != null) return m.mm(&m.head, x);
+         const wt = try transposeLast(m.head.w, m.s);
+         defer _ = mlx.mlx_array_free(wt);
+         var out = mlx.mlx_array_new();
+@@ -250,6 +262,12 @@
+             }
+             try fused_rows.sliceQkvPart(&gate, both, 0, dw.gu.widths[0], s);
+             try fused_rows.sliceQkvPart(&up, both, dw.gu.widths[0], dw.gu.widths[1], s);
++        } else if (try smallop.denseGateUp(s, dw.gate.x3, dw.up.x3, x)) |gu| {
++            // turboexl3_glm53f: TURBOEXL3_GLM53F_SMALLOP_FUSE: the two EXL3 linears in one launch, each its own bytes
++            _ = mlx.mlx_array_free(gate);
++            _ = mlx.mlx_array_free(up);
++            gate = gu[0];
++            up = gu[1];
+         } else {
+             gate = try m.mm(&dw.gate, x);
+             up = try m.mm(&dw.up, x);
+@@ -364,7 +382,8 @@
+ }
+ // ── load ──
+ /// A weight triple as stored (`<base>.{weight,scales,biases}`), scales and biases absent on a dense weight.
+-const Triple = struct { w: Array, s: Array = .{}, b: Array = .{} };
++/// turboexl3_glm53f: `x3`, an exllamav3 linear as stored (`w` its trellis).
++const Triple = struct { w: Array, s: Array = .{}, b: Array = .{}, x3: ?t3.Proj = null };
+ const Loader = struct {
+     src: *const quant_abi.Source,
+     c: *const Config,
+@@ -377,6 +396,16 @@
+         if (a.ctx != null) try l.owned.append(gpa, a);
+         return a;
+     }
++    /// turboexl3_glm53f: TURBOEXL3_GLM53F_TRUNK_F16_FREE: `a`, an f16 source this load cast to bf16, out of the model's
++    /// arrays and into src/f16_free.zig's hands until the load is done (its owned handle moved, else a new reference)
++    fn letGo(l: *Loader, a: Array) !void {
++        for (l.owned.items, 0..) |o, i| if (o.ctx == a.ctx) {
++            try f16_free.take(a);
++            _ = l.owned.swapRemove(i);
++            return;
++        };
++        try f16_free.hold(a);
++    }
+     /// A reference of the model's own on `a` (a source tensor, or one this load made).
+     fn keep(l: *Loader, a: Array) !Array {
+         if (a.ctx == null) return a;
+@@ -407,6 +436,13 @@
+     /// A release's e4m3 projection carries its 64 x 128 scale grid as `weight_scale_inv` (`fp8_block128`).
+     fn triple(l: *const Loader, base: []const u8) !Triple {
+         var nb: [256]u8 = undefined;
++        // turboexl3_glm53f: an exllamav3 linear (`.trellis`, `.suh`, `.svh`; its `.mul1` is the codebook's, checked at parse).
++        const tr = l.get(try std.fmt.bufPrint(&nb, "{s}.trellis", .{base}));
++        if (tr.ctx != null) {
++            var sb: [256]u8 = undefined;
++            const x3: t3.Proj = .{ .trellis = tr, .suh = try l.need(try std.fmt.bufPrint(&sb, "{s}.suh", .{base})), .svh = try l.need(try std.fmt.bufPrint(&nb, "{s}.svh", .{base})) };
++            return .{ .w = tr, .x3 = x3 };
++        }
+         const sc = l.get(try std.fmt.bufPrint(&nb, "{s}.scales", .{base}));
+         return .{
+             .w = try l.need(try std.fmt.bufPrint(&nb, "{s}.weight", .{base})),
+@@ -416,15 +452,28 @@
+     }
+     /// A dense weight stored `[out, in]` as the `[in, out]` view a plain matmul reads.
+     fn transposed(l: *Loader, t: *Triple) !void {
+-        if (t.s.ctx != null or t.w.ctx == null) return;
++        if (t.s.ctx != null or t.w.ctx == null or t.x3 != null) return;
+         t.w = try l.own(try transposeLast(t.w, l.s));
+     }
+     fn kept(l: *Loader, t: Triple) !Triple {
++        if (t.x3) |p| {
++            const x3: t3.Proj = .{ .trellis = try l.keep(p.trellis), .suh = try l.keep(p.suh), .svh = try l.keep(p.svh) };
++            return .{ .w = x3.trellis, .x3 = x3 };
++        }
+         return .{ .w = try l.keep(t.w), .s = try l.keep(t.s), .b = try l.keep(t.b) };
+     }
+     fn lin(l: *Loader, raw: Triple, in_dim: ?u32) !Linear {
++        // turboexl3_glm53f: TURBOEXL3_GLM53F_TRUNK_F16_FREE (src/f16_free.zig): a plain f16 matrix cast to bf16 as below,
++        // its f16 source then let go (no reference of the model's on it)
++        if (f16_free.on and raw.x3 == null and raw.s.ctx == null and raw.w.ctx != null and mlx.mlx_array_dtype(raw.w) == .float16 and mlx.getShape(raw.w).len >= 2) {
++            const bf = try l.own(try astypeEval(raw.w, .bfloat16, l.s));
++            try l.letGo(raw.w);
++            return .{ .w = bf };
++        }
+         const t = try l.kept(raw);
+-        if (t.s.ctx == null) return .{ .w = t.w };
++        if (t.x3) |p| return .{ .w = p.trellis, .x3 = p };
++        // turboexl3_glm53f: an exllamav3 pack's plain f16 matrices in the activation dtype (bf16), so no matmul promotes.
++        if (t.s.ctx == null) return .{ .w = if (t.w.ctx != null and mlx.mlx_array_dtype(t.w) == .float16 and mlx.getShape(t.w).len >= 2) try l.own(try astypeEval(t.w, .bfloat16, l.s)) else t.w };
+         // e4m3: the matmul knows it by its dtypes; no affine kernel may claim it.
+         if (fp8_block128.isBlockScaled(t.w, t.s)) return .{ .w = t.w, .s = t.s, .bits = 0, .group_size = fp8_block128.block_cols };
+         const qp = resolve(l.c, t.w, t.s, in_dim);
+@@ -499,17 +548,22 @@
+         var parts: [3]Triple = undefined;
+         var conv_w: [3]Array = undefined;
+         var any_scales = false;
+-        for (&parts, &conv_w, [_][]const u8{ "q", "k", "v" }) |*p, *cw, x| {
+-            p.* = try l.triple(try std.fmt.bufPrint(&nb, "{s}.{s}_proj", .{ base, x }));
+-            if (p.s.ctx != null) any_scales = true;
+-            // The reference nests the conv in a module (`<x>_conv1d.conv.weight`); mlx-lm flattens it.
+-            if (fused_conv.ctx == null) {
+-                cw.* = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}_conv1d.conv.weight", .{ base, x }));
+-                if (cw.ctx == null) cw.* = try l.need(try std.fmt.bufPrint(&nb, "{s}.{s}_conv1d.weight", .{ base, x }));
++        // turboexl3_glm53f: an exllamav3 pack ships q|k|v as one EXL3 `qkv_proj` (beside the joined conv).
++        const fused_qkv = l.has(try std.fmt.bufPrint(&nb, "{s}.qkv_proj.trellis", .{base}));
++        if (fused_qkv and fused_conv.ctx == null) return error.Glm53fKdaConvNotJoined;
++        if (!fused_qkv) {
++            for (&parts, &conv_w, [_][]const u8{ "q", "k", "v" }) |*p, *cw, x| {
++                p.* = try l.triple(try std.fmt.bufPrint(&nb, "{s}.{s}_proj", .{ base, x }));
++                if (p.s.ctx != null) any_scales = true;
++                // The reference nests the conv in a module (`<x>_conv1d.conv.weight`); mlx-lm flattens it.
++                if (fused_conv.ctx == null) {
++                    cw.* = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}_conv1d.conv.weight", .{ base, x }));
++                    if (cw.ctx == null) cw.* = try l.need(try std.fmt.bufPrint(&nb, "{s}.{s}_conv1d.weight", .{ base, x }));
++                }
+             }
+         }
+         // q, k and v join only when quantized identically; otherwise each projects alone.
+-        const joinable = blk: {
++        const joinable = !fused_qkv and blk: {
+             var w_cols: [3]c_int = undefined;
+             var s_cols: [3]c_int = undefined;
+             for (parts, 0..) |p, n| {
+@@ -519,7 +573,7 @@
+             }
+             break :blk fused_rows.joinableCols(&w_cols) and fused_rows.joinableCols(&s_cols);
+         };
+-        var qkv: Triple = .{ .w = .{} };
++        var qkv: Triple = if (fused_qkv) try l.triple(try std.fmt.bufPrint(&nb, "{s}.qkv_proj", .{base})) else .{ .w = .{} };
+         var qkv_parts: [3]Triple = @splat(.{ .w = .{} });
+         if (joinable) {
+             qkv.w = try l.own(try array.concatRows(&.{ parts[0].w, parts[1].w, parts[2].w }, l.s));
+@@ -527,7 +581,7 @@
+                 qkv.s = try l.own(try array.concatRows(&.{ parts[0].s, parts[1].s, parts[2].s }, l.s));
+                 if (parts[0].b.ctx != null) qkv.b = try l.own(try array.concatRows(&.{ parts[0].b, parts[1].b, parts[2].b }, l.s));
+             }
+-        } else qkv_parts = parts;
++        } else if (!fused_qkv) qkv_parts = parts;
+         var joined_conv = if (fused_conv.ctx != null) fused_conv else try l.own(try array.concatRows(&conv_w, l.s));
+         // HF-layout packs store the depthwise conv `[C, 1, K]`; MLX's conv1d reads `[C, K, 1]`.
+         const csh = mlx.getShape(joined_conv);
+@@ -650,7 +704,9 @@
+         // mlx-lm quantizes the router under its module (`mlp.gate.gate_proj`); the reference keeps `mlp.gate`.
+         const rt = if (!l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.weight", .{base})) and l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.gate_proj.weight", .{base}))) "mlp.gate.gate_proj" else "mlp.gate";
+         const ex = if (l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.experts.gate_proj.weight", .{base}))) "mlp.experts" else "mlp.switch_mlp";
+-        const spec: ?exl3.Spec = if (glm) l.exl3 else null;
++        // turboexl3_glm53f: no resident Sushi bank (`expert_quant`): the plugin's packs stream their routed experts and
++        // bind the MTP layer's itself (turboexl3's Spec has no codebook table, so that arm does not compile here).
++        const spec: ?exl3.Spec = null;
+         const lf: [3][]const u8 = if (spec != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
+         // A streamed pack's experts live in its bank (`experts.bin`), bound after the load.
+         var banks: [3]Triple = @splat(.{ .w = .{} });
+@@ -725,7 +781,7 @@
+         const root = if (std.mem.endsWith(u8, l.prefix, ".model")) l.prefix[0 .. l.prefix.len - ".model".len] else l.prefix;
+         const base = try std.fmt.bufPrint(&bb, "{s}.mtp.0", .{root});
+         var nb: [256]u8 = undefined;
+-        if (!l.has(try std.fmt.bufPrint(&nb, "{s}.eh_proj.weight", .{base}))) return null;
++        if (!l.has(try std.fmt.bufPrint(&nb, "{s}.eh_proj.weight", .{base})) and !l.has(try std.fmt.bufPrint(&nb, "{s}.eh_proj.trellis", .{base}))) return null;
+         var kb: [112]u8 = undefined;
+         const block = try std.fmt.bufPrint(&kb, "{s}.block", .{base});
+         return .{
+@@ -736,7 +792,10 @@
+             .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{block})),
+             .eh_proj = try l.proj(try std.fmt.bufPrint(&nb, "{s}.eh_proj", .{base}), 2 * c.hidden_size),
+             .dsa = try l.dsa(block),
+-            .moe = try l.routed(block, false),
++            // turboexl3_glm53f: a streamed pack's head experts are its own bank's (`mtp-experts.bin`), bound after the load.
++            .moe = try l.routed(block, c.streamed),
++            // turboexl3_glm53f: TURBOEXL3_GLM53F_MTP_ROUTER: the head's router as stored, for ROUTER's plan (off: none)
++            .router_raw = if (c.streamed and @import("../../../fused_router.zig").mtp_on) try l.keep(try l.need(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.weight", .{block}))) else .{},
+         };
+     }
+     /// Every layer, in order; on a failure the built ones' compiled routing goes with the slice.
+@@ -849,8 +908,9 @@
+     }
+     m.final_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.norm.weight", .{prefix}));
+     const lm_prefix = if (std.mem.eql(u8, prefix, "language_model.model")) "language_model" else prefix;
+-    var head: Triple = .{ .w = l.get(try std.fmt.bufPrint(&nb, "{s}.lm_head.weight", .{lm_prefix})) };
+-    if (head.w.ctx != null) {
++    // turboexl3_glm53f: an exllamav3 pack's head is EXL3 (`lm_head.trellis`).
++    var head: Triple = if (l.has("lm_head.trellis")) try l.triple("lm_head") else .{ .w = l.get(try std.fmt.bufPrint(&nb, "{s}.lm_head.weight", .{lm_prefix})) };
++    if (head.x3 != null) {} else if (head.w.ctx != null) {
+         if (!floatDtype(head.w)) {
+             head.s = try l.need(try std.fmt.bufPrint(&nb, "{s}.lm_head.scales", .{lm_prefix}));
+             const bn = try std.fmt.bufPrint(&nb, "{s}.lm_head.biases", .{lm_prefix});
