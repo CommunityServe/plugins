@@ -20,6 +20,7 @@ pub const all = [_]Decl{
     .{ .name = "TURBOEXL3_GLM53F_LAYER_BILL", .kind = .bool, .default = "1", .help = "Bill the slot rows at each routed layer's own row size (the pack's v2 manifest), not the widest" },
     .{ .name = "TURBOEXL3_GLM53F_GROW_UNFILLED", .kind = .bool, .default = "1", .help = "Take the decode grow's new slot rows as MLX buffers without the zero fill" },
     .{ .name = "TURBOEXL3_GLM53F_PROMPT_KEEP", .kind = .bool, .default = if (seams.prompt_keep) "1" else "0", .help = "No prompt-phase admission evicts a resident expert (needs the kit stream's prompt_keep seam)" },
+    .{ .name = "TURBOEXL3_GLM53F_PREDICT", .kind = .bool, .default = "1", .help = "The decode lookahead's next-layer scores on the kit's router NAX plan (router_nax.predict: the stock predictor's bits)" },
     .{ .name = "TURBOEXL3_GLM53F_SPEC_PICK1", .kind = .bool, .default = "1", .help = "The decode lookahead reads ahead one record a layer call, its most likely (off: 2); the read pool unchanged" },
     .{ .name = "TURBOEXL3_GLM53F_DEMAND_HELP", .kind = .number, .default = "0", .help = "0 off (rejected in its A/B); 2 decode's read pool puts its demand first and a waiting demand read takes its claimed record's untaken pieces (the kit stream's demandFirst(2))" },
     .{ .name = "TURBOEXL3_GLM53F_ADOPT_PIECES", .kind = .bool, .default = if (seams.adopt_pieces) "1" else "0", .help = "A demand read served from a lookahead record copies its bytes in pieces across the read pool's workers (needs the kit stream's adopt_pieces seam)" },
@@ -124,7 +125,7 @@ test "turboexl3_glm53f stream options: every default is the frozen exact configu
         }
         try t.expectEqualStrings(d.default, defaultOf(d.name).?);
     }
-    try t.expectEqual(@as(usize, 19), all.len);
+    try t.expectEqual(@as(usize, 20), all.len);
     try t.expectEqualStrings("g4m3.t4.t4", defaultOf("TURBOEXL3_GLM53F_BANKED").?);
     try t.expectEqualStrings("g1", defaultOf("TURBOEXL3_GLM53F_DEC").?);
     try t.expectEqualStrings("bk128", defaultOf("TURBOEXL3_GLM53F_PF_OPTS").?);
