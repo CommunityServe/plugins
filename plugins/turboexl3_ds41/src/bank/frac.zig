@@ -18,6 +18,10 @@
 //! bank's rows; the banked decode as before. A layer at
 //! n 32 or 48 runs exactly as it did (the same launches, the same words): a pack without a fractional layer is served
 //! byte for byte as before.
+//!
+//! TURBOEXL3_DS41_PF_INT8 (src/pf_int8.zig; not exact) moves the prompt calls of the layers at n 32 (K 2) onto the same
+//! turboexl3 path too (routed.zig, `int8_n`), where turboexl3's int8 prefill GEMMs serve them; their decode waves stay
+//! banked, and n 48 stays on the DIG-X lane. Unset, nothing here changes.
 
 const std = @import("std");
 
@@ -40,6 +44,8 @@ pub const Error = error{FracSetting};
 pub const frac_n = [_]u32{ 24, 40 };
 /// The widths the streamer's DIG-X lane and decode GEMVs have texts for: K 2 and K 3.
 pub const digx_n = [_]u32{ 32, 48 };
+/// The DIG-X width whose prompt calls TURBOEXL3_DS41_PF_INT8 moves onto turboexl3 (K 2).
+pub const int8_n: u32 = 32;
 
 /// A fractional wide call's pairs a `moeClamped` call: bounds a chunk's working set (its rows in bf16 and f32, the
 /// turboexl3 chain's intermediates, its f32 output) at about half a GiB, two chunks in flight, about the stock lane's two
@@ -126,6 +132,25 @@ pub fn loadLine(buf: []u8, widths: []const u32) []const u8 {
     return w.buffered();
 }
 
+/// The load line of TURBOEXL3_DS41_PF_INT8's move: the layers at `int8_n` (`widths[L]` halfwords a tile).
+pub fn int8LoadLine(buf: []u8, widths: []const u32) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    w.print("deepseek_v41: TURBOEXL3_DS41_PF_INT8: the n{d} (K {d}) layers' prompt calls on turboexl3's int8 prefill too, layers ", .{ int8_n, int8_n / 16 }) catch {};
+    var first = true;
+    var l: usize = 0;
+    while (l < widths.len) : (l += 1) {
+        if (widths[l] != int8_n) continue;
+        var e = l;
+        while (e + 1 < widths.len and widths[e + 1] == int8_n) e += 1;
+        if (!first) w.writeAll(",") catch {};
+        if (e == l) w.print("{d}", .{l}) catch {} else w.print("{d}-{d}", .{ l, e }) catch {};
+        first = false;
+        l = e;
+    }
+    w.writeAll(" (their decode waves banked as before)\n") catch {};
+    return w.buffered();
+}
+
 /// The cold rows' gate|up of a fractional layer runs at its down, whole (turboexl3's banked call reads the down's suh in
 /// its gate|up finish): `gateUp` returns its rows and parks the call's gate and up arrays here, keyed by the rows'
 /// array; `down` takes them back. A small ring: the hook runs a chunk's down right after its gate|up, or a wave's groups'
@@ -195,6 +220,17 @@ test "frac: the load line names the fractional runs" {
     var z: [40]u32 = @splat(48);
     z[23] = 32;
     try testing.expect(std.mem.indexOf(u8, loadLine(&buf, &z), "no fractional layer") != null);
+}
+
+test "frac: TURBOEXL3_DS41_PF_INT8's load line names the K 2 layers' runs" {
+    var w: [40]u32 = @splat(32);
+    for (0..6) |l| w[l] = 40;
+    for (35..40) |l| w[l] = 40;
+    w[20] = 48;
+    var buf: [512]u8 = undefined;
+    const line = int8LoadLine(&buf, &w);
+    try testing.expect(std.mem.indexOf(u8, line, "the n32 (K 2) layers' prompt calls on turboexl3's int8 prefill too, layers 6-19,21-34 (") != null);
+    try testing.expect(std.mem.endsWith(u8, line, "\n"));
 }
 
 test "frac: the parked gate|up ring" {

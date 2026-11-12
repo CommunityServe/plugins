@@ -2,7 +2,11 @@
 //! one finish launch for every group, each group's W_hat decoded once a layer and kept across its runs (`Hats`, 67 MB
 //! at the pack's shape), MLX's matmul per group between: 10 launches a run where the per-group `linear` took 41. The
 //! same words: every value statement is turboexl3's prep.metal / finish.metal, re-addressed; decode rows keep the stock
-//! call.
+//! call. Where turboexl3's trunk int8 takes the inner products a host splits off at the group's shape
+//! (TURBOEXL3_DS41_PF_INT8 3 or 4: `t3.trunk_q8.innerTakes`), each group's inner product is its int8 one instead, as
+//! turboexl3's split-off pieces run it: the group's int8 weights decoded once a layer and kept (`Hats.int8`, half the
+//! bytes), then per run the int8 prepare of the joined prepare's plane and the int8 GEMM to z (`trunk_q8.piecePrepared`),
+//! the joined finish over z as before.
 
 const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
@@ -102,11 +106,12 @@ pub fn deinit() void {
 // ── a run ──
 
 /// A layer's kept W_hat, one per group (turboexl3's `Dense.dequantize` of the group's trellis), decoded at the layer's
-/// first joined run and freed at its end (`deinit`).
+/// first joined run and freed at its end (`deinit`); with `int8`, each group's int8 weights instead (`trunk_q8.decodeW`).
 pub const Hats = struct {
     trellis: A = none,
     w: [max_groups]A = @splat(none),
     n: usize = 0,
+    int8: bool = false,
     pub fn deinit(h: *Hats) void {
         for (h.w[0..h.n]) |x| _ = mlx.mlx_array_free(x);
         h.* = .{};
@@ -166,24 +171,28 @@ pub fn run(s: mlx.mlx_stream, x: A, p: t3.Proj, hats: *Hats) !?A {
     if (rows <= t3.kernels.DECODE_ROWS_MAX) return null;
     const d = try t3.denseCached(.{ .in = @intCast(in), .out = @intCast(out), .rate = shape.rate, .dec = .mul1, .out_dtype = xd });
     if (d.pathFor(rows) != .matmul) return null;
-    if (hats.n != 0 and hats.trellis.ctx != p.trellis.ctx) return error.WoaJoinHats;
+    // turboexl3's trunk int8 on the split-off inner products at the group's shape (TURBOEXL3_DS41_PF_INT8 3 or 4)
+    const q8 = t3.trunk_q8.innerTakes(d);
+    if (hats.n != 0 and (hats.trellis.ctx != p.trellis.ctx or hats.int8 != q8)) return error.WoaJoinHats;
 
     // One prepare launch: xp half [G, rows, in] (prep.metal's natural order, LANE_ORDER 0).
     const xp = try launch(kp, &.{ x, p.suh }, &.{ ci(g), ci(rows), ci(in) }, .float16, .{ ci(in / 128 * 32), ci(rows), ci(g) }, &.{ .{ .name = "DIM", .v = ci(in) }, .{ .name = "LANE_ORDER", .v = 0 }, .{ .name = "G", .v = ci(g) } }, null, .float16, s);
     defer _ = mlx.mlx_array_free(xp);
 
-    // The groups' W_hat, decoded once a layer (the per-group `linear`'s own dequantize of its trellis slice).
+    // The groups' W_hat, decoded once a layer (the per-group `linear`'s own dequantize of its trellis slice), or on
+    // trunk int8 its int8 weights (`root.linearPiecesBegin`'s int8 decode).
     if (hats.n == 0) {
         var t = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(t);
         try mlx.check(mlx.mlx_reshape(&t, p.trellis, &[_]c_int{ tsh[0] * tsh[1], tsh[2], tsh[3] }, 3, s));
         hats.trellis = p.trellis;
+        hats.int8 = q8;
         for (0..g) |gi| {
             const lo: c_int = @intCast(gi);
             var v = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(v);
             try mlx.check(mlx.mlx_slice(&v, t, &[_]c_int{ lo * tsh[1], 0, 0 }, 3, &[_]c_int{ (lo + 1) * tsh[1], tsh[2], tsh[3] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-            hats.w[gi] = try d.dequantize(s, v);
+            hats.w[gi] = if (q8) try t3.trunk_q8.decodeW(s, d, v) else try d.dequantize(s, v);
             hats.n = gi + 1;
         }
     }
@@ -202,6 +211,12 @@ pub fn run(s: mlx.mlx_stream, x: A, p: t3.Proj, hats: *Hats) !?A {
         var xg = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(xg);
         try mlx.check(mlx.mlx_reshape(&xg, plane, &[_]c_int{ ci(rows), ci(in) }, 2, s));
+        if (q8) {
+            // the plane's int8 prepare and the int8 GEMM to z half [rows, out], trunk int8's own launches
+            z[gi] = try t3.trunk_q8.piecePrepared(d, s, xg, hats.w[gi], rows);
+            made = gi + 1;
+            continue;
+        }
         z[gi] = mlx.mlx_array_new();
         made = gi + 1;
         try mlx.check(mlx.mlx_matmul(&z[gi], xg, hats.w[gi], s));
