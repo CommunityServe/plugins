@@ -367,6 +367,9 @@ fn openBank(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.B
     };
     // `[stream-stats]` where the kit's Bank carries the request's summary lines
     if (comptime @hasField(abi.Bank, "meters")) out.meters = &Bank.meters;
+    // A prompt call's rows each run by themselves (turboexl3's prompt GEMMs reduce a row over its own K only, in an order
+    // the call's other rows do not move): a split prompt forward may run two prompt forwards' rows in one call.
+    if (comptime @hasField(abi.Bank, "rows_independent")) out.rows_independent = true;
     return .ok;
 }
 
