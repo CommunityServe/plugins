@@ -30,6 +30,20 @@
       "icon": "plugins/turboexl3_ds41/icon.png"
     },
     {
+      "name": "turboexl3_ling",
+      "title": "TurboEXL3 - Ling 3.1 Flash",
+      "kind": "model",
+      "version": "0.1.0",
+      "summary": "Ling-3.1-flash EXL3 packs streamed from SSD: mlx-serve's own Ling (bailing_hybrid) model and expert streamer, the EXL3 math in turboexl3, on M5-class Macs (NAX).",
+      "models": [
+        "bailing_hybrid with an exllamav3 quantization_config and an experts.bin bank (turboderp/Ling-3.1-flash-exl3 2.60bpw and 2.10bpw, repacked by qwen38-exl3-mlx-serve-converter/scripts/ling_exl3_to_streaming.py)"
+      ],
+      "requires_mlx_serve": ">=26.11.3",
+      "fixture": "none",
+      "homepage": "https://github.com/davidtai/turboexl3",
+      "icon": "plugins/turboexl3_ling/icon.png"
+    },
+    {
       "name": "turboexl3_qwen38",
       "title": "TurboEXL3 - Qwen 3.8 Flash",
       "kind": "model",

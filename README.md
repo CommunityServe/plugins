@@ -28,6 +28,7 @@ log says `[plugin] sushi_ds41 serves ...`. Details: [docs/using-plugins.md](docs
 | Plugin | Kind | Serves | Needs mlx-serve |
 |---|---|---|---|
 | [`sushi_ds41`](plugins/sushi_ds41) | model | DeepSeek-V4.1-Flash STQ packs on sushi's model code: DSpark (greedy and sampled), prefix cache, images | see [`plugins.json`](plugins.json) |
+| [`turboexl3_ling`](plugins/turboexl3_ling) | model | Ling-3.1-flash EXL3 packs (turboderp's, repacked for streaming): experts streamed from SSD, the EXL3 math on turboexl3, M5-class Macs (NAX) | see [`plugins.json`](plugins.json) |
 
 `plugins.json` is the machine-readable index (generated from each plugin's `plugin.json`).
 
