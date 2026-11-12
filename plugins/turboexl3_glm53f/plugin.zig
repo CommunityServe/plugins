@@ -506,6 +506,7 @@ test "turboexl3_glm53f: [stream-stats] splits the stream's own counters at the p
 }
 
 test {
+    _ = shared;
     _ = config;
     _ = bank_rows;
     _ = options;
