@@ -62,6 +62,34 @@ pub fn rowsByLayer(free: u64, decode_free: u64, layer_bytes: []const u64, transi
     return .{ .prompt = p, .decode = d };
 }
 
+/// The bank's bytes each phase as a plan bills them (what the budget pays for): the slot rows and the streamer's
+/// transient rows (prompt) or decode window rows (decode). A `bank-fit.json` base is a phase's measured peak less these.
+pub const Billed = struct { prompt: u64, decode: u64 };
+
+/// `rowsForPhases`' bill of `p`: every layer at the widest row, the transient rows in the prompt phase.
+pub fn billedUniform(p: Plan, record: u64, n_moe: u32, transient: u32) Billed {
+    const row = record * n_moe;
+    return .{ .prompt = @as(u64, p.prompt) * row + @as(u64, transient) * record, .decode = @as(u64, p.decode) * row };
+}
+
+/// `rowsByLayer`'s bill of `p` and its split's `decode_rows`: each layer's own row bytes, with `transient` (prompt) or
+/// `window` (decode) rows of each geometry.
+pub fn billedByLayer(p: Plan, decode_rows: []const u32, layer_bytes: []const u64, transient: u32, window: u32) Billed {
+    var widest: u64 = 0;
+    var sum: u64 = 0;
+    for (layer_bytes) |b| {
+        widest = @max(widest, b);
+        sum +|= b;
+    }
+    var alt: u64 = 0;
+    for (layer_bytes) |b| if (b != widest) {
+        alt = @max(alt, b);
+    };
+    var decode: u64 = @as(u64, window) * (widest + alt);
+    for (decode_rows, layer_bytes) |r, b| decode +|= @as(u64, r) * b;
+    return .{ .prompt = @as(u64, p.prompt) * sum + @as(u64, transient) * (widest + alt), .decode = decode };
+}
+
 /// The decode lookahead's records read ahead a layer call (`mimo/stream_source.zig` `lookahead.budget`); plugin.zig
 /// checks it against the streamer at compile time.
 pub const streamer_spec_budget: u32 = 2;
@@ -160,8 +188,22 @@ test "turboexl3_glm53f bank rows: the per-layer bill fits each phase's bytes wit
     try testing.expect(@as(u64, plan.prompt) * sum + 96 * geo <= g53smd_free);
     try testing.expect(@as(u64, plan.decode + 1) * sum + 32 * geo > g53smd_free);
     try testing.expectEqual(Plan{ .prompt = 8, .decode = 8 }, try rowsByLayer(0, 0, &bytes, streamer_transient_rows, streamer_window_rows, 8, 288, &uniformSplit, &pr, &dr));
+    // the plan's bill: each phase within its bytes, one more decode row a layer past them
+    _ = try rowsByLayer(g53smd_free, g53smd_free, &bytes, streamer_transient_rows, streamer_window_rows, 8, 288, &uniformSplit, &pr, &dr);
+    const billed = billedByLayer(plan, &dr, &bytes, streamer_transient_rows, streamer_window_rows);
+    try testing.expectEqual(@as(u64, 130) * sum + 96 * geo, billed.prompt);
+    try testing.expectEqual(@as(u64, 133) * sum + 32 * geo, billed.decode);
+    try testing.expect(billed.decode <= g53smd_free and billed.decode + sum > g53smd_free);
     const small = try rowsByLayer(60 << 30, 30 << 30, &bytes, streamer_transient_rows, streamer_window_rows, 8, 288, &uniformSplit, &pr, &dr);
     try testing.expect(small.prompt <= small.decode);
+}
+
+test "turboexl3_glm53f bank rows: the widest-row bill is its rows at the widest row, the transient rows in the prompt phase" {
+    const record: u64 = 12_619_776;
+    const b = billedUniform(.{ .prompt = 100, .decode = 102 }, record, 42, streamer_transient_rows);
+    try testing.expectEqual(@as(u64, 100 * 42 + 96) * record, b.prompt);
+    try testing.expectEqual(@as(u64, 102 * 42) * record, b.decode);
+    try testing.expect(b.prompt <= g53smd_free and b.decode <= g53smd_free);
 }
 
 test "turboexl3_glm53f bank rows: a switch is on at 1, off unset, empty or 0, and any other value is refused by name" {

@@ -16,6 +16,7 @@ const mtp_bank = @import("src/mtp_bank.zig");
 const bank_rows = @import("src/bank_rows.zig");
 const bank_layers = @import("src/bank_layers.zig");
 const options = @import("src/options.zig");
+const stream_stats = @import("src/stream_stats.zig");
 pub const config = @import("config.zig");
 
 // ── what the bank's modules read from `mlx_host` ──
@@ -282,13 +283,19 @@ fn readSwitches() !bank_rows.Switches {
     };
 }
 
+const Planned = struct { rows: bank_rows.Plan, billed: bank_rows.Billed };
+
 /// The rows `budget` buys over the bank in `dir`: each phase's bytes less the keep-warm engine's, billed at each routed
-/// layer's own row (`LAYER_BILL`) or the widest.
-fn plan(dir: []const u8, sw: bank_rows.Switches, geo: glm5n.Geometry, budget: abi.BankBudget, top_k: u32) !bank_rows.Plan {
+/// layer's own row (`LAYER_BILL`) or the widest; and the bytes each phase bills (the keep-warm engine's in both).
+fn plan(dir: []const u8, sw: bank_rows.Switches, geo: glm5n.Geometry, budget: abi.BankBudget, top_k: u32) !Planned {
     const warm: u64 = if (sw.keep_warm) glm5n.keep_warm_bill_bytes else 0;
     const free = budget.prompt -| warm;
     const decode_free = budget.decode -| warm;
-    if (!sw.layer_bill) return bank_rows.rowsForPhases(free, decode_free, geo.record_bytes, geo.num_moe_layers, glm5n.transient_rows, top_k, geo.num_experts);
+    if (!sw.layer_bill) {
+        const p = bank_rows.rowsForPhases(free, decode_free, geo.record_bytes, geo.num_moe_layers, glm5n.transient_rows, top_k, geo.num_experts);
+        const b = bank_rows.billedUniform(p, geo.record_bytes, geo.num_moe_layers, glm5n.transient_rows);
+        return .{ .rows = p, .billed = .{ .prompt = b.prompt + warm, .decode = b.decode + warm } };
+    }
     const n: usize = geo.num_moe_layers;
     const bytes = try gpa.alloc(u64, n);
     defer gpa.free(bytes);
@@ -298,7 +305,9 @@ fn plan(dir: []const u8, sw: bank_rows.Switches, geo: glm5n.Geometry, budget: ab
     defer gpa.free(pr);
     const dr = try gpa.alloc(u32, n);
     defer gpa.free(dr);
-    return bank_rows.rowsByLayer(free, decode_free, bytes, glm5n.transient_rows, bank_rows.streamer_window_rows, top_k, geo.num_experts, &splitRows, pr, dr);
+    const p = try bank_rows.rowsByLayer(free, decode_free, bytes, glm5n.transient_rows, bank_rows.streamer_window_rows, top_k, geo.num_experts, &splitRows, pr, dr);
+    const b = bank_rows.billedByLayer(p, dr, bytes, glm5n.transient_rows, bank_rows.streamer_window_rows);
+    return .{ .rows = p, .billed = .{ .prompt = b.prompt + warm, .decode = b.decode + warm } };
 }
 
 fn splitRows(p: bank_rows.Plan, prompt: []u32, decode: []u32) anyerror!void {
@@ -313,7 +322,7 @@ fn bankRows(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.B
     if (!tkit.nax.available()) return no_nax;
     const sw = readSwitches() catch |e| return Verdict.named(.unsupported, @errorName(e));
     const g = glm5n.geometryOf(gpa, io, ctx.model_dir.slice()) catch |e| return bankRefusal(e);
-    const p = plan(ctx.model_dir.slice(), sw, g, budget, geo.top_k) catch |e| return bankRefusal(e);
+    const p = (plan(ctx.model_dir.slice(), sw, g, budget, geo.top_k) catch |e| return bankRefusal(e)).rows;
     out.* = .{ .prompt = p.prompt, .decode = p.decode, .row_bytes = g.record_bytes * g.num_moe_layers };
     return .ok;
 }
@@ -336,10 +345,16 @@ fn openBank(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.B
         return Verdict.named(.unsupported, "Glm5NextStreamSeam");
     }
     const dir = ctx.model_dir.slice();
+    // TURBOEXL3_GLM53F_SEED_DECODE: the profile's sha256 for its line (the open below refuses a pack without it by name)
+    const seed: ?SeedFile = if (sw.seed_decode) seedDecodeFile(dir) catch null else null;
     const g = glm5n.geometryOf(gpa, io, dir) catch |e| return bankRefusal(e);
-    const p = plan(dir, sw, g, budget, geo.top_k) catch |e| return bankRefusal(e);
+    const planned = plan(dir, sw, g, budget, geo.top_k) catch |e| return bankRefusal(e);
+    const p = planned.rows;
     const b = Bank.open(ctx, geo, g, .{ .prompt = p.prompt, .decode = p.decode }) catch |e| return bankRefusal(e);
     const line = std.fmt.bufPrint(&about, "{d} prompt / {d} decode slot rows per layer ({d} B the widest row)", .{ p.prompt, p.decode, g.record_bytes }) catch "";
+    engaged(sw, g, seed);
+    // a bank-fit.json base is a phase's measured peak less these
+    log.info("[turboexl3_glm53f] bank bytes: prompt {d} B, decode {d} B (budget {d} / {d} B)\n", .{ planned.billed.prompt, planned.billed.decode, budget.prompt, budget.decode });
     out.* = .{
         .ctx = b,
         .close = &Bank.close,
@@ -350,8 +365,44 @@ fn openBank(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.B
         .phase = &Bank.phase,
         .read_ahead = &Bank.readAhead,
     };
+    // `[stream-stats]` where the kit's Bank carries the request's summary lines
+    if (comptime @hasField(abi.Bank, "meters")) out.meters = &Bank.meters;
     return .ok;
 }
+
+/// The bank switches' lines at the bank's open, as G2 prints them, so a served run's log shows which engaged.
+fn engaged(sw: bank_rows.Switches, g: glm5n.Geometry, seed: ?SeedFile) void {
+    if (seed) |sf| log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_SEED_DECODE=1: the resident seed read {s} (sha256 {s}, {d} B) in place of expert-usage-v1.json\n", .{ glm5n.seed_decode_file, sf.sha[0..12], sf.bytes });
+    if (sw.layer_bill) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_LAYER_BILL=1: the slot rows billed at each routed layer's own row (expert-manifest-v2.json), the widest {d} B, with both geometries' transient and window rows\n", .{g.record_bytes});
+    if (sw.grow_unfilled) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_GROW_UNFILLED=1: the decode grow's new slot rows take their buffers without the zero fill (GrowFill.unfilled: a row is read only after its record landed)\n", .{});
+    if (sw.prompt_keep) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_PROMPT_KEEP=1: no prompt-phase admission evicts a resident: a prompt miss takes an empty prompt row, else a transient row, and the read-ahead takes empty rows only\n", .{});
+    if (sw.spec_pick1) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_SPEC_PICK1=1: the decode lookahead reads ahead one record a layer call, the most likely of the next layer's non-resident predictions (default {d}); the read pool keeps its {d} speculative slots and threads and its bytes; reads only, no slot or row count changes\n", .{ bank_rows.streamer_spec_budget, 2 * bank_rows.streamer_spec_budget });
+    if (sw.demand_first != 0) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_DEMAND_HELP={d}: the read pool puts decode's demand first (the kit stream's demandFirst({d}), set at each decode phase and back to 0 at each prompt phase); the same bytes into the same rows; no slot or row count changes\n", .{ sw.demand_first, sw.demand_first });
+    if (sw.adopt_pieces) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_ADOPT_PIECES=1: a demand read served from a lookahead record copies its bytes into its rows in up to {d} pieces (one a read pool worker); the same bytes into the same rows; no slot or row count changes\n", .{bank_rows.streamer_io_workers});
+    if (sw.keep_warm) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_KEEP_WARM=1: the keep-warm engine on the expert stream's waits (gpu_warm at waits, over this plugin's own Metal shim, src/csrc/glm53f_gpu_warm.m); no model array, graph or MLX queue touched; {d} B billed: the slot rows were sized from that much less\n", .{glm5n.keep_warm_bill_bytes});
+}
+
+/// `TURBOEXL3_GLM53F_SEED_DECODE`'s profile in the pack (`glm5n.seed_decode_file`): its bytes' sha256 in hex and its
+/// size, for its line.
+const SeedFile = struct { sha: [64]u8, bytes: u64 };
+fn seedDecodeFile(dir: []const u8) !SeedFile {
+    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    defer d.close(io);
+    const text = try d.readFileAlloc(io, glm5n.seed_decode_file, gpa, .limited(stream.expert_usage.max_file_bytes));
+    defer gpa.free(text);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(text);
+    const digest = h.finalResult();
+    var out: SeedFile = .{ .sha = undefined, .bytes = text.len };
+    _ = std.fmt.bufPrint(&out.sha, "{x}", .{&digest}) catch unreachable;
+    return out;
+}
+
+/// The kit's stream counters (`kit.streamed.expert.Stats`), named through the streamer's module: naming the source's own
+/// type pulls its MLX kernels into the MLX-free test binary.
+const StreamStats = stream.expert_stats;
+/// `[stream-stats]` (src/stream_stats.zig): one streamed bank a process.
+var meter: stream_stats.Meter(StreamStats) = .{};
 
 /// The GLM bank and the routers it predicts with: each routed layer's router as the bank reads it (bf16
 /// `[experts, hidden]`, from the trunk's f32 `[hidden, experts]`: the same values), held for the bank's life.
@@ -405,7 +456,14 @@ const Bank = struct {
         return done(of(ctx).src.settle());
     }
     fn phase(ctx: ?*anyopaque, prompt: bool) callconv(.c) Verdict {
-        return done(of(ctx).src.setPhase(prompt));
+        const b = of(ctx);
+        meter.mark(prompt, b.src.inner);
+        return done(b.src.setPhase(prompt));
+    }
+    /// The request's `[stream-stats]` lines: its prompt phase's and its decode phase's counters.
+    fn meters(ctx: ?*anyopaque, out: *abi.Str) callconv(.c) void {
+        const b = of(ctx);
+        out.* = abi.Str.of(meter.lines(b.src.inner.stats(), stream_stats.Extra.of(b.src.inner)));
     }
     fn readAhead(ctx: ?*anyopaque, layer: u32, ids: [*]const u16, n: usize) callconv(.c) Verdict {
         return done(of(ctx).src.readAhead(layer, ids[0..n]));
@@ -438,6 +496,10 @@ fn share2(a: A) A {
 pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
     _ = a;
     return .{ .files = &.{.{ .name = "config.json", .bytes = "{\"model_type\":\"glm5_next\"}" }}, .block = "{\"quant_method\":\"exl3\",\"codebook\":\"mul1\"}" };
+}
+
+test "turboexl3_glm53f: [stream-stats] splits the stream's own counters at the phase change" {
+    try stream_stats.expectPhases(StreamStats);
 }
 
 test {

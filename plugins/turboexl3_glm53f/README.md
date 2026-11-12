@@ -42,3 +42,6 @@ GLM-5.3-Flash tiles at each routed rate (src/frac_test.zig, src/glm_tiles.json).
 
 At load, the log names the plugin: `[plugins] loaded turboexl3_glm53f (quant, sha256 ...)`. It also prints the
 bank's rows: `glm5_next: streamed experts, N prompt / M decode slot rows per layer (R B the widest row): ...`.
+Each bank switch that is on prints its own line, and `bank bytes: prompt P B, decode D B` gives the bytes the rows
+bill in each phase. With a server whose bank ABI has `meters`, each request's summary ends with two `[stream-stats]`
+lines (prompt and decode): the stream's routes, hits, misses, reads and lookahead in that phase.

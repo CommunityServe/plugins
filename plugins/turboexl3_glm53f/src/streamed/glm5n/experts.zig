@@ -129,6 +129,16 @@ pub const seams = struct {
     pub const adopt_pieces = @hasField(B.S.Lookahead, "adopt_pieces");
 };
 
+/// turboexl3_glm53f: the read pool's counters for `[stream-stats]` (`Source.poolCounters`): the demand ranges that
+/// waited for a lookahead record in flight and that wait (ns); DEMAND_SPLIT's ranges split and pieces; ADOPT_PIECES'
+/// ranges copied in pieces and the pieces another worker copied (0 where the kit's stream lacks the seam).
+pub const PoolCounters = struct {
+    adopt_waits: i64 = 0,
+    adopt_wait_ns: i64 = 0,
+    split: [2]i64 = .{ 0, 0 },
+    adopt: [2]i64 = .{ 0, 0 },
+};
+
 /// turboexl3_glm53f: the first switch set for the next `Source.open` whose seam this kit's stream lacks (its variable),
 /// null when none is.
 pub fn missingSeam() ?[]const u8 {
@@ -643,6 +653,23 @@ pub fn SourceOf(comptime fam: Family) type {
 
         pub fn stats(self: *Self) sdk_ext.expert.Stats {
             return self.stream_source.stats();
+        }
+
+        /// The read pool's counters `stats` does not carry, since the pool's start: the demand ranges' waits for a
+        /// lookahead record in flight, and the seams' side arrays where this kit's stream has them
+        /// (src/stream_stats.zig).
+        pub fn poolCounters(self: *Self) PoolCounters {
+            const st = self.sdk_stream;
+            var c: PoolCounters = .{ .adopt_waits = st.pool.counter(.adopt_waits), .adopt_wait_ns = st.pool.counter(.adopt_wait_ns) };
+            if (comptime @hasDecl(@TypeOf(st.*), "splitStats")) {
+                const s = st.splitStats();
+                c.split = .{ s[0], s[1] };
+            }
+            if (comptime @hasDecl(@TypeOf(st.*), "adoptStats")) {
+                const s = st.adoptStats();
+                c.adopt = .{ s[0], s[1] };
+            }
+            return c;
         }
 
     };

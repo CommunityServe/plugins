@@ -8,6 +8,8 @@ pub const sdk = @import("sdk");
 pub const glm5n_source = @import("streamed/glm5n_source.zig");
 /// The kit's usage profile (`expert-usage-v1.json`), for TURBOEXL3_GLM53F_SEED_DECODE's profile read (its size cap).
 pub const expert_usage = @import("mlx_serve").streamed.expert.usage;
+/// The kit's stream counters (`kit.streamed.expert.Stats`), for the plugin's `[stream-stats]` lines (src/stream_stats.zig).
+pub const expert_stats = @import("mlx_serve").streamed.expert.Stats;
 /// The kit's read pool (`kit.streamed.expert.io`).
 pub const expert_io = @import("mlx_serve").streamed.expert.io;
 /// The keep-warm engine (`gpu_warm`, TURBOEXL3_GLM53F_KEEP_WARM), for its trace proofs (src/keep_warm_test.zig).
