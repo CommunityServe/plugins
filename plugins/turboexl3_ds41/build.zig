@@ -58,9 +58,9 @@ pub fn build(b: *std.Build) void {
     root.addImport("mlx_stream", stream);
 
     // The lane's MLX-free tests (src/*_test.zig), each a root of its own: the a4k record layout through the kit's read
-    // pool, the half-integer-rate tiles against turboexl3's format.
+    // pool, the half-integer-rate tiles against turboexl3's format; and TURBOEXL3_DS41_PF_INT8's switch (src/pf_int8.zig).
     const format = b.createModule(.{ .root_source_file = dep.path("src/core/format.zig"), .target = target, .optimize = optimize });
-    for ([_][]const u8{ "frac", "a4k" }) |name| {
+    for ([_][]const u8{ "frac", "a4k", "pf_int8" }) |name| {
         const m = b.createModule(.{ .root_source_file = b.path(b.fmt("src/{s}_test.zig", .{name})), .target = target, .optimize = optimize, .link_libc = true });
         if (std.mem.eql(u8, name, "frac")) {
             m.addImport("turboexl3_format", format);

@@ -2,7 +2,7 @@
   "name": "turboexl3_ds41",
   "title": "TurboEXL3 - DeepSeek 4.1 Flash",
   "kind": "quant",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "summary": "DeepSeek-V4.1-Flash EXL3 packs on mlx-serve's own DeepSeek-V4.1 model: the trunk's EXL3 math in turboexl3, the routed experts streamed from the pack's experts.bin by this plugin's own streamer, on M5-class Macs (NAX).",
   "models": [
     "deepseek_v41 with an exllamav3 quantization_config and an experts.bin bank (OpensourceWTF/DeepSeek-V4.1-Flash-1017-streaming-repack-exl3@2.81bpw)"
