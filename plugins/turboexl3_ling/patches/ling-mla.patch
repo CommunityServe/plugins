@@ -1,0 +1,621 @@
+--- a/plugins/bailing_hybrid/mla.zig
++++ b/plugins/bailing_hybrid/mla.zig
+@@ -2,9 +2,32 @@
+ //! Ling 3.0's multi-head latent attention (the naive DeepSeek-V3 form: per-head keys and values expanded before the
+ //! cache) on one slot through `CacheOps`.
+ //! copied_from: sdk/blocks/attention/mla.zig (`mlaAttnWith`, the cache update replaced by `Slots.append`).
++//! turboexl3_ling: no layer here caches the expanded keys and values. A trunk MLA layer caches kv_b's rows and the
++//! roped key once a token (`rope1Attn`, the rope-once layout); the MTP head's layer caches its normed latent and roped
++//! key (`latentAttn`).
++const std = @import("std");
+ const mlx = @import("mlx_serve").mlx;
+ const Slots = @import("../glm5_next/slots.zig").Slots;
+ const trunk = @import("../glm5_next/trunk.zig");
++const ling = @import("../../../ling_exl3.zig");
++/// turboexl3_ling: the run-path marks of the served paths that ran (src/ling_ran.zig).
++const ran = @import("../../../ling_ran.zig");
++/// turboexl3_ling: the rope-once MLA cache (src/ling_mla_rope1.zig): a trunk MLA layer caches kv_b's rows and the roped
++/// key once a token (`rope1Attn`), read in place, each call the expanded cache's words.
++const ling_mla_rope1 = @import("../../../ling_mla_rope1.zig");
++/// turboexl3_ling: KV_SCHEME_DENSE_COPIES (src/ling_kv_scheme.zig): a quantized cache's view, warned of once a load.
++const kv_scheme = @import("../../../ling_kv_scheme.zig");
++/// turboexl3_ling: the MTP head alone on the latent cache (src/ling_mtp_latent.zig).
++/// The head's layer caches its normed KV latent `[B, 1, T, kv_lora]` as K and its roped shared key `[B, 1, T, rope]` as
++/// V: kv_lora + rope values a token instead of heads x (qk + v). A prompt chunk expands every cached row through kv_b
++/// as the naive form does; a decode or verify call of at most `absorbed_max_rows` rows attends in the latent (kv_b's
++/// key half folded into the query, its value half applied to the output). The trunk's layers cache the rope-once layout.
++const ling_mtp_latent = @import("../../../ling_mtp_latent.zig");
++pub const absorbed_max_rows: c_int = 16;
++/// turboexl3_ling: a prompt call wider than this many query rows (a layer-major call) attends in spans of this many,
++/// each over the keys up to its own last row, so a span's working set is an engine chunk's; a call this wide or
++/// narrower attends at once, as before.
++pub const prompt_span_rows: c_int = 4096;
+ pub fn mlaAttn(
+     self: *const trunk.Model,
+     sl: Slots,
+@@ -66,20 +89,6 @@
+     try mlx.check(mlx.mlx_slice(&k_pe_flat, kv_a, &[_]c_int{ 0, 0, kv_lora }, 3, &[_]c_int{ batch, seq_len, kv_lora + rope_d }, 3, &strides3, 3, self.s));
+     const latent = try self.rmsNorm(latent_raw, fa.kv_a_norm);
+     defer _ = mlx.mlx_array_free(latent);
+-    const kv_flat = try self.mm(&fa.kv_b, latent);
+-    defer _ = mlx.mlx_array_free(kv_flat);
+-    var kv_heads = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(kv_heads);
+-    try mlx.check(mlx.mlx_reshape(&kv_heads, kv_flat, &[_]c_int{ batch, seq_len, h_count, nope + v_dim }, 4, self.s));
+-    var kv_t = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(kv_t);
+-    try mlx.check(mlx.mlx_transpose_axes(&kv_t, kv_heads, &perm, 4, self.s));
+-    var k_nope = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(k_nope);
+-    try mlx.check(mlx.mlx_slice(&k_nope, kv_t, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, h_count, seq_len, nope }, 4, &strides4, 4, self.s));
+-    var v_t = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(v_t);
+-    try mlx.check(mlx.mlx_slice(&v_t, kv_t, &[_]c_int{ 0, 0, 0, nope }, 4, &[_]c_int{ batch, h_count, seq_len, nope + v_dim }, 4, &strides4, 4, self.s));
+     var k_pe_t = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(k_pe_t);
+     {
+@@ -96,44 +105,16 @@
+     defer _ = mlx.mlx_array_free(k_rot);
+     try mlx.check(mlx.mlx_fast_rope(&q_rot, q_rot_raw, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
+     try mlx.check(mlx.mlx_fast_rope(&k_rot, k_pe_t, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
+-    // The rope key is MQA — one head, replicated so the cached K is a
+-    // plain [B,H,S,qk_dim] tensor the standard cache path can carry.
+-    var k_rot_b = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(k_rot_b);
+-    try mlx.check(mlx.mlx_broadcast_to(&k_rot_b, k_rot, &[_]c_int{ batch, h_count, seq_len, rope_d }, 4, self.s));
+-    var queries = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(queries);
+-    {
+-        const parts = [_]mlx.mlx_array{ q_nope, q_rot };
+-        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+-        defer _ = mlx.mlx_vector_array_free(vec);
+-        try mlx.check(mlx.mlx_concatenate_axis(&queries, vec, -1, self.s));
+-    }
+-    var keys = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(keys);
+-    {
+-        const parts = [_]mlx.mlx_array{ k_nope, k_rot_b };
+-        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+-        defer _ = mlx.mlx_vector_array_free(vec);
+-        try mlx.check(mlx.mlx_concatenate_axis(&keys, vec, -1, self.s));
+-    }
+-    // The cache stores views; a strided V slice must own its bytes before
+-    // it is written into the buffer (mlx `slice` is a VIEW op).
+-    var v_contig = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(v_contig);
+-    try mlx.check(mlx.mlx_contiguous(&v_contig, v_t, false, self.s));
+-    var kv_view = try sl.append(0, layer, keys, v_contig, self.s);
+-    defer kv_view.deinit();
+-    // Plain SDPA: MLX has a fused vector kernel for exactly this
+-    // asymmetric (192-wide query, 128-wide value) decode shape, and falls
+-    // back to the composed path at prefill widths. The quantized-KV fused
+-    // kernels assume one head width for both, so MLA never opts in.
+     var attn_out = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(attn_out);
+-    const none_mask = mlx.mlx_array_new();
+-    defer _ = mlx.mlx_array_free(none_mask);
+-    const sel_mode: [*:0]const u8 = if (is_prefill) "causal" else "";
+-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, sel_mode, none_mask, .{ .ctx = null }, false, self.s));
++    if (ling_mtp_latent.isHead(fa)) {
++        try latentAttn(self, sl, fa, layer, batch, seq_len, attn_scale, q_nope, q_rot, latent, k_rot, is_prefill, &attn_out);
++    } else {
++        // turboexl3_ling: kv_b's rows and the roped key cached as they come (the rope-once layout)
++        const kv_flat = try self.mm(&fa.kv_b, latent);
++        defer _ = mlx.mlx_array_free(kv_flat);
++        try rope1Attn(self, sl, layer, batch, seq_len, attn_scale, q_nope, q_rot, kv_flat, k_rot, is_prefill, &attn_out);
++    }
+     // [B,H,S,Dv] → [B,S,H,Dv]; the gate is per (token, head).
+     var attn_t = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(attn_t);
+@@ -175,3 +156,511 @@
+     // bf16 mirror, and it can opt in once someone A/Bs it.
+     return self.mm(&fa.o, attn_flat);
+ }
++
++/// turboexl3_ling: the MTP head's fused latent decode, turboexl3's three launches (src/ling_mla_fused.zig).
++const ling_mla_fused = @import("../../../ling_mla_fused.zig");
++/// turboexl3_ling: the latent decode's composed chain and kv_b's stored rows (src/ling_mla_latent.zig).
++const ling_mla_latent = @import("../../../ling_mla_latent.zig");
++
++/// The MTP head's latent attention (`ling_mtp_latent.isHead`): appends the chunk's normed latent `[B, S, kv_lora]` and
++/// roped shared key `k_rot` `[B, 1, S, rope]`, then attends over every cached row into `out` `[B, H, S, v]`.
++fn latentAttn(
++    self: *const trunk.Model,
++    sl: Slots,
++    fa: *const trunk.Mla,
++    layer: u32,
++    batch: c_int,
++    seq_len: c_int,
++    attn_scale: f32,
++    q_nope: mlx.mlx_array,
++    q_rot: mlx.mlx_array,
++    latent: mlx.mlx_array,
++    k_rot: mlx.mlx_array,
++    is_prefill: bool,
++    out: *mlx.mlx_array,
++) !void {
++    const cfg = self.c;
++    const s = self.s;
++    const h_count: c_int = @intCast(cfg.num_attention_heads);
++    const nope: c_int = @intCast(cfg.mla_qk_nope_head_dim);
++    const rope_d: c_int = @intCast(cfg.mla_qk_rope_head_dim);
++    const v_dim: c_int = @intCast(cfg.mla_v_head_dim);
++    const kv_lora: c_int = @intCast(cfg.mla_kv_lora_rank);
++    const perm = [_]c_int{ 0, 2, 1, 3 };
++    const strides4 = [_]c_int{ 1, 1, 1, 1 };
++    // kv_b as a plain matrix (a quantized one has no halves to fold), held as the loader holds a dense projection: the
++    // `[kv_lora, H * (nope + v)]` view a plain matmul reads (trunk.zig `proj`), which the prompt chunk's `self.mm` reads.
++    const w = fa.kv_b.w;
++    if (fa.kv_b.exl3 or fa.kv_b.bits != 0 or w.ctx == null) return error.LingLatentCacheNeedsPlainKvB;
++    var lat4 = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(lat4);
++    try mlx.check(mlx.mlx_reshape(&lat4, latent, &[_]c_int{ batch, 1, seq_len, kv_lora }, 4, s));
++    var kv_view = try sl.append(0, layer, lat4, k_rot, s);
++    defer kv_view.deinit();
++    const total: c_int = mlx.getShape(kv_view.k)[2];
++    const sel_mode: [*:0]const u8 = if (is_prefill) "causal" else "";
++    if (seq_len > absorbed_max_rows) {
++        // A prompt chunk: every cached row expanded through kv_b, then the naive attention.
++        var lat_all = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(lat_all);
++        try mlx.check(mlx.mlx_reshape(&lat_all, kv_view.k, &[_]c_int{ batch, total, kv_lora }, 3, s));
++        const kv_flat = try self.mm(&fa.kv_b, lat_all);
++        defer _ = mlx.mlx_array_free(kv_flat);
++        var kv_heads = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(kv_heads);
++        try mlx.check(mlx.mlx_reshape(&kv_heads, kv_flat, &[_]c_int{ batch, total, h_count, nope + v_dim }, 4, s));
++        var kv_t = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(kv_t);
++        try mlx.check(mlx.mlx_transpose_axes(&kv_t, kv_heads, &perm, 4, s));
++        var k_nope = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(k_nope);
++        try mlx.check(mlx.mlx_slice(&k_nope, kv_t, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, h_count, total, nope }, 4, &strides4, 4, s));
++        var v_t = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(v_t);
++        try mlx.check(mlx.mlx_slice(&v_t, kv_t, &[_]c_int{ 0, 0, 0, nope }, 4, &[_]c_int{ batch, h_count, total, nope + v_dim }, 4, &strides4, 4, s));
++        var k_rot_b = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(k_rot_b);
++        try mlx.check(mlx.mlx_broadcast_to(&k_rot_b, kv_view.v, &[_]c_int{ batch, h_count, total, rope_d }, 4, s));
++        const queries = try cat2(q_nope, q_rot, s);
++        defer _ = mlx.mlx_array_free(queries);
++        const keys = try cat2(k_nope, k_rot_b, s);
++        defer _ = mlx.mlx_array_free(keys);
++        var v_contig = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(v_contig);
++        try mlx.check(mlx.mlx_contiguous(&v_contig, v_t, false, s));
++        try spanAttn(out, queries, keys, v_contig, attn_scale, seq_len, sel_mode, s);
++        return;
++    }
++    // turboexl3_ling: the head's decode and verify calls run in turboexl3's three launches (each row's bits its own, so
++    // an exact verify's rows take the one call too) over kv_b's stored rows `[H * (nope + v), kv_lora]`, the transpose
++    // of the loader's view, and mark MTP_HEAD_LATENT's run-path bit. A call the kernel does not take runs the composed
++    // chain below.
++    const geo: ling_mla_latent.Geometry = .{ .heads = h_count, .nope = nope, .v = v_dim, .kv_lora = kv_lora };
++    const w_rows = try ling_mla_latent.kvRows(w, geo, s);
++    defer _ = mlx.mlx_array_free(w_rows);
++    if (try ling_mla_fused.attend(out, s, q_nope, q_rot, kv_view.k, kv_view.v, w_rows, attn_scale)) {
++        ran.mark(.MTP_HEAD_LATENT);
++        return;
++    }
++    // A decode or verify call the kernel does not take: the composed latent chain (src/ling_mla_latent.zig `decode`,
++    // the ops this file had), under a name of its own, so a run-path line shows the fused launches stopped taking a
++    // call (the served shapes never reach it).
++    ran.mark(.MTP_HEAD_LATENT_COMPOSED);
++    try ling_mla_latent.decode(out, q_nope, q_rot, kv_view.k, kv_view.v, w, geo, attn_scale, s);
++}
++
++/// `a` and `b` joined on the last axis.
++fn cat2(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
++    var r = mlx.mlx_array_new();
++    errdefer _ = mlx.mlx_array_free(r);
++    const parts = [_]mlx.mlx_array{ a, b };
++    const vec = mlx.mlx_vector_array_new_data(&parts, 2);
++    defer _ = mlx.mlx_vector_array_free(vec);
++    try mlx.check(mlx.mlx_concatenate_axis(&r, vec, -1, s));
++    return r;
++}
++
++/// turboexl3_ling: a causal prompt call's attention in spans of 512 query rows, each over the keys up to its own last
++/// row, each row `spanAttn`'s words (attn_spans.zig).
++const attn_spans = @import("attn_spans.zig");
++/// turboexl3_ling: the MLA prompt attention as one causal flash launch (src/ling_flash.zig), ahead of the spans.
++const ling_flash = @import("../../../ling_flash.zig");
++
++/// `out` = the attention of `queries` `[B, H, S, D]` over `keys`/`values` (`[B, Hk, T, *]`, the query rows the last S
++/// of the T), in spans of `prompt_span_rows` query rows past that width (`mode` causal: each span over the keys up to
++/// its last row, causal from the bottom right as MLX aligns it).
++fn spanAttn(out: *mlx.mlx_array, queries: mlx.mlx_array, keys: mlx.mlx_array, values: mlx.mlx_array, scale: f32, seq_len: c_int, mode: [*:0]const u8, s: mlx.mlx_stream) !void {
++    if (ling_flash.takes(mode, seq_len)) if (try ling_flash.attend(out, queries, keys, values, scale, s)) return;
++    const none_mask = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(none_mask);
++    if (std.mem.orderZ(u8, mode, "causal") == .eq) {
++        if (try attn_spans.attend(out, queries, keys, values, scale, seq_len, prompt_span_rows, s)) {
++            ran.mark(.MLA_SPANS);
++            return;
++        }
++    }
++    if (seq_len <= prompt_span_rows) {
++        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(out, queries, keys, values, scale, mode, none_mask, .{ .ctx = null }, false, s));
++        return;
++    }
++    const qs = mlx.getShape(queries);
++    const ks = mlx.getShape(keys);
++    const vs = mlx.getShape(values);
++    const first = ks[2] - seq_len;
++    const parts = mlx.mlx_vector_array_new();
++    defer _ = mlx.mlx_vector_array_free(parts);
++    const st4 = [_]c_int{ 1, 1, 1, 1 };
++    var r0: c_int = 0;
++    while (r0 < seq_len) : (r0 += prompt_span_rows) {
++        const r1 = @min(r0 + prompt_span_rows, seq_len);
++        var q = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(q);
++        try mlx.check(mlx.mlx_slice(&q, queries, &[_]c_int{ 0, 0, r0, 0 }, 4, &[_]c_int{ qs[0], qs[1], r1, qs[3] }, 4, &st4, 4, s));
++        var k = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(k);
++        try mlx.check(mlx.mlx_slice(&k, keys, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ ks[0], ks[1], first + r1, ks[3] }, 4, &st4, 4, s));
++        var v = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(v);
++        try mlx.check(mlx.mlx_slice(&v, values, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ vs[0], vs[1], first + r1, vs[3] }, 4, &st4, 4, s));
++        var o = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(o);
++        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, mode, none_mask, .{ .ctx = null }, false, s));
++        _ = mlx.mlx_vector_array_append_value(parts, o);
++    }
++    try mlx.check(mlx.mlx_concatenate_axis(out, parts, 2, s));
++}
++
++/// turboexl3_ling: the exact verify's MLA rows in one launch per kind of row (src/ling_verify_mla.zig), each row MLX's
++/// one-row words (verify_rows.zig).
++const ling_verify_mla = @import("../../../ling_verify_mla.zig");
++const verify_rows = @import("verify_rows.zig");
++
++/// turboexl3_ling: an exact verify's rows in one launch per kind of row where `verify_rows.attend` serves them (each
++/// row's words its one-row call's), else `rowAttn`.
++fn verifyAttn(out: *mlx.mlx_array, queries: mlx.mlx_array, keys: mlx.mlx_array, values: mlx.mlx_array, scale: f32, seq_len: c_int, s: mlx.mlx_stream) !void {
++    if (try verify_rows.attend(out, queries, keys, values, scale, seq_len, s)) {
++        ling_verify_mla.engaged(seq_len, verify_rows.last.groups, verify_rows.last.two_pass);
++        return;
++    }
++    ling_verify_mla.declined(seq_len);
++    try rowAttn(out, queries, keys, values, scale, seq_len, s);
++}
++
++/// `out` = the attention of each query row of `queries` `[B, H, S, D]` alone (S calls of one row, MLX's one-row
++/// kernel), row r over the keys and values (`[B, Hk, T, *]`, the S query rows the last S of the T) up to its own:
++/// serial decode's bytes for every row of a verify.
++fn rowAttn(out: *mlx.mlx_array, queries: mlx.mlx_array, keys: mlx.mlx_array, values: mlx.mlx_array, scale: f32, seq_len: c_int, s: mlx.mlx_stream) !void {
++    const none_mask = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(none_mask);
++    const qs = mlx.getShape(queries);
++    const ks = mlx.getShape(keys);
++    const vs = mlx.getShape(values);
++    const first = ks[2] - seq_len;
++    const parts = mlx.mlx_vector_array_new();
++    defer _ = mlx.mlx_vector_array_free(parts);
++    const st4 = [_]c_int{ 1, 1, 1, 1 };
++    var r: c_int = 0;
++    while (r < seq_len) : (r += 1) {
++        var q = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(q);
++        try mlx.check(mlx.mlx_slice(&q, queries, &[_]c_int{ 0, 0, r, 0 }, 4, &[_]c_int{ qs[0], qs[1], r + 1, qs[3] }, 4, &st4, 4, s));
++        var k = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(k);
++        try mlx.check(mlx.mlx_slice(&k, keys, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ ks[0], ks[1], first + r + 1, ks[3] }, 4, &st4, 4, s));
++        var v = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(v);
++        try mlx.check(mlx.mlx_slice(&v, values, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ vs[0], vs[1], first + r + 1, vs[3] }, 4, &st4, 4, s));
++        var o = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(o);
++        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", none_mask, .{ .ctx = null }, false, s));
++        _ = mlx.mlx_vector_array_append_value(parts, o);
++    }
++    try mlx.check(mlx.mlx_concatenate_axis(out, parts, 2, s));
++}
++
++/// turboexl3_ling: a trunk MLA layer's attention on the rope-once cache: appends kv_b's rows `kv_flat`
++/// `[B, S, H (nope + v)]` as `[B, 1, S, H (nope + v)]` (V) and the roped shared key `k_rot` `[B, 1, S, rope]` (K), then
++/// attends over every cached row into `out` `[B, H, S, v]` through the cache's views (src/ling_mla_rope1.zig `views`):
++/// a decode row and an exact verify's rows on the verify kernels' rope-once texts (`verify_rows.attendRope1`), a prompt
++/// call the flash launch takes (src/ling_flash.zig `takes`) on turboexl3's rope-once flash launch, any other call over
++/// the expanded key (`ling_mla_rope1.expand`) on `verifyAttn` or `spanAttn`. Each the words the expanded cache's call
++/// gives.
++fn rope1Attn(
++    self: *const trunk.Model,
++    sl: Slots,
++    layer: u32,
++    batch: c_int,
++    seq_len: c_int,
++    attn_scale: f32,
++    q_nope: mlx.mlx_array,
++    q_rot: mlx.mlx_array,
++    kv_flat: mlx.mlx_array,
++    k_rot: mlx.mlx_array,
++    is_prefill: bool,
++    out: *mlx.mlx_array,
++) !void {
++    const cfg = self.c;
++    const s = self.s;
++    const h_count: c_int = @intCast(cfg.num_attention_heads);
++    const nope: c_int = @intCast(cfg.mla_qk_nope_head_dim);
++    const v_dim: c_int = @intCast(cfg.mla_v_head_dim);
++    var rows4 = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(rows4);
++    try mlx.check(mlx.mlx_reshape(&rows4, kv_flat, &[_]c_int{ batch, 1, seq_len, h_count * (nope + v_dim) }, 4, s));
++    var kv_view = try sl.append(0, layer, k_rot, rows4, s);
++    defer kv_view.deinit();
++    // turboexl3_ling: KV_SCHEME_DENSE_COPIES (src/ling_kv_scheme.zig `atView`): one branch on the view's own `bits`
++    // (mlx-serve's `KvView.bits`, 0 on a dense cache); a quantized cache's K and V here are dense dequantized copies.
++    kv_scheme.atView(kv_view.raw.bits);
++    ran.mark(.MLA_ROPE_ONCE);
++    try rope1Read(self, kv_view.k, kv_view.v, seq_len, attn_scale, q_nope, q_rot, is_prefill, out);
++}
++
++/// turboexl3_ling: the read half of `rope1Attn`, and of D2's `mlaGroup` at each span's cut view: the attention of a
++/// call's `seq_len` query rows (`q_nope`, `q_rot` `[B, H, S, *]`) over a rope-once view, `rope` the roped keys
++/// `[B, 1, T, rope]` and `rows` kv_b's rows `[B, 1, T, H (nope + v)]`, into `out` `[B, H, S, v]`. Its T rows are the
++/// keys, and the query rows the last S of them (causal from the bottom right), so the view's row count is the call's key
++/// count.
++fn rope1Read(
++    self: *const trunk.Model,
++    rope: mlx.mlx_array,
++    rows: mlx.mlx_array,
++    seq_len: c_int,
++    attn_scale: f32,
++    q_nope: mlx.mlx_array,
++    q_rot: mlx.mlx_array,
++    is_prefill: bool,
++    out: *mlx.mlx_array,
++) !void {
++    const cfg = self.c;
++    const s = self.s;
++    const h_count: c_int = @intCast(cfg.num_attention_heads);
++    const nope: c_int = @intCast(cfg.mla_qk_nope_head_dim);
++    const v_dim: c_int = @intCast(cfg.mla_v_head_dim);
++    var vw = try ling_mla_rope1.views(rows, rope, h_count, nope, v_dim, s);
++    defer vw.deinit();
++    const total: c_int = mlx.getShape(rope)[2];
++    var queries = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(queries);
++    {
++        const parts = [_]mlx.mlx_array{ q_nope, q_rot };
++        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
++        defer _ = mlx.mlx_vector_array_free(vec);
++        try mlx.check(mlx.mlx_concatenate_axis(&queries, vec, -1, s));
++    }
++    const sel_mode: [*:0]const u8 = if (is_prefill) "causal" else "";
++    if ((ling.exact_rows and seq_len > 1) or (!is_prefill and seq_len == 1)) {
++        // a decode row or an exact verify's rows: each row its one-row MLX SDPA call's words
++        if (try verify_rows.attendRope1(out, queries, vw.nope, vw.v, vw.rope, attn_scale, seq_len, s)) {
++            ling_mla_rope1.engaged(.rows, seq_len, total);
++            return;
++        }
++    } else if (ling_flash.takes(sel_mode, seq_len)) {
++        // a prompt call: the flash launch's words over the expanded key
++        if (try ling_mla_rope1.flash(out, queries, vw, attn_scale, s)) {
++            ling_mla_rope1.engaged(.flash, seq_len, total);
++            return;
++        }
++    }
++    // a call neither takes: the expanded key built from the views (the same words), on verifyAttn or spanAttn
++    const keys = try ling_mla_rope1.expand(vw, h_count, s);
++    defer _ = mlx.mlx_array_free(keys);
++    ling_mla_rope1.engaged(.expand, seq_len, total);
++    if (ling.exact_rows and seq_len > 1)
++        try verifyAttn(out, queries, keys, vw.v, attn_scale, seq_len, s)
++    else
++        try spanAttn(out, queries, keys, vw.v, attn_scale, seq_len, sel_mode, s);
++}
++
++// ── turboexl3_ling D2: one KV append for an MLA layer's prompt spans past 24,576 ──
++
++/// D2: one span's projections for `mlaGroup`, by `mlaAttn`'s ops at the span's own rows and position (its lines from the
++/// query to kv_b, copied, so `mlaAttn` itself is unchanged; the D2 byte test, src/ling_d2_test.zig, holds the two to the
++/// same words): the query's nope and roped halves `[B, H, S, *]`, kv_b's rows `[B, S, H (nope + v)]` and the roped
++/// shared key `[B, 1, S, rope]`.
++const SpanQkv = struct {
++    q_nope: mlx.mlx_array,
++    q_rot: mlx.mlx_array,
++    kv_flat: mlx.mlx_array,
++    k_rot: mlx.mlx_array,
++
++    fn deinit(q: *SpanQkv) void {
++        inline for (.{ q.q_nope, q.q_rot, q.kv_flat, q.k_rot }) |x| if (x.ctx != null) {
++            _ = mlx.mlx_array_free(x);
++        };
++    }
++};
++
++fn spanQkv(self: *const trunk.Model, x: mlx.mlx_array, fa: *const trunk.Mla, offset: c_int, batch: c_int, seq_len: c_int) !SpanQkv {
++    const cfg = self.c;
++    const h_count: c_int = @intCast(cfg.num_attention_heads);
++    const nope: c_int = @intCast(cfg.mla_qk_nope_head_dim);
++    const rope_d: c_int = @intCast(cfg.mla_qk_rope_head_dim);
++    const qk_dim: c_int = nope + rope_d;
++    const kv_lora: c_int = @intCast(cfg.mla_kv_lora_rank);
++    const perm = [_]c_int{ 0, 2, 1, 3 };
++    const strides3 = [_]c_int{ 1, 1, 1 };
++    const strides4 = [_]c_int{ 1, 1, 1, 1 };
++    var r: SpanQkv = .{ .q_nope = mlx.mlx_array_new(), .q_rot = mlx.mlx_array_new(), .kv_flat = .{ .ctx = null }, .k_rot = mlx.mlx_array_new() };
++    errdefer r.deinit();
++    const q_flat = if (fa.q.w.ctx != null)
++        try self.mm(&fa.q, x)
++    else blk: {
++        const q_a = try self.mm(&fa.q_a, x);
++        defer _ = mlx.mlx_array_free(q_a);
++        const q_a_n = try self.rmsNorm(q_a, fa.q_a_norm);
++        defer _ = mlx.mlx_array_free(q_a_n);
++        break :blk try self.mm(&fa.q_b, q_a_n);
++    };
++    defer _ = mlx.mlx_array_free(q_flat);
++    var q_heads = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(q_heads);
++    try mlx.check(mlx.mlx_reshape(&q_heads, q_flat, &[_]c_int{ batch, seq_len, h_count, qk_dim }, 4, self.s));
++    var q_t = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(q_t);
++    try mlx.check(mlx.mlx_transpose_axes(&q_t, q_heads, &perm, 4, self.s));
++    try mlx.check(mlx.mlx_slice(&r.q_nope, q_t, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, h_count, seq_len, nope }, 4, &strides4, 4, self.s));
++    var q_rot_raw = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(q_rot_raw);
++    try mlx.check(mlx.mlx_slice(&q_rot_raw, q_t, &[_]c_int{ 0, 0, 0, nope }, 4, &[_]c_int{ batch, h_count, seq_len, qk_dim }, 4, &strides4, 4, self.s));
++    const kv_a = try self.mm(&fa.kv_a, x);
++    defer _ = mlx.mlx_array_free(kv_a);
++    var latent_raw = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(latent_raw);
++    try mlx.check(mlx.mlx_slice(&latent_raw, kv_a, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ batch, seq_len, kv_lora }, 3, &strides3, 3, self.s));
++    var k_pe_flat = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(k_pe_flat);
++    try mlx.check(mlx.mlx_slice(&k_pe_flat, kv_a, &[_]c_int{ 0, 0, kv_lora }, 3, &[_]c_int{ batch, seq_len, kv_lora + rope_d }, 3, &strides3, 3, self.s));
++    const latent = try self.rmsNorm(latent_raw, fa.kv_a_norm);
++    defer _ = mlx.mlx_array_free(latent);
++    var k_pe_t = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(k_pe_t);
++    {
++        var k_pe_h = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(k_pe_h);
++        try mlx.check(mlx.mlx_reshape(&k_pe_h, k_pe_flat, &[_]c_int{ batch, seq_len, 1, rope_d }, 4, self.s));
++        try mlx.check(mlx.mlx_transpose_axes(&k_pe_t, k_pe_h, &perm, 4, self.s));
++    }
++    const traditional = cfg.rope_interleaved_pairs;
++    try mlx.check(mlx.mlx_fast_rope(&r.q_rot, q_rot_raw, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
++    try mlx.check(mlx.mlx_fast_rope(&r.k_rot, k_pe_t, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
++    r.kv_flat = try self.mm(&fa.kv_b, latent);
++    return r;
++}
++
++/// D2: one span's output for `mlaGroup` from its attention `attn_out` `[B, H, S, v]`, by `mlaAttn`'s ops after the
++/// attention (copied): the transpose, the head-wise gate of its input `x` and o_proj.
++fn spanOut(self: *const trunk.Model, x: mlx.mlx_array, fa: *const trunk.Mla, attn_out: mlx.mlx_array, batch: c_int, seq_len: c_int) !mlx.mlx_array {
++    const cfg = self.c;
++    const h_count: c_int = @intCast(cfg.num_attention_heads);
++    const v_dim: c_int = @intCast(cfg.mla_v_head_dim);
++    const perm = [_]c_int{ 0, 2, 1, 3 };
++    var attn_t = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(attn_t);
++    try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm, 4, self.s));
++    var gated: mlx.mlx_array = .{ .ctx = null };
++    defer if (gated.ctx != null) {
++        _ = mlx.mlx_array_free(gated);
++    };
++    if (cfg.mla_head_gate and fa.g.w.ctx != null) {
++        const gate_logits = try self.mm(&fa.g, x);
++        defer _ = mlx.mlx_array_free(gate_logits);
++        var g_f32 = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(g_f32);
++        try mlx.check(mlx.mlx_astype(&g_f32, gate_logits, .float32, self.s));
++        var g_sig = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(g_sig);
++        try mlx.check(mlx.mlx_sigmoid(&g_sig, g_f32, self.s));
++        var g_cast = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(g_cast);
++        try mlx.check(mlx.mlx_astype(&g_cast, g_sig, mlx.mlx_array_dtype(attn_t), self.s));
++        var g_4d = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(g_4d);
++        try mlx.check(mlx.mlx_reshape(&g_4d, g_cast, &[_]c_int{ batch, seq_len, h_count, 1 }, 4, self.s));
++        gated = mlx.mlx_array_new();
++        try mlx.check(mlx.mlx_multiply(&gated, attn_t, g_4d, self.s));
++    }
++    var attn_flat = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(attn_flat);
++    try mlx.check(mlx.mlx_reshape(&attn_flat, if (gated.ctx != null) gated else attn_t, &[_]c_int{ batch, seq_len, h_count * v_dim }, 3, self.s));
++    return self.mm(&fa.o, attn_flat);
++}
++
++/// D2: `parts` joined on the row axis (2), in order: each part's words copied unchanged
++fn joinRows(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
++    var r = mlx.mlx_array_new();
++    errdefer _ = mlx.mlx_array_free(r);
++    const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
++    defer _ = mlx.mlx_vector_array_free(vec);
++    try mlx.check(mlx.mlx_concatenate_axis(&r, vec, 2, s));
++    return r;
++}
++
++/// D2's run-path mark, at each call whose spans share an append, and its engaged line, once a process.
++var d2_said = false;
++
++fn d2Engaged(n_spans: usize, first: c_int, end: c_int) void {
++    ran.mark(.D2);
++    if (d2_said) return;
++    d2_said = true;
++    std.log.info("[turboexl3_ling] D2 engaged: an MLA layer's {d} prompt spans, positions {d} to {d}, append their keys and values in one call, so mlx-serve grows the KV once for them, not once a span; each span attends over its rows up to its own end", .{ n_spans, first, end });
++}
++
++/// turboexl3_ling D2 (one KV append for an MLA layer's prompt spans past 24,576; the copied table_forward.zig
++/// `hiddenSpans` calls it at a trunk MLA layer's spans from src/ling_rq.zig `groupStart` on): the spans `xs` (each
++/// `[1, rows[i], hidden]`, in order, the first at position `pos0`) through this layer's mixer, each span's output in
++/// `out[i]` (the caller frees them) with the words `mlaAttn` gives that span after the spans before it.
++/// - Each span's projections are `mlaAttn`'s at its own rows and position (`spanQkv`): a projection over more rows could
++///   tile differently.
++/// - Their roped keys and kv_b rows, joined in the spans' order (`joinRows`), reach the cache in one CacheOps.append. So
++///   the cache holds the words the appends a span wrote, and mlx-serve grows the KV at most once for the spans.
++/// - Each span attends over the view cut at its own last row (`rope1Read`: the view's rows are the call's keys, the
++///   span's query rows the last of them), then `spanOut`.
++/// Two spans or more mark D2 on the run-path line (`d2Engaged`).
++pub fn mlaGroup(self: *const trunk.Model, sl: Slots, xs: []const mlx.mlx_array, fa: *const trunk.Mla, layer: u32, pos0: c_int, rows: []const c_int, out: []mlx.mlx_array) !void {
++    if (xs.len == 0 or xs.len != rows.len or out.len != rows.len) return error.LingD2Group;
++    if (ling_mtp_latent.isHead(fa)) return error.LingD2HeadLayer;
++    const cfg = self.c;
++    const s = self.s;
++    const h_count: c_int = @intCast(cfg.num_attention_heads);
++    const nope: c_int = @intCast(cfg.mla_qk_nope_head_dim);
++    const v_dim: c_int = @intCast(cfg.mla_v_head_dim);
++    const width: c_int = h_count * (nope + v_dim);
++    const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
++    const st4 = [_]c_int{ 1, 1, 1, 1 };
++    const a = std.heap.c_allocator;
++    const n = rows.len;
++    // each span's projections, at its own rows and position
++    const qkv = try a.alloc(SpanQkv, n);
++    defer a.free(qkv);
++    var made: usize = 0;
++    defer for (qkv[0..made]) |*q| q.deinit();
++    var at: c_int = pos0;
++    for (xs, rows) |x, r| {
++        qkv[made] = try spanQkv(self, x, fa, at, 1, r);
++        made += 1;
++        at += r;
++    }
++    // the spans' roped keys `[1, 1, R, rope]` and kv_b rows `[1, 1, R, H (nope + v)]`, joined in order, in one append
++    const ks = try a.alloc(mlx.mlx_array, n);
++    defer a.free(ks);
++    const vs = try a.alloc(mlx.mlx_array, n);
++    defer a.free(vs);
++    for (vs) |*v| v.* = mlx.mlx_array_new();
++    defer for (vs) |v| {
++        _ = mlx.mlx_array_free(v);
++    };
++    for (qkv, rows, ks, vs) |q, r, *k, *v| {
++        k.* = q.k_rot;
++        try mlx.check(mlx.mlx_reshape(v, q.kv_flat, &[_]c_int{ 1, 1, r, width }, 4, s));
++    }
++    const k_all = try joinRows(ks, s);
++    defer _ = mlx.mlx_array_free(k_all);
++    const v_all = try joinRows(vs, s);
++    defer _ = mlx.mlx_array_free(v_all);
++    var kv_view = try sl.append(0, layer, k_all, v_all, s);
++    defer kv_view.deinit();
++    // KV_SCHEME_DENSE_COPIES and MLA_ROPE_ONCE as `rope1Attn` has them at its append
++    kv_scheme.atView(kv_view.raw.bits);
++    ran.mark(.MLA_ROPE_ONCE);
++    if (n > 1) d2Engaged(n, pos0, at);
++    // each span over the view cut at its own last row: the view holds rows [0, at) (a full cache's every row), so a
++    // span's end is its row count there; a view of any other rows is refused by name, never cut
++    const ksh = mlx.getShape(kv_view.k);
++    const vsh = mlx.getShape(kv_view.v);
++    if (ksh.len != 4 or vsh.len != 4 or ksh[2] != at or vsh[2] != at) return error.LingD2ViewRows;
++    var end: c_int = pos0;
++    for (qkv, rows, xs, out) |q, r, x, *o| {
++        end += r;
++        var kc = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(kc);
++        try mlx.check(mlx.mlx_slice(&kc, kv_view.k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ ksh[0], ksh[1], end, ksh[3] }, 4, &st4, 4, s));
++        var vc = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(vc);
++        try mlx.check(mlx.mlx_slice(&vc, kv_view.v, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ vsh[0], vsh[1], end, vsh[3] }, 4, &st4, 4, s));
++        var attn = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(attn);
++        try rope1Read(self, kc, vc, r, attn_scale, q.q_nope, q.q_rot, true, &attn);
++        o.* = try spanOut(self, x, fa, attn, 1, r);
++    }
++}

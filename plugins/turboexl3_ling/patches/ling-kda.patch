@@ -1,0 +1,575 @@
+--- a/plugins/glm5_next/kda.zig
++++ b/plugins/glm5_next/kda.zig
+@@ -19,6 +19,12 @@
+ const kernels = @import("../../sdk/blocks/gdn/kernels.zig");
+ const sliceQkvPart = @import("../../sdk/blocks/linear/fused_rows.zig").sliceQkvPart;
+ const trunk = @import("trunk.zig");
++const ling = @import("../../../ling_exl3.zig");
++/// turboexl3_ling: Ling's KDA kernels (sdk/blocks/kda/ling.zig).
++const ling_kda_k = @import("../../sdk/blocks/kda/ling.zig");
++/// turboexl3_ling: the step's epilogue (src/ling_kda_epi.zig): the launch also writes a verify's window inputs and
++/// o_proj's prepared rows, and o_proj runs its GEMV alone.
++const kda_epi = @import("../../../ling_kda_epi.zig");
+ const Array = mlx.mlx_array;
+ const Model = trunk.Model;
+ const Kda = trunk.Kda;
+@@ -70,7 +76,231 @@
+     return gate_mod.gdnGateChain(A_log, a, dt_bias, gate_mod.gdnChainGateDtype(mlx.mlx_array_dtype(a), m.ssmStateDtype()), m.s);
+ }
+ /// The layer over `x` `[B, S, hidden]` on `e`; `capture` keeps every row's state for rollback (a verify).
++/// turboexl3_ling: a layer's rows, or an exact verify's (`ling.exact_rows`) row by row past the projections
++/// (`exactRows`).
+ pub fn forward(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq_len: c_int, is_prefill: bool, capture: bool) !Array {
++    if (ling.exact_rows and capture and batch == 1 and seq_len > 1 and seq_len <= exact_max_rows and !la.in.built() and
++        e.initialized and e.conv_state.ctx != null and e.ssm_state.ctx != null)
++    {
++        if (try exactRowsFused(m, x, la, e, seq_len)) |y| return y;
++        return exactRows(m, x, la, e, seq_len);
++    }
++    return forwardWith(m, x, la, e, batch, seq_len, is_prefill, capture, null, false);
++}
++
++/// turboexl3_ling (src/ling_kdaproj.zig `proj`): q|k|v, a and z of x in one GEMV launch at decode rows, each its bytes;
++/// null where q|k|v ships in parts or turboexl3 declines.
++fn projFused(m: *const Model, la: *const Kda, x: Array) !?[3]Array {
++    if (la.qkv.w.ctx == null) return null;
++    return @import("../../../ling_kdaproj.zig").proj(m.s, x, &la.qkv, &la.a, &la.z);
++}
++
++/// turboexl3_ling (src/ling_kdaproj.zig `projPrompt`): q|k|v, a and z of x at prompt rows, their products and finishes
++/// in one launch past each one's prepare and W_hat, each its bytes; null where q|k|v ships in parts or turboexl3
++/// declines.
++fn projPrompt(m: *const Model, la: *const Kda, x: Array) !?[3]Array {
++    if (la.qkv.w.ctx == null) return null;
++    return @import("../../../ling_kdaproj.zig").projPrompt(m.s, x, &la.qkv, &la.a, &la.z);
++}
++
++/// turboexl3_ling (src/ling_kdaproj.zig `projPromptGate`, KDA_GATE_EPI): `projPrompt`'s launch with a's output its
++/// bounded gate g (f32), the served gate's words, so the gate's own launch does not run. Null, nothing launched, where
++/// the layer's call is not the one the gate serves (a bounded gate, a prompt forward outside a verify, no low-rank stage
++/// on a, and not the per-core recurrence, which reads a itself); where q|k|v ships in parts; where turboexl3 declines.
++fn projPromptGate(m: *const Model, la: *const Kda, x: Array, is_prefill: bool, capture: bool) !?[3]Array {
++    const c = m.c;
++    if (c.kda_gate_lower_bound == 0.0 or !is_prefill or capture or la.a2.w.ctx != null or la.qkv.w.ctx == null) return null;
++    // `forwardWith`'s `kda_fused`, at q|k|v's dtype: the launch's outputs are in x's
++    if (kda_recurrence.serves(m.s, @intCast(c.linear_num_key_heads), @intCast(c.linear_num_value_heads), @intCast(c.linear_key_head_dim), @intCast(c.linear_value_head_dim), mlx.mlx_array_dtype(x), m.ssmStateDtype())) return null;
++    return @import("../../../ling_kdaproj.zig").projPromptGate(m.s, x, &la.qkv, &la.a, &la.z, .{ .A_log = la.A_log, .dt_bias = la.dt_bias, .bound = c.kda_gate_lower_bound });
++}
++
++/// turboexl3_ling (src/ling_kdaproj.zig `projB`): `projFused`'s launch with b_proj as a fourth member, its output into
++/// `b`, each of the four its own bytes; null where q|k|v ships in parts or turboexl3 declines (the caller runs
++/// `projFused` and b_proj's matmul apart).
++fn projFusedB(m: *const Model, la: *const Kda, x: Array, b: *Array) !?[3]Array {
++    if (la.qkv.w.ctx == null) return null;
++    return @import("../../../ling_kdaproj.zig").projB(m.s, x, &la.qkv, &la.a, &la.z, &la.b, b);
++}
++
++/// turboexl3_ling: `exactRows` in one launch per layer: the same projections over every row, then
++/// sdk/blocks/kda/ling.zig's `verifyRows`, whose row r has the bytes of serial decode's one-row step on row r (the
++/// state's store and load between rows included), the state after every row and the window's inputs kept as
++/// `exactRows` keeps them. Null (`exactRows` runs) where the launch does not serve: past 8 rows, a gate with a low-rank
++/// stage, an unbounded gate.
++fn exactRowsFused(m: *Model, x: Array, la: *const Kda, e: *Entry, seq_len: c_int) !?Array {
++    if (seq_len > ling_kda_k.decode_max_rows or m.c.kda_gate_lower_bound == 0.0) return null;
++    if (la.a2.w.ctx != null or la.z2.w.ctx != null or m.c.linear_conv_kernel_dim != 4) return null;
++    const s = m.s;
++    // b_proj in projFused's launch (projFusedB: b_fused), else its own matmul below
++    var b_fused: Array = .{ .ctx = null };
++    const qaz = try projFusedB(m, la, x, &b_fused) orelse try projFused(m, la, x);
++    const qkv = if (qaz) |t| t[0] else try qkvProj(m, la, x);
++    defer free(qkv);
++    const z = if (qaz) |t| t[2] else try m.mm(&la.z, x);
++    defer free(z);
++    const a = if (qaz) |t| t[1] else try m.mm(&la.a, x);
++    defer free(a);
++    const b = if (b_fused.ctx != null) b_fused else try m.mm(&la.b, x);
++    defer free(b);
++    if (m.kda.q_scale.ctx == null) {
++        const inv: f32 = 1.0 / @as(f32, @floatFromInt(m.c.linear_key_head_dim));
++        m.kda.q_scale = try scalarOf(inv, mlx.mlx_array_dtype(qkv), s);
++        m.kda.k_scale = try scalarOf(@sqrt(inv), mlx.mlx_array_dtype(qkv), s);
++    }
++    const in: ling_kda_k.DecodeIn = .{
++        .qkv = qkv,
++        .z = z,
++        .a = a,
++        .b = b,
++        .conv_state = e.conv_state,
++        .conv_w = la.conv_w,
++        .A_log = la.A_log,
++        .dt_bias = la.dt_bias,
++        .state = e.ssm_state,
++        .norm_w = la.norm_w,
++        .q_scale = m.kda.q_scale,
++        .k_scale = m.kda.k_scale,
++        .qk_eps = qkNormEps(m),
++        .norm_eps = m.c.rms_norm_eps,
++        .bound = m.c.kda_gate_lower_bound,
++        .hk = @intCast(m.c.linear_num_key_heads),
++        .hv = @intCast(m.c.linear_num_value_heads),
++        .dk = @intCast(m.c.linear_key_head_dim),
++        .dv = @intCast(m.c.linear_value_head_dim),
++    };
++    // The epilogue (src/ling_kda_epi.zig): the same launch also writes the window's inputs and o_proj's prepared rows,
++    // and o_proj runs its GEMV alone over them: the concatenate and o_proj's prepare launch gone, every word the same
++    if (try kda_epi.verifyRows(s, in, &la.out)) |r| {
++        free(e.conv_state);
++        e.conv_state = r.conv_state;
++        free(e.ssm_state);
++        e.ssm_state = r.state;
++        free(e.spec_state_seq);
++        e.spec_state_seq = r.state_seq;
++        free(e.spec_conv_input);
++        e.spec_conv_input = r.conv_input;
++        return r.out;
++    }
++    const r = (try ling_kda_k.verifyRows(s, in)) orelse return null;
++    defer free(r.y);
++    free(e.conv_state);
++    e.conv_state = r.conv_state;
++    free(e.ssm_state);
++    e.ssm_state = r.state;
++    free(e.spec_state_seq);
++    e.spec_state_seq = r.state_seq;
++    free(e.spec_conv_input);
++    e.spec_conv_input = r.conv_input;
++    return try m.mm(&la.out, r.y);
++}
++
++/// The widest exact verify a KDA layer steps.
++const exact_max_rows = 16;
++/// A row's projections, handed to `forwardWith` in place of its own.
++const Pre = struct { qkv: Array, z: Array, a: Array, b: Array };
++
++/// turboexl3_ling: an exact verify's rows. The projections run over every row (turboexl3's linears are row-independent;
++/// a dense one goes row by row through `mm`); then each row's conv, gates, recurrence and gated norm take the one-row
++/// path serial decode takes, the state after every row kept for a partial accept's rollback (`spec_state_seq`
++/// [S, 1, Hv, Dv, Dk], `spec_conv_input` the window's 3 inputs then the rows', as the capture kernel leaves them);
++/// then the out projection over every row.
++fn exactRows(m: *Model, x: Array, la: *const Kda, e: *Entry, seq_len: c_int) !Array {
++    const s = m.s;
++    // b_proj in projFused's launch (projFusedB: b_fused), else its own matmul below
++    var b_fused: Array = .{ .ctx = null };
++    const qaz = try projFusedB(m, la, x, &b_fused) orelse try projFused(m, la, x);
++    const qkv = if (qaz) |t| t[0] else try qkvProj(m, la, x);
++    defer free(qkv);
++    const z = if (qaz) |t| t[2] else try m.mm(&la.z, x);
++    defer free(z);
++    const a = if (qaz) |t| t[1] else try m.mm(&la.a, x);
++    defer free(a);
++    const b = if (b_fused.ctx != null) b_fused else try m.mm(&la.b, x);
++    defer free(b);
++    const conv_before = ref(e.conv_state);
++    defer free(conv_before);
++    var ys: [exact_max_rows]Array = undefined;
++    var states: [exact_max_rows]Array = undefined;
++    var n: usize = 0;
++    defer for (ys[0..n], states[0..n]) |y, st| {
++        free(y);
++        free(st);
++    };
++    while (n < @as(usize, @intCast(seq_len))) {
++        const r: c_int = @intCast(n);
++        const p: Pre = .{ .qkv = try rowOf(qkv, r, s), .z = try rowOf(z, r, s), .a = try rowOf(a, r, s), .b = try rowOf(b, r, s) };
++        defer inline for (.{ p.qkv, p.z, p.a, p.b }) |t| free(t);
++        const y = try forwardWith(m, x, la, e, 1, 1, false, false, p, true);
++        ys[n] = y;
++        states[n] = ref(e.ssm_state);
++        n += 1;
++    }
++    {
++        const vec = mlx.mlx_vector_array_new_data(&states, n);
++        defer _ = mlx.mlx_vector_array_free(vec);
++        free(e.spec_state_seq);
++        e.spec_state_seq = mlx.mlx_array_new();
++        try mlx.check(mlx.mlx_stack_axis(&e.spec_state_seq, vec, 0, s));
++    }
++    {
++        const parts = [_]Array{ conv_before, qkv };
++        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
++        defer _ = mlx.mlx_vector_array_free(vec);
++        free(e.spec_conv_input);
++        e.spec_conv_input = mlx.mlx_array_new();
++        try mlx.check(mlx.mlx_concatenate_axis(&e.spec_conv_input, vec, 1, s));
++    }
++    var y_all = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(y_all);
++    {
++        const vec = mlx.mlx_vector_array_new_data(&ys, n);
++        defer _ = mlx.mlx_vector_array_free(vec);
++        try mlx.check(mlx.mlx_concatenate_axis(&y_all, vec, 1, s));
++    }
++    return m.mm(&la.out, y_all);
++}
++
++/// Row `r` of a `[1, S, W]` array, `[1, 1, W]`.
++fn rowOf(a: Array, r: c_int, s: mlx.mlx_stream) !Array {
++    const sh = mlx.getShape(a);
++    var out = mlx.mlx_array_new();
++    errdefer _ = mlx.mlx_array_free(out);
++    try mlx.check(mlx.mlx_slice(&out, a, &[_]c_int{ 0, r, 0 }, 3, &[_]c_int{ sh[0], r + 1, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
++    return out;
++}
++
++/// A new reference on `a`.
++fn ref(a: Array) Array {
++    var r = mlx.mlx_array_new();
++    _ = mlx.mlx_array_set(&r, a);
++    return r;
++}
++
++/// The out projection, or (`raw`, an exact verify's row) its input, a new reference.
++fn outProj(m: *Model, la: *const Kda, y: Array, raw: bool) !Array {
++    if (raw) return ref(y);
++    return m.mm(&la.out, y);
++}
++
++/// turboexl3_ling (src/ling_kda_norm_prep.zig `oProj`, KDA_NORM_PREP): `outProj`'s words of the norm-gate's output,
++/// with that output written as o_proj's prepared rows in one launch, so neither the norm-gate's own launch nor o_proj's
++/// prepare runs. It takes the norm-gate call's arguments. Null, nothing launched, where the call is not the one it
++/// stands in for: o_proj's output wanted (not `raw`), the sigmoid gate, a prompt forward at the norm-gate's prompt rows
++/// (`gdnPrefillFusedFor`) on its table (TAB 1), y of the call's shape; and where the plugin declines (o_proj outside
++/// the layer's LAYER_WHAT scope or off `linear`'s matmul path there, operands turboexl3 does not take).
++fn normPrep(m: *const Model, la: *const Kda, y: Array, z: Array, z_off: c_int, z_stride: c_int, swish: bool, hv: c_int, dv: c_int, batch: c_int, seq: c_int, tab_in: ?bool, is_prefill: bool, raw: bool) !?Array {
++    if (raw or swish or !is_prefill or dv != 128) return null;
++    // `gdnNormGateFusedTab`'s rules for its prompt arm and its table
++    if (!decode_fused.gdnPrefillFusedFor(seq, batch) or !(tab_in orelse (seq >= 17))) return null;
++    const ysh = mlx.getShape(y);
++    if (ysh.len != 4 or ysh[0] != batch or ysh[1] != seq or ysh[2] != hv or ysh[3] != dv) return null;
++    return @import("../../../ling_kda_norm_prep.zig").oProj(m.s, .{ .y = y, .z = z, .z_off = @intCast(z_off), .z_stride = @intCast(z_stride), .norm_w = la.norm_w, .eps = m.kda.eps }, &la.out);
++}
++
++/// `forward`'s body: `pre` the row's projections when given (an exact verify's row), `raw` the out projection left to
++/// the caller.
++fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq_len: c_int, is_prefill: bool, capture: bool, given: ?Pre, raw: bool) !Array {
+     const s = m.s;
+     const c = m.c;
+     const num_k_heads: c_int = @intCast(c.linear_num_key_heads);
+@@ -94,7 +324,15 @@
+     defer _ = mlx.mlx_array_free(z_proj);
+     defer _ = mlx.mlx_array_free(a_proj);
+     defer _ = mlx.mlx_array_free(b_proj);
+-    if (la.in.built() and (batch * seq_len <= 1 or (batch == 1 and seq_len <= kda_recurrence.MAX_WINDOW))) {
++    // turboexl3_ling (KDA_GATE_EPI): the gate the prompt projection's launch made (`projPromptGate`), else null.
++    var g_epi: Array = .{ .ctx = null };
++    defer free(g_epi);
++    if (given) |p| {
++        qkv = ref(p.qkv);
++        z_proj = ref(p.z);
++        a_proj = ref(p.a);
++        b_proj = ref(p.b);
++    } else if (la.in.built() and (batch * seq_len <= 1 or (batch == 1 and seq_len <= kda_recurrence.MAX_WINDOW))) {
+         const all = try m.mm(&la.in.lin, x);
+         in_all = all;
+         qkv = mlx.mlx_array_new();
+@@ -106,10 +344,35 @@
+         try sliceQkvPart(&z_proj, all, w[0], w[1], s);
+         try sliceQkvPart(&a_proj, all, w[0] + w[1], w[2], s);
+         try sliceQkvPart(&b_proj, all, w[0] + w[1] + w[2], w[3], s);
++    } else if (try projFusedB(m, la, x, &b_proj) orelse try projFused(m, la, x)) |qaz| {
++        qkv = qaz[0];
++        a_proj = qaz[1];
++        z_proj = qaz[2];
++        // b_proj came with the projections (projFusedB), else its own matmul
++        if (b_proj.ctx == null) b_proj = try m.mm(&la.b, x);
++    } else if (try projPromptGate(m, la, x, is_prefill, capture)) |qgz| {
++        qkv = qgz[0];
++        g_epi = qgz[1];
++        z_proj = qgz[2];
++        // a's output went to the gate inside the launch. The packed prework below still binds `a` (it reads its shape)
++        // and at GATE 0 never reads it, so a takes a new reference of q|k|v (bf16, as a was).
++        a_proj = ref(qkv);
++        b_proj = try m.mm(&la.b, x);
++    } else if (try projPrompt(m, la, x)) |qaz| {
++        qkv = qaz[0];
++        a_proj = qaz[1];
++        z_proj = qaz[2];
++        b_proj = try m.mm(&la.b, x);
+     } else {
+         qkv = try qkvProj(m, la, x);
+-        z_proj = try m.mm(&la.z, x);
+-        a_proj = try m.mm(&la.a, x);
++        // turboexl3_ling (src/ling_pair.zig): z | a in one launch at decode rows, each its bytes.
++        if (try @import("../../../ling_pair.zig").pair(s, x, &la.z, &la.a)) |za| {
++            z_proj = za[0];
++            a_proj = za[1];
++        } else {
++            z_proj = try m.mm(&la.z, x);
++            a_proj = try m.mm(&la.a, x);
++        }
+         b_proj = try m.mm(&la.b, x);
+     }
+     // KDA decode: one dispatch per layer over the row-joined projection; a verify steps row by row, keeping each
+@@ -140,7 +403,7 @@
+         e.conv_state = r.conv_state;
+         _ = mlx.mlx_array_free(e.ssm_state);
+         e.ssm_state = r.state;
+-        return m.mm(&la.out, r.y);
++        return outProj(m, la, r.y, raw);
+     }
+     // Low-rank gates: the projections above are the first stage; the joined buffer's a/z columns are then
+     // first-stage values, so readers lose it.
+@@ -165,6 +428,50 @@
+     }
+     const inv_scale_sq = m.kda.q_scale;
+     const inv_sqrt_sc = m.kda.k_scale;
++    // turboexl3_ling (sdk/blocks/kda/ling.zig `decodeStep`): a decode step in one launch per layer (the conv, SiLU, q/k
++    // norms, beta, the per-channel gate, the delta rule and the gated norm), each piece the arithmetic of the op or
++    // kernel it replaces below, so the same bytes; a verify's capture and a cold layer keep the path below.
++    if (bounded and !capture and batch == 1 and seq_len <= ling_kda_k.decode_max_rows and kernel == 4 and
++        e.initialized and e.conv_state.ctx != null and e.ssm_state.ctx != null and la.a2.w.ctx == null and la.z2.w.ctx == null)
++    ling_step: {
++        const in: ling_kda_k.DecodeIn = .{
++            .qkv = qkv,
++            .z = z_proj,
++            .a = a_proj,
++            .b = b_proj,
++            .conv_state = e.conv_state,
++            .conv_w = la.conv_w,
++            .A_log = la.A_log,
++            .dt_bias = la.dt_bias,
++            .state = e.ssm_state,
++            .norm_w = la.norm_w,
++            .q_scale = inv_scale_sq,
++            .k_scale = inv_sqrt_sc,
++            .qk_eps = qkNormEps(m),
++            .norm_eps = c.rms_norm_eps,
++            .bound = c.kda_gate_lower_bound,
++            .hk = num_k_heads,
++            .hv = num_v_heads,
++            .dk = dk,
++            .dv = dv,
++        };
++        // The epilogue (src/ling_kda_epi.zig): the same launch also writes o_proj's prepared rows, and o_proj runs its
++        // GEMV alone over them (a caller that takes y itself, `raw`, keeps the step's own launch)
++        if (!raw) if (try kda_epi.decodeStep(s, in, &la.out)) |r| {
++            _ = mlx.mlx_array_free(e.conv_state);
++            e.conv_state = r.conv_state;
++            _ = mlx.mlx_array_free(e.ssm_state);
++            e.ssm_state = r.state;
++            return r.out;
++        };
++        const r = (try ling_kda_k.decodeStep(s, in)) orelse break :ling_step;
++        defer _ = mlx.mlx_array_free(r.y);
++        _ = mlx.mlx_array_free(e.conv_state);
++        e.conv_state = r.conv_state;
++        _ = mlx.mlx_array_free(e.ssm_state);
++        e.ssm_state = r.state;
++        return outProj(m, la, r.y, raw);
++    }
+     var q_scaled = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(q_scaled);
+     var k_scaled = mlx.mlx_array_new();
+@@ -176,9 +483,14 @@
+     // The per-core recurrence builds the per-channel gate itself, so the prework skips its per-head one.
+     const kda_fused = bounded and !capture and
+         kda_recurrence.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype());
++    // turboexl3_ling: the packed prework (gate off: KDA's per-channel gate stays below) and the norm-gate epilogue
++    // without the per-core recurrence, which refuses Ling's 64 heads on a 40-core GPU and its bf16 state. Both kernels
++    // are the composed chain's bytes (mlx-serve's own tests); the stock recurrence and the gate keep theirs.
++    const ling_prework = !kda_fused and bounded and !capture;
++    const prework_route = kda_fused or ling_prework;
+     // Wide prework is token-local; a cold chunk supplies the same zero history as the composed conv.
+-    const prefill_fused = kda_fused and is_prefill and decode_fused.gdnPrefillFusedFor(seq_len, batch);
+-    if (kda_fused and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
++    const prefill_fused = prework_route and is_prefill and decode_fused.gdnPrefillFusedFor(seq_len, batch);
++    if (prework_route and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
+         kernel == 4 and (e.initialized or prefill_fused))
+     blk: {
+         var zero_conv: Array = .{ .ctx = null };
+@@ -214,6 +526,8 @@
+             .batch = batch,
+             .gate = false,
+             .g_dtype = gdn_decode.gateDtype(mlx.mlx_array_dtype(qkv), m.ssmStateDtype()),
++            // turboexl3_ling: MLX's tabulated sigmoid at every width, so decode rows keep the composed chain's bytes.
++            .tab = if (ling_prework) true else null,
+         }) catch null) orelse break :blk;
+         free(e.conv_state);
+         e.conv_state = pre.conv_state;
+@@ -222,6 +536,10 @@
+             decode_fused.gdn_prefill_engaged = true;
+             log.info("[gdn-prefill] engaged: S={d} B={d} cold={}\n", .{ seq_len, batch, cold });
+         }
++        if (ling_prework and !ling_prework_said) {
++            ling_prework_said = true;
++            log.info("[kda] Ling's packed prework and norm-gate engaged: S={d}\n", .{seq_len});
++        }
+         _ = mlx.mlx_array_free(q_scaled);
+         _ = mlx.mlx_array_free(k_scaled);
+         _ = mlx.mlx_array_free(v_heads);
+@@ -268,8 +586,11 @@
+     }
+     // One gate value per key channel: the bounded sigmoid where the config bounds it (fla's two arms), else the
+     // softplus chain over `A_log` expanded per channel. The per-core recurrence builds the gate itself.
+-    const g = if (kda_fused) Array{ .ctx = null } else if (bounded)
+-        try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s)
++    // turboexl3_ling (sdk/blocks/kda/ling.zig `gate`): the bounded gate in one launch, kdaGateChain's ops' formulas.
++    // KDA_GATE_EPI: where the prompt projection's launch made it (`g_epi`), no launch here.
++    const g = if (g_epi.ctx != null) ref(g_epi) else if (kda_fused) Array{ .ctx = null } else if (bounded)
++        ((try ling_kda_k.gate(s, la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound)) orelse
++            try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s))
+     else
+         try softplusGate(m, la.A_log, a_proj, la.dt_bias);
+     defer free(g);
+@@ -338,7 +659,21 @@
+         y_bthd = r.y;
+         _ = mlx.mlx_array_free(e.ssm_state);
+         e.ssm_state = r.state;
+-    } else {
++    } else stock: {
++        // turboexl3_ling (sdk/blocks/kda/ling.zig `recurBlocked`): prompt rows on the blocked recurrence, the stock
++        // kernel's arithmetic with each block of tokens staged per threadgroup of value rows. It takes the gate per head:
++        // g, flat [B, S, Hv*Dk] here, viewed as [B, S, Hv, Dk] (no copy).
++        if (bounded and is_prefill) blocked: {
++            const g_heads = (try ling_kda_k.gateHeads(s, g, batch, seq_len, num_v_heads, dk)) orelse break :blocked;
++            defer _ = mlx.mlx_array_free(g_heads);
++            if (try ling_kda_k.recurBlocked(s, q_scaled, k_scaled, v_heads, g_heads, beta, e.ssm_state, out_dtype)) |r| {
++                _ = mlx.mlx_array_free(y_bthd);
++                y_bthd = r.y;
++                _ = mlx.mlx_array_free(e.ssm_state);
++                e.ssm_state = r.state;
++                break :stock;
++            }
++        }
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(kcfg, &[_]c_int{ batch, num_v_heads, dv, dk }, 4, state_dtype));
+         // A per-channel gate is another indexing contract than the blocked kernel's per-head one: stock kernel.
+         try kernels.gdnSetGrid(kcfg, .stock, dv, num_v_heads, batch);
+@@ -359,9 +694,12 @@
+     // rms_norm(y) * sigmoid(z) straight to the out projection's input (decode and verify widths).
+     if (fused_prework) {
+         if (m.kda.eps.ctx == null) m.kda.eps = mlx.mlx_array_new_float(c.rms_norm_eps);
+-        if (try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len)) |flat| {
++        // turboexl3_ling (KDA_NORM_PREP): the norm-gate's output as o_proj's prepared rows in one launch, then o_proj
++        // from them (`normPrep`); where it declines, the norm-gate and o_proj below.
++        if (try normPrep(m, la, y_bthd, z_proj, 0, value_dim, false, num_v_heads, dv, batch, seq_len, if (ling_prework) true else null, is_prefill, raw)) |out| return out;
++        if (try decode_fused.gdnNormGateFusedTab(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len, if (ling_prework) true else null)) |flat| {
+             defer _ = mlx.mlx_array_free(flat);
+-            return m.mm(&la.out, flat);
++            return outProj(m, la, flat, raw);
+         }
+     }
+     var z_heads = mlx.mlx_array_new();
+@@ -379,8 +717,10 @@
+     var out_flat = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(out_flat);
+     try mlx.check(mlx.mlx_reshape(&out_flat, gated, &[_]c_int{ batch, seq_len, value_dim }, 3, s));
+-    return m.mm(&la.out, out_flat);
++    return outProj(m, la, out_flat, raw);
+ }
++/// turboexl3_ling: the packed prework's engagement line, once.
++var ling_prework_said = false;
+ fn templateArgs(kcfg: mlx.mlx_fast_metal_kernel_config, in_dt: mlx.mlx_dtype, st_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, dk: c_int, dv: c_int, hk: c_int, hv: c_int) !void {
+     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "InT", in_dt));
+     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "StT", st_dt));
+--- a/sdk/blocks/gdn/decode_fused.zig
++++ b/sdk/blocks/gdn/decode_fused.zig
+@@ -77,7 +77,7 @@
+     gdn_prework_kernel = kernel;
+     return kernel;
+ }
+-const GdnPreworkCfgKey = struct { hk: c_int, hv: c_int, seq: c_int, batch: c_int, c: c_int, qs: c_int, qo: c_int, bs: c_int, bo: c_int, as: c_int, ao: c_int, dt: mlx.mlx_dtype, gt: mlx.mlx_dtype, gate: bool };
++const GdnPreworkCfgKey = struct { hk: c_int, hv: c_int, seq: c_int, batch: c_int, c: c_int, qs: c_int, qo: c_int, bs: c_int, bo: c_int, as: c_int, ao: c_int, dt: mlx.mlx_dtype, gt: mlx.mlx_dtype, gate: bool, tab: bool };
+ var gdn_prework_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+ var gdn_prework_cfg_key: GdnPreworkCfgKey = std.mem.zeroes(GdnPreworkCfgKey);
+ pub const GdnPrework = struct {
+@@ -125,6 +125,10 @@
+     gate: bool = true,
+     /// The dtype `g` is computed and stored in: the recurrent state's. Null: the activations'.
+     g_dtype: ?mlx.mlx_dtype = null,
++    /// turboexl3_ling: the sigmoids (SiLU, beta) read from MLX's own sigmoid of every 16-bit pattern at every width;
++    /// null: from 17 rows, the formula below them (its fast exp rounds a bf16 sigmoid apart from MLX's op on rare
++    /// inputs: the batched test allows beta 7.6e-6 apart).
++    tab: ?bool = null,
+ };
+ /// One fused dispatch for the GDN prework at S 1..9 x B batched slots
+ /// (batch*seq <= GDN_FUSED_MAX_ROWS; per-head gate archs only). Null →
+@@ -154,7 +158,8 @@
+     if (csh.len != 3 or csh[0] != in.batch or csh[1] != 3 or csh[2] != c_dim) return null;
+     const nkeep: c_int = 3;
+     const gt = in.g_dtype orelse dt;
+-    const key = GdnPreworkCfgKey{ .hk = in.hk, .hv = in.hv, .seq = in.seq, .batch = in.batch, .c = c_dim, .qs = in.qkv_stride, .qo = in.qkv_off, .bs = in.b_stride, .bo = in.b_off, .as = in.a_stride, .ao = in.a_off, .dt = dt, .gt = gt, .gate = in.gate };
++    const tab = in.tab orelse (in.seq >= 17);
++    const key = GdnPreworkCfgKey{ .hk = in.hk, .hv = in.hv, .seq = in.seq, .batch = in.batch, .c = c_dim, .qs = in.qkv_stride, .qo = in.qkv_off, .bs = in.b_stride, .bo = in.b_off, .as = in.a_stride, .ao = in.a_off, .dt = dt, .gt = gt, .gate = in.gate, .tab = tab };
+     if (gdn_prework_cfg == null or !std.meta.eql(gdn_prework_cfg_key, key)) {
+         if (gdn_prework_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+         const config = mlx.mlx_fast_metal_kernel_config_new();
+@@ -172,7 +177,7 @@
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "GT", gt));
+-        const ints = .{ .{ "HK", in.hk }, .{ "HV", in.hv }, .{ "DK", in.dk }, .{ "DV", in.dv }, .{ "NKEEP", nkeep }, .{ "C", c_dim }, .{ "TAB", @as(c_int, @intFromBool(in.seq >= 17)) }, .{ "QSTRIDE", in.qkv_stride }, .{ "QOFF", in.qkv_off }, .{ "BSTRIDE", in.b_stride }, .{ "BOFF", in.b_off }, .{ "ASTRIDE", in.a_stride }, .{ "AOFF", in.a_off }, .{ "GATE", @as(c_int, @intFromBool(in.gate)) } };
++        const ints = .{ .{ "HK", in.hk }, .{ "HV", in.hv }, .{ "DK", in.dk }, .{ "DV", in.dv }, .{ "NKEEP", nkeep }, .{ "C", c_dim }, .{ "TAB", @as(c_int, @intFromBool(tab)) }, .{ "QSTRIDE", in.qkv_stride }, .{ "QOFF", in.qkv_off }, .{ "BSTRIDE", in.b_stride }, .{ "BOFF", in.b_off }, .{ "ASTRIDE", in.a_stride }, .{ "AOFF", in.a_off }, .{ "GATE", @as(c_int, @intFromBool(in.gate)) } };
+         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
+         gdn_prework_cfg = config;
+         gdn_prework_cfg_key = key;
+@@ -182,7 +187,7 @@
+     defer _ = mlx.mlx_array_free(seq_arr);
+     const eps_arr = mlx.mlx_array_new_float(in.qk_eps);
+     defer _ = mlx.mlx_array_free(eps_arr);
+-    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (in.seq >= 17) try sigmoidTableFor(s, dt) else in.qkv, seq_arr, eps_arr };
++    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (tab) try sigmoidTableFor(s, dt) else in.qkv, seq_arr, eps_arr };
+     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+     defer _ = mlx.mlx_vector_array_free(inputs_vec);
+     var outputs_vec = mlx.mlx_vector_array_new();
+@@ -224,7 +229,7 @@
+ var gdn_normgate_kernel: ?mlx.mlx_fast_metal_kernel = null;
+ var gdn_normgate_engaged: bool = false;
+ var gdn_normgate_declined: bool = false;
+-const GdnNormGateCfgKey = struct { hv: c_int, seq: c_int, batch: c_int, zs: c_int, zo: c_int, swish: bool, dt: mlx.mlx_dtype };
++const GdnNormGateCfgKey = struct { hv: c_int, seq: c_int, batch: c_int, zs: c_int, zo: c_int, swish: bool, dt: mlx.mlx_dtype, tab: bool };
+ var gdn_normgate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+ var gdn_normgate_cfg_key: GdnNormGateCfgKey = std.mem.zeroes(GdnNormGateCfgKey);
+ fn getGdnNormGateKernel() !mlx.mlx_fast_metal_kernel {
+@@ -255,6 +260,26 @@
+     batch: c_int,
+     seq: c_int,
+ ) !?mlx.mlx_array {
++    return gdnNormGateFusedTab(s, y, z, z_off, z_stride, norm_w, eps, swish, hv, dv, batch, seq, null);
++}
++/// `gdnNormGateFused` with the sigmoid's source chosen: `tab` true reads MLX's own sigmoid of every 16-bit pattern at
++/// every width (turboexl3_ling's KDA), null from 17 rows (the formula below them).
++pub fn gdnNormGateFusedTab(
++    s: mlx.mlx_stream,
++    y: mlx.mlx_array,
++    z: mlx.mlx_array,
++    z_off: c_int,
++    z_stride: c_int,
++    norm_w: mlx.mlx_array,
++    eps: mlx.mlx_array,
++    swish: bool,
++    hv: c_int,
++    dv: c_int,
++    batch: c_int,
++    seq: c_int,
++    tab_in: ?bool,
++) !?mlx.mlx_array {
++    const tab = tab_in orelse (seq >= 17);
+     if (dv != 128 or !mlx.streamIsGpu(s)) return null;
+     const prefill = gdnPrefillFusedFor(seq, batch);
+     if (!prefill and !gdnDecodeFusedEnabled()) return null;
+@@ -278,7 +303,7 @@
+         }
+         return null;
+     }
+-    const key = GdnNormGateCfgKey{ .hv = hv, .seq = seq, .batch = batch, .zs = z_stride, .zo = z_off, .swish = swish, .dt = dt };
++    const key = GdnNormGateCfgKey{ .hv = hv, .seq = seq, .batch = batch, .zs = z_stride, .zo = z_off, .swish = swish, .dt = dt, .tab = tab };
+     if (gdn_normgate_cfg == null or !std.meta.eql(gdn_normgate_cfg_key, key)) {
+         if (gdn_normgate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+         const config = mlx.mlx_fast_metal_kernel_config_new();
+@@ -287,14 +312,14 @@
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, batch * seq, hv));
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+-        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "TAB", @as(c_int, @intFromBool(seq >= 17)) } };
++        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "TAB", @as(c_int, @intFromBool(tab)) } };
+         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SWISH", @intFromBool(swish)));
+         gdn_normgate_cfg = config;
+         gdn_normgate_cfg_key = key;
+     }
+     const kernel = try getGdnNormGateKernel();
+-    const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps, if (seq >= 17) try sigmoidTableFor(s, dt) else y };
++    const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps, if (tab) try sigmoidTableFor(s, dt) else y };
+     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+     defer _ = mlx.mlx_vector_array_free(inputs_vec);
+     var outputs_vec = mlx.mlx_vector_array_new();

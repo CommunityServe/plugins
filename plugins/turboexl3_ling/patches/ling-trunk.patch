@@ -1,0 +1,947 @@
+--- a/plugins/glm5_next/trunk.zig
++++ b/plugins/glm5_next/trunk.zig
+@@ -33,7 +33,14 @@
+ const Array = mlx.mlx_array;
+ pub const Linear = linear.Linear;
+ const build_options = @import("build_options");
+-pub const Bank = if (build_options.mlx_stream) @import("../../sdk/weights/streamed.zig").Glm5n.Source else void;
++/// turboexl3_ling: Ling-3.1's EXL3 bank (the plugin's ling_source.zig in the streamer).
++pub const Bank = if (build_options.mlx_stream) @import("mlx_stream").ling_source.Source else void;
++/// turboexl3_ling: the trunk's EXL3 projections and Ling-3.1's per-layer clamps (the plugin's src/ling_exl3.zig).
++const ling = @import("../../../ling_exl3.zig");
++/// turboexl3_ling: EMBED_ROWS (the plugin's src/ling_embed.zig): the embedding's rows read from the pack, the table
++/// never resident.
++const ling_embed = @import("../../../ling_embed.zig");
++
+ const QuantMode = @FieldType(Linear, "mode");
+ const QuantParams = params.QuantParams;
+ const Config = config.Config;
+@@ -129,6 +136,19 @@
+     dsa: Dsa,
+     moe: moe.Moe.Weights,
+ };
++/// turboexl3_ling: Ling's NextN (MTP) layer, `<prefix>.layers.<num_hidden_layers>` (mtp_use_kda false):
++/// `eh_proj(cat[enorm(embed(x)), hnorm(h)])` through one MLA + MoE block, then `final_layernorm`. Its routed experts
++/// are bound after the load (`moe.streamed`), as the trunk's bank is.
++pub const LingHead = struct {
++    enorm: Array,
++    hnorm: Array,
++    final_norm: Array,
++    input_norm: Array,
++    post_norm: Array,
++    eh_proj: Linear,
++    mla: Mla,
++    moe: moe.Moe.Weights,
++};
+ /// The KDA layers' constants, built on first use in the projections' dtype (the legacy `gdn_*` caches).
+ pub const KdaConsts = struct {
+     q_scale: Array = .{},
+@@ -149,6 +169,8 @@
+     /// The `mtp.0` head's weights, read at load; served once `HeadHooks.load` evaluated them.
+     mtp: ?Head = null,
+     mtp_ready: bool = false,
++    /// turboexl3_ling: the NextN head (`lingHead`), when the plugin loads it.
++    ling_mtp: ?LingHead = null,
+     kda: KdaConsts = .{},
+     /// `rms_norm_eps` as an array (the add+norm kernel's).
+     rms_eps: Array = .{},
+@@ -160,6 +182,7 @@
+         m.bank = null;
+         for (m.layers) |*l| if (l.mlp == .moe) compiled.free(&l.mlp.moe.route_fn);
+         if (m.mtp) |*h| compiled.free(&h.moe.route_fn);
++        if (m.ling_mtp) |*h| compiled.free(&h.moe.route_fn);
+         inline for (.{ m.kda.q_scale, m.kda.k_scale, m.kda.ones, m.kda.eps, m.rms_eps }) |a| if (a.ctx != null) {
+             _ = mlx.mlx_array_free(a);
+         };
+@@ -173,6 +196,9 @@
+     }
+     /// `x @ l^T` at `l`'s own quant geometry.
+     pub fn mm(m: *const Model, l: *const Linear, x: Array) !Array {
++        if (l.exl3) return ling.linear(m.s, x, l.w, l.s, l.b);
++        // turboexl3_ling: an exact verify's rows of a dense matmul in one launch, each serial decode's one-row gemv.
++        if (l.s.ctx == null and ling.splitRows(x)) return ling.denseRows(m.s, x, l.w);
+         return qmatmulBits(x, l.w, l.s, l.b, l.bits, l.group_size, l.mode, m.s);
+     }
+     pub fn rmsNorm(m: *const Model, x: Array, w: Array) !Array {
+@@ -190,32 +216,10 @@
+     }
+     /// The embedding rows of `ids` `[B, L]`: `[B, L, hidden]` bf16.
+     pub fn embedding(m: *const Model, ids: Array) !Array {
+-        const s = m.s;
+-        const e = &m.embed;
+-        const sh = mlx.getShape(ids);
+-        var flat = mlx.mlx_array_new();
+-        defer _ = mlx.mlx_array_free(flat);
+-        try mlx.check(mlx.mlx_reshape(&flat, ids, &[_]c_int{sh[0] * sh[1]}, 1, s));
+-        var tw = mlx.mlx_array_new();
+-        defer _ = mlx.mlx_array_free(tw);
+-        try mlx.check(mlx.mlx_take_axis(&tw, e.w, flat, 0, s));
+-        var emb = mlx.mlx_array_new();
+-        defer _ = mlx.mlx_array_free(emb);
+-        if (e.s.ctx == null) {
+-            try mlx.check(mlx.mlx_astype(&emb, tw, .bfloat16, s));
+-        } else {
+-            var ts = mlx.mlx_array_new();
+-            defer _ = mlx.mlx_array_free(ts);
+-            try mlx.check(mlx.mlx_take_axis(&ts, e.s, flat, 0, s));
+-            var tb = mlx.mlx_array_new();
+-            defer _ = mlx.mlx_array_free(tb);
+-            if (e.b.ctx != null) try mlx.check(mlx.mlx_take_axis(&tb, e.b, flat, 0, s));
+-            try mlx.check(mlx.mlx_dequantize(&emb, tw, ts, tb, mlx.mlx_optional_int.some(@intCast(e.group_size)), mlx.mlx_optional_int.some(@intCast(e.bits)), e.mode.cstr(), .{}, .{ .value = .bfloat16, .has_value = true }, s));
+-        }
+-        var out = mlx.mlx_array_new();
+-        errdefer _ = mlx.mlx_array_free(out);
+-        try mlx.check(mlx.mlx_reshape(&out, emb, &[_]c_int{ sh[0], sh[1], @intCast(m.c.hidden_size) }, 3, s));
+-        return out;
++        // turboexl3_ling (EMBED_ROWS): the rows read from the pack's table, its stored words (the plugin's
++        // src/ling_embed.zig). The trunk holds no resident table (`evalTrunk`), so no take runs here, and with no table
++        // open the rows are refused by name.
++        return ling_embed.rowsOf(m.s, ids, m.c.hidden_size);
+     }
+     /// The logits of `x`: a dense head `[vocab, hidden]` is read through a transposed view (the embedding it may
+     /// alias stays `[vocab, hidden]`).
+@@ -250,8 +254,18 @@
+             }
+             try fused_rows.sliceQkvPart(&gate, both, 0, dw.gu.widths[0], s);
+             try fused_rows.sliceQkvPart(&up, both, dw.gu.widths[0], dw.gu.widths[1], s);
++        } else if (try @import("../../../ling_pair.zig").pair(s, x, &dw.gate, &dw.up)) |gu| {
++            // turboexl3_ling (PAIR, src/ling_pair.zig): gate | up in one launch at decode rows.
++            gate = gu[0];
++            up = gu[1];
+         } else {
+             gate = try m.mm(&dw.gate, x);
++            // turboexl3_ling (SWIGLU_EPI, src/ling_swiglu_epi.zig): at prompt rows up's finish runs swiglu's SwiGLU of
++            // the gate's value and its own, the chain's words; null keeps the chain
++            if (dw.up.exl3 and !m.c.swiglu_clamp) if (try @import("../../../ling_swiglu_epi.zig").up(s, x, dw.up.w, dw.up.s, dw.up.b, gate, 0, fused_act.sigmoidTableFor, .dense)) |act| {
++                defer _ = mlx.mlx_array_free(act);
++                return m.mm(&dw.down, act);
++            };
+             up = try m.mm(&dw.up, x);
+         }
+         const act = try m.swiglu(gate, up);
+@@ -407,6 +421,18 @@
+     /// A release's e4m3 projection carries its 64 x 128 scale grid as `weight_scale_inv` (`fp8_block128`).
+     fn triple(l: *const Loader, base: []const u8) !Triple {
+         var nb: [256]u8 = undefined;
++        // turboexl3_ling: an exllamav3 projection, `<base>.{trellis,suh,svh,mul1}`, its mul1 the codebook turboexl3 decodes.
++        const tr = l.get(try std.fmt.bufPrint(&nb, "{s}.trellis", .{base}));
++        if (tr.ctx != null) {
++            const m1 = try l.need(try std.fmt.bufPrint(&nb, "{s}.mul1", .{base}));
++            var v: i32 = 0;
++            try mlx.check(mlx.mlx_array_item_int32(&v, m1));
++            if (@as(u32, @bitCast(v)) != ling.mul1_multiplier) {
++                log.err("{s}.mul1 is 0x{x}, not mul1's 0x{x}\n", .{ base, @as(u32, @bitCast(v)), ling.mul1_multiplier });
++                return error.Exl3CodebookUnsupported;
++            }
++            return .{ .w = tr, .s = try l.need(try std.fmt.bufPrint(&nb, "{s}.suh", .{base})), .b = try l.need(try std.fmt.bufPrint(&nb, "{s}.svh", .{base})) };
++        }
+         const sc = l.get(try std.fmt.bufPrint(&nb, "{s}.scales", .{base}));
+         return .{
+             .w = try l.need(try std.fmt.bufPrint(&nb, "{s}.weight", .{base})),
+@@ -423,6 +449,13 @@
+         return .{ .w = try l.keep(t.w), .s = try l.keep(t.s), .b = try l.keep(t.b) };
+     }
+     fn lin(l: *Loader, raw: Triple, in_dim: ?u32) !Linear {
++        // turboexl3_ling: an EXL3 projection runs on turboexl3; a plain f16 one (exllamav3 keeps a few: b_proj, kv_b_proj,
++        // the MLA gate) is cast to the activation dtype once.
++        if (ling.isTrellis(raw.w, raw.s, raw.b)) {
++            const k = try l.kept(raw);
++            return .{ .w = k.w, .s = k.s, .b = k.b, .exl3 = true };
++        }
++        if (raw.s.ctx == null and raw.w.ctx != null and mlx.mlx_array_dtype(raw.w) == .float16) return .{ .w = try l.own(try astypeEval(raw.w, .bfloat16, l.s)) };
+         const t = try l.kept(raw);
+         if (t.s.ctx == null) return .{ .w = t.w };
+         // e4m3: the matmul knows it by its dtypes; no affine kernel may claim it.
+@@ -499,7 +532,9 @@
+         var parts: [3]Triple = undefined;
+         var conv_w: [3]Array = undefined;
+         var any_scales = false;
+-        for (&parts, &conv_w, [_][]const u8{ "q", "k", "v" }) |*p, *cw, x| {
++        // turboexl3_ling: exllamav3 keeps q|k|v as one projection (`qkv_proj`) beside the joined conv.
++        const one_qkv = l.has(try std.fmt.bufPrint(&nb, "{s}.qkv_proj.trellis", .{base}));
++        if (!one_qkv) for (&parts, &conv_w, [_][]const u8{ "q", "k", "v" }) |*p, *cw, x| {
+             p.* = try l.triple(try std.fmt.bufPrint(&nb, "{s}.{s}_proj", .{ base, x }));
+             if (p.s.ctx != null) any_scales = true;
+             // The reference nests the conv in a module (`<x>_conv1d.conv.weight`); mlx-lm flattens it.
+@@ -507,9 +542,9 @@
+                 cw.* = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}_conv1d.conv.weight", .{ base, x }));
+                 if (cw.ctx == null) cw.* = try l.need(try std.fmt.bufPrint(&nb, "{s}.{s}_conv1d.weight", .{ base, x }));
+             }
+-        }
++        };
+         // q, k and v join only when quantized identically; otherwise each projects alone.
+-        const joinable = blk: {
++        const joinable = !one_qkv and blk: {
+             var w_cols: [3]c_int = undefined;
+             var s_cols: [3]c_int = undefined;
+             for (parts, 0..) |p, n| {
+@@ -527,6 +562,9 @@
+                 qkv.s = try l.own(try array.concatRows(&.{ parts[0].s, parts[1].s, parts[2].s }, l.s));
+                 if (parts[0].b.ctx != null) qkv.b = try l.own(try array.concatRows(&.{ parts[0].b, parts[1].b, parts[2].b }, l.s));
+             }
++        } else if (one_qkv) {
++            if (fused_conv.ctx == null) return error.MissingWeight;
++            qkv = try l.triple(try std.fmt.bufPrint(&nb, "{s}.qkv_proj", .{base}));
+         } else qkv_parts = parts;
+         var joined_conv = if (fused_conv.ctx != null) fused_conv else try l.own(try array.concatRows(&conv_w, l.s));
+         // HF-layout packs store the depthwise conv `[C, 1, K]`; MLX's conv1d reads `[C, K, 1]`.
+@@ -627,7 +665,8 @@
+         var d = try l.triple(try l.layerName(&nb, i, "mlp.down_proj"));
+         for ([_]*Triple{ &g, &u, &d }) |t| try l.transposed(t);
+         var gu: linear.Joined = .{};
+-        if (g.s.ctx != null) {
++        // turboexl3_ling: an EXL3 gate and up stay apart (turboexl3 runs each).
++        if (g.s.ctx != null and !ling.isTrellis(g.w, g.s, g.b)) {
+             const group = [_][3]*Array{ .{ &g.w, &g.s, &g.b }, .{ &u.w, &u.s, &u.b } };
+             if (try fused_rows.fuseRowGroup(&group, l.s)) |f| {
+                 for ([_]Array{ f.w, f.s, f.b }) |x| _ = try l.own(x);
+@@ -650,7 +689,8 @@
+         // mlx-lm quantizes the router under its module (`mlp.gate.gate_proj`); the reference keeps `mlp.gate`.
+         const rt = if (!l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.weight", .{base})) and l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.gate_proj.weight", .{base}))) "mlp.gate.gate_proj" else "mlp.gate";
+         const ex = if (l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.experts.gate_proj.weight", .{base}))) "mlp.experts" else "mlp.switch_mlp";
+-        const spec: ?exl3.Spec = if (glm) l.exl3 else null;
++        // turboexl3_ling: no Sushi expert banks (the edge format.zig refuses them): the arm is out at compile time.
++        const spec: ?exl3.Spec = null;
+         const lf: [3][]const u8 = if (spec != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
+         // A streamed pack's experts live in its bank (`experts.bin`), bound after the load.
+         var banks: [3]Triple = @splat(.{ .w = .{} });
+@@ -680,6 +720,17 @@
+         try l.transposed(&router);
+         // GLM routes in f32 (`moe_router_dtype`).
+         if (glm and router.s.ctx == null) router.w = try l.f32Table(router.w, false);
++        // turboexl3_ling: Ling routes in f32 too (`router_dtype` fp32: the reference's `F.linear` of x and the router in
++        // f32), exllamav3's f16 router widened exactly.
++        // turboexl3_ling (ROUTER_F16, src/ling_router.zig): no f32 table (8 MiB a layer); the f16 weight's transposed view
++        // above (the pack's words, which the model keeps either way) serves as is, with the Linear made over it (`lin`
++        // would cast a plain f16 weight to bf16): the fused router widens it in registers, then + 0; the block's own
++        // matmul rebuilds the table for its call (`stockTable`: `f32Table`'s astype, then + 0).
++        var router16 = false;
++        if (!glm and router.s.ctx == null and router.w.ctx != null and mlx.mlx_array_dtype(router.w) == .float16) {
++            try mlx.check(mlx.mlx_array_eval(router.w));
++            router16 = true;
++        }
+         if (!streamed) for (&banks) |*t| {
+             try l.transposed(t);
+             t.* = try l.kept(t.*);
+@@ -690,7 +741,7 @@
+         const inter: ?u32 = if (c.moe_intermediate_size > 0) c.moe_intermediate_size else null;
+         const shared_inter: ?u32 = if (c.shared_expert_intermediate_size > 0) c.shared_expert_intermediate_size else null;
+         var w: moe.Moe.Weights = .{
+-            .router = try l.lin(router, c.hidden_size),
++            .router = if (router16) .{ .w = try l.keep(router.w) } else try l.lin(router, c.hidden_size),
+             .route = .{ .sigmoid_bias = .{
+                 .expert_bias = expert_bias,
+                 .norm = c.moe_route_norm,
+@@ -765,7 +816,10 @@
+             }
+             L.mixer = if (c.isLinearLayer(i)) .{ .kda = try l.kda(i) } else if (c.isGlm5()) .{ .dsa = try l.dsa(base) } else .{ .mla = try l.mla(i) };
+             L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed) } else .{ .dense = try l.dense(i) };
+-            if (c.streamed and L.mlp == .moe) L.router_raw = try l.keep(try l.need(try l.layerName(&nb, i, "mlp.gate.weight")));
++            // turboexl3_ling: the predictor reads the router in bf16 (exllamav3 stores it f16).
++            if (c.streamed and L.mlp == .moe) L.router_raw = try l.own(try astypeEval(try l.need(try l.layerName(&nb, i, "mlp.gate.weight")), .bfloat16, l.s));
++            // turboexl3_ling: the late layers' shared expert takes Ling's clamp after the SiLU.
++            if (L.mlp == .moe) L.mlp.moe.shared_limit_out = @floatFromInt(ling.sharedLimit(i));
+             built += 1;
+         }
+         return out;
+@@ -856,6 +910,9 @@
+             const bn = try std.fmt.bufPrint(&nb, "{s}.lm_head.biases", .{lm_prefix});
+             head.b = if (bias_mandatory) try l.need(bn) else l.get(bn);
+         }
++    } else if (l.has("lm_head.trellis")) {
++        // turboexl3_ling: exllamav3's head, an EXL3 projection.
++        head = try l.triple("lm_head");
+     } else if (l.has("lm_head.weight")) {
+         head = .{ .w = l.get("lm_head.weight"), .s = l.get("lm_head.scales"), .b = l.get("lm_head.biases") };
+         if (head.s.ctx == null) head.s = emb.s;
+@@ -886,9 +943,38 @@
+ fn evalTrunk(m: *const Model) !void {
+     const vec = mlx.mlx_vector_array_new();
+     defer _ = mlx.mlx_vector_array_free(vec);
+-    for (m.owned.items) |a| _ = mlx.mlx_vector_array_append_value(vec, a);
++    // turboexl3_ling (EMBED_ROWS, the plugin's src/ling_embed.zig): the embedding table stays the shards' tensor,
++    // unevaluated, so it is never resident (each forward reads its rows from the pack).
++    for (m.owned.items) |a| if (!ling_embed.keepsLazy(a, m.embed.w)) {
++        _ = mlx.mlx_vector_array_append_value(vec, a);
++    };
+     try mlx.check(mlx.mlx_eval(vec));
+ }
++/// turboexl3_ling: Ling's NextN layer from `src` (the same shards the trunk read), its tensors kept by the model; null
++/// when the pack has none. Its routed experts are not read here (the plugin stacks them resident and binds them).
++pub fn lingHead(m: *Model, src: *const quant_abi.Source) !?LingHead {
++    const c = m.c;
++    const prefix = probePrefix(src, c.weight_prefix, "word_embeddings.weight");
++    var l: Loader = .{ .src = src, .c = c, .s = m.s, .prefix = prefix, .owned = &m.owned, .exl3 = null };
++    const idx: u32 = c.num_hidden_layers;
++    var bb: [96]u8 = undefined;
++    const base = try std.fmt.bufPrint(&bb, "{s}.layers.{d}", .{ prefix, idx });
++    var nb: [256]u8 = undefined;
++    if (!l.has(try std.fmt.bufPrint(&nb, "{s}.enorm.weight", .{base}))) return null;
++    var h: LingHead = .{
++        .enorm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.enorm.weight", .{base})),
++        .hnorm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.hnorm.weight", .{base})),
++        .final_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.final_layernorm.weight", .{base})),
++        .input_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.input_layernorm.weight", .{base})),
++        .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{base})),
++        .eh_proj = try l.proj(try std.fmt.bufPrint(&nb, "{s}.eh_proj", .{base}), 2 * c.hidden_size),
++        .mla = try l.mla(idx),
++        .moe = try l.routed(base, true),
++    };
++    errdefer compiled.free(&h.moe.route_fn);
++    try evalTrunk(m);
++    return h;
++}
+ /// Makes the MTP head resident (`HeadHooks.load`).
+ pub fn readyHead(m: *Model) !void {
+     if (m.mtp_ready) return;
+--- a/sdk/bases/blocks/linear.zig
++++ b/sdk/bases/blocks/linear.zig
+@@ -11,6 +11,8 @@
+ const qmm_int8 = @import("../../blocks/qmm/qmm_int8.zig");
+ const rht = @import("../../quant/hadamard/rht.zig");
+ const Array = ops.Array;
++/// turboexl3_ling: an EXL3 projection runs on turboexl3 (the plugin's src/ling_exl3.zig).
++const ling = @import("../../../../ling_exl3.zig");
+ const Graph = ops.Graph;
+ /// `x @ w^T` (+ an additive `bias`). A dense `w` is stored pre-transposed `[in, out]` with null scales.
+ pub const Linear = struct {
+@@ -28,6 +30,8 @@
+     /// `H_block(signs * x)` through the registry's memo (`signs` pooled there; null = an unrotated weight).
+     rht: ?*rht.Registry = null,
+     signs: Array = .{},
++    /// turboexl3_ling: `w` is an EXL3 trellis [in/16, out/16, n], `s` its suh and `b` its svh (F16).
++    exl3: bool = false,
+     pub fn forward(l: *const Linear, g: *Graph, x: Array) !Array {
+         if (l.bias.ctx == null) return g.adopt(try l.matmul(g, x));
+         var t = g.scope();
+@@ -35,11 +39,14 @@
+         return g.keep(try t.add(try t.adopt(try l.matmul(g, x)), l.bias));
+     }
+     fn matmul(l: *const Linear, g: *Graph, x: Array) !Array {
++        if (l.exl3) return ling.linear(g.s, x, l.w, l.s, l.b);
+         if (l.rht) |reg| return l.rotated(reg, x, g.s);
+         if (l.ternary) {
+             if (try qmv_nax2.qmm(x, l.w, l.s, l.b, l.bits, l.group_size, g.s)) |y| return y;
+             if (try qmv2.qmm(x, l.w, l.s, l.b, l.bits, l.group_size, true, false, g.s)) |y| return y;
+         }
++        // turboexl3_ling: an exact verify's rows of a dense matmul (the router) in one launch, each the one-row gemv.
++        if (l.s.ctx == null and ling.splitRows(x)) return ling.denseRows(g.s, x, l.w);
+         return qmatmulBits(x, l.w, l.s, l.b, l.bits, l.group_size, l.mode, g.s);
+     }
+     /// The engine's rotated arm: the 2-bit kernels first (each declines what it does not serve), then the opt-in int8
+--- a/sdk/bases/blocks/moe.zig
++++ b/sdk/bases/blocks/moe.zig
+@@ -37,6 +37,10 @@
+ const HiddenAct = @import("../../blocks/mlp/activations.zig").HiddenAct;
+ const Array = ops.Array;
+ const Graph = ops.Graph;
++/// turboexl3_ling: the MoE tail in one launch (MOE_TAIL, src/ling_tail.zig).
++const moe_tail = @import("../../../../ling_tail.zig");
++/// turboexl3_ling: the MoE tail at prompt widths (PF_MOE_TAIL, src/ling_pf_tail.zig).
++const pf_tail = @import("../../../../ling_pf_tail.zig");
+ const Ctx = block.Ctx;
+ const Linear = linear.Linear;
+ /// An expert bank `[E, out, in]` and its quant geometry.
+@@ -100,6 +104,9 @@
+         clamp: ?u32 = 0,
+         /// The clamp as the composed chain applies it (`swiglu_limit` with `swiglu_clamp`); 0 = none.
+         clamp_limit: f32 = 0,
++        /// turboexl3_ling: the shared expert's SwiGLU clamped after the SiLU (Ling-3.1's `share_expert_swiglu_limit_list`):
++        /// min(silu(g), L) * clamp(u, -L, L); 0 = none. A streamed bank's routed experts take theirs in the bank's math.
++        shared_limit_out: f32 = 0,
+         /// The routing chain compiled (`compileRouting`); null = op by op.
+         route_fn: compiled.Closure = .{ .ctx = null },
+         /// Set: the experts are the format's (`gate`/`up`/`down` unread).
+@@ -164,10 +171,31 @@
+     return .{ .inds = inds, .scores = scores, .gate_logit = gl };
+ }
+ fn routerLogits(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
++    // turboexl3_ling (ROUTER_FUSED, src/ling_router.zig): the logits and the layer's read-ahead scores in one launch, the
++    // block's words: at one row always, at 2 to 8 rows in the exact verify only.
++    if (try lingLogits(w, parent, x)) |y| return y;
++    // turboexl3_ling (ROUTER_F16, src/ling_router.zig): a router kept in f16 runs the block's own matmul over the f32
++    // table rebuilt for the call as the loader's `f32Table` builds one (astype, then + 0: its words and layout).
++    if (try @import("../../../../ling_router.zig").stockTable(parent.s, w.router.w)) |tbl| {
++        var l16 = w.router;
++        l16.w = try parent.adopt(tbl);
++        return l16.forward(parent, x);
++    }
+     if (w.route != .logit_bias) return w.router.forward(parent, x);
+     var t = parent.scope();
+     defer t.deinit();
+     return parent.keep(try t.matmul(try t.astype(x, .float32), w.router.w));
++}
++/// turboexl3_ling: `routerLogits` on turboexl3 (src/ling_router.zig `logits`) for a streamed layer's sigmoid-bias router
++/// over its plain weight, the f16 view the loader keeps or an f32 table (`forward` is one matmul there); null where the
++/// block's own router runs.
++fn lingLogits(w: *const Moe.Weights, parent: *Graph, x: Array) !?Array {
++    const st = w.streamed orelse return null;
++    if (w.route != .sigmoid_bias) return null;
++    const l = &w.router;
++    if (l.exl3 or l.rht != null or l.ternary or l.s.ctx != null or l.b.ctx != null or l.bias.ctx != null) return null;
++    const y = (try @import("../../../../ling_router.zig").logits(parent.s, x, l.w, st.layer)) orelse return null;
++    return try parent.adopt(y);
+ }
+ fn route(w: *const Moe.Weights, g: *Graph, logits: Array, fold: ?router_kernel.RouterGate) !Routed {
+     switch (w.route) {
+@@ -176,6 +204,9 @@
+             return adoptRouting(g, try routing.kolibriRoutingChain(logits, bias, w.top_k, g.s));
+         },
+         .sigmoid_bias => |r| {
++            // turboexl3_ling (ROUTER_FUSED, src/ling_router.zig): over `lingLogits`' logits, the served kernel's text with
++            // its weights stored in bf16 (the activation dtype: `mlp`'s astype then has nothing to do).
++            if (r.n_group > 1) if (try @import("../../../../ling_router.zig").select(g.s, logits, r.expert_bias, w.top_k, r.n_group, r.topk_group, r.norm, r.scale)) |sel| return adoptRouting(g, sel);
+             if (r.n_group > 1) return adoptRouting(g, try routing.groupLimitedRouting(logits, r.expert_bias, w.top_k, r.n_group, r.topk_group, r.norm, r.scale, g.s));
+             if (try router_kernel.moeRouterTopK(g.s, logits, r.expert_bias, w.top_k, .sigmoid_bias, r.norm, r.scale, .bfloat16, 0, 0, null)) |f| return adoptRouting(g, f);
+             if (w.route_fn.ctx != null) if (try compiled.apply(g, w.route_fn, &.{ logits, r.expert_bias }, 2)) |o| return .{ .inds = o[0], .scores = o[1] };
+@@ -192,6 +223,7 @@
+ /// `act(gate) * up`: SiLU, clamped where the pack clamps.
+ fn geglu(w: *const Moe.Weights, parent: *Graph, gate: Array, up: Array) !Array {
+     const s = parent.s;
++    if (w.shared_limit_out > 0) return parent.adopt(try @import("../../../../ling_exl3.zig").swigluClampOut(s, gate, up, w.shared_limit_out));
+     if (w.clamp_limit > 0) {
+         if (try fused_act.fusedClampedSwiGLU(s, gate, up, w.clamp_limit)) |y| return parent.adopt(y);
+         return parent.adopt(try clampedSwiGLU(s, gate, up, w.clamp_limit));
+@@ -205,6 +237,9 @@
+     var t = parent.scope();
+     defer t.deinit();
+     const g = &t;
++    // turboexl3_ling (src/ling_router.zig): the read-ahead scores `lingLogits` made live until the block's routed call
++    // has taken them.
++    defer @import("../../../../ling_router.zig").clear();
+     const logits = try routerLogits(w, g, x);
+     // At one row the shared expert's gate logit rides the softmax router kernel.
+     const fold: ?router_kernel.RouterGate = blk: {
+@@ -228,11 +263,61 @@
+     const y = try routedExperts(w, g, x, r, shared_down, null);
+     if (y.shared_fused) return parent.keep(y.sum);
+     const se = w.shared orelse return parent.keep(y.sum);
+-    if (!se.gated()) return parent.keep(try g.add(y.sum, try sharedDown(w, g, &se, x)));
++    if (!se.gated()) return parent.keep(try g.add(y.sum, tailShared(try sharedDown(w, g, &se, x))));
+     const down = shared_down orelse try sharedDown(w, g, &se, x);
+     const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
+     return parent.keep(try g.add(y.sum, try g.mul(try g.sigmoid(logit), down)));
++}
++/// turboexl3_ling (a layer-major prompt pass, the copied table_forward.zig `hiddenSpans`): `mlp` of a span of several
++/// rows in three stages, so a prompt's spans route and finish one at a time while one routed call takes many spans'
++/// rows: `mlpRoute` (`mlp` up to its routed call), `routedSum` (the routed call) and `mlpFinish` (the shared expert and
++/// the add). At several rows the router folds no gate, so `shared_down` is null and the routed call is
++/// `routedExperts(w, g, x, r, null, null)`; with no fused kernel (a streamed bank has none) `mlp(x)` is
++/// `mlpFinish(x, routedSum(x, r.inds, r.scores))` op for op.
++pub const SpanRoute = struct { inds: Array, scores: Array };
++pub fn mlpRoute(w: *const Moe.Weights, parent: *Graph, x: Array) !SpanRoute {
++    if (w.fused != null) return error.LayerMajorFusedMoe;
++    var t = parent.scope();
++    defer t.deinit();
++    const g = &t;
++    defer @import("../../../../ling_router.zig").clear();
++    const logits = try routerLogits(w, g, x);
++    var r = try route(w, g, logits, null);
++    if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
++    if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
++    return .{ .inds = try parent.keep(r.inds), .scores = try parent.keep(r.scores) };
++}
++/// `mlp`'s end over the span's routed sum `sum` (its rows of `routedSum`): the shared expert, gated or not, added.
++pub fn mlpFinish(w: *const Moe.Weights, parent: *Graph, x: Array, sum: Array) !Array {
++    var t = parent.scope();
++    defer t.deinit();
++    const g = &t;
++    const se = w.shared orelse return parent.keep(sum);
++    if (!se.gated()) {
++        const down = try sharedDown(w, g, &se, x);
++        // turboexl3_ling (PF_MOE_TAIL): the span's shared expert output for its tail, a reference of
++        // src/ling_pf_tail.zig's own (nothing while no layer is armed); the add is the chain's, as before.
++        pf_tail.shared(down);
++        return parent.keep(try g.add(sum, down));
++    }
++    const down = try sharedDown(w, g, &se, x);
++    const logit = try se.gate_logit.forward(g, x);
++    return parent.keep(try g.add(sum, try g.mul(try g.sigmoid(logit), down)));
+ }
++/// turboexl3_ling (MOE_TAIL): the ungated shared expert's output (`shared`, returned as it is) noted for the layer's
++/// tail (src/ling_tail.zig: the forward armed the layer and the source kept its rows). No op.
++fn tailShared(shared: Array) Array {
++    moe_tail.shared(shared);
++    return shared;
++}
++/// turboexl3_ling (MOE_TAIL): a layer the forward may arm for its tail. Its sum is a streamed source's routed sum plus an
++/// ungated shared expert (no fused kernel, no format banks), the one sum the tail's launch makes.
++pub fn tailServes(w: *const Moe.Weights) bool {
++    const st = w.streamed orelse return false;
++    if (w.fused != null or w.format_banks != null or st.routed.math != .source) return false;
++    const se = w.shared orelse return false;
++    return !se.gated();
++}
+ /// The routed experts' weighted sum `[B, S, D]` for routes `inds` and their weights `scores` (in `x`'s dtype), no
+ /// shared expert: `mlp`'s arms, as the Routed hook's contract reads them.
+ pub fn routedSum(w: *const Moe.Weights, parent: *Graph, x: Array, inds: Array, scores: Array) !Array {
+@@ -314,9 +399,34 @@
+     return g.adopt(.{ .ctx = y.ctx });
+ }
+ fn sharedDown(w: *const Moe.Weights, parent: *Graph, se: *const SharedExpert, x: Array) !Array {
++    // turboexl3_ling (SHARED_F3, src/ling_shared.zig): the shared expert at decode rows in turboexl3's two launches, the
++    // chain's words below; null keeps the chain
++    if (se.gate.exl3 and se.up.exl3 and se.down.exl3) {
++        const ls = @import("../../../../ling_shared.zig");
++        if (try ls.run(parent.s, x, .{ se.gate.w, se.gate.s, se.gate.b }, .{ se.up.w, se.up.s, se.up.b }, .{ se.down.w, se.down.s, se.down.b }, w.shared_limit_out, fused_act.sigmoidTableFor)) |y| return parent.adopt(y);
++    }
+     var t = parent.scope();
+     defer t.deinit();
+     const g = &t;
++    // turboexl3_ling (PAIR, src/ling_pair.zig): gate | up in one launch at decode rows, each its bytes.
++    if (try @import("../../../../ling_pair.zig").pair(g.s, x, &se.gate, &se.up)) |gu| {
++        const gate = try g.adopt(gu[0]);
++        const up = try g.adopt(gu[1]);
++        return parent.keep(try se.down.forward(g, try geglu(w, g, gate, up)));
++    }
++    // turboexl3_ling (SHARED_LAYER_WHAT, src/ling_shared_layer.zig): a layer-major layer's wide span over the layer's
++    // W_hats, decoded once at its first wide span, the chain's words; null keeps the chain below
++    if (se.gate.exl3 and se.up.exl3 and se.down.exl3 and se.up.bias.ctx == null and w.clamp_limit == 0) {
++        const sl = @import("../../../../ling_shared_layer.zig");
++        if (try sl.run(g.s, x, .{ .trellis = se.gate.w, .suh = se.gate.s, .svh = se.gate.b }, .{ .trellis = se.up.w, .suh = se.up.s, .svh = se.up.b }, .{ .trellis = se.down.w, .suh = se.down.s, .svh = se.down.b }, w.shared_limit_out, fused_act.sigmoidTableFor)) |y| return parent.adopt(y);
++    }
++    // turboexl3_ling (SWIGLU_EPI, src/ling_swiglu_epi.zig): at prompt rows up's finish runs geglu's SwiGLU of the gate's
++    // value and its own, the chain's words; null keeps the chain
++    if (se.up.exl3 and se.up.bias.ctx == null and w.clamp_limit == 0) {
++        const gate = try se.gate.forward(g, x);
++        if (try @import("../../../../ling_swiglu_epi.zig").up(g.s, x, se.up.w, se.up.s, se.up.b, gate, w.shared_limit_out, fused_act.sigmoidTableFor, .shared)) |h| return parent.keep(try se.down.forward(g, try g.adopt(h)));
++        return parent.keep(try se.down.forward(g, try geglu(w, g, gate, try se.up.forward(g, x))));
++    }
+     return parent.keep(try se.down.forward(g, try geglu(w, g, try se.gate.forward(g, x), try se.up.forward(g, x))));
+ }
+ /// An ungated shared expert the affine-4 kernels carry: 3- or 4-bit affine at the routed bit-width and group size.
+--- a/plugins/bailing_hybrid/table_forward.zig
++++ b/plugins/bailing_hybrid/table_forward.zig
+@@ -9,6 +9,26 @@
+ const glm_moe = @import("../glm5_next/moe.zig");
+ const mla = @import("mla.zig");
+ const Array = mlx.mlx_array;
++/// turboexl3_ling: the layer-major prompt pass's pieces (`hiddenSpans`).
++const std = @import("std");
++const ops = @import("../../mlx/ops.zig");
++const moe_block = @import("../../sdk/bases/blocks/moe.zig");
++/// turboexl3_ling: a MoE layer's shared-expert W_hats decoded once for its spans (SHARED_LAYER_WHAT;
++/// src/ling_shared_layer.zig).
++const shared_layer = @import("../../../ling_shared_layer.zig");
++/// turboexl3_ling: a layer's other dense prefill linears over W_hats decoded once for its spans (LAYER_WHAT;
++/// src/ling_layer_what.zig).
++const layer_what = @import("../../../ling_layer_what.zig");
++/// turboexl3_ling: a MoE layer's routed sum, shared expert add and tail in one launch (MOE_TAIL; src/ling_tail.zig).
++const moe_tail = @import("../../../ling_tail.zig");
++/// turboexl3_ling: a layer-major MoE layer's tail at each prompt span in one launch over its routed call's unjoined
++/// outputs (PF_MOE_TAIL; src/ling_pf_tail.zig).
++const pf_tail = @import("../../../ling_pf_tail.zig");
++/// turboexl3_ling: the run-path line's marks (src/ling_ran.zig).
++const ran = @import("../../../ling_ran.zig");
++/// turboexl3_ling D2: an MLA layer's group of prompt spans that append their keys and values in one call
++/// (src/ling_rq.zig `groupStart`).
++const ling_rq = @import("../../../ling_rq.zig");
+ pub const Step = struct {
+     slots: slots_mod.Slots,
+     capture: bool = false,
+@@ -58,6 +78,15 @@
+             _ = mlx.mlx_array_free(ff_normed);
+             ff_normed = try m.rmsNorm(h, lw.post_norm);
+         }
++        // MOE_TAIL: the source keeps a decode-lane call's rows and the block its shared expert's output for the layer's
++        // tail (`moeTailOf`); the layer's end frees them.
++        const serves = switch (lw.mlp) {
++            .moe => |*mw| moe_block.tailServes(mw),
++            .dense => false,
++        };
++        const tail_arm = serves and batch * seq_len <= moe_tail.max_rows;
++        if (tail_arm) moe_tail.arm(li);
++        defer if (tail_arm) moe_tail.end();
+         const mlp_out = switch (lw.mlp) {
+             .moe => |*mw| try glm_moe.forward(mw, m.s, ff_normed),
+             .dense => |*dw| try m.denseMlp(dw, ff_normed),
+@@ -65,7 +94,11 @@
+         defer _ = mlx.mlx_array_free(mlp_out);
+         const last = layer_idx + 1 == n_layers;
+         const next_norm = if (last) m.final_norm else m.layers[layer_idx + 1].input_norm;
+-        if (try m.narrowAddNorm(h, mlp_out, next_norm)) |fused| {
++        // MOE_TAIL: an armed MoE layer's tail with the MLP output's own ops in one launch (`moeTailOf`) first; else the
++        // add and the next layer's input norm as one kernel where one serves, else the add alone.
++        if (try moeTailOf(m, &h, next_norm, &carried_normed)) {
++            // the launch wrote `h` and `carried_normed`
++        } else if (try m.narrowAddNorm(h, mlp_out, next_norm)) |fused| {
+             _ = mlx.mlx_array_free(h);
+             h = fused.h;
+             carried_normed = fused.normed;
+@@ -89,3 +122,355 @@
+     }
+     return m.rmsNorm(h, m.final_norm);
+ }
++
++// ── turboexl3_ling: the MoE tail in one launch (MOE_TAIL, src/ling_tail.zig) ──
++
++/// The armed layer's MLP output and tail in one launch (turboexl3's `ling.moeTail`): the routed sum over the call's
++/// joined rows and weights (the source's), its astype to bf16 and the shared expert's add (the MoE block's), then the
++/// residual add into `h` and its RMSNorm with `w` (`carried`), the chain's words. The MLP output the block returned is
++/// left unread (its owner frees it unevaluated). False where the layer left no parts (not armed, a call off the decode
++/// lane) or the launch does not take the call (its checks come before it builds anything; the first such call logs
++/// why): the caller keeps the chain. Where the source kept the call's outputs unjoined (ROUTED_JOIN), the launch reads
++/// them in place (`ling.moeTailParts`, `moe_tail.launch`).
++fn moeTailOf(m: *trunk.Model, h: *Array, w: Array, carried: *?Array) !bool {
++    const p = moe_tail.take() orelse return false;
++    if (w.ctx == null) return false;
++    const out = moe_tail.launch(m.s, h.*, p, w, m.rms_eps) catch |e| switch (e) {
++        error.BadExl3Shape, error.BadExl3Dtype => {
++            moe_tail.declined(e);
++            return false;
++        },
++        else => return e,
++    };
++    ran.mark(.MOE_TAIL);
++    _ = mlx.mlx_array_free(h.*);
++    h.* = out.h;
++    carried.* = out.normed;
++    return true;
++}
++
++// ── turboexl3_ling: the layer-major prompt pass (plugin.zig `spanMajor`) ──
++
++/// Each KDA layer's conv window and scan state after the spans `after` (ascending span indices) as `hiddenSpans` keeps
++/// them: `conv[c][layer]`, `ssm[c][layer]` (null arrays for the other layers), references the caller frees.
++pub const SpanKeep = struct {
++    after: []const usize,
++    conv: []const []Array,
++    ssm: []const []Array,
++};
++
++fn takeRef(a: Array) Array {
++    var r = mlx.mlx_array_new();
++    if (a.ctx != null) _ = mlx.mlx_array_set(&r, a);
++    return r;
++}
++
++fn freeAll(xs: []Array) void {
++    for (xs) |*x| if (x.ctx != null) {
++        _ = mlx.mlx_array_free(x.*);
++        x.* = .{ .ctx = null };
++    };
++}
++
++/// A prompt's spans (`spans`: each span's rows in order, the first at `sl.positions[0]`) layer by layer, each span's
++/// bytes what `hidden` gives it as a forward of its own after the spans before it (the engine's chunk loop). Every op
++/// whose bytes may depend on its call's rows runs on one span at a time, in the spans' order, at the span's position:
++/// the input norm, the KDA or MLA mixer on the slot's cache, the residual adds and norms, the dense FFN, the router and
++/// the shared expert. A MoE layer's routed experts run in the calls `calls` names over whole spans (each call's end, an
++/// index into `spans` past its last span: the whole pass's calls, src/ling_segments.zig `routedCalls`, so a C4 segment
++/// of a run runs the run's own calls): each row of a prompt call has the same bytes whatever else the call holds
++/// (turboexl3's prompt-rows test), and a call reads each expert once, not once a span. Each layer is evaluated before
++/// the next. A span of one row takes the router's 1-row fold in `hidden`; the caller forwards such spans (every span of
++/// a decode lane's rows or fewer) on its own. `keep` takes each KDA layer's state after its spans.
++/// D2: at an MLA layer the spans that start at `d2_from` (src/ling_rq.zig `d2Start`) or later, two or more of them,
++/// append their keys and values in one call (`mixGroup`, mla.zig `mlaGroup`), each its words as before.
++/// Returns each span's final-normed hidden `[1, S, H]` in `out` (the caller frees them).
++pub fn hiddenSpans(m: *trunk.Model, sl: slots_mod.Slots, token_ids: Array, spans: []const u32, calls: []const u32, keep: ?*const SpanKeep, d2_from: u64, out: []Array) !void {
++    const a = std.heap.c_allocator;
++    const n = spans.len;
++    if (n == 0 or out.len != n) return error.LayerMajorSpans;
++    for (spans) |r| if (r < 2) return error.LayerMajorOneRowSpan;
++    const s = m.s;
++    const pos0: u32 = sl.positions[0];
++    const starts = try a.alloc(u32, n + 1);
++    defer a.free(starts);
++    starts[0] = 0;
++    for (spans, 0..) |r, j| starts[j + 1] = starts[j] + r;
++    const pos = try a.alloc(u32, n);
++    defer a.free(pos);
++    for (pos, 0..) |*p, j| p.* = pos0 + starts[j];
++    const h = try a.alloc(Array, n);
++    defer a.free(h);
++    const carried = try a.alloc(Array, n);
++    defer a.free(carried);
++    const ff = try a.alloc(Array, n);
++    defer a.free(ff);
++    const mlp_out = try a.alloc(Array, n);
++    defer a.free(mlp_out);
++    // D2: a grouped span's mixer output, made at its group's first span (`mixGroup`) until its span takes it
++    const d_out = try a.alloc(Array, n);
++    defer a.free(d_out);
++    inline for (.{ h, carried, ff, mlp_out, d_out }) |xs| for (xs) |*x| {
++        x.* = .{ .ctx = null };
++    };
++    defer inline for (.{ h, carried, ff, mlp_out, d_out }) |xs| freeAll(xs);
++    for (0..n) |j| {
++        var ids = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(ids);
++        try mlx.check(mlx.mlx_slice(&ids, token_ids, &[_]c_int{ 0, @intCast(starts[j]) }, 2, &[_]c_int{ 1, @intCast(starts[j + 1]) }, 2, &[_]c_int{ 1, 1 }, 2, s));
++        h[j] = try m.embedding(ids);
++    }
++    const n_layers = m.layers.len;
++    // LAYER_WHAT: the pass's counts from zero (`passEnd` marks the run-path line where a kept W_hat was read past its
++    // decode)
++    layer_what.passBegin();
++    for (m.layers, 0..) |*lw, layer_idx| {
++        const li: u32 = @intCast(layer_idx);
++        const last = layer_idx + 1 == n_layers;
++        const next_norm = if (last) m.final_norm else m.layers[layer_idx + 1].input_norm;
++        // LAYER_WHAT: this layer's dense prefill linears (its mixer's EXL3 projections, a dense layer's MLP) over W_hats
++        // decoded at its first wide span; dropped before its routed calls (whose route read evaluates the mixer) or
++        // after a dense layer's MLP (the layer's graph holds what it reads until it is evaluated)
++        layer_what.begin(lw);
++        defer layer_what.end();
++        // D2: an MLA layer's spans from the first that starts at `d2_from` on, when two or more do (src/ling_rq.zig
++        // `groupStart`), run their mixer at that span in one KV append (`mixGroup`); every other span as before.
++        const g: usize = if (lw.mixer == .mla) ling_rq.groupStart(pos, d2_from) else n;
++        // The mixer and the post-attention norm, span by span (`hidden`'s order).
++        for (0..n) |j| {
++            const S: c_int = @intCast(spans[j]);
++            const span_sl: slots_mod.Slots = .{ .ops = sl.ops, .caches = sl.caches, .positions = pos[j .. j + 1] };
++            if (j == g) try mixGroup(m, span_sl, lw, li, h, carried, pos, spans, g, d_out);
++            // D2: a grouped span's input norm went into its group (`mixGroup`), and its mixer output is the group's
++            const normed: Array = if (j >= g) .{ .ctx = null } else if (carried[j].ctx != null) carried[j] else try m.rmsNorm(h[j], lw.input_norm);
++            if (j < g) carried[j] = .{ .ctx = null };
++            defer if (normed.ctx != null) {
++                _ = mlx.mlx_array_free(normed);
++            };
++            const attn_out = if (j >= g) grouped: {
++                const o = d_out[j];
++                d_out[j] = .{ .ctx = null };
++                break :grouped o;
++            } else switch (lw.mixer) {
++                .kda => |*la| try slots_mod.kda(m, span_sl, 0, normed, la, li, 1, S, true, false),
++                .mla => |*w| try mla.mlaAttn(m, span_sl, normed, w, li, @intCast(pos[j]), 1, S, true),
++                .dsa => return error.LingLayerIsDsa,
++            };
++            defer _ = mlx.mlx_array_free(attn_out);
++            if (keep) |k| if (lw.mixer == .kda) for (k.after, 0..) |aj, c| if (aj == j) {
++                k.conv[c][layer_idx] = takeRef(span_sl.state(0, li, .conv));
++                k.ssm[c][layer_idx] = takeRef(span_sl.state(0, li, .ssm));
++            };
++            if (try m.narrowAddNorm(h[j], attn_out, lw.post_norm)) |fused| {
++                _ = mlx.mlx_array_free(h[j]);
++                h[j] = fused.h;
++                ff[j] = fused.normed;
++            } else {
++                var h_new = mlx.mlx_array_new();
++                try mlx.check(mlx.mlx_add(&h_new, h[j], attn_out, s));
++                _ = mlx.mlx_array_free(h[j]);
++                h[j] = h_new;
++                ff[j] = try m.rmsNorm(h[j], lw.post_norm);
++            }
++        }
++        if (lw.mlp == .moe) layer_what.end();
++        // PF_MOE_TAIL: a MoE layer whose sum the tail makes (a streamed source's routed sum plus an ungated shared
++        // expert) ends each span in one launch (src/ling_pf_tail.zig): its calls keep their unjoined outputs and its
++        // spans their shared expert outputs; the layer's end frees them.
++        const pf_arm = lw.mlp == .moe and moe_block.tailServes(&lw.mlp.moe);
++        if (pf_arm) pf_tail.arm(li, n);
++        defer if (pf_arm) pf_tail.end();
++        // The MLP: a dense FFN span by span; a MoE layer's router and shared expert span by span around its routed calls.
++        switch (lw.mlp) {
++            .dense => |*dw| for (0..n) |j| {
++                mlp_out[j] = try m.denseMlp(dw, ff[j]);
++            },
++            .moe => |*mw| try moeSpans(s, mw, ff, spans, calls, mlp_out, nextMoe(m, layer_idx)),
++        }
++        layer_what.end();
++        // The residual add and the next layer's norm, span by span.
++        // PF_MOE_TAIL: the next norm's weight widened, then eps, the armed layer's tail operand.
++        const pf_we: ?Array = if (pf_arm) pf_tail.normWeights(s, next_norm, m.rms_eps) catch null else null;
++        defer if (pf_we) |x| {
++            _ = mlx.mlx_array_free(x);
++        };
++        for (0..n) |j| {
++            // PF_MOE_TAIL: the span's tail in one launch, its residual and next norm (the chain's own arrays are freed
++            // unevaluated); a span the launch refuses keeps the chain below.
++            if (pf_we) |we| if (pf_tail.launch(s, j, h[j], we)) |o| {
++                _ = mlx.mlx_array_free(h[j]);
++                h[j] = o.h;
++                carried[j] = o.normed;
++                continue;
++            };
++            if (try m.narrowAddNorm(h[j], mlp_out[j], next_norm)) |fused| {
++                _ = mlx.mlx_array_free(h[j]);
++                h[j] = fused.h;
++                carried[j] = fused.normed;
++            } else {
++                var h_next = mlx.mlx_array_new();
++                try mlx.check(mlx.mlx_add(&h_next, h[j], mlp_out[j], s));
++                _ = mlx.mlx_array_free(h[j]);
++                h[j] = h_next;
++            }
++        }
++        freeAll(ff);
++        freeAll(mlp_out);
++        try evalLayer(m, sl, li, lw.mixer == .kda, h, carried);
++    }
++    layer_what.passEnd();
++    for (0..n) |j| {
++        if (carried[j].ctx != null) {
++            out[j] = carried[j];
++            carried[j] = .{ .ctx = null };
++        } else out[j] = try m.rmsNorm(h[j], m.final_norm);
++    }
++}
++
++/// D2: an MLA layer's grouped spans `g..` through mla.zig `mlaGroup` (one CacheOps.append for their keys and values),
++/// each span's input norm made as the span loop makes it (its carried norm, else the norm of its hidden), each output
++/// into `d_out` for the span loop to take.
++fn mixGroup(m: *trunk.Model, sl: slots_mod.Slots, lw: *const trunk.Layer, li: u32, h: []const Array, carried: []Array, pos: []const u32, spans: []const u32, g: usize, d_out: []Array) !void {
++    const a = std.heap.c_allocator;
++    const n = spans.len;
++    const xs = try a.alloc(Array, n - g);
++    defer a.free(xs);
++    @memset(xs, .{ .ctx = null });
++    defer freeAll(xs);
++    const rows = try a.alloc(c_int, n - g);
++    defer a.free(rows);
++    for (xs, rows, g..) |*x, *r, j| {
++        x.* = if (carried[j].ctx != null) carried[j] else try m.rmsNorm(h[j], lw.input_norm);
++        carried[j] = .{ .ctx = null };
++        r.* = @intCast(spans[j]);
++    }
++    try mla.mlaGroup(m, sl, xs, &lw.mixer.mla, li, @intCast(pos[g]), rows, d_out[g..n]);
++}
++
++/// A MoE layer over every span's normed rows `ff`: the router span by span, the routed experts in the calls `calls`
++/// names over whole spans (`routedSum`; each call's end, an index into `spans` past its last span, in order, the last
++/// `spans.len`), then each span's shared expert and add (`mlpFinish`) on its rows of its call.
++/// `ahead` (D2, PROMPT_AHEAD): the next routed layer, whose experts are read ahead once this layer's last routed call is
++/// built (`promptAhead`); null: none (the last routed layer).
++fn moeSpans(s: mlx.mlx_stream, mw: *const moe_block.Moe.Weights, ff: []const Array, spans: []const u32, calls: []const u32, out: []Array, ahead: ?*const moe_block.Moe.Weights) !void {
++    const a = std.heap.c_allocator;
++    var g = ops.Graph.init(a, s);
++    defer g.deinit();
++    // SHARED_LAYER_WHAT: this layer's shared-expert W_hats, decoded at its first wide span, serve its other spans;
++    // dropped once its spans are done (the layer's graph holds what it reads until `evalLayer`)
++    shared_layer.begin();
++    defer shared_layer.end();
++    const n = spans.len;
++    // C4: the calls cover the spans, each one span or more, in order
++    var prev: usize = 0;
++    for (calls) |c| {
++        if (c <= prev or c > n) return error.LayerMajorCalls;
++        prev = c;
++    }
++    if (prev != n) return error.LayerMajorCalls;
++    const routes = try a.alloc(moe_block.SpanRoute, n);
++    defer a.free(routes);
++    for (0..n) |j| routes[j] = try moe_block.mlpRoute(mw, &g, ff[j]);
++    var j0: usize = 0;
++    for (calls) |c| {
++        const j1: usize = c;
++        var xs: [64]Array = undefined;
++        var is: [64]Array = undefined;
++        var ws: [64]Array = undefined;
++        if (j1 - j0 > xs.len) return error.LayerMajorTooManySpans;
++        for (j0..j1, 0..) |j, i| {
++            xs[i] = ff[j];
++            is[i] = routes[j].inds;
++            ws[i] = routes[j].scores;
++        }
++        const k = j1 - j0;
++        const x = if (k == 1) xs[0] else try g.concat(xs[0..k], 1);
++        const inds = if (k == 1) is[0] else try g.concat(is[0..k], 1);
++        const scores = if (k == 1) ws[0] else try g.concat(ws[0..k], 1);
++        // PF_MOE_TAIL: the call's spans, whose tails read its unjoined outputs (src/ling_pf_tail.zig)
++        pf_tail.beginCall(j0, j1, spans);
++        const sum = try moe_block.routedSum(mw, &g, x, inds, scores);
++        pf_tail.endCall();
++        var at: c_int = 0;
++        for (j0..j1) |j| {
++            const S: c_int = @intCast(spans[j]);
++            const part = if (k == 1) sum else try g.sliceAxis(sum, 1, at, at + S);
++            pf_tail.atSpan(j);
++            out[j] = g.escape(try moe_block.mlpFinish(mw, &g, ff[j], part));
++            at += S;
++        }
++        j0 = j1;
++    }
++    // D2: this layer's routed calls are done (each drained its groups and let its slots go); the next routed layer's
++    // reads start now, beside this layer's tail (`evalLayer`) and the next layer's mixer.
++    if (ahead) |nw| try promptAhead(&g, nw, ff);
++}
++
++/// D2 (PROMPT_AHEAD): the next routed layer `nw`'s routes predicted over every span's rows from this layer's MoE input
++/// `ff` by that layer's own router (`mlpRoute`: its logits, Ling's group limit and its top-k: C1's decode predictor at
++/// prompt width), the ids read back in one evaluation, and handed to its source's read-ahead (`Routed.read_ahead_fn`:
++/// the predicted experts hottest first into that layer's persistent rows; that layer's routing barrier lands them before
++/// its seed). Residency only: the predicted routes choose reads, never a routed expert, a slot byte or an output. A
++/// layer without a streamed source or a read-ahead entry reads nothing.
++fn promptAhead(g: *ops.Graph, nw: *const moe_block.Moe.Weights, ff: []const Array) !void {
++    const st = nw.streamed orelse return;
++    const f = st.routed.read_ahead_fn orelse return;
++    const a = std.heap.c_allocator;
++    var t = g.scope();
++    defer t.deinit();
++    const host = try a.alloc(Array, ff.len);
++    defer a.free(host);
++    // Lever 4 (PROMPT_AHEAD_BF16): the route over a bf16 copy of that layer's router weight, so its logits are one bf16
++    // GEMM on `ff` (the activation dtype) instead of the f32 table's. The routing chain after it is the stock one
++    // (sigmoid plus bias, the group limit, top-k, in f32). Only the predicted reads can change.
++    var wb = nw.*;
++    wb.router.w = try t.astype(nw.router.w, .bfloat16);
++    ran.mark(.PROMPT_AHEAD_BF16);
++    for (ff, host) |x, *h| h.* = try t.astype((try moe_block.mlpRoute(&wb, &t, x)).inds, .uint32);
++    try ops.evalMany(host);
++    var total: usize = 0;
++    for (host) |h| total += mlx.mlx_array_size(h);
++    const ids = try a.alloc(u16, total);
++    defer a.free(ids);
++    var at: usize = 0;
++    for (host) |h| {
++        const n = mlx.mlx_array_size(h);
++        const src = (mlx.mlx_array_data_uint32(h) orelse return error.NoData)[0..n];
++        for (ids[at..][0..n], src) |*d, v| d.* = @intCast(v);
++        at += n;
++    }
++    try f(st.routed.ctx, st.layer, ids).get();
++}
++
++/// D2: the first routed layer after model layer `li` (null: none).
++fn nextMoe(m: *trunk.Model, li: usize) ?*const moe_block.Moe.Weights {
++    for (m.layers[li + 1 ..]) |*l| switch (l.mlp) {
++        .moe => |*w| return w,
++        else => {},
++    };
++    return null;
++}
++
++/// A layer's outputs evaluated: every span's hidden (and carried norm), and the layer's cache (its KDA state, or its
++/// MLA K/V) so the next layer's graph does not hold this one's.
++fn evalLayer(m: *trunk.Model, sl: slots_mod.Slots, li: u32, kda: bool, h: []const Array, carried: []const Array) !void {
++    const vec = mlx.mlx_vector_array_new();
++    defer _ = mlx.mlx_vector_array_free(vec);
++    for (h) |x| _ = mlx.mlx_vector_array_append_value(vec, x);
++    for (carried) |x| if (x.ctx != null) {
++        _ = mlx.mlx_vector_array_append_value(vec, x);
++    };
++    if (kda) {
++        inline for (.{ .conv, .ssm }) |which| {
++            const st = sl.state(0, li, which);
++            if (st.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, st);
++        }
++        try mlx.check(mlx.mlx_eval(vec));
++    } else {
++        var v = try sl.view(0, li, m.s);
++        defer v.deinit();
++        _ = mlx.mlx_vector_array_append_value(vec, v.k);
++        _ = mlx.mlx_vector_array_append_value(vec, v.v);
++        try mlx.check(mlx.mlx_eval(vec));
++    }
++}
+--- a/sdk/util/shared.zig
++++ b/sdk/util/shared.zig
+@@ -10,7 +10,8 @@
+     return struct {
+         var storage: T = init;
+         var cached: ?*T = null;
+-        const sym = "mlx_serve_shared_" ++ name;
++        // turboexl3_ling: this plugin's copies export under their own prefix (the kit's own copy of a file exports its name).
++        const sym = "turboexl3_ling_shared_" ++ name;
+         fn addr() callconv(.c) *anyopaque {
+             return &storage;
+         }
+@@ -32,7 +33,7 @@
+ pub fn SharedThreadLocal(comptime T: type, comptime name: []const u8, comptime init: T) type {
+     return struct {
+         threadlocal var storage: T = init;
+-        const sym = "mlx_serve_shared_tls_" ++ name;
++        const sym = "turboexl3_ling_shared_tls_" ++ name;
+         fn addr() callconv(.c) *anyopaque {
+             return @ptrCast(&storage);
+         }
