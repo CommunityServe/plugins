@@ -1,0 +1,16 @@
+.{
+    .name = .turboexl3_glm53f,
+    .version = "0.0.0",
+    .fingerprint = 0xbfaf775800ab58a2,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .mlx_serve_kit = .{ .path = "../../.kit/kit" },
+        // turboexl3 (davidtai/turboexl3): the EXL3 kernels and its plugin-kit launcher, at ca709a7 on turboexl3 main
+        // (GLM-5.3-Flash's shapes, rates and schedules; the int8 prefill options).
+        .turboexl3 = .{
+            .url = "https://github.com/davidtai/turboexl3/archive/ca709a7f31688b0825b4218fc543de34da6721d8.tar.gz",
+            .hash = "turboexl3-0.1.0-tZE8b4koUgF7hg1-MSRTC3BUhwl2qp35iYWq9szndJuk",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "tests", "NOTICE", "README.md", "icon.png" },
+}
