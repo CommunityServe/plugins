@@ -23,10 +23,12 @@ the model: its forward, MTP, the prefix cache and the bill. The plugin does only
 
 ## Switches
 
-The plugin reads 19 `TURBOEXL3_GLM53F_*` switches at load (src/options.zig). The kit exports them as the plugin's
+The plugin reads 20 `TURBOEXL3_GLM53F_*` switches at load (src/options.zig). The kit exports them as the plugin's
 options, so the app's plugin page can set them. Each default is the value of the served configuration.
 `PROMPT_KEEP` and `ADOPT_PIECES` need a seam in the kit's stream. If the kit has no such seam, they default to off,
 and the plugin refuses the bank if one is set.
+`PREDICT` defaults to off: the bank's predictor already scores the next layer with one bf16 gemv, and the kit's
+`router_nax.predict` serves f16 routers only, so on this path it never engages.
 
 The model's own levers (the KDA and DSA kernels, the fused router, the split prompt forward and others) are not
 in this plugin. Each is an mlx-serve change to `glm5_next`.
