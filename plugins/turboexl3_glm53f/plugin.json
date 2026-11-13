@@ -1,0 +1,18 @@
+{
+  "name": "turboexl3_glm53f",
+  "title": "TurboEXL3 - GLM 5.3 Flash",
+  "kind": "quant",
+  "version": "0.4.0",
+  "summary": "GLM-5.3-Flash EXL3 streaming packs on mlx-serve's own glm5_next model: the trunk's EXL3 linears and the MTP layer's experts on turboexl3, the routed experts streamed from the pack's experts.bin by this plugin's GLM bank, on M5-class Macs (NAX).",
+  "models": [
+    "glm5_next with an exllamav3 quantization_config and a turboexl3 expert_streaming bank (the streaming repack of turboderp/GLM-5.3-Flash-exl3 sc_2.10bpw, sc_2.60bpw, sc_3.10bpw, sc_4.10bpw)"
+  ],
+  "requires_mlx_serve": ">=26.11.3",
+  "kit_note": "Needs mlx-serve's glm5_next with the outside quant seams (sdk/quant/outside_model.zig; core-outside-quant), which serves an expert_streaming pack through the quant plugin that claims it.",
+  "fixture": "kit",
+  "test_step": "test",
+  "maintainers": ["davidtai"],
+  "license": "MIT",
+  "homepage": "https://github.com/davidtai/turboexl3",
+  "icon": "icon.png"
+}

@@ -30,6 +30,20 @@
       "icon": "plugins/turboexl3_ds41/icon.png"
     },
     {
+      "name": "turboexl3_glm53f",
+      "title": "TurboEXL3 - GLM 5.3 Flash",
+      "kind": "quant",
+      "version": "0.4.0",
+      "summary": "GLM-5.3-Flash EXL3 streaming packs on mlx-serve's own glm5_next model: the trunk's EXL3 linears and the MTP layer's experts on turboexl3, the routed experts streamed from the pack's experts.bin by this plugin's GLM bank, on M5-class Macs (NAX).",
+      "models": [
+        "glm5_next with an exllamav3 quantization_config and a turboexl3 expert_streaming bank (the streaming repack of turboderp/GLM-5.3-Flash-exl3 sc_2.10bpw, sc_2.60bpw, sc_3.10bpw, sc_4.10bpw)"
+      ],
+      "requires_mlx_serve": ">=26.11.3",
+      "fixture": "kit",
+      "homepage": "https://github.com/davidtai/turboexl3",
+      "icon": "plugins/turboexl3_glm53f/icon.png"
+    },
+    {
       "name": "turboexl3_qwen38",
       "title": "TurboEXL3 - Qwen 3.8 Flash",
       "kind": "model",

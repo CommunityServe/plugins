@@ -1,0 +1,39 @@
+turboexl3_glm53f builds against the mlx-serve plugin kit and turboexl3 (build.zig.zon, by URL and hash). It vendors
+no third-party file unchanged. The code below came from other projects and is now this plugin's own code.
+
+--------------------------------------------------------------------------------
+mlx-serve
+https://github.com/ddalcu/mlx-serve
+Copyright (c) 2026 David Dalcu
+Licensed under the MIT License.
+
+src/streamed/ and src/exl3/ are mlx-serve's GLM-5.3-Flash EXL3 bank and its scheduler (from mlx-serve's
+src/sdk/weights/streamed/ and src/sdk/quant/exl3/stream/: the bank source, the GLM bank, MiMo's stream bridge, the
+routed experts' scheduler, the stream's own SDK and the EXL3 stream quant). They moved out of mlx-serve at bc6c5f2c,
+and mlx-serve no longer carries them, so this plugin maintains them. Their imports point at this plugin's files and
+the kit. This plugin removed the functions, declarations and tests that it never reaches, and the DeepSeek-V4.1
+kernel texts and test fixtures. The stream itself and its read pool are the kit's (`kit.streamed`), not copies.
+
+src/host_shims.zig replaces mlx-serve's sdk/weights/streamed/csrc/mlx_event_shim.cpp, mlx_alloc_shim.cpp,
+mlx_launch_cache.inc, mimo_gpu_address.inc and q3_event_shim.mm: it gives their C symbols over the server's host
+table. src/csrc/glm53f_gpu_warm.m replaces sdk/weights/streamed/csrc/mimo_gpu_warm.inc: it gives its C symbols and
+its kernel's text over Metal's own API. Both are this plugin's code.
+
+--------------------------------------------------------------------------------
+mlx-stream
+https://github.com/davidtai/mlx-stream
+Copyright (c) 2026 David Tai
+Licensed under the MIT License.
+
+mlx-serve absorbed mlx-stream into its server. The SSD expert streamer, its SDK and the EXL3 stream quant above came
+from it. The packed expert record and manifest formats, the streamed-bank layout and the routed-expert EXL3 Metal
+kernels are David Tai's earlier work. mlx-serve's NOTICE carries mlx-stream's full entry, with what mlx-stream itself
+incorporates (MLX, ExLlamaV3, DeepSeek-V4.1-Flash).
+
+--------------------------------------------------------------------------------
+tests/fixtures/config.json is the config.json of a GLM-5.3-Flash sc_3.10bpw streaming repack (turboderp's sc_3.10bpw
+branch of https://huggingface.co/turboderp/GLM-5.3-Flash-exl3, with the converter's `expert_streaming` block),
+unchanged. [OPEN: the model's licence, from the model card.]
+
+src/glm_tiles.json holds routed-expert tiles of turboderp's GLM-5.3-Flash EXL3 packs, used by the tile gate
+(src/frac_test.zig). [OPEN: the same licence.]
