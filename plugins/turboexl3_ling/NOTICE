@@ -1,0 +1,13 @@
+turboexl3_ling builds against the mlx-serve plugin kit and turboexl3 (build.zig.zon, by URL and hash). It vendors
+nothing: its routed experts stream over the kit's expert stream (`kit.streamed`), which the kit ships.
+
+src/host_shims.zig is this plugin's code standing in for mlx-serve's C++ shims over MLX's private headers (the kit
+stream's event, alloc and launch-cache symbols, served over the server's host table).
+
+ExLlamaV3 (https://github.com/turboderp-org/exllamav3, Copyright (c) turboderp, MIT): the EXL3 format the bank reads
+follows exllamav3; no exllamav3 code is shipped. The packed expert record and manifest formats (expert-manifest-v2) are
+mlx-stream's (https://github.com/davidtai/mlx-stream, Copyright (c) 2026 David Tai, MIT), which mlx-serve absorbed.
+
+--------------------------------------------------------------------------------
+tests/fixtures/config-2.60bpw.json is the config.json of turboderp/Ling-3.1-flash-exl3 (branch 2.60bpw, revision
+5368b6b9), unchanged.

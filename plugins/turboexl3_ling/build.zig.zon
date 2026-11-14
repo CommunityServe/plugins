@@ -1,0 +1,16 @@
+.{
+    .name = .turboexl3_ling,
+    .version = "0.0.0",
+    .fingerprint = 0x6622aae1486afd87,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .mlx_serve_kit = .{ .path = "../../.kit/kit" },
+        // turboexl3 (davidtai/turboexl3): the EXL3 kernels and its plugin-kit launcher, with Ling-3.1-flash's kernels
+        // (main at PR #9's merge, 0a376d11).
+        .turboexl3 = .{
+            .url = "https://github.com/davidtai/turboexl3/archive/0a376d11065f410edd7b54188a948633cb8ee8d3.tar.gz",
+            .hash = "turboexl3-0.1.0-tZE8b64tZgHDbDE2BZt6dvQLm2aPfwgIHj6wTWK4twA2",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig", "src", "tests", "NOTICE", "README.md" },
+}
