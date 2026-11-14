@@ -17,6 +17,11 @@
 //! bytes do not depend on how the bank's residency split the call. The decode waves stay banked. A call's layer is told
 //! by its code array's tile width; a bank without such a layer (`State.any_frac`, set by `warm`) never reads it, so
 //! every call goes to the stock math exactly as before.
+//!
+//! TURBOEXL3_DS41_PF_INT8 (src/pf_int8.zig; not exact): with turboexl3's int8 prefill on (`Config.pf_int8`, set at the
+//! plugin's `open`), a K 2 layer's prompt calls (n 32: `frac.int8_n`) take the same path (`State.int8_k2`, set by
+//! `warm`), so turboexl3's int8 prefill GEMMs serve them in place of the DIG-X lane; their decode waves stay banked (exact),
+//! and a K 3 layer stays on the DIG-X lane.
 
 const std = @import("std");
 const mlx = @import("mlx_serve").mlx;
@@ -45,6 +50,9 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
             n: usize = 0,
             /// TURBOEXL3_DS41_FRAC: the bank holds a layer at a half-integer rate (`warm`); false, no call reads a width.
             any_frac: bool = false,
+            /// TURBOEXL3_DS41_PF_INT8: turboexl3's int8 prefill is on and the bank holds a K 2 layer (`warm`): those
+            /// layers' prompt calls run here too.
+            int8_k2: bool = false,
             /// A fractional cold-row chunk's gate and up arrays, from its `gateUp` to its `down`.
             parked: frac.Parked(Proj) = .{},
         };
@@ -52,7 +60,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         /// The stock math's decode GEMV (a wide prompt call's cold rows; the decode waves are banked). A fractional layer's
         /// (TURBOEXL3_DS41_FRAC): the rows, bf16, its gate and up parked for its `down`, which runs the whole expert.
         pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: Proj, up: Proj) !T {
-            if (self.state.any_frac and fracCode(g, gate.code)) {
+            if (self.t3Call(g, gate.code)) {
                 const xb = if (g.dtypeOf(x) == .bfloat16) x else try g.astype(x, .bfloat16);
                 self.state.parked.put(xb.ctx, gate, up);
                 return xb;
@@ -66,7 +74,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         /// [rows, hidden] at weight 1 as the stock down returns them, each value the hot path's (rounded to bf16 where the
         /// lane stores its expert outputs in bf16).
         pub fn down(self: *const Self, g: *G, h: T, ids: T, d: Proj) !T {
-            if (self.state.any_frac and fracCode(g, d.code)) {
+            if (self.t3Call(g, d.code)) {
                 const gu = self.state.parked.take(h.ctx) orelse return error.FracDownWithoutGateUp;
                 const b: Bank = .{ .gate = gu.gate, .up = gu.up, .down = d };
                 const rows: usize = @intCast(g.shapeOf(ids).dim(0));
@@ -133,6 +141,14 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         /// Whether `code`'s tiles are a fractional width (off the DIG-X lane's 32 and 48 halfwords).
         fn fracCode(g: *G, code: T) bool {
             return !frac.isDigx(@intCast(g.shapeOf(code).dim(3)));
+        }
+
+        /// Whether a prompt call over `code`'s layer runs here on turboexl3: a fractional layer's (TURBOEXL3_DS41_FRAC), or
+        /// under TURBOEXL3_DS41_PF_INT8 a K 2 layer's (`State.int8_k2`).
+        fn t3Call(self: *const Self, g: *G, code: T) bool {
+            if (self.state.any_frac and fracCode(g, code)) return true;
+            const w: u64 = @intCast(g.shapeOf(code).dim(3));
+            return self.state.int8_k2 and w == frac.int8_n;
         }
 
         /// The streamer's banked route (its hook's `banked`, and DEVROUTE's device wave over it).
@@ -206,6 +222,13 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
                 var lb: [512]u8 = undefined;
                 std.debug.print("{s}", .{frac.loadLine(&lb, widths[0..@min(banks.len, widths.len)])});
             }
+            // TURBOEXL3_DS41_PF_INT8: turboexl3's int8 prefill on (the plugin's `open` set it), the K 2 layers' prompt calls
+            // move here
+            if (t3.config.get().pf_int8 != 0 and std.mem.indexOfScalar(u32, widths[0..@min(banks.len, widths.len)], frac.int8_n) != null) {
+                self.state.int8_k2 = true;
+                var lb: [512]u8 = undefined;
+                std.debug.print("{s}", .{frac.int8LoadLine(&lb, widths[0..@min(banks.len, widths.len)])});
+            }
             return out;
         }
 
@@ -230,7 +253,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
 
         /// A wide prompt call's waves: the stock math's (its DIG-X lane).
         pub fn prefill(self: *const Self, g: *G, layer: u32, x: T, rows: PrefillRows, bank: Bank) !T {
-            if (self.state.any_frac and fracCode(g, bank.gate.code)) return self.fracPrefill(g, x, rows, bank);
+            if (self.t3Call(g, bank.gate.code)) return self.fracPrefill(g, x, rows, bank);
             return self.stock.prefill(g, layer, x, rows, bank);
         }
 
@@ -343,7 +366,7 @@ pub fn Math(comptime G: type, comptime Proj: type, comptime Bank: type, comptime
         pub const has_parts = Stock.has_parts;
         pub fn prefillParts(self: *const Self, g: *G, layer: u32, x: T, rows: PrefillRows, bank: Bank, alloc: std.mem.Allocator, outs: *std.ArrayList(T), pos: *std.ArrayList(u32)) !void {
             // A fractional layer's call: `fracParts`' chunks as its parts, each row in its assignment row.
-            if (self.state.any_frac and fracCode(g, bank.gate.code)) return self.fracParts(g, x, rows, bank, alloc, outs, pos);
+            if (self.t3Call(g, bank.gate.code)) return self.fracParts(g, x, rows, bank, alloc, outs, pos);
             return self.stock.prefillParts(g, layer, x, rows, bank, alloc, outs, pos);
         }
     };

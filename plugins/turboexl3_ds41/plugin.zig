@@ -14,6 +14,7 @@ const shared_swiglu = @import("src/shared_swiglu.zig");
 const stream = @import("mlx_stream");
 const exl3 = stream.exl3_source;
 const shims = @import("src/host_shims.zig");
+const pf_int8 = @import("src/pf_int8.zig");
 pub const config = @import("config.zig");
 
 /// Shown at install and in Settings.
@@ -23,6 +24,7 @@ pub const plugin = kit.sdk.Plugin{ .name = "turboexl3_ds41", .kind = .quant, .op
     .{ .name = "TURBOEXL3_DS41_FRAC", .kind = .bool, .default = "1", .help = "Serve layers at a half-integer rate (off: a pack with them is refused)" },
     .{ .name = "TURBOEXL3_DS41_RESIDENT_SEED", .kind = .text, .help = "usage: fill the prompt rows with each layer's most used experts at load; none: no seed. Empty: by the pack" },
     .{ .name = "TURBOEXL3_DS41_EXPERT_USAGE_DIR", .kind = .text, .help = "The folder the seed reads expert-usage-v1.json from (absolute). Empty: the pack's" },
+    .{ .name = "TURBOEXL3_DS41_PF_INT8", .kind = .number, .default = "0", .help = "Not exact: 0 off; 1 the routed experts turboexl3 serves at prompt rows on int8, a scale each activation 128-block; 3 1 and the attention projections at prompt rows on int8; 4 1 and every trunk linear at prompt rows on int8 (2 is refused: one scale a row does not fit hidden 5120)" },
 } };
 
 pub const table = abi.QuantTable{
@@ -67,7 +69,24 @@ fn open(ctx: *abi.LoadCtx) callconv(.c) Verdict {
     cf.banked_m3 = true;
     cf.banked_variant_gu = t3.groupVariantOf("t4") orelse return Verdict.refuse(.failed, "turboexl3_ds41: turboexl3 has no t4 GEMV variant");
     cf.banked_variant_dn = cf.banked_variant_gu;
+    // TURBOEXL3_DS41_PF_INT8 (src/pf_int8.zig): turboexl3's int8 prefill GEMMs at the centered 509.5, set before the
+    // first prompt (a prefill engine reads them when it is made)
+    const int8 = pf_int8.PfInt8.read(&processEnv) catch |e| {
+        h.log(.err, "[turboexl3_ds41] {s}: TURBOEXL3_DS41_PF_INT8 takes 1 (the routed experts turboexl3 serves on int8), 3 (1 and the attention projections) or 4 (1 and every trunk linear) (unset or 0: the exact prefill; 2, one scale a row, does not fit hidden 5120): the load is refused\n", .{@errorName(e)});
+        return Verdict.named(.unsupported, @errorName(e));
+    };
+    const level: u8 = if (int8) |p| p.level else 0;
+    cf.pf_int8 = if (level != 0) 1 else 0;
+    cf.pf_int8_c2 = if (level != 0) 1019 else 1020;
+    cf.pf_trunk_int8 = level >= 3;
+    // the joined wo_a run (src/woa_join.zig) splits its groups' inner products off `linear`
+    cf.pf_trunk_int8_inner = level >= 3;
     t3.configure(cf) catch |e| return Verdict.named(.failed, @errorName(e));
+    t3.trunk_q8.shapes.get().* = if (level >= 3) t3.deepseek_v41.trunkShapes(level, &int8_shapes) else null;
+    if (int8) |p| {
+        if (!int8_said) h.log(.info, pf_int8.line, .{ p.level, p.words(), if (t3.trunk_q8.shapes.get().*) |sh| sh.len else 0 });
+        int8_said = true;
+    }
     woaj.build(gpa) catch |e| return Verdict.named(.failed, @errorName(e));
     // Prompt rows' matmul and finish as one launch at the tiles turboexl3 tables (pg2: the same words), compiled now.
     if (nax) {
@@ -77,6 +96,16 @@ fn open(ctx: *abi.LoadCtx) callconv(.c) Verdict {
         t3.pgemm.warm(s, .float32, .{ 5120, 512 }) catch |e| return Verdict.named(.failed, @errorName(e));
     }
     return .ok;
+}
+
+/// The trunk int8 shapes while TURBOEXL3_DS41_PF_INT8 is 3 or 4 (turboexl3's `trunk_q8.shapes` points here), and its
+/// load line, once a process
+var int8_shapes: [t3.deepseek_v41.trunk.len]t3.trunk_q8.Shape = undefined;
+var int8_said = false;
+
+/// An option's value as the process holds it (std.c.getenv), the reader src/pf_int8.zig takes
+fn processEnv(name: [:0]const u8) ?[]const u8 {
+    return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
 
 fn close(_: *abi.LoadCtx) callconv(.c) void {}

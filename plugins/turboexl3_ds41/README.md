@@ -25,6 +25,27 @@ bank reads `TURBOEXL3_DS41_FRAC`, `TURBOEXL3_DS41_RESIDENT_SEED`, `TURBOEXL3_DS4
 app's Models ▸ Plugins page sets them) and `MLX_MAX_MB_PER_BUFFER` at its open; the old `MLX_SERVE_DSV41_*` names are
 not read (a warning names any that is set).
 
+`TURBOEXL3_DS41_PF_INT8` (an option, read at the format's open; not exact; `0`, the default: the exact prefill) puts
+turboexl3's int8 prefill GEMMs on: `1` the routed experts turboexl3 serves at prompt rows (the layers at a half-integer
+rate, the DSpark stages' banks, and the K 2 layers' prompt calls, which move off the streamer's DIG-X lane onto
+turboexl3 under this option; decode stays on the banked decode, K 3 layers on DIG-X), int8 activations at a scale each
+128-block; `3` = 1 plus the attention projections at prompt rows (wq_a, wkv and the compressors', wq_b, wo_a with
+the joined run's groups, wo_b, the indexer's wq_b) at one scale a row; `4` = 3 plus every trunk linear (the shared
+expert, DSpark's main_proj). `2` (one scale a row on the routed experts) is refused by name: hidden 5120 is past the 32
+blocks that scheme holds. Any other value refuses the load by name. The int8 weights are rebuilt at the centered 509.5.
+Decode and verify rows stay exact. A line at load names the level; turboexl3 logs an engage line where each int8 path
+first runs (the joined wo_a's at its warm run, at load). turboexl3's src/models/deepseek_v41/deepseek_int8_test.zig
+holds each path to the exact one at these shapes.
+
+Measured at level 4 against the default (exact) prefill, on an M5 Max (128 GB) with turboderp's 2.25bpw streaming pack
+on stock mlx-serve 9a173773, a 17,639-token coding prompt and 1,024 tokens, 4 runs an arm (ABBA, BAAB): prefill
+1,618 against 1,463 tok/s (+10.6%) and decode 42.0 against 43.6 tok/s (-3.8%; DSpark accepts fewer drafts) with
+greedy sampling; prefill 1,625 against 1,454 tok/s (+11.7%) and decode 38.8 against 41.4 tok/s (-6.2%) with the
+card's sampling. Quality over 32 held-out documents (code, prose, chat; about 16K tokens each): perplexity +0.11% on
+prompt rows, KL(exact || level 4) 0.0080 nats against 0.0061 for the exact attention path against the default flash
+attention. HumanEval (164 problems, greedy, thinking off): 158 of 164 at level 4 and at the default, with one flip
+each way. Levels 1 and 3 are not measured on this model; the other packs are not measured.
+
     scripts/build.sh turboexl3_ds41                    # from the repo root: tests, then ReleaseFast
     scripts/install.sh turboexl3_ds41 --home ~/tmp/h   # under a throwaway HOME
 
