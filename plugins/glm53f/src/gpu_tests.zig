@@ -53,7 +53,7 @@ fn evalAll(arrs: []const Array) !void {
 /// Sets each of `sws` to `on` (the others as the environment has them) until `release`.
 const Forced = struct {
     fn set(sws: []const Switch, on: bool) void {
-        for (sws) |sw| options.forced[@intFromEnum(sw)] = on;
+        for (sws) |sw| options.forced[@backingInt(sw)] = on;
     }
     fn release() void {
         options.forced = @splat(null);

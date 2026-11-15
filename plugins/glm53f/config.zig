@@ -3,6 +3,7 @@
 //! pack's experts.bin. mlx-serve's own glm5_next keeps every other pack (it claims by `model_type`). The parse is
 //! mlx-serve's glm5_next parse over the KDA-hybrid family config (`kit.bases.kda_hybrid.config`), its facts the same, so
 //! the host bills and schedules the pack as it does for glm5_next. Text only: the vision tower is not read.
+//! copied_from: mlx-serve src/plugins/glm5_next/config.zig@385c3957 (`readGlm` without its vision keys, `glmFacts`).
 
 const std = @import("std");
 const kit = @import("mlx_serve");

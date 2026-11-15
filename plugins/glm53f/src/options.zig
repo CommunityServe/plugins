@@ -43,7 +43,7 @@ pub const all = [_]Decl{
 };
 
 comptime {
-    for (all, 0..) |d, i| if (@intFromEnum(d.sw) != i) @compileError("options: `all` out of `Switch` order at " ++ d.name);
+    for (all, 0..) |d, i| if (@backingInt(d.sw) != i) @compileError("options: `all` out of `Switch` order at " ++ d.name);
     if (all.len != @typeInfo(Switch).@"enum".field_names.len) @compileError("options: a switch without its declaration");
 }
 
@@ -58,7 +58,7 @@ pub fn valueOn(v: []const u8) bool {
 
 /// Switch `sw` as set (read once), else its default.
 pub fn on(sw: Switch) bool {
-    const i = @intFromEnum(sw);
+    const i = @backingInt(sw);
     if (forced[i]) |v| return v;
     if (cached[i]) |v| return v;
     const d = all[i];
@@ -69,7 +69,7 @@ pub fn on(sw: Switch) bool {
 
 /// The default of switch `sw`, as a bool.
 pub fn defaultOn(sw: Switch) bool {
-    return valueOn(all[@intFromEnum(sw)].default);
+    return valueOn(all[@backingInt(sw)].default);
 }
 
 /// `all` as the kit's options (`sdk.Plugin.options`).
@@ -98,7 +98,7 @@ test "glm53f options: every switch is a GLM53F_ option of the kit's rules, with 
 test "glm53f options: a value is on unless empty or starting with 0; a forced value wins" {
     const t = std.testing;
     try t.expect(valueOn("1") and valueOn("yes") and !valueOn("0") and !valueOn("") and !valueOn("00"));
-    forced[@intFromEnum(Switch.kda_prompt_chunk)] = true;
-    defer forced[@intFromEnum(Switch.kda_prompt_chunk)] = null;
+    forced[@backingInt(Switch.kda_prompt_chunk)] = true;
+    defer forced[@backingInt(Switch.kda_prompt_chunk)] = null;
     try t.expect(on(.kda_prompt_chunk));
 }
