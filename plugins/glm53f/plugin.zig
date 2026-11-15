@@ -199,5 +199,6 @@ test {
     _ = @import("src/dsa_append.zig");
     _ = @import("src/kda_chunk.zig");
     _ = @import("src/kda_percore.zig");
+    _ = @import("src/span_plan.zig");
     _ = @import("src/gpu_tests.zig");
 }

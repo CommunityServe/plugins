@@ -268,6 +268,21 @@ test "glm53f parse: the repack with a Sushi expert_quant block or fp8 residents,
     try testing.expectEqual(abi.Verdict.Code.failed, parse(&dir, abi.Str.of("{"), .{}, null, true, &p).code);
 }
 
+test "glm53f parse: a streaming pack takes the whole prompt only with GLM53F_WHOLE_PROMPT on" {
+    const mem = packDir(repack_json, true);
+    const dir = mem.packDir();
+    defer options.forced[@backingInt(options.Switch.whole_prompt)] = null;
+    for ([_]bool{ false, true }) |on| {
+        options.forced[@backingInt(options.Switch.whole_prompt)] = on;
+        var p: abi.Parsed = .{};
+        try testing.expect(parse(&dir, abi.Str.of(repack_json), .{}, null, true, &p).isOk());
+        defer freeParsed(&p);
+        try testing.expectEqual(on, p.caps.whole_prompt_prefill);
+        // the engine keeps its GLM bills: the plugin prices no prompt of its own
+        try testing.expect(p.caps.streamed_weights);
+    }
+}
+
 test {
     _ = options;
 }

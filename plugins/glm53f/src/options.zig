@@ -1,7 +1,7 @@
 //! glm53f's switches as `Manifest.options`: every `GLM53F_*` variable the plugin reads, its kind (`bool` "0" or "1"),
 //! the plugin's own value when none is set and one line of help. The defaults are #1196's (mlx-serve 4bab19a5, the
 //! stack the GLM-5.3-Flash sweeps measured): each exact switch on, the three rounding-class ones (`KDA_PROMPT_CHUNK`,
-//! `KDA_PROMPT_PERCORE`, `DSA_PROMPT_ONEP`) off. A switch reads its variable once; a value is on unless it is empty or
+//! `KDA_PROMPT_PERCORE`, `DSA_PROMPT_ONEP`) off. `WHOLE_PROMPT` (J5, src/prompt.zig) is off until its A/B. A switch reads its variable once; a value is on unless it is empty or
 //! starts with '0'. MLX-free.
 const std = @import("std");
 const kit = @import("mlx_serve");
@@ -21,6 +21,7 @@ pub const Switch = enum {
     prompt_async_eval,
     router_nax,
     router_one1,
+    whole_prompt,
 };
 
 pub const Decl = struct { sw: Switch, name: []const u8, default: []const u8, help: []const u8 };
@@ -40,6 +41,7 @@ pub const all = [_]Decl{
     .{ .sw = .prompt_async_eval, .name = "GLM53F_PROMPT_ASYNC_EVAL", .default = "1", .help = "A prompt forward's cadence evals go to the GPU without the host's wait (the same arrays and order)" },
     .{ .sw = .router_nax, .name = "GLM53F_ROUTER_NAX", .default = "1", .help = "The 4096 x 288 sigmoid router keeps its stored copy and routes 2 to 4 rows on MLX's split-K NAX chains (the stock route's bytes)" },
     .{ .sw = .router_one1, .name = "GLM53F_ROUTER_ONE1", .default = "1", .help = "With ROUTER_NAX: a one-row router call in one launch (the stock route's bytes)" },
+    .{ .sw = .whole_prompt, .name = "GLM53F_WHOLE_PROMPT", .default = "0", .help = "A streaming pack takes the whole prompt in one forward and runs its last chunk and held-back tail as a pair, their routed experts in one bank call (each span's bytes); off until its A/B" },
 };
 
 comptime {
@@ -88,10 +90,10 @@ test "glm53f options: every switch is a GLM53F_ option of the kit's rules, with 
         try t.expect(d.help.len > 0);
         for (all[0..i]) |e| try t.expect(!std.mem.eql(u8, d.name, e.name));
     }
-    // #1196's defaults: the exact switches on, the rounding-class three off.
+    // #1196's defaults: the exact switches on, the rounding-class three off; the whole-prompt pass off until its A/B.
     for (all) |d| {
-        const inexact = d.sw == .kda_prompt_percore or d.sw == .kda_prompt_chunk or d.sw == .dsa_prompt_onep;
-        try t.expectEqual(!inexact, defaultOn(d.sw));
+        const off = d.sw == .kda_prompt_percore or d.sw == .kda_prompt_chunk or d.sw == .dsa_prompt_onep or d.sw == .whole_prompt;
+        try t.expectEqual(!off, defaultOn(d.sw));
     }
 }
 
