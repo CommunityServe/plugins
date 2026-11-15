@@ -13,19 +13,33 @@ pub const min_rows: u32 = 16;
 /// `ends` (absolute span ends, `Forward.prompt_spans`) cover the `rows` rows from `pos0` in ascending order, and every
 /// checkpoint position is one of them.
 pub fn check(pos0: u64, rows: u64, ends: []const u64, cps: []const u64) !void {
-    _ = .{ pos0, rows, ends, cps };
+    if (ends.len == 0) return error.PromptSpansEmpty;
+    var prev = pos0;
+    for (ends) |e| {
+        if (e <= prev) return error.PromptSpansNotAscending;
+        prev = e;
+    }
+    if (prev != pos0 + rows) return error.PromptSpansNotThePrompt;
+    for (cps) |c| if (std.mem.indexOfScalar(u64, ends, c) == null) return error.PromptCheckpointOffSpan;
 }
 
 /// Each span's rows into `out` (`ends.len` of them; `check` holds).
 pub fn rowsOf(pos0: u64, ends: []const u64, out: []u32) !void {
-    _ = .{ pos0, ends, out };
+    var prev = pos0;
+    for (ends, out) |e, *r| {
+        r.* = std.math.cast(u32, e - prev) orelse return error.PromptSpanTooWide;
+        prev = e;
+    }
 }
 
 /// The index of the pair's first span (the last chunk), or null: every span runs alone. The last span is the held-back
 /// tail (`max_tail` rows or fewer) and both spans are wider than `min_rows`.
 pub fn pairAt(rows: []const u32) ?usize {
-    _ = rows;
-    return null;
+    if (rows.len < 2) return null;
+    const a = rows[rows.len - 2];
+    const b = rows[rows.len - 1];
+    if (b > max_tail or b <= min_rows or a <= min_rows) return null;
+    return rows.len - 2;
 }
 
 // ── tests ──

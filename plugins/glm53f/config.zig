@@ -154,6 +154,8 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
         .images = false,
     };
     if (c.streamed_bank) family.bankFacts(p);
+    // J5 (src/prompt.zig): the engine hands a streaming pack's whole prompt to one forward, by the chunk loop's spans.
+    if (c.streamed_bank and options.on(.whole_prompt)) p.caps.whole_prompt_prefill = true;
     p.shell.state_dtype = .f32;
     p.chat.thinking_default = .on;
     p.chat.effort_vocab = .glm5;
