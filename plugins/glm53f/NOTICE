@@ -33,9 +33,15 @@ origin in a `copied_from:` line:
 The KDA-hybrid trunk these files run on (the loader, KDA layer, slots and table glue) is the kit's
 (`kit.bases.kda_hybrid`), not a copy.
 
-tests/fixtures/config.json is the config.json of a GLM-5.3-Flash sc_3.10bpw streaming repack (turboderp's
-sc_3.10bpw branch of https://huggingface.co/turboderp/GLM-5.3-Flash-exl3, with the converter's `expert_streaming`
-block), unchanged. [OPEN: the model's licence, from the model card.]
+--------------------------------------------------------------------------------
+GLM-5.3-Flash, by Z.ai; its EXL3 quantization, by turboderp
+https://huggingface.co/zai-org/GLM-5.3-Flash, https://huggingface.co/turboderp/GLM-5.3-Flash-exl3
+Licensed under the MIT License (the pack's model card: "The license is MIT, as turboderp's repository").
+
+tests/fixtures/config.json is the config.json of the sc_3.10bpw branch of
+https://huggingface.co/OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3: turboderp's config.json from the
+sc_3.10bpw branch of turboderp/GLM-5.3-Flash-exl3 (commit b570edf655a2bb00beca23e18d3b98724bfc2db5) with the
+converter's `expert_streaming` block, unchanged.
 
 --------------------------------------------------------------------------------
 oMLX, by jundot

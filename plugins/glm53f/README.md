@@ -49,6 +49,9 @@ load is refused by name. When a route runs, its first use logs an `engaged` line
 The GPU tests compare each speed change with the stock arm it replaces. The exact switches must match bit for bit;
 the rounding-class ones must stay within their bound.
 
+Two switches have no GPU test: `HEAD_LAST_ROW` and `PROMPT_ASYNC_EVAL`. The standard A/B's same-greedy-text check
+covers them.
+
 ## Known gaps
 
 - **The bill is glm5_next's**, so the published bank fits stay valid. Two copies are not billed:
@@ -59,7 +62,8 @@ the rounding-class ones must stay within their bound.
 - **No whole-prompt pass yet.** The prompt runs in the engine's chunks, as glm5_next's does, so #1196's
   split-prompt gain (prefill 804.9 to 887.4 tok/s in g53pfs1) is not here. The whole-prompt pass waits for mlx-serve's
   E3, E5, E7 and J2.
-- **No GPU tests** for `HEAD_LAST_ROW` (its arm is the kit's `moe.mlpLastRow`, tested in mlx-serve) and
-  `PROMPT_ASYNC_EVAL`. The standard A/B's greedy text checks both.
+- **No GPU tests** for `HEAD_LAST_ROW` (its arm is the kit's `moe.mlpLastRow`, tested in mlx-serve, and it needs a
+  format bank) and `PROMPT_ASYNC_EVAL` (the same arrays go to `mlx_async_eval`). The standard A/B's same-greedy-text
+  check covers both.
 - **Not measured on this plugin yet:** speed and greedy text. The standard A/B (16K coding cell, ABBA) against
   #1196's stack and against stock mlx-serve with turboexl3_glm53f decides both.
