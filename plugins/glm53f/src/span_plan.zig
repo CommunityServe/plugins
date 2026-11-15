@@ -42,6 +42,16 @@ pub fn pairAt(rows: []const u32) ?usize {
     return rows.len - 2;
 }
 
+/// What of a prompt forward decides whether its pair may run: one slot, no capture layers, no media rows, and the head
+/// over the last row only (with `.all_rows` every span's logits come from its own forward).
+pub const Facts = struct { slots: usize = 1, captures: usize = 0, media: bool = false, all_rows: bool = false };
+
+/// `pairAt` for a forward of `facts`: null (every span alone) where the forward is not a pair's.
+pub fn pairOf(rows: []const u32, facts: Facts) ?usize {
+    _ = .{ rows, facts };
+    return null;
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -76,4 +86,14 @@ test "glm53f span plan: the last chunk and a held-back tail of 17 to 31 rows are
     try testing.expectEqual(@as(?usize, null), pairAt(&.{ 16, 31 }));
     try testing.expectEqual(@as(?usize, null), pairAt(&.{31}));
     try testing.expectEqual(@as(?usize, null), pairAt(&.{}));
+}
+
+test "glm53f span plan: a pair only for one slot's prompt with no captures, no media and the last row's logits" {
+    const rows = [_]u32{ 16_356, 31 };
+    try testing.expectEqual(@as(?usize, 0), pairOf(&rows, .{}));
+    try testing.expectEqual(@as(?usize, null), pairOf(&rows, .{ .slots = 2 }));
+    try testing.expectEqual(@as(?usize, null), pairOf(&rows, .{ .captures = 1 }));
+    try testing.expectEqual(@as(?usize, null), pairOf(&rows, .{ .media = true }));
+    try testing.expectEqual(@as(?usize, null), pairOf(&rows, .{ .all_rows = true }));
+    try testing.expectEqual(@as(?usize, null), pairOf(&.{ 16_356, 1 }, .{}));
 }
