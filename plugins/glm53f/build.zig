@@ -38,7 +38,7 @@ fn wire(m: *std.Build.Module) void {
 const mlx_free_filters = [_][]const u8{ "glm53f", "router_nax:" };
 
 /// The tests `gpu-test` runs, by name (src/gpu_tests.zig).
-const gpu_filters = [_][]const u8{"glm53f gpu"};
+const gpu_filters = [_][]const u8{"glm-5.3-flash gpu:"};
 
 /// A module graph of the GPU tests' own over plugin.zig, whose test block imports src/gpu_tests.zig (the dylib never
 /// links MLX; the tests link the server's).
