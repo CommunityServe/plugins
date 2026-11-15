@@ -195,5 +195,9 @@ test {
     _ = config;
     _ = router_nax;
     _ = @import("src/options.zig");
+    _ = @import("src/dsa_prompt.zig");
+    _ = @import("src/dsa_append.zig");
+    _ = @import("src/kda_chunk.zig");
+    _ = @import("src/kda_percore.zig");
     _ = @import("src/gpu_tests.zig");
 }

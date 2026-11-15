@@ -576,3 +576,33 @@ test "router_nax: a call takes its launch by its rows and the switches, and rout
     f.gpu = false;
     try testing.expectEqual(@as(?Reason, .stream), decline(f, .one1));
 }
+
+// Bar: a checkout with CRLF lines (Windows) gives the one-row launch's text byte for byte, and on an LF checkout the
+// text is the header's own.
+test "router_nax: the one-row text is the same from a CRLF checkout of MLX's gemv.h" {
+    @setEvalBranchQuota(50_000_000);
+    const lf = comptime withoutCr(steel.gemv);
+    const crlf = comptime blk: {
+        var n: usize = 0;
+        for (lf) |c| n += if (c == '\n') 2 else 1;
+        var out: [n]u8 = undefined;
+        var i: usize = 0;
+        for (lf) |c| {
+            if (c == '\n') {
+                out[i] = '\r';
+                i += 1;
+            }
+            out[i] = c;
+            i += 1;
+        }
+        const final = out;
+        break :blk final;
+    };
+    try testing.expect(std.mem.indexOfScalar(u8, &crlf, '\r') != null);
+    try testing.expectEqualStrings(lf, comptime withoutCr(&crlf));
+    try testing.expectEqualStrings(gemv_kernel, comptime gemvKernel(withoutCr(&crlf)));
+    if (comptime std.mem.indexOfScalar(u8, steel.gemv, '\r') == null) {
+        try testing.expectEqualStrings(steel.gemv, lf);
+        try testing.expectEqualStrings(gemv_kernel, comptime gemvKernel(steel.gemv));
+    }
+}

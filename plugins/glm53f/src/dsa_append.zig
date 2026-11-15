@@ -213,3 +213,20 @@ pub fn end() void {
     _ = mlx.mlx_array_free(table.gathered);
     table = .{};
 }
+
+// ── tests ──
+
+const testing = std.testing;
+
+test "glm53f dsa window rows: TAILS reads the stock tail's 3 rows (fewer at the cache's start) for a one-slot window over the trunk's 11 DSA layers or the head's one, and nothing for a prompt, a batch or other layer counts" {
+    for (1..17) |r| try testing.expectEqual(@as(c_int, 3), tailRows(1, @intCast(r), 1, 16390, trunk_layers));
+    try testing.expectEqual(@as(c_int, 3), tailRows(1, 1, 1, 16390, head_layers));
+    try testing.expectEqual(@as(c_int, 2), tailRows(1, 3, 1, 2, trunk_layers));
+    try testing.expectEqual(@as(c_int, 1), tailRows(1, 1, 1, 1, head_layers));
+    try testing.expectEqual(@as(c_int, 0), tailRows(1, 3, 1, 0, trunk_layers));
+    try testing.expectEqual(@as(c_int, 0), tailRows(1, 17, 1, 16390, trunk_layers));
+    try testing.expectEqual(@as(c_int, 0), tailRows(2, 3, 1, 16390, trunk_layers));
+    try testing.expectEqual(@as(c_int, 0), tailRows(1, 3, 2, 16390, trunk_layers));
+    try testing.expectEqual(@as(c_int, 0), tailRows(1, 3, 1, 16390, 10));
+    try testing.expectEqual(@as(c_int, 0), tailRows(1, 3, 1, 16390, 0));
+}

@@ -203,3 +203,36 @@ pub fn assemble(o: *Array, s: mlx.mlx_stream, dense: Array, sparse: Array) !bool
     engaged("the one-copy output");
     return true;
 }
+
+// ── tests ──
+
+const testing = std.testing;
+
+test "glm53f dsa prompt indexer: plans GLM-5.3-Flash's indexer shapes from 2 rows and more pools than it selects, its scratch 32 MiB of rows at most and at least 256 rows" {
+    // a 16K prompt's main call and tail, a 64K and a 128K context
+    try testing.expectEqual(Plan{ .rows = 14305, .pools = 4089, .groups = 2051 }, indexPlan(&.{ 1, 14305, 32, 128 }, true, &.{ 1, 14305, 32 }, true, &.{ 1, 16356, 256 }, true).?);
+    try testing.expectEqual(Plan{ .rows = 31, .pools = 4096, .groups = 31 }, indexPlan(&.{ 1, 31, 32, 128 }, true, &.{ 1, 31, 32 }, true, &.{ 1, 16387, 256 }, true).?);
+    try testing.expectEqual(Plan{ .rows = 4096, .pools = 16384, .groups = 512 }, indexPlan(&.{ 1, 4096, 32, 128 }, true, &.{ 1, 4096, 32 }, true, &.{ 1, 65536, 256 }, true).?);
+    try testing.expectEqual(Plan{ .rows = 4096, .pools = 65536, .groups = 256 }, indexPlan(&.{ 1, 4096, 32, 128 }, true, &.{ 1, 4096, 32 }, true, &.{ 1, 262144, 256 }, true).?);
+    // one row, another indexer, other dtypes, a batch, a cache within the selection, mismatched weights
+    try testing.expect(indexPlan(&.{ 1, 1, 32, 128 }, true, &.{ 1, 1, 32 }, true, &.{ 1, 16356, 256 }, true) == null);
+    try testing.expect(indexPlan(&.{ 1, 64, 64, 128 }, true, &.{ 1, 64, 64 }, true, &.{ 1, 16356, 256 }, true) == null);
+    try testing.expect(indexPlan(&.{ 1, 64, 32, 64 }, true, &.{ 1, 64, 32 }, true, &.{ 1, 16356, 128 }, true) == null);
+    try testing.expect(indexPlan(&.{ 1, 64, 32, 128 }, false, &.{ 1, 64, 32 }, true, &.{ 1, 16356, 256 }, true) == null);
+    try testing.expect(indexPlan(&.{ 1, 64, 32, 128 }, true, &.{ 1, 64, 32 }, false, &.{ 1, 16356, 256 }, true) == null);
+    try testing.expect(indexPlan(&.{ 2, 64, 32, 128 }, true, &.{ 2, 64, 32 }, true, &.{ 2, 16356, 256 }, true) == null);
+    try testing.expect(indexPlan(&.{ 1, 64, 32, 128 }, true, &.{ 1, 64, 32 }, true, &.{ 1, 2051, 256 }, true) == null);
+    try testing.expect(indexPlan(&.{ 1, 64, 32, 128 }, true, &.{ 1, 63, 32 }, true, &.{ 1, 16356, 256 }, true) == null);
+    // the scratch: budget rows, at least min_groups, at most one a query row
+    try testing.expectEqual(@as(c_int, 2051), groupsFor(100000, 4089));
+    try testing.expectEqual(@as(c_int, 17), groupsFor(17, 4089));
+    try testing.expectEqual(@as(c_int, 256), groupsFor(100000, 1 << 20));
+    try testing.expect(@as(usize, @intCast(groupsFor(100000, 4089))) * 4089 * 4 <= scratch_bytes);
+    // only GLM-5.3-Flash's indexer
+    try testing.expect(indexerServes(test_ix));
+    try testing.expect(!indexerServes(.{ .topk = 1024, .kpool = 4, .heads = 32, .head_dim = 128 }));
+    try testing.expect(!indexerServes(.{ .topk = 2048, .kpool = 8, .heads = 32, .head_dim = 128 }));
+}
+
+/// GLM-5.3-Flash's indexer (the DSA speed changes' tests share it).
+pub const test_ix: Indexer = .{ .topk = 2048, .kpool = 4, .heads = 32, .head_dim = 128 };

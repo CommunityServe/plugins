@@ -192,3 +192,23 @@ fn apply(s: mlx.mlx_stream, kern: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_m
     }
     return outs;
 }
+
+// ── tests ──
+
+const testing = std.testing;
+
+test "glm53f kda chunk: the launch takes GLM-5.3-Flash's 64 heads of 128 at its gate bound of -5 as 128 threadgroups; other layouts and bounds are refused" {
+    try testing.expect(layoutServes(64, 64, 128, 128));
+    try testing.expectEqual(@as(c_int, 128), groupsFor(64));
+    // its threadgroups cover the value rows: 64 value rows each, 8 simdgroups of 8
+    try testing.expectEqual(@as(c_int, 64 * 128), groupsFor(64) * value_rows);
+    try testing.expectEqual(threads, @divExact(value_rows, 8) * 32);
+    // grouped heads, heads of 64, value heads of 64, no heads
+    try testing.expect(!layoutServes(32, 64, 128, 128));
+    try testing.expect(!layoutServes(64, 64, 64, 128));
+    try testing.expect(!layoutServes(64, 64, 128, 64));
+    try testing.expect(!layoutServes(0, 0, 128, 128));
+    for ([_]f32{ -5.0, -4.0, -1.0, -0.25 }) |lb| try testing.expect(boundServes(lb));
+    // past the text's range (a chunk's factors past e^40), no bound (Ling's softplus gate), a positive one, NaN
+    for ([_]f32{ -5.001, -6.0, -10.0, 0.0, 1.0, std.math.nan(f32) }) |lb| try testing.expect(!boundServes(lb));
+}

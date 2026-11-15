@@ -63,3 +63,26 @@ pub fn recur(s: mlx.mlx_stream, q: Array, k: Array, v: Array, a: Array, beta: Ar
     }
     return out;
 }
+
+// ── tests ──
+
+const testing = std.testing;
+
+// Bar: GLM-5.3-Flash's 8,192 value rows take two threadgroups a core where one a core passes 128 rows, the stock plan
+// where one a core fits, and none past two a core; every plan covers the rows in even ranges of at most 128.
+test "glm53f kda percore: the plan puts 64 heads of 128 on 40 cores as 80 threadgroups of 104 rows" {
+    try testing.expectEqual(@as(?kr.Plan, .{ .ntg = 80, .rows = 104 }), planFor(64, 128, 40));
+    try testing.expectEqual(@as(?kr.Plan, .{ .ntg = 76, .rows = 108 }), planFor(64, 128, 38));
+    try testing.expectEqual(@as(?kr.Plan, .{ .ntg = 64, .rows = 128 }), planFor(64, 128, 32));
+    try testing.expectEqual(@as(?kr.Plan, .{ .ntg = 64, .rows = 128 }), planFor(64, 128, 64));
+    try testing.expectEqual(@as(?kr.Plan, .{ .ntg = 80, .rows = 104 }), planFor(64, 128, 80));
+    try testing.expectEqual(@as(?kr.Plan, null), planFor(64, 128, 31));
+    try testing.expectEqual(@as(?kr.Plan, null), planFor(64, 128, 0));
+    var cores: c_int = 32;
+    while (cores <= 128) : (cores += 1) {
+        const p = planFor(64, 128, cores).?;
+        try testing.expect(p.ntg * p.rows >= 64 * 128 and @rem(p.rows, 2) == 0 and p.rows <= max_rows);
+        try testing.expect(p.ntg <= max_per_core * cores);
+        if (kr.planFor(64, 128, cores)) |stock| try testing.expectEqual(stock, p);
+    }
+}
