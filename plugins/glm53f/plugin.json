@@ -8,7 +8,7 @@
     "glm5_next with an exllamav3 quantization_config and a turboexl3 expert_streaming bank (OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3: sc_2.10bpw, sc_2.60bpw, sc_3.10bpw, sc_4.10bpw), beside turboexl3_glm53f"
   ],
   "requires_mlx_serve": ">=26.11.3",
-  "kit_note": "Needs a kit with the KDA-hybrid base (kit.bases.kda_hybrid with Hooks.router and KdaConsts.stages), kit.mlx_device and Host.quant_claimant: mlx-serve's J1, E4, J5c, J6 and J4 (built here against glm-cs/s1-base2).",
+  "kit_note": "Needs a kit with the KDA-hybrid base (kit.bases.kda_hybrid with Hooks.router and KdaConsts.stages), kit.mlx_device and Host.quant_claimant: mlx-serve's J1, E4, J5c, J6 and J4 (built here against glm-cs/s1-base2); GLM53F_WHOLE_PROMPT also needs E3 and E7 (main e285ab55; glm-cs/s1-base3).",
   "fixture": "kit",
   "test_step": "mlx-free-test",
   "maintainers": ["davidtai"],

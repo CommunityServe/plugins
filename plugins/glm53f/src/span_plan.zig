@@ -48,8 +48,8 @@ pub const Facts = struct { slots: usize = 1, captures: usize = 0, media: bool = 
 
 /// `pairAt` for a forward of `facts`: null (every span alone) where the forward is not a pair's.
 pub fn pairOf(rows: []const u32, facts: Facts) ?usize {
-    _ = .{ rows, facts };
-    return null;
+    if (facts.slots != 1 or facts.captures > 0 or facts.media or facts.all_rows) return null;
+    return pairAt(rows);
 }
 
 // ── tests ──

@@ -18,6 +18,7 @@ const kda_recurrence = kit.blocks.kda.recurrence;
 const axisView = kit.mlx_array.axisView;
 const concatAxis1 = kit.mlx_array.concatAxis1;
 const glm_moe = kh.moe;
+const moe = kit.bases.blocks.moe;
 const dsa_prompt = @import("dsa_prompt.zig");
 const dsa_append = @import("dsa_append.zig");
 const options = @import("options.zig");
@@ -122,8 +123,156 @@ pub fn hidden(m: *Model, st: *const Step, token_ids: Array) !Array {
     return m.rmsNorm(mean, m.final_norm);
 }
 
-/// A split prompt forward's spans (`Forward.split_rows`): span A, `a` rows from position `pos_a`, then span B, `b` rows
-/// from `pos_b` = `pos_a + a`.
+// ── the whole prompt's pair (J5, src/prompt.zig) ──
+
+/// The KDA states span A leaves at each layer, for its checkpoint: `conv[layer]` and `ssm[layer]`, references the
+/// caller frees (left as they are at a layer that is not KDA).
+pub const Keep = struct { conv: []Array, ssm: []Array };
+
+/// Two spans as two forwards, span A's (`st_a`, `ids_a`) then span B's (`st_b`, `ids_b`, positioned from A's end), run
+/// layer by layer: each span's final-normed hidden `[1, S, H]`, what `hidden` gives that span's own forward. At each
+/// layer span A's attention sublayer runs, its KDA states are kept (`keep`), span B's runs, then both MLP sublayers
+/// (`mlpPair`), a MoE layer's routed experts in one call over both spans' rows where `join`, then each span's
+/// evaluation at `hidden`'s cadence. Each layer's KV and states are the layer's own, so A then B at every layer leaves
+/// the caches as A's forward then B's. Both spans must be wider than `glm5.HC_PRE_MAX_ROWS` (the caller's plan).
+/// copied_from: mlx-serve src/plugins/glm5_next/table_forward.zig@4bab19a5 (`hiddenSplit`), span A's states kept here
+/// for `CacheOps.checkpoint` in place of #1196's `Forward.split_states`.
+pub fn hiddenPair(m: *Model, st_a: *const Step, st_b: *const Step, ids_a: Array, ids_b: Array, join: bool, keep: Keep) ![2]Array {
+    const cfg = m.c;
+    const steps = [2]*const Step{ st_a, st_b };
+    const ids = [2]Array{ ids_a, ids_b };
+    for (steps) |st| if (st.batched or st.capture or st.capture_ids.len > 0) return error.GlmPairStep;
+    var streams: [2]Array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (streams) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var batch: [2]c_int = undefined;
+    var seq_len: [2]c_int = undefined;
+    // Each span's [B, S, HC, D] stream, as `hidden` builds it.
+    for (ids, &streams, &batch, &seq_len) |token_ids, *stream, *bt, *sl| {
+        const emb = try m.embedding(token_ids);
+        defer _ = mlx.mlx_array_free(emb);
+        const x_shape = mlx.getShape(emb);
+        bt.* = x_shape[0];
+        sl.* = x_shape[1];
+        if (sl.* <= glm5.HC_PRE_MAX_ROWS) return error.GlmPairShortSpan;
+        var e4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(e4);
+        try mlx.check(mlx.mlx_expand_dims(&e4, emb, 2, m.s));
+        try mlx.check(mlx.mlx_broadcast_to(stream, e4, &[_]c_int{ bt.*, sl.*, glm5.HC, x_shape[2] }, 4, m.s));
+    }
+    const n_layers = cfg.num_hidden_layers;
+    if (keep.conv.len < n_layers or keep.ssm.len < n_layers) return error.GlmPairKeep;
+    var deferred: [2]?glm5.Deferred = .{ null, null };
+    defer for (&deferred) |*d| if (d.*) |*df| df.deinit();
+    for (m.layers[0..n_layers], 0..) |*lw, li| {
+        try sublayer(m, st_a, &streams[0], &deferred[0], lw, true, li, batch[0], seq_len[0], true);
+        if (lw.mixer == .kda) {
+            keep.conv[li] = ref(st_a.slots.state(0, @intCast(li), .conv));
+            keep.ssm[li] = ref(st_a.slots.state(0, @intCast(li), .ssm));
+        }
+        try sublayer(m, st_b, &streams[1], &deferred[1], lw, true, li, batch[1], seq_len[1], true);
+        try mlpPair(m, &streams, &deferred, lw, join);
+        for (steps, streams) |st, stream| {
+            if (st.eval_every > 0 and ((li + 1) % st.eval_every == 0 or li + 1 == n_layers)) {
+                try evalWith(st.slots, stream, @intCast(li + 1), asyncEval());
+            }
+        }
+    }
+    var out: [2]Array = undefined;
+    var made: usize = 0;
+    errdefer for (out[0..made]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&streams, &deferred, &out) |*stream, *d, *o| {
+        if (d.*) |*df| {
+            _ = mlx.mlx_array_free(stream.*);
+            stream.* = try df.materialize(m.s);
+        }
+        var mean = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mean);
+        try mlx.check(mlx.mlx_mean_axis(&mean, stream.*, 2, false, m.s));
+        o.* = try m.rmsNorm(mean, m.final_norm);
+        made += 1;
+    }
+    return out;
+}
+
+/// A new reference on `a` (null stays null).
+fn ref(a: Array) Array {
+    var r = mlx.mlx_array_new();
+    if (a.ctx != null) _ = mlx.mlx_array_set(&r, a);
+    return r;
+}
+
+/// Both spans' MLP sublayers, each inside its hyper-connection as `sublayer` runs it (`attn` false), but a MoE layer's
+/// routed experts where `join`: each span routed alone (`moe.mlpRoute`), one routed call over both spans' rows
+/// (`moe.routedSum`, each row its own span's call's bytes: the bank's `rows_independent`), each span finished on its
+/// rows (`moe.mlpFinish`). Without `join`, or on a dense layer, each span's MLP runs alone.
+/// copied_from: mlx-serve src/plugins/glm5_next/table_forward.zig@4bab19a5 (`mlpSublayerSplit`), its joined call
+/// (#1196's `moe.mlpSplit`) on the kit's split routed MLP.
+fn mlpPair(m: *Model, streams: *[2]Array, deferred: *[2]?glm5.Deferred, lw: *const Layer, join: bool) !void {
+    const cfg = m.c;
+    const w = lw.ffn_hc.?;
+    const norm_w = lw.post_norm;
+    var cs: [2]glm5.Collapsed = undefined;
+    var made: usize = 0;
+    defer for (cs[0..made]) |*c| c.deinit();
+    var normed: [2]Array = .{ .{ .ctx = null }, .{ .ctx = null } };
+    defer for (normed) |a| if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (streams, deferred, &cs, &normed) |*stream, *d, *c, *nrm| {
+        if (glm5.hcRowsServes(m.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w)) return error.GlmPairShortSpan;
+        if (d.*) |*df| {
+            _ = mlx.mlx_array_free(stream.*);
+            stream.* = try df.materialize(m.s);
+            df.deinit();
+            d.* = null;
+        }
+        c.* = try glm5.collapse(m.s, stream.*, w.fn_rows, w.scale, w.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps);
+        made += 1;
+        nrm.* = try m.rmsNorm(c.x, norm_w);
+    }
+    var outs: [2]Array = .{ .{ .ctx = null }, .{ .ctx = null } };
+    defer for (outs) |a| if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a);
+    };
+    switch (lw.mlp) {
+        .moe => |*mw| if (join) {
+            outs = try routedPair(m, mw, normed);
+        } else for (normed, &outs) |x, *o| {
+            o.* = try glm_moe.forward(mw, m.s, x);
+        },
+        .dense => |*dw| for (normed, &outs) |x, *o| {
+            o.* = try m.denseMlp(dw, x);
+        },
+    }
+    for (streams, &cs, outs) |*stream, *c, o| {
+        const res = try glm5.expand(m.s, o, stream.*, c);
+        _ = mlx.mlx_array_free(stream.*);
+        stream.* = res;
+    }
+}
+
+/// The block over two spans' rows `xs` with one routed call (the caller checked `moe.joinServes`): each output as
+/// `glm_moe.forward` gives it for that span alone, both owned by the caller.
+fn routedPair(m: *Model, mw: *const moe.Moe.Weights, xs: [2]Array) ![2]Array {
+    var g = kit.mlx_ops.Graph.init(std.heap.c_allocator, m.s);
+    defer g.deinit();
+    const ra = try moe.mlpRoute(mw, &g, xs[0]);
+    const rb = try moe.mlpRoute(mw, &g, xs[1]);
+    const x = try g.concat(&xs, 1);
+    const sum = try moe.routedSum(mw, &g, x, try g.concat(&.{ ra.inds, rb.inds }, 1), try g.concat(&.{ ra.scores, rb.scores }, 1));
+    const rows_a = mlx.getShape(xs[0])[1];
+    const rows_b = mlx.getShape(xs[1])[1];
+    const ya = try moe.mlpFinish(mw, &g, xs[0], try g.sliceAxis(sum, 1, 0, rows_a));
+    const yb = try moe.mlpFinish(mw, &g, xs[1], try g.sliceAxis(sum, 1, rows_a, rows_a + rows_b));
+    return .{ g.escape(ya), g.escape(yb) };
+}
+
+/// One sublayer (attention when `attn`, else the MLP) inside its hyper-connection. For one token the expand stays
+/// in `deferred` (then `stream` is stale until the forward materializes it).
 fn sublayer(m: *Model, st: *const Step, stream: *Array, deferred: *?glm5.Deferred, lw: *const Layer, attn: bool, li: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !void {
     const cfg = m.c;
     const w = if (attn) lw.attn_hc.? else lw.ffn_hc.?;

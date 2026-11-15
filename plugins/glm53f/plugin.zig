@@ -19,6 +19,8 @@ const fwd = @import("src/table_forward.zig");
 const head = @import("src/head.zig");
 const stages = @import("src/stages.zig");
 const router_nax = @import("src/router_nax.zig");
+const prompt = @import("src/prompt.zig");
+const options = @import("src/options.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -101,6 +103,8 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m = host.of(mp);
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "glm53f: forward mode not declared");
     const ops = f.cache_ops orelse return Verdict.refuse(.unsupported, "glm53f: a forward without cache_ops");
+    // J5: a whole prompt by its spans, each span's bank phase its own (the whole forward's is never set).
+    if (options.on(.whole_prompt) and prompt.serves(f)) return prompt.forward(m, ops, f, out);
     trunk.bankPhase(m, if (f.mode == .batched_rows) @min(f.caches.len, fwd.MOE_DECODE_BATCH_MAX) else f.rows) catch |e| return Verdict.named(.failed, @errorName(e));
     if (f.mode == .batched_rows) {
         if (f.rows != 1 or f.tokens.len != f.caches.len or f.positions.len != f.caches.len) return Verdict.refuse(.unsupported, "glm53f: batched rows take one host token per slot");
@@ -194,7 +198,7 @@ test "glm53f bill: glm5_next's terms, and a GLM streaming pack bills its 8-bit d
 test {
     _ = config;
     _ = router_nax;
-    _ = @import("src/options.zig");
+    _ = options;
     _ = @import("src/dsa_prompt.zig");
     _ = @import("src/dsa_append.zig");
     _ = @import("src/kda_chunk.zig");
