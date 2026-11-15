@@ -58,8 +58,8 @@ fn strIs(v: ?std.json.Value, want: []const u8) bool {
 
 /// A marker claim, which beats the built-in glm5_next's claim by `model_type`; any other pack is not this plugin's.
 pub fn claims(model_type: abi.Str, config_json: abi.Str, dir: *const abi.PackDir) callconv(.c) abi.Claim {
-    _ = .{ model_type, config_json, dir };
-    return .no;
+    if (!isRepack(model_type.slice(), config_json.slice())) return .no;
+    return if (dir.has("experts.bin")) .by_marker else .no;
 }
 
 /// glm5_next's family arm (mlx-serve src/plugins/glm5_next/config.zig `readGlm`), without the vision tower's keys.
@@ -176,7 +176,12 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
 /// experts run on mlx-serve's own EXL3 format, which a plugin cannot reach) and fp8_block128 residents (the kit has no
 /// fp8 reader).
 fn refusal(config_json: []const u8) ?abi.Verdict {
-    _ = config_json;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), config_json, .{}) catch return null;
+    if (doc != .object) return null;
+    if (doc.object.get("expert_quant") != null) return refused("glm53f: a Sushi expert_quant pack (mlx-serve's glm5_next serves it)");
+    if (doc.object.get("residents_format") != null) return refused("glm53f: a residents_format pack (fp8_block128 residents need mlx-serve's own reader)");
     return null;
 }
 
