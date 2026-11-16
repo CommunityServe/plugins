@@ -243,6 +243,15 @@ test "glm53f parse: the repack parses as glm5_next does, streamed, decoded one r
     try testing.expectEqual(@as(u32, 4), c.dsv4_hc_mult);
 }
 
+test "glm53f parse: the repack asks for the engine's own glm5_next config (its renames, family fields and bills)" {
+    const mem = packDir(repack_json, true);
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(parse(&dir, abi.Str.of(repack_json), .{}, null, true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expect(p.wantsEngineConfig());
+}
+
 test "glm53f parse: the repack with a Sushi expert_quant block or fp8 residents, a RoPE'd sparse attention and broken JSON are refused by name" {
     // the repack as the family parse takes it, with a block this plugin does not serve
     inline for (.{ "{\"expert_quant\":{\"format\":\"exl3\"},", "{\"residents_format\":\"fp8_block128\"," }) |extra| {
