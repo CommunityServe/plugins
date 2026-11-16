@@ -81,6 +81,9 @@ fn gpuTests(b: *std.Build, mod: *std.Build.Module) void {
     linked.addRPath(.{ .cwd_relative = mlx_lib });
     linked.linkSystemLibrary("mlxc", .{});
     linked.linkSystemLibrary("mlx", .{});
+    // The kit's device and system readings (mlx/device.zig, sdk/util/system.zig: the GPU's cores and architecture) call
+    // IOKit and CoreFoundation, which the dylib reaches through the server's process; a test executable links them.
+    if (linked.resolved_target.?.result.os.tag == .macos) for ([_][]const u8{ "CoreFoundation", "IOKit" }) |f| linked.linkFramework(f, .{});
     const t = b.addTest(.{ .name = "gpu-test", .root_module = linked, .filters = &gpu_filters });
     run_step.dependOn(&b.addRunArtifact(t).step);
     build_step.dependOn(&b.addInstallArtifact(t, .{}).step);
