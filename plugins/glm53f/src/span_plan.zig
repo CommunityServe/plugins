@@ -52,6 +52,22 @@ pub fn pairOf(rows: []const u32, facts: Facts) ?usize {
     return pairAt(rows);
 }
 
+/// Why a pair-shaped ending (`pairAt`) ran its spans apart.
+pub const Apart = enum { slots, captures, media, all_rows, layer_no_join };
+
+/// What of `facts` keeps a pair-shaped ending apart, or null (the routed layers' join is the caller's check).
+pub fn apartOf(facts: Facts) ?Apart {
+    _ = facts;
+    return null;
+}
+
+/// The prompt pass's line for a pair-shaped ending: both spans' rows and whether the pair joined (`apart` null) or ran
+/// apart, and why. Logged once a pass, so a run's log shows each request's pair.
+pub fn passLine(buf: []u8, rows_a: u32, rows_b: u32, apart: ?Apart) ![]const u8 {
+    _ = .{ buf, rows_a, rows_b, apart };
+    return "";
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -96,4 +112,16 @@ test "glm53f span plan: a pair only for one slot's prompt with no captures, no m
     try testing.expectEqual(@as(?usize, null), pairOf(&rows, .{ .media = true }));
     try testing.expectEqual(@as(?usize, null), pairOf(&rows, .{ .all_rows = true }));
     try testing.expectEqual(@as(?usize, null), pairOf(&.{ 16_356, 1 }, .{}));
+}
+
+test "glm53f span plan: the pass line names both spans and whether the pair joined or ran apart, and why" {
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings("[glm53f] whole-prompt pass: chunk 16356 rows, tail 31 rows, joined", try passLine(&buf, 16_356, 31, null));
+    try testing.expectEqualStrings("[glm53f] whole-prompt pass: chunk 225 rows, tail 31 rows, apart (layer_no_join)", try passLine(&buf, 225, 31, .layer_no_join));
+    try testing.expectEqualStrings("[glm53f] whole-prompt pass: chunk 16356 rows, tail 31 rows, apart (captures)", try passLine(&buf, 16_356, 31, .captures));
+    try testing.expectEqual(@as(?Apart, null), apartOf(.{}));
+    try testing.expectEqual(@as(?Apart, .slots), apartOf(.{ .slots = 2 }));
+    try testing.expectEqual(@as(?Apart, .captures), apartOf(.{ .captures = 1 }));
+    try testing.expectEqual(@as(?Apart, .media), apartOf(.{ .media = true }));
+    try testing.expectEqual(@as(?Apart, .all_rows), apartOf(.{ .all_rows = true }));
 }
