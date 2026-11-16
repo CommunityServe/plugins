@@ -48,7 +48,7 @@ pub const Facts = struct { slots: usize = 1, captures: usize = 0, media: bool = 
 
 /// `pairAt` for a forward of `facts`: null (every span alone) where the forward is not a pair's.
 pub fn pairOf(rows: []const u32, facts: Facts) ?usize {
-    if (facts.slots != 1 or facts.captures > 0 or facts.media or facts.all_rows) return null;
+    if (apartOf(facts) != null) return null;
     return pairAt(rows);
 }
 
@@ -57,15 +57,19 @@ pub const Apart = enum { slots, captures, media, all_rows, layer_no_join };
 
 /// What of `facts` keeps a pair-shaped ending apart, or null (the routed layers' join is the caller's check).
 pub fn apartOf(facts: Facts) ?Apart {
-    _ = facts;
+    if (facts.slots != 1) return .slots;
+    if (facts.captures > 0) return .captures;
+    if (facts.media) return .media;
+    if (facts.all_rows) return .all_rows;
     return null;
 }
 
 /// The prompt pass's line for a pair-shaped ending: both spans' rows and whether the pair joined (`apart` null) or ran
 /// apart, and why. Logged once a pass, so a run's log shows each request's pair.
 pub fn passLine(buf: []u8, rows_a: u32, rows_b: u32, apart: ?Apart) ![]const u8 {
-    _ = .{ buf, rows_a, rows_b, apart };
-    return "";
+    const head = "[glm53f] whole-prompt pass: chunk {d} rows, tail {d} rows, ";
+    if (apart) |why| return std.fmt.bufPrint(buf, head ++ "apart ({s})", .{ rows_a, rows_b, @tagName(why) });
+    return std.fmt.bufPrint(buf, head ++ "joined", .{ rows_a, rows_b });
 }
 
 // ── tests ──

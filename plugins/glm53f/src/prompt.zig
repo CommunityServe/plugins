@@ -1,7 +1,7 @@
 //! glm53f's whole-prompt forward (J5: `Caps.whole_prompt_prefill`, GLM53F_WHOLE_PROMPT, a streaming pack). The engine
 //! hands the whole prompt to one forward with the chunk loop's span ends (`Forward.prompt_spans`). Each span but the
 //! pair runs as the chunk loop's forward of its own (its bank phase, the table's forward, the settle). The pair, the
-//! last chunk and the held-back tail (`span_plan.pairOf`), runs layer by layer with one routed call over both spans'
+//! last chunk and the held-back tail (`span_plan.pairAt`), runs layer by layer with one routed call over both spans'
 //! rows (`table_forward.hiddenPair`), as #1196's split prompt forward did, where every routed layer takes the joined
 //! call (`moe.joinServes`). Each checkpoint the engine wants (`Forward.ssm_checkpoints`) is filed as soon as its span
 //! ends (`CacheOps.checkpoint`, which copies it); the pair's chunk span's after the pair. The bill is the engine's
@@ -211,18 +211,11 @@ fn joins(m: *const trunk.Model, rows_a: u32, rows_b: u32) bool {
 }
 
 var pair_said = false;
-var declined_said = false;
 
 fn pairSaid(rows_a: u32, rows_b: u32) void {
     if (pair_said) return;
     pair_said = true;
     log.info("[glm53f] whole-prompt pair engaged: a {d}-row chunk and its {d}-row tail in one routed call a layer\n", .{ rows_a, rows_b });
-}
-
-fn declinedSaid(rows_a: u32, rows_b: u32) void {
-    if (declined_said) return;
-    declined_said = true;
-    log.info("[glm53f] whole-prompt pair declined: a routed layer does not join a {d}-row and a {d}-row span; each span runs alone\n", .{ rows_a, rows_b });
 }
 
 fn run(m: *trunk.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out: *abi.ForwardOut, why: *abi.Verdict) !void {
@@ -243,11 +236,16 @@ fn run(m: *trunk.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out: *a
     const ids = try host.tokenIds(f);
     defer _ = mlx.mlx_array_free(ids);
 
-    var pair = span_plan.pairOf(rows, .{ .slots = f.caches.len, .captures = n_cap, .media = f.media.ctx != null, .all_rows = f.logits == .all_rows });
-    if (pair) |j| if (!joins(m, rows[j], rows[j + 1])) {
-        declinedSaid(rows[j], rows[j + 1]);
-        pair = null;
-    };
+    // A pair-shaped ending runs as the pair, or apart where a fact of the forward or a routed layer keeps it apart; one
+    // line a pass says which (the first-use engaged line is `pairSaid`'s).
+    var pair: ?usize = null;
+    if (span_plan.pairAt(rows)) |j| {
+        const facts: span_plan.Facts = .{ .slots = f.caches.len, .captures = n_cap, .media = f.media.ctx != null, .all_rows = f.logits == .all_rows };
+        const apart: ?span_plan.Apart = span_plan.apartOf(facts) orelse if (!joins(m, rows[j], rows[j + 1])) .layer_no_join else null;
+        var buf: [160]u8 = undefined;
+        log.info("{s}\n", .{try span_plan.passLine(&buf, rows[j], rows[j + 1], apart)});
+        if (apart == null) pair = j;
+    }
     const alone_end = pair orelse rows.len;
     var at: u32 = 0;
     for (rows[0..alone_end], 0..) |r, j| {
