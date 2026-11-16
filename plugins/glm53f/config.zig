@@ -293,6 +293,9 @@ test "glm53f parse: a streaming pack takes the whole prompt only with GLM53F_WHO
         try testing.expect(parse(&dir, abi.Str.of(repack_json), .{}, null, true, &p).isOk());
         defer freeParsed(&p);
         try testing.expectEqual(on, p.caps.whole_prompt_prefill);
+        // a whole prompt read at its last row asks for that row alone (`Caps.prompt_last_row`), so the pass's head
+        // runs over its tail; without it the engine asks every prompt row's logits
+        try testing.expectEqual(on, p.caps.prompt_last_row);
         // the engine keeps its GLM bills: the plugin prices no prompt of its own
         try testing.expect(p.caps.streamed_weights);
     }
