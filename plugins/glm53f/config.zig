@@ -155,7 +155,12 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
     };
     if (c.streamed_bank) family.bankFacts(p);
     // J5 (src/prompt.zig): the engine hands a streaming pack's whole prompt to one forward, by the chunk loop's spans.
-    if (c.streamed_bank and options.on(.whole_prompt)) p.caps.whole_prompt_prefill = true;
+    // A prompt read at its last row (no prompt logprobs) then asks for that row's logits alone (`Caps.prompt_last_row`):
+    // the pass's head runs over its last span, as the chunk loop's last forward runs it, not over every prompt row.
+    if (c.streamed_bank and options.on(.whole_prompt)) {
+        p.caps.whole_prompt_prefill = true;
+        p.caps.prompt_last_row = true;
+    }
     p.shell.state_dtype = .f32;
     p.chat.thinking_default = .on;
     p.chat.effort_vocab = .glm5;
