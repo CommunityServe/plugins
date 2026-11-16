@@ -11,6 +11,10 @@ with the speed changes of mlx-serve #1196.
 - The pack's EXL3 linears and its routed-expert bank belong to the **turboexl3_glm53f** quant plugin, which must be
   installed too. This plugin reaches it through the host (`Host.quant_claimant`).
 
+Its parse asks for the engine's own glm5_next config (`Parsed.engine_config`), so the server renames the pack's
+weights, sizes its bank and bills its prompt and decode as it does for mlx-serve's own glm5_next. A server without
+that field loads no pack through this plugin.
+
 It claims a pack by its markers: a `glm5_next` config with exllamav3's `quantization_config`, an `expert_streaming`
 block of family `turboexl3`, and the pack's `experts.bin`. mlx-serve's own glm5_next keeps every other GLM pack.
 Text only: image rows are refused by name.

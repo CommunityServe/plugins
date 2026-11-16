@@ -167,6 +167,10 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
     p.placeholder_ids.image = c.image_token_id;
     p.weights.prefix = abi.Str.of(c.weight_prefix);
     if (c.modelopt) p.weights.quant_layout = abi.Str.of("modelopt");
+    // The engine's own glm5_next config with this binding: the pack's weight renames (the hyper-connections, kv_b's
+    // halves, the MTP layer), the family fields its GLM bills read, and the streaming bank's facts. Without it an
+    // outside plugin's config is these facts alone.
+    p.engine_config = true;
 }
 
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
