@@ -559,6 +559,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 return h.ex.run(g, h.layer, xf, indices, hoist);
             }
 
+            /// turboexl3_glm53f: `routedHoist` ending before the join's take (JOIN_INDEXED, a decode-lane call): the
+            /// concatenated outputs and each routed position's row in them (`Indexed`).
+            pub fn routedHoistIndexed(h: Hook, g: *G, xf: T, indices: T, hoist: []const T) !Indexed {
+                return h.ex.runEnd(g, h.layer, xf, indices, hoist, .indexed);
+            }
+
             /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs as the
             /// combine's sources and each assignment's (source, row); `releaseParts` after the combines are evaluated.
             pub fn routedParts(h: Hook, g: *G, xf: T, indices: T) !Parts {
@@ -726,6 +732,18 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// `waitGu` and down after `waitDown`, each wave started on the GPU;
         /// release; the outputs in the router's order, `[n, k, hidden]` f32.
         pub fn run(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T) !T {
+            return self.runEnd(g, layer, xf, indices, hoist, .take);
+        }
+
+        /// turboexl3_glm53f: a decode-lane call's outputs before the join's take (`Hook.routedHoistIndexed`,
+        /// JOIN_INDEXED, TURBOEXL3_GLM53F_MOE_COMBINE1: the caller's combine reads the rows in place): the concatenated
+        /// outputs [rows, hidden] and each routed position's row in them, u32 [n * k] (`joinOrder`; the stock join takes
+        /// exactly these rows).
+        pub const Indexed = struct { rows: T, order: T };
+        /// How a call ends: the join's take (`run`, every caller's route) or the indexed rows (JOIN_INDEXED).
+        const Ending = enum { take, indexed };
+
+        fn runEnd(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T, comptime ending: Ending) !(if (ending == .take) T else Indexed) {
             const n: u32 = @intCast(g.shapeOf(xf).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             const n_ids = n * k;
@@ -791,7 +809,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             released = true;
             // DEVROUTE: the layer's next call reads the policy after this route (the other LUT of the pair).
             if (dev != null) try self.devLutAfterRoute(g, layer);
-            return self.join(g, &acc, n, k);
+            return if (comptime ending == .take) self.join(g, &acc, n, k) else joinIndexed(g, &acc, n, k);
         }
 
         /// Each routed position's row in the concatenated outputs: the LAST row carrying it (DEVROUTE's miss parts follow
@@ -809,6 +827,16 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const n_ids = joinOrder(acc.pos[0..acc.n_pos], n * k, &order);
             const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
             return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+        }
+
+        /// turboexl3_glm53f: `join` without its take: the concatenated outputs and the order the take would read them in
+        /// (JOIN_INDEXED).
+        fn joinIndexed(g: *G, acc: *const Acc, n: u32, k: u32) !Indexed {
+            const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
+            var order: [max_route_ids]u32 = undefined;
+            const n_ids = joinOrder(acc.pos[0..acc.n_pos], n * k, &order);
+            const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
+            return .{ .rows = joined, .order = ord };
         }
 
         /// P1's construction self-check (`Wide.read_ahead`), once on the real stream before any request:

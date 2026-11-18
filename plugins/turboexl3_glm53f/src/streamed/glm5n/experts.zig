@@ -31,6 +31,11 @@ const T = mlx.mlx_array;
 const Module = @This();
 
 pub const top_k: u32 = 8;
+comptime {
+    // turboexl3_glm53f: TURBOEXL3_GLM53F_MOE_COMBINE1's text runs at the bank's geometry
+    const combine1 = @import("mlx_host").moe_combine1;
+    if (@as(u32, @intCast(combine1.top_k)) != top_k or @as(u32, @intCast(combine1.hidden)) != exl3_bank.flash.hidden) @compileError("glm5_next: src/moe_combine1.zig's dims are not the bank's");
+}
 /// The bridge over the NVFP4 bank: its {w, scales, global_scale} slot bindings, its read pool's 10 MiB staging.
 pub const B = bridge.For(exl3_bank, .{ .Arrays = exl3_bank.Arrays, .staging_bytes = settings.reader_staging_bytes });
 pub const Stream = B.Stream;
@@ -560,7 +565,26 @@ pub fn SourceOf(comptime fam: Family) type {
             const nt: u32 = @intCast(g.shapeOf(x).d[0]);
             profile.call();
             if (self.decodeLaneAt(nt)) {
-                const ids32 = try g.astype(expert_ids, .int32);
+                // turboexl3_glm53f: TURBOEXL3_GLM53F_ROUTE_VIEW (src/route_view.zig): the router's uint32 ids as an int32
+                // view (ids below 288: the same bits; MLX's View shares the buffer), where the stock lane casts them
+                const ids32 = if (try @import("mlx_host").route_view.view(g.s, expert_ids)) |v| try g.adopt(v) else try g.astype(expert_ids, .int32);
+                // turboexl3_glm53f: TURBOEXL3_GLM53F_MOE_COMBINE1 (src/moe_combine1.zig): the call ends before the join's
+                // take (JOIN_INDEXED) and one text reads each position's row in place through the join's order: the stock
+                // join and combine's bits in one launch; a call the text declines takes the stock take and combine
+                const combine1 = @import("mlx_host").moe_combine1;
+                if (combine1.on) {
+                    const idx = try self.ex.at(layer).routedHoistIndexed(g, x, ids32, hoist);
+                    const encode_start = profile.now();
+                    if (try combine1.combine(g.s, idx.rows, idx.order, route_weights)) |y| {
+                        profile.charge(.encode, encode_start);
+                        return y;
+                    }
+                    const routed = try g.reshape(try g.take(idx.rows, idx.order, 0), &.{ @intCast(nt), @intCast(top_k), g.shapeOf(idx.rows).d[1] });
+                    const w32 = if (g.dtypeOf(route_weights) == .float32) route_weights else try g.astype(route_weights, .float32);
+                    const output = try combineStock(g, routed, w32);
+                    profile.charge(.encode, encode_start);
+                    return g.keep(output);
+                }
                 const routed = try self.ex.at(layer).routedHoist(g, x, ids32, hoist);
                 const encode_start = profile.now();
                 const output = try combineStock(g, routed, route_weights);

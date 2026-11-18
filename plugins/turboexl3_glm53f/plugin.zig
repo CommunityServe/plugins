@@ -28,6 +28,12 @@ pub const env = @import("src/host/env.zig");
 pub const shared = @import("src/host/shared.zig");
 pub const quant_abi = abi;
 pub const routed_t3 = @import("src/routed_t3.zig");
+/// TURBOEXL3_GLM53F_MOE_COMBINE1: the decode lane's join and combine in one launch (src/moe_combine1.zig; the bank's
+/// glm5n/experts.zig reads it as `mlx_host.moe_combine1`).
+pub const moe_combine1 = @import("src/moe_combine1.zig");
+/// TURBOEXL3_GLM53F_ROUTE_VIEW: the decode lane's route ids as an int32 view (src/route_view.zig; the bank's
+/// glm5n/experts.zig reads it as `mlx_host.route_view`).
+pub const route_view = @import("src/route_view.zig");
 
 /// Shown at install and in Settings.
 pub const version = "0.4.0";
@@ -115,6 +121,12 @@ fn configure(s: mlx.mlx_stream) !void {
     const hz = try routed_t3.parseSwitch(envSpan("TURBOEXL3_GLM53F_HOST_ZERO"));
     host_zero.apply(hz);
     if (hz) log.info(host_zero.line, .{});
+    // TURBOEXL3_GLM53F_MOE_COMBINE1: a decode call's routed join and combine in one launch
+    moe_combine1.on = try routed_t3.parseSwitch(envSpan("TURBOEXL3_GLM53F_MOE_COMBINE1"));
+    if (moe_combine1.on) log.info(moe_combine1.line, .{});
+    // TURBOEXL3_GLM53F_ROUTE_VIEW: a decode call's route ids as an int32 view of the router's uint32 ids
+    route_view.on = try routed_t3.parseSwitch(envSpan("TURBOEXL3_GLM53F_ROUTE_VIEW"));
+    if (route_view.on) log.info(route_view.line, .{});
     if (try routed_t3.PfInt8.read(&routed_t3.processEnv)) |p| {
         try p.apply();
         log.info(routed_t3.pf_int8_line, .{ routed_t3.processEnv("TURBOEXL3_GLM53F_PF_INT8").?, p.words() });
@@ -505,4 +517,6 @@ test {
     _ = bank_layers;
     _ = routed_t3;
     _ = host_zero;
+    _ = moe_combine1;
+    _ = route_view;
 }
