@@ -23,6 +23,7 @@ const dsa_prompt = @import("dsa_prompt.zig");
 const dsa_append = @import("dsa_append.zig");
 const options = @import("options.zig");
 const pf_reuse = @import("pf_reuse.zig");
+const dsa_hold = @import("dsa_hold.zig");
 const log = kit.log;
 
 const Array = mlx.mlx_array;
@@ -409,6 +410,8 @@ fn kdaSlots(m: *Model, sl: Slots, x: Array, la: *const trunk.Kda, layer: u32) !A
 /// picks every earlier token the attention is plain causal and prefill runs it on lifted keys.
 pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trunk.Dsa, layer: u32, batch: c_int, seq_len: c_int) !Array {
     const cfg = m.c;
+    // GLM53F_DSA_HOLD: a decode or verify forward drops what a prompt pass left held.
+    if (seq_len <= glm5.HC_PRE_MAX_ROWS) dsa_hold.idle();
     const s = m.s;
     const offset: usize = sl.positions[slot];
     const heads: c_int = @intCast(cfg.num_attention_heads);
@@ -533,6 +536,12 @@ pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trun
         const q_scale: ?f32 = scale;
         const q_abs = try headMm(m, qh_s, &d.embed_q, true);
         defer _ = mlx.mlx_array_free(q_abs);
+        // GLM53F_DSA_HOLD: a trunk layer's prompt span (not the MTP head's) releases what its previous DSA layer kept into
+        // MLX's cache under the limit in force raised by its bytes, then evaluates q_abs (its allocation now).
+        const trunk_span = batch == 1 and seq_len > glm5.HC_PRE_MAX_ROWS and layer < m.layers.len and m.layers[layer].mixer == .dsa and &m.layers[layer].mixer.dsa == d;
+        var hold = dsa_hold.release(trunk_span, layer, rows, dsa_hold.bytesOf(q_abs));
+        defer dsa_hold.restore(&hold);
+        try dsa_hold.settle(&hold, q_abs);
         var o_lat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(o_lat);
         if (glm5.selectsAll(t, ix) and rows <= glm5.HC_PRE_MAX_ROWS and batch == 1) {
@@ -589,6 +598,11 @@ pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trun
             const lat_out = nax orelse try glm5.sparseLatentAttention(s, q_abs, view.k, sel, q_scale, 64);
             _ = mlx.mlx_array_free(o_lat);
             o_lat = lat_out;
+            // GLM53F_DSA_HOLD: o_lat evaluated now (its allocation under the raised limit), the limit back, and both kept
+            // for the forward's next trunk DSA layer.
+            try dsa_hold.settle(&hold, o_lat);
+            dsa_hold.restore(&hold);
+            dsa_hold.keep(trunk_span, dsa_hold.nextDsa(m, layer), rows, q_abs, o_lat);
         }
         parts[1] = try headMm(m, o_lat, &d.unembed, true);
     }

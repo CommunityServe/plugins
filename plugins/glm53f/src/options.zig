@@ -23,6 +23,7 @@ pub const Switch = enum {
     router_one1,
     whole_prompt,
     pf_reuse,
+    dsa_hold,
 };
 
 pub const Decl = struct { sw: Switch, name: []const u8, default: []const u8, help: []const u8 };
@@ -44,6 +45,7 @@ pub const all = [_]Decl{
     .{ .sw = .router_one1, .name = "GLM53F_ROUTER_ONE1", .default = "1", .help = "With ROUTER_NAX: a one-row router call in one launch (the stock route's bytes)" },
     .{ .sw = .whole_prompt, .name = "GLM53F_WHOLE_PROMPT", .default = "1", .help = "A streaming pack takes the whole prompt in one forward and runs its last chunk and held-back tail as a pair, their routed experts in one bank call (each span's bytes)" },
     .{ .sw = .pf_reuse, .name = "GLM53F_PF_REUSE", .default = "1", .help = "A prompt forward's KDA runs keep their buffers in MLX's cache from a run's first layer to its last, the limit raised by the bill's layer envelope a row (the same kernels and bytes)" },
+    .{ .sw = .dsa_hold, .name = "GLM53F_DSA_HOLD", .default = "1", .help = "Memory for compute: a prompt DSA layer keeps its q_abs and o_lat for its next DSA layer, which takes their buffers from MLX's cache (the same kernels and bytes)" },
 };
 
 comptime {
