@@ -22,6 +22,7 @@ pub const Switch = enum {
     router_nax,
     router_one1,
     whole_prompt,
+    pf_reuse,
 };
 
 pub const Decl = struct { sw: Switch, name: []const u8, default: []const u8, help: []const u8 };
@@ -42,6 +43,7 @@ pub const all = [_]Decl{
     .{ .sw = .router_nax, .name = "GLM53F_ROUTER_NAX", .default = "1", .help = "The 4096 x 288 sigmoid router keeps its stored copy and routes 2 to 4 rows on MLX's split-K NAX chains (the stock route's bytes)" },
     .{ .sw = .router_one1, .name = "GLM53F_ROUTER_ONE1", .default = "1", .help = "With ROUTER_NAX: a one-row router call in one launch (the stock route's bytes)" },
     .{ .sw = .whole_prompt, .name = "GLM53F_WHOLE_PROMPT", .default = "1", .help = "A streaming pack takes the whole prompt in one forward and runs its last chunk and held-back tail as a pair, their routed experts in one bank call (each span's bytes)" },
+    .{ .sw = .pf_reuse, .name = "GLM53F_PF_REUSE", .default = "1", .help = "A prompt forward's KDA runs keep their buffers in MLX's cache from a run's first layer to its last, the limit raised by the bill's layer envelope a row (the same kernels and bytes)" },
 };
 
 comptime {

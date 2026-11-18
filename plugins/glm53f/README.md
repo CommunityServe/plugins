@@ -41,6 +41,7 @@ is on by default: each won its standard A/B, so the default is the fastest accep
 | `ROUTER_NAX` | on | Routes 2 to 4 rows on MLX's split-K NAX chains over the stored router | the stock route's bytes |
 | `ROUTER_ONE1` | on | With `ROUTER_NAX`: runs a one-row router call in one launch | the stock route's bytes |
 | `WHOLE_PROMPT` | on | Takes the whole prompt in one forward (J5); runs the last chunk and the held-back tail (17 to 31 rows) layer by layer, their routed experts in one bank call | each span's bytes |
+| `PF_REUSE` | on | Keeps a prompt forward's KDA runs' buffers in MLX's cache from a run's first layer to its last (the limit raised by the bill's layer envelope a row, put back at the next DSA layer); turboexl3_glm53f's `TURBOEXL3_GLM53F_PF_REUSE` is its routed-prefill half | the same bytes |
 
 If `KDA_PROMPT_CHUNK` or `KDA_PROMPT_PERCORE` is on and its route cannot serve this GPU or the pack's heads, the
 load is refused by name. When a route runs, its first use logs an `engaged` line.

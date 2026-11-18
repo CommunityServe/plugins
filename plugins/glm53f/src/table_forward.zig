@@ -22,6 +22,7 @@ const moe = kit.bases.blocks.moe;
 const dsa_prompt = @import("dsa_prompt.zig");
 const dsa_append = @import("dsa_append.zig");
 const options = @import("options.zig");
+const pf_reuse = @import("pf_reuse.zig");
 const log = kit.log;
 
 const Array = mlx.mlx_array;
@@ -80,6 +81,10 @@ pub fn hidden(m: *Model, st: *const Step, token_ids: Array) !Array {
     const batch: c_int = x_shape[0];
     const seq_len: c_int = x_shape[1];
     const is_prefill = seq_len > 1 and !st.batched;
+    // GLM53F_PF_REUSE: a prompt forward's KDA runs hold their buffers in MLX's cache, the limit put back at its end (an
+    // error's too).
+    pf_reuse.begin(cfg, is_prefill and !st.capture, @as(u64, @intCast(batch)) * @as(u64, @intCast(seq_len)));
+    defer pf_reuse.end();
     var stream = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(stream);
     {
@@ -93,6 +98,8 @@ pub fn hidden(m: *Model, st: *const Step, token_ids: Array) !Array {
     var deferred: ?glm5.Deferred = null;
     defer if (deferred) |*df| df.deinit();
     for (m.layers[0..n_layers], 0..) |*lw, li| {
+        // GLM53F_PF_REUSE: before the layer's attention, its KDA run's cache limit.
+        pf_reuse.layer(li, lw.mixer == .kda, li + 1 < n_layers and m.layers[li + 1].mixer == .kda);
         for ([_]bool{ true, false }) |attn| {
             try sublayer(m, st, &stream, &deferred, lw, attn, li, batch, seq_len, is_prefill);
         }
@@ -163,9 +170,14 @@ pub fn hiddenPair(m: *Model, st_a: *const Step, st_b: *const Step, ids_a: Array,
     }
     const n_layers = cfg.num_hidden_layers;
     if (keep.conv.len < n_layers or keep.ssm.len < n_layers) return error.GlmPairKeep;
+    // GLM53F_PF_REUSE: both spans' rows one prompt forward's, the limit put back at its end.
+    pf_reuse.begin(cfg, true, @as(u64, @intCast(batch[0])) * @as(u64, @intCast(seq_len[0])) + @as(u64, @intCast(batch[1])) * @as(u64, @intCast(seq_len[1])));
+    defer pf_reuse.end();
     var deferred: [2]?glm5.Deferred = .{ null, null };
     defer for (&deferred) |*d| if (d.*) |*df| df.deinit();
     for (m.layers[0..n_layers], 0..) |*lw, li| {
+        // GLM53F_PF_REUSE: before the layer's attention (span A's, then span B's), its KDA run's cache limit.
+        pf_reuse.layer(li, lw.mixer == .kda, li + 1 < n_layers and m.layers[li + 1].mixer == .kda);
         try sublayer(m, st_a, &streams[0], &deferred[0], lw, true, li, batch[0], seq_len[0], true);
         if (lw.mixer == .kda) {
             keep.conv[li] = ref(st_a.slots.state(0, @intCast(li), .conv));

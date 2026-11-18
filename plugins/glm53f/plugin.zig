@@ -204,5 +204,6 @@ test {
     _ = @import("src/kda_chunk.zig");
     _ = @import("src/kda_percore.zig");
     _ = @import("src/span_plan.zig");
+    _ = @import("src/pf_reuse.zig");
     _ = @import("src/gpu_tests.zig");
 }
