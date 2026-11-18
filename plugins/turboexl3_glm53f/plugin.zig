@@ -17,6 +17,7 @@ const bank_rows = @import("src/bank_rows.zig");
 const bank_layers = @import("src/bank_layers.zig");
 const options = @import("src/options.zig");
 const stream_stats = @import("src/stream_stats.zig");
+const host_zero = @import("src/host_zero.zig");
 pub const config = @import("config.zig");
 
 // ── what the bank's modules read from `mlx_host` ──
@@ -110,6 +111,10 @@ fn configure(s: mlx.mlx_stream) !void {
     const pf_reuse = try routed_t3.parseSwitch(envSpan("TURBOEXL3_GLM53F_PF_REUSE"));
     try routed_t3.PfReuse.apply(pf_reuse);
     if (pf_reuse) log.info(routed_t3.pf_reuse_line, .{t3.prefill.size_class_rows});
+    // TURBOEXL3_GLM53F_HOST_ZERO: DEC-ONE's arrival counters made on the host, set in turboexl3 before any dense call
+    const hz = try routed_t3.parseSwitch(envSpan("TURBOEXL3_GLM53F_HOST_ZERO"));
+    host_zero.apply(hz);
+    if (hz) log.info(host_zero.line, .{});
     if (try routed_t3.PfInt8.read(&routed_t3.processEnv)) |p| {
         try p.apply();
         log.info(routed_t3.pf_int8_line, .{ routed_t3.processEnv("TURBOEXL3_GLM53F_PF_INT8").?, p.words() });
@@ -499,4 +504,5 @@ test {
     _ = mtp_bank;
     _ = bank_layers;
     _ = routed_t3;
+    _ = host_zero;
 }
