@@ -1,8 +1,8 @@
 //! glm53f's switches as `Manifest.options`: every `GLM53F_*` variable the plugin reads, its kind (`bool` "0" or "1"),
-//! the plugin's own value when none is set and one line of help. The defaults are #1196's (mlx-serve 4bab19a5, the
-//! stack the GLM-5.3-Flash sweeps measured): each exact switch on, the three rounding-class ones (`KDA_PROMPT_CHUNK`,
-//! `KDA_PROMPT_PERCORE`, `DSA_PROMPT_ONEP`) off. `WHOLE_PROMPT` (J5, src/prompt.zig) is off until its A/B. A switch reads its variable once; a value is on unless it is empty or
-//! starts with '0'. MLX-free.
+//! the plugin's own value when none is set and one line of help. Every switch is on by default: each one won its
+//! standard A/B, so the default is the fastest accepted stack (the three rounding-class ones, `KDA_PROMPT_CHUNK`,
+//! `KDA_PROMPT_PERCORE` and `DSA_PROMPT_ONEP`, included). A switch reads its variable once; a value is on unless it
+//! is empty or starts with '0'. MLX-free.
 const std = @import("std");
 const kit = @import("mlx_serve");
 
@@ -32,16 +32,16 @@ pub const all = [_]Decl{
     .{ .sw = .kda_lazy_seq, .name = "GLM53F_KDA_LAZY_SEQ", .default = "1", .help = "A KDA verify's per-row states come from a launch MLX runs only when a rollback reads them (the same bits)" },
     .{ .sw = .kda_prompt_prologue, .name = "GLM53F_KDA_PROMPT_PROLOGUE", .default = "1", .help = "A KDA layer's prompt rows take the conv, SiLU, q/k norms and scales in one launch (the chain's bytes)" },
     .{ .sw = .kda_prompt_normgate, .name = "GLM53F_KDA_PROMPT_NORMGATE", .default = "1", .help = "A KDA layer's prompt rows take the norm-gate epilogue in one launch (the chain's bytes)" },
-    .{ .sw = .kda_prompt_percore, .name = "GLM53F_KDA_PROMPT_PERCORE", .default = "0", .help = "Not exact: a KDA layer's prompt recurrence on the per-core kernel at up to two threadgroups a core" },
-    .{ .sw = .kda_prompt_chunk, .name = "GLM53F_KDA_PROMPT_CHUNK", .default = "0", .help = "Not exact: a KDA layer's prompt recurrence as the chunkwise delta rule (16-row chunks); a load it cannot serve is refused" },
+    .{ .sw = .kda_prompt_percore, .name = "GLM53F_KDA_PROMPT_PERCORE", .default = "1", .help = "Not exact: a KDA layer's prompt recurrence on the per-core kernel at up to two threadgroups a core" },
+    .{ .sw = .kda_prompt_chunk, .name = "GLM53F_KDA_PROMPT_CHUNK", .default = "1", .help = "Not exact: a KDA layer's prompt recurrence as the chunkwise delta rule (16-row chunks); a load it cannot serve is refused" },
     .{ .sw = .dsa_prompt_indexer, .name = "GLM53F_DSA_PROMPT_INDEXER", .default = "1", .help = "A DSA layer's prompt rows: the indexer's scores, top-k and expansion in one launch, the output in one copy (the same tokens and bytes)" },
-    .{ .sw = .dsa_prompt_onep, .name = "GLM53F_DSA_PROMPT_ONEP", .default = "0", .help = "Not exact: a DSA prompt pass's sparse latent attention with P as one fp16 piece" },
+    .{ .sw = .dsa_prompt_onep, .name = "GLM53F_DSA_PROMPT_ONEP", .default = "1", .help = "Not exact: a DSA prompt pass's sparse latent attention with P as one fp16 piece" },
     .{ .sw = .dsa_tails, .name = "GLM53F_DSA_TAILS", .default = "1", .help = "A decode, verify or draft forward reads its DSA layers' indexer tail rows first, in one launch (the same rows)" },
     .{ .sw = .head_last_row, .name = "GLM53F_HEAD_LAST_ROW", .default = "1", .help = "The MTP head's merged first draft step runs its routed experts for its last row alone (that row's bytes)" },
     .{ .sw = .prompt_async_eval, .name = "GLM53F_PROMPT_ASYNC_EVAL", .default = "1", .help = "A prompt forward's cadence evals go to the GPU without the host's wait (the same arrays and order)" },
     .{ .sw = .router_nax, .name = "GLM53F_ROUTER_NAX", .default = "1", .help = "The 4096 x 288 sigmoid router keeps its stored copy and routes 2 to 4 rows on MLX's split-K NAX chains (the stock route's bytes)" },
     .{ .sw = .router_one1, .name = "GLM53F_ROUTER_ONE1", .default = "1", .help = "With ROUTER_NAX: a one-row router call in one launch (the stock route's bytes)" },
-    .{ .sw = .whole_prompt, .name = "GLM53F_WHOLE_PROMPT", .default = "0", .help = "A streaming pack takes the whole prompt in one forward and runs its last chunk and held-back tail as a pair, their routed experts in one bank call (each span's bytes); off until its A/B" },
+    .{ .sw = .whole_prompt, .name = "GLM53F_WHOLE_PROMPT", .default = "1", .help = "A streaming pack takes the whole prompt in one forward and runs its last chunk and held-back tail as a pair, their routed experts in one bank call (each span's bytes)" },
 };
 
 comptime {
@@ -81,7 +81,7 @@ pub fn forKit(comptime O: type) [all.len]O {
     return out;
 }
 
-test "glm53f options: every switch is a GLM53F_ option of the kit's rules, with #1196's default and a line of help" {
+test "glm53f options: every switch is a GLM53F_ option of the kit's rules, on by default, with a line of help" {
     const t = std.testing;
     const dy = kit.abi.dylib;
     for (all, 0..) |d, i| {
@@ -90,11 +90,8 @@ test "glm53f options: every switch is a GLM53F_ option of the kit's rules, with 
         try t.expect(d.help.len > 0);
         for (all[0..i]) |e| try t.expect(!std.mem.eql(u8, d.name, e.name));
     }
-    // #1196's defaults: the exact switches on, the rounding-class three off; the whole-prompt pass off until its A/B.
-    for (all) |d| {
-        const off = d.sw == .kda_prompt_percore or d.sw == .kda_prompt_chunk or d.sw == .dsa_prompt_onep or d.sw == .whole_prompt;
-        try t.expectEqual(!off, defaultOn(d.sw));
-    }
+    // The fastest accepted stack is the default: every switch on.
+    for (all) |d| try t.expect(defaultOn(d.sw));
 }
 
 test "glm53f options: a value is on unless empty or starting with 0; a forced value wins" {
