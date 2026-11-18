@@ -446,6 +446,26 @@ pub fn LagPendingOf(comptime Ctx: type) type {
 
 /// `{s}` the variable's value, then the texts (`BankedSchedule.textSet`) and the variants' indices
 pub const banked_line = "[turboexl3_glm53f] TURBOEXL3_GLM53F_BANKED={s}: the banked decode on turboexl3's {s} texts (banked_group 4), gate|up variant {d}, down variant {d} (the same reads, decodes and sums)\n";
+/// `{d}` turboexl3's size class (`t3.prefill.size_class_rows`)
+pub const pf_reuse_line = "[turboexl3_glm53f] TURBOEXL3_GLM53F_PF_REUSE=1: the routed prefill's row-slot arrays at multiples of {d} row-slots (turboexl3's size classes), so successive calls' buffers match MLX's cache; the same kernels on the same rows\n";
+
+/// `TURBOEXL3_GLM53F_PF_REUSE=1` (exact): the routed prefill's row-slot-sized arrays at turboexl3's size classes
+/// (`Config.pf_size_class`: a call's row-slot arrays at its row-slots rounded up to a multiple of
+/// `t3.prefill.size_class_rows`, with the 128-row tiles and without `pf_t128_zfit`, as the served configuration runs):
+/// successive calls' buffers then match MLX's cache, which reuses a buffer only within two pages of a request. The
+/// kernels run over the call's rows and nothing reads the padding, so the same bytes. The frozen line's switch of this
+/// name also held a prompt forward's KDA runs in MLX's cache: that half is the model's (glm53f's GLM53F_PF_REUSE).
+/// Set with `t3.configure` before any prefill engine is made (`pfOptions` is read when an engine is built).
+/// copied_from: CommunityServe plugins/turboexl3_glm53f/src/pf_reuse.zig@ac87fe1 (`applySizeClasses`).
+pub const PfReuse = struct {
+    /// turboexl3's configuration with the size classes on (`on`) or off, every other field kept.
+    pub fn apply(on: bool) !void {
+        var c = t3.config.get().*;
+        c.pf_size_class = on;
+        try t3.configure(c);
+    }
+};
+
 /// `{s}` the variable's value, then the variant's name
 pub const dec_line = "[turboexl3_glm53f] TURBOEXL3_GLM53F_DEC={s}: the dense decode GEMV (DEC-ONE) on turboexl3's '{s}' text (the same reads, decodes and sums)\n";
 /// `{s}` the variable's value, then bk128
@@ -1044,6 +1064,26 @@ test "turboexl3_glm53f stream math: TURBOEXL3_GLM53F_PF_OPTS takes bk128 and set
     try t.expectEqual(saved.pf_t128_bk128, t3.config.get().pf_t128_bk128);
     try t.expectEqual(saved.pf_t128, t3.config.get().pf_t128);
     try t.expectEqual(saved.banked_group, t3.config.get().banked_group);
+}
+
+test "turboexl3_glm53f stream math: TURBOEXL3_GLM53F_PF_REUSE sets turboexl3's routed prefill size classes and keeps every other field; the class rounds a call's row-slots up to 256" {
+    const t = std.testing;
+    const saved = t3.config.get().*;
+    defer t3.configure(saved) catch unreachable;
+    try PfReuse.apply(true);
+    try t.expect(t3.config.get().pf_size_class);
+    // the classes engage only beside the 128-row tiles without zfit (turboexl3's `pfOptions`): the served configuration
+    try t.expect(t3.config.get().pf_t128 and !t3.config.get().pf_t128_zfit);
+    try t.expectEqual(saved.pf_bk128, t3.config.get().pf_bk128);
+    try t.expectEqual(saved.pf_int8, t3.config.get().pf_int8);
+    try t.expectEqual(saved.banked_group, t3.config.get().banked_group);
+    try PfReuse.apply(false);
+    try t.expect(!t3.config.get().pf_size_class);
+    try t.expectEqual(@as(u32, 256), t3.prefill.size_class_rows);
+    try t.expectEqual(@as(u32, 32768), t3.prefill.classRows(32768));
+    try t.expectEqual(@as(u32, 32768), t3.prefill.classRows(32767));
+    try t.expectEqual(@as(u32, 256), t3.prefill.classRows(1));
+    try t.expectEqual(@as(u32, 0), t3.prefill.classRows(0));
 }
 
 test "turboexl3_glm53f stream math: TURBOEXL3_GLM53F_PF_INT8 takes 1 to 4 and sets turboexl3's routed prefill int8 scheme (3: scheme 1 and the trunk's KDA qkv and o_proj on int8; 4: scheme 1 and every trunk linear); unset and 0 keep the exact chain, anything else refuses by name" {

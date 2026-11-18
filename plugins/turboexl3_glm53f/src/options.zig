@@ -35,6 +35,7 @@ pub const all = [_]Decl{
     .{ .name = "TURBOEXL3_GLM53F_PG2", .kind = .text, .default = "50115151111", .help = "The trunk's prefill tile codes on turboexl3's pg2, one a linear (11)" },
     .{ .name = "TURBOEXL3_GLM53F_PF_STAGE", .kind = .bool, .default = "1", .help = "A prompt call routes its layer's misses before its routing barrier" },
     .{ .name = "TURBOEXL3_GLM53F_PF_DRAIN_LAG", .kind = .bool, .default = "1", .help = "With PF_FEED: a prompt MoE group's drain waits for the next group's first chunk" },
+    .{ .name = "TURBOEXL3_GLM53F_PF_REUSE", .kind = .bool, .default = "1", .help = "The routed prefill's row-slot arrays at turboexl3's size classes (multiples of 256 row-slots), so successive calls' buffers match MLX's cache (the same kernels and bytes)" },
     .{ .name = "TURBOEXL3_GLM53F_PF_INT8", .kind = .number, .default = "0", .help = "Not exact: 0 off; 1 the routed prefill's gate|up and down GEMMs on int8, a scale each activation 128-block; 2 one scale a row; 3 1 and the trunk's KDA qkv and o_proj at prefill rows on int8; 4 1 and every trunk linear at prefill rows on int8" },
 };
 
@@ -120,7 +121,7 @@ test "turboexl3_glm53f stream options: every default is the frozen exact configu
         }
         try t.expectEqualStrings(d.default, defaultOf(d.name).?);
     }
-    try t.expectEqual(@as(usize, 19), all.len);
+    try t.expectEqual(@as(usize, 20), all.len);
     try t.expectEqualStrings("g4m3.t4.t4", defaultOf("TURBOEXL3_GLM53F_BANKED").?);
     try t.expectEqualStrings("g1", defaultOf("TURBOEXL3_GLM53F_DEC").?);
     try t.expectEqualStrings("bk128", defaultOf("TURBOEXL3_GLM53F_PF_OPTS").?);

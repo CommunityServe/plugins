@@ -105,6 +105,11 @@ fn configure(s: mlx.mlx_stream) !void {
         try o.apply();
         log.info(routed_t3.pf_opts_line, .{ routed_t3.processEnv("TURBOEXL3_GLM53F_PF_OPTS").?, o.bk128 });
     }
+    // TURBOEXL3_GLM53F_PF_REUSE: the routed prefill's row-slot arrays at turboexl3's size classes, before any prefill
+    // engine is made
+    const pf_reuse = try routed_t3.parseSwitch(envSpan("TURBOEXL3_GLM53F_PF_REUSE"));
+    try routed_t3.PfReuse.apply(pf_reuse);
+    if (pf_reuse) log.info(routed_t3.pf_reuse_line, .{t3.prefill.size_class_rows});
     if (try routed_t3.PfInt8.read(&routed_t3.processEnv)) |p| {
         try p.apply();
         log.info(routed_t3.pf_int8_line, .{ routed_t3.processEnv("TURBOEXL3_GLM53F_PF_INT8").?, p.words() });

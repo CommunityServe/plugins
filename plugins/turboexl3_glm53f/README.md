@@ -23,7 +23,7 @@ the model: its forward, MTP, the prefix cache and the bill. The plugin does only
 
 ## Switches
 
-The plugin reads 19 `TURBOEXL3_GLM53F_*` switches at load (src/options.zig). The kit exports them as the plugin's
+The plugin reads 20 `TURBOEXL3_GLM53F_*` switches at load (src/options.zig). The kit exports them as the plugin's
 options, so the app's plugin page can set them. Each default is the value of the served configuration.
 `PROMPT_KEEP` and `ADOPT_PIECES` need a seam in the kit's stream. If the kit has no such seam, they default to off,
 and the plugin refuses the bank if one is set.
