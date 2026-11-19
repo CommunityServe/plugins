@@ -9,7 +9,7 @@
 //!   the rows, then its transpose's reshape copies again. Here each part's transpose is concatenated along the rows:
 //!   one copy into the output projection's layout, the same values.
 //! Each piece declines (null or false: the stock path runs) outside GLM-5.3-Flash's shapes.
-//! GLM53F_DSA_PROMPT_ONEP (default off, rounding-class): a prompt pass's sparse latent attention (the NAX text,
+//! GLM53F_DSA_PROMPT_ONEP (on by default, rounding-class): a prompt pass's sparse latent attention (the NAX text,
 //! past 8 rows) meets the values with P as one fp16 piece (`dsa_nax.sparseLatentOneP`), not the stock hi and lo
 //! pieces: half the PV MMAs, P rounded once, so not the stock bytes. Off, nothing changes.
 //! copied_from: mlx-serve src/plugins/glm5_next/dsa_prompt.zig@4bab19a5 (#1196), its tests on the GPU in src/gpu_tests.zig.

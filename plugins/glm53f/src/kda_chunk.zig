@@ -2,8 +2,9 @@
 //! rounding-class): fla's chunk_kda form over 16-row chunks, each chunk's rows through one triangular solve in f32
 //! simdgroup matrices and the state read and written once a chunk, not once a row; the gate built in the launch from
 //! the gate input, dt_bias and A_log by kdaGateChain's statements. Its sums run in another order than the per-token
-//! route's, so its outputs are that route's within rounding, not its bits. It takes GLM's prompt rows where the per-core
-//! route declines, after the prologue, the packed prework or the chain.
+//! route's, so its outputs are that route's within rounding, not its bits. It takes GLM's prompt rows first (the
+//! per-core route takes them only where this one declines: stages.zig `routeOf`), after the prologue, the packed
+//! prework or the chain.
 //! copied_from: mlx-serve src/plugins/glm5_next/kda_chunk.zig@4bab19a5 (#1196), its tests on the GPU in src/gpu_tests.zig.
 
 const std = @import("std");

@@ -1,5 +1,5 @@
 //! A GLM KDA layer's prompt recurrence and its bounded gate on oMLX's per-core kernel at up to two threadgroups a core
-//! (GLM53F_KDA_PROMPT_PERCORE, off by default). The stock route (`sdk/blocks/kda/recurrence.zig`) plans one
+//! (GLM53F_KDA_PROMPT_PERCORE, on by default). The stock route (`sdk/blocks/kda/recurrence.zig`) plans one
 //! threadgroup a core of at most 128 value rows, so it declines GLM-5.3-Flash's 64 x 128 value rows below 64 cores;
 //! this plan takes two a core there (40 cores: 80 threadgroups of 104 rows), through the stock route's kernel text and
 //! launch (`recurAt`). The gate is built in the kernel (its sigmoid on the fast exp) and the delta rule sums in another
