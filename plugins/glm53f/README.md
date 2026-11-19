@@ -54,6 +54,7 @@ with it on (arm B). An exact switch also had to write the same text in both arms
 | `WHOLE_PROMPT` | Takes the whole prompt in one forward pass. It runs the last chunk and the held-back tail (17 to 31 rows) layer by layer, with each layer's routed experts in one bank call | exact |
 | `PF_REUSE` | Keeps the buffers of a prompt's KDA runs in MLX's cache from a run's first layer to its last | exact |
 | `DSA_HOLD` | Keeps a prompt DSA layer's q_abs and o_lat for the next DSA layer, which reuses their buffers | exact |
+| `TRUNK_F16_FREE` | Frees the trunk's f16 matrices once their bf16 copies are evaluated, before the bank opens, so the bank's slot rows take those bytes (about 0.65 GB on sc_3.10) | exact |
 
 Exactness, below, defines the classes and stock.
 
@@ -89,7 +90,7 @@ Each switch belongs to one of three classes.
 
 | Class | Meaning | Switches |
 |---|---|---|
-| Exact | Computes the same bytes as the stock code it replaces | 14 of glm53f's 17 switches (all but the three below). Every turboexl3_glm53f switch except `PF_INT8`, at the values that plugin accepts, with `PG2` at its default table |
+| Exact | Computes the same bytes as the stock code it replaces | 15 of glm53f's 18 switches (all but the three below). Every turboexl3_glm53f switch except `PF_INT8`, at the values that plugin accepts, with `PG2` at its default table |
 | Rounding-class | Rounds differently from stock, uses no int8, and passed the NLL floor test | `KDA_PROMPT_CHUNK`, `KDA_PROMPT_PERCORE` and `DSA_PROMPT_ONEP` |
 | Inexact | Uses lower-precision (int8) math | None in glm53f. turboexl3_glm53f's `TURBOEXL3_GLM53F_PF_INT8`, off by default |
 
@@ -232,7 +233,8 @@ prompt, four runs an arm. Decode speed is not compared, because the two arms wri
 
 ### Not measured as of 2026-11-19
 
-- The current default as one configuration, with all five later exact switches on (note 1).
+- The current default as one configuration, with all five later exact switches on (note 1), and `TRUNK_F16_FREE`
+  and turboexl3_glm53f's `SHARED_HOIST`.
 - The stock text with the current switch set. The 2026-11-16 run predates the five later switches.
 - The prefill gain of the three switches together, against all three at 0.
 - The NLL floor test and the per-switch prefill A/Bs on this plugin.
@@ -254,13 +256,14 @@ Some GPU tests skip on some GPUs. The `KDA_PROMPT_PERCORE` and `KDA_PROMPT_CHUNK
 one-per-core kernel launches (64 cores or more). The `KDA_PROMPT_PERCORE` test also skips below 32 cores. The
 `KDA_PROMPT_CHUNK` test skips where its test launch fails, and the `DSA_PROMPT_ONEP` test skips without NAX.
 
-The other five exact switches have no GPU test. Each wrote the same greedy text in both arms of its standard A/B
+The other six exact switches have no GPU test. Each wrote the same greedy text in both arms of its standard A/B
 instead.
 
 - `HEAD_LAST_ROW` runs the kit's `moe.mlpLastRow`, which mlx-serve tests. A test here would need a format bank.
 - `PROMPT_ASYNC_EVAL` sends the same arrays to `mlx_async_eval`.
 - `WHOLE_PROMPT` needs a pack and its caches, and the kit ships no harness that loads them.
 - `PF_REUSE` and `DSA_HOLD` change only which buffers MLX reuses, not the values.
+- `TRUNK_F16_FREE` changes only when the f16 bytes are freed; the trunk reads the same bf16 arrays.
 
 ## Known gaps
 
@@ -272,3 +275,7 @@ instead.
 - **The whole-prompt pass** (`WHOLE_PROMPT`, src/prompt.zig) needs mlx-serve main at commit e285ab55 or later. It
   joins only with the prefix cache on. With the prefix cache off, the last span is one row.
 - **What is not measured** is listed at the end of Exactness.
+- **`TRUNK_F16_FREE` moves the bank's memory.** A bank fit (`bank-fit.json`) measured with it on gives the rows its
+  freed bytes; a server that turns it off under that fit peaks about 0.65 GB higher. Measure the fit with the switch
+  set as served. It needs a kit with `kda_hybrid` `Hooks.free_f16_sources` and `Source.release`; without the
+  engine's `Source.release` the bytes stay until the load's end and the rows do not grow.

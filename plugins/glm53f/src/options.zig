@@ -24,6 +24,7 @@ pub const Switch = enum {
     whole_prompt,
     pf_reuse,
     dsa_hold,
+    trunk_f16_free,
 };
 
 pub const Decl = struct { sw: Switch, name: []const u8, default: []const u8, help: []const u8 };
@@ -46,6 +47,7 @@ pub const all = [_]Decl{
     .{ .sw = .whole_prompt, .name = "GLM53F_WHOLE_PROMPT", .default = "1", .help = "A streaming pack takes the whole prompt in one forward and runs its last chunk and held-back tail as a pair, their routed experts in one bank call (each span's bytes)" },
     .{ .sw = .pf_reuse, .name = "GLM53F_PF_REUSE", .default = "1", .help = "A prompt forward's KDA runs keep their buffers in MLX's cache from a run's first layer to its last, the limit raised by the bill's layer envelope a row (the same kernels and bytes)" },
     .{ .sw = .dsa_hold, .name = "GLM53F_DSA_HOLD", .default = "1", .help = "Memory for compute: a prompt DSA layer keeps its q_abs and o_lat for its next DSA layer, which takes their buffers from MLX's cache (the same kernels and bytes)" },
+    .{ .sw = .trunk_f16_free, .name = "GLM53F_TRUNK_F16_FREE", .default = "1", .help = "The trunk's f16 matrices let their f16 bytes go once their bf16 copies are evaluated, before the bank opens, so the bank's rows take them (the same arrays read)" },
 };
 
 comptime {

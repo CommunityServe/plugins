@@ -68,7 +68,10 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
-    const mp = host.load(plugin.name, ctx, .{ .router = .{ .fill = &router_nax.fill } }, out) orelse {
+    var hooks: kh.trunk.Hooks = .{ .router = .{ .fill = &router_nax.fill } };
+    // GLM53F_TRUNK_F16_FREE: a kit without the hook leaves the f16 sources as they were
+    if (comptime @hasField(kh.trunk.Hooks, "free_f16_sources")) hooks.free_f16_sources = options.on(.trunk_f16_free);
+    const mp = host.load(plugin.name, ctx, hooks, out) orelse {
         router_nax.release();
         return null;
     };
