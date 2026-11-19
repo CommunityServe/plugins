@@ -25,8 +25,8 @@
 //!   knows none of these (it arrives as EngineFailed).
 //! The predictor (the decode lookahead's next-layer scores) is the stock math's.
 //!
-//! Opt-in fused paths (`Switches`, read once at construction; each off by default, each turboexl3's entry that gives the
-//! default path's bytes, held so by turboexl3's src/models/glm53f/fused_test.zig):
+//! Fused paths (`Switches`, read once at construction; each on by default in src/options.zig, each turboexl3's entry
+//! that gives the default path's bytes, held so by turboexl3's src/models/glm53f/fused_test.zig):
 //! - `TURBOEXL3_GLM53F_PF_ROWS=1`: a prompt call and a cold-row chunk on `t3.moeClampedRows`: the chain's prepare reads
 //!   each row-slot's x row through the call's row map and its finish stores bf16, in place of the default's gather
 //!   (`take`), its cast to f32 and the cast of moeClamped's f32 y to bf16 (two full copies of the call's rows and two of
@@ -34,7 +34,7 @@
 //! - `TURBOEXL3_GLM53F_DEC_BF16=1`: a decode wave on `t3.moeClampedBankedAs` at bf16: the banked down finish stores bf16, in
 //!   place of moeClampedBanked's f32 y and its cast (one launch a routed layer fewer a forward).
 //!
-//! Opt-in schedules (the same kernels' arithmetic, so the same bytes; each off by default):
+//! Schedules (the same kernels' arithmetic, so the same bytes; each on by default, src/options.zig):
 //! - `TURBOEXL3_GLM53F_PF_FEED=1`: a prompt call returns with its last chunks in flight. The scheduler queues a group's
 //!   bank calls back to back and evaluates the group's outputs once before its slots go back (`Wide.seed`'s feed), so
 //!   that one wait covers every chunk; the default also waits at each call's end.
@@ -226,7 +226,7 @@ pub const PfOpts = struct {
     }
 };
 
-/// `TURBOEXL3_GLM53F_PF_INT8=1`, `2` or `3`: the routed prefill's gate|up and down GEMMs on int8 (turboexl3's
+/// `TURBOEXL3_GLM53F_PF_INT8=1` to `4`: the routed prefill's gate|up and down GEMMs on int8 (turboexl3's
 /// `Config.pf_int8`; not exact): each activation row as int8 in 128-blocks and each weight's trellis decoded to int8 in
 /// the GEMM's stage, int8 MMAs into int32 sums; 1 a scale each activation 128-block (each block's sums folded into f32 at
 /// its scale), 2 one scale a row (one fold). turboexl3 takes it beside the 128-row tiles on the deferred MUL1 map and
