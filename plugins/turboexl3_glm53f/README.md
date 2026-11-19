@@ -113,7 +113,8 @@ levels 1, 3 and 4 each wrote a different text from level 0.
 
 ### Not measured as of 2026-11-19
 
-- `PF_INT8` at any level on these two plugins.
+- `PF_INT8` levels 1 to 3 on these two plugins. Level 4 ran in the 1K to 256K sweep (glm53f's "Not measured" list
+  says how that build differs), and its results are on the GLM-5.3-Flash-streaming-repack-exl3 Hugging Face card.
 - Level 2 on the standard prompt, and level 2's HumanEval score.
 - `PG2` tables other than the default.
 - The items in glm53f's "Not measured" list, which cover this plugin's defaults too.
