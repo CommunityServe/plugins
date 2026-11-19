@@ -1,0 +1,17 @@
+{
+  "name": "glm53f",
+  "title": "GLM 5.3 Flash - EXL3 streaming runner",
+  "kind": "model",
+  "version": "0.1.0",
+  "summary": "GLM-5.3-Flash's runner for the turboexl3 EXL3 streaming repacks, with mlx-serve #1196's speed changes, over the kit's KDA-hybrid trunk; the pack's EXL3 linears and routed bank stay the turboexl3_glm53f quant plugin's. M5-class Macs (NAX).",
+  "models": [
+    "glm5_next with an exllamav3 quantization_config and a turboexl3 expert_streaming bank (OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3: sc_2.10bpw, sc_2.60bpw, sc_3.10bpw, sc_4.10bpw), beside turboexl3_glm53f"
+  ],
+  "requires_mlx_serve": ">=26.11.3",
+  "kit_note": "Needs a kit with the KDA-hybrid base (kit.bases.kda_hybrid with Hooks.router and KdaConsts.stages), kit.mlx_device and Host.quant_claimant: mlx-serve's J1, E4, J5c, J6 and J4, and Parsed.engine_config (glm-cs/outside-engine-config 0cbe591c); GLM53F_WHOLE_PROMPT also needs E3 and E7 (main e285ab55). GLM53F_TRUNK_F16_FREE needs kit.bases.kda_hybrid's Hooks.free_f16_sources and the engine's Source.release. Built here against glm-cs/s1-base3-cfg2.",
+  "fixture": "kit",
+  "test_step": "mlx-free-test",
+  "maintainers": ["davidtai"],
+  "license": "MIT",
+  "homepage": "https://github.com/davidtai/turboexl3"
+}
