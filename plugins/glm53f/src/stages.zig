@@ -3,7 +3,7 @@
 //! trunk's stock stage runs. The trunk asks a stage only on GLM's prompt rows (one slot, 17 rows or more, off the
 //! per-core arm) or verify rows (one slot, captured), as #1196's `kda.zig` did.
 //! - prologue (GLM53F_KDA_PROMPT_PROLOGUE): `kda_prologue.prologue`.
-//! - recurrence (GLM53F_KDA_PROMPT_CHUNK, then GLM53F_KDA_PROMPT_PERCORE; both off, rounding-class).
+//! - recurrence (GLM53F_KDA_PROMPT_CHUNK, then GLM53F_KDA_PROMPT_PERCORE; both on by default, rounding-class).
 //! - verify_prework, verify_gate (GLM53F_KDA_VERIFY; the gate's exp(A_log) in its launch with GLM53F_KDA_EXPSIG): the
 //!   packed prework at MLX's sigmoid op (`decode_fused.gdnPreworkFused`, `.table`) with the capture's conv input, and
 //!   `kda_verify.gate`.
@@ -37,16 +37,26 @@ pub const all: kda.Stages = .{
     .epilogue = &epilogue,
 };
 
-/// The model's stages after its load, and the load's checks of the switches that refuse a load by name: the chunkwise
-/// route's (`kda_chunk.loadCheck`) and the per-core route's (no plan or launch on this GPU at the pack's heads).
+/// The model's stages after its load, and the load's checks of the chunkwise route (`kda_chunk.loadCheck`) and the
+/// per-core route (no plan or launch on this GPU at the pack's heads). Both routes are on by default: where one cannot
+/// serve this GPU and the user did not set its switch, it is dropped with an info line and the KDA prompt takes the
+/// next route; a switch the user set refuses the load by name.
 pub fn install(m: *trunk.Model) !void {
     m.kda.stages = all;
-    try kda_chunk.loadCheck(m.s, m.c);
+    kda_chunk.loadCheck(m.s, m.c) catch |e| {
+        if (options.explicit(.kda_prompt_chunk)) return e;
+        log.info("glm53f: GLM53F_KDA_PROMPT_CHUNK (on by default) cannot serve this GPU ({s}); the KDA prompt takes the next route\n", .{@errorName(e)});
+        options.drop(.kda_prompt_chunk);
+    };
     if (options.on(.kda_prompt_percore)) {
         const c = m.c;
         if (!kda_percore.serves(m.s, @intCast(c.linear_num_key_heads), @intCast(c.linear_num_value_heads), @intCast(c.linear_key_head_dim), @intCast(c.linear_value_head_dim), .bfloat16, m.ssmStateDtype())) {
-            log.err("glm53f: GLM53F_KDA_PROMPT_PERCORE is set, and the per-core route has no plan or launch on this GPU at the pack's KDA heads\n", .{});
-            return error.KdaPercoreNoPlan;
+            if (options.explicit(.kda_prompt_percore)) {
+                log.err("glm53f: GLM53F_KDA_PROMPT_PERCORE is set, and the per-core route has no plan or launch on this GPU at the pack's KDA heads\n", .{});
+                return error.KdaPercoreNoPlan;
+            }
+            log.info("glm53f: GLM53F_KDA_PROMPT_PERCORE (on by default) has no plan or launch on this GPU at the pack's KDA heads; the KDA prompt takes the next route\n", .{});
+            options.drop(.kda_prompt_percore);
         }
     }
 }

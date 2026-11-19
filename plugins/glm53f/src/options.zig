@@ -35,7 +35,7 @@ pub const all = [_]Decl{
     .{ .sw = .kda_prompt_prologue, .name = "GLM53F_KDA_PROMPT_PROLOGUE", .default = "1", .help = "A KDA layer's prompt rows take the conv, SiLU, q/k norms and scales in one launch (the chain's bytes)" },
     .{ .sw = .kda_prompt_normgate, .name = "GLM53F_KDA_PROMPT_NORMGATE", .default = "1", .help = "A KDA layer's prompt rows take the norm-gate epilogue in one launch (the chain's bytes)" },
     .{ .sw = .kda_prompt_percore, .name = "GLM53F_KDA_PROMPT_PERCORE", .default = "1", .help = "Rounding-class (NLL floor-tested, int8-free): a KDA layer's prompt recurrence on the per-core kernel at up to two threadgroups a core" },
-    .{ .sw = .kda_prompt_chunk, .name = "GLM53F_KDA_PROMPT_CHUNK", .default = "1", .help = "Rounding-class (NLL floor-tested, int8-free): a KDA layer's prompt recurrence as the chunkwise delta rule (16-row chunks); a load it cannot serve is refused" },
+    .{ .sw = .kda_prompt_chunk, .name = "GLM53F_KDA_PROMPT_CHUNK", .default = "1", .help = "Rounding-class (NLL floor-tested, int8-free): a KDA layer's prompt recurrence as the chunkwise delta rule (16-row chunks); a GPU it cannot serve turns it off at load, unless you set it" },
     .{ .sw = .dsa_prompt_indexer, .name = "GLM53F_DSA_PROMPT_INDEXER", .default = "1", .help = "A DSA layer's prompt rows: the indexer's scores, top-k and expansion in one launch, the output in one copy (the same tokens and bytes)" },
     .{ .sw = .dsa_prompt_onep, .name = "GLM53F_DSA_PROMPT_ONEP", .default = "1", .help = "Rounding-class (NLL floor-tested, int8-free): a DSA prompt pass's sparse latent attention with P as one fp16 piece" },
     .{ .sw = .dsa_tails, .name = "GLM53F_DSA_TAILS", .default = "1", .help = "A decode, verify or draft forward reads its DSA layers' indexer tail rows first, in one launch (the same rows)" },
@@ -73,6 +73,18 @@ pub fn on(sw: Switch) bool {
     return cached[i].?;
 }
 
+/// Whether the user set switch `sw` (its variable is in the environment, or a test forced it), not just its default.
+pub fn explicit(sw: Switch) bool {
+    const i = @backingInt(sw);
+    if (forced[i] != null) return true;
+    return std.c.getenv(@ptrCast(all[i].name.ptr)) != null;
+}
+
+/// Turns switch `sw` off for this process: a default-on route that cannot serve this GPU, which nobody asked for.
+pub fn drop(sw: Switch) void {
+    cached[@backingInt(sw)] = false;
+}
+
 /// The default of switch `sw`, as a bool.
 pub fn defaultOn(sw: Switch) bool {
     return valueOn(all[@backingInt(sw)].default);
@@ -96,6 +108,25 @@ test "glm53f options: every switch is a GLM53F_ option of the kit's rules, on by
     }
     // The fastest accepted stack is the default: every switch on.
     for (all) |d| try t.expect(defaultOn(d.sw));
+}
+
+test "glm53f options: a default the user did not set is not explicit and can be dropped; a set one is explicit" {
+    const t = std.testing;
+    const i = @backingInt(Switch.kda_prompt_percore);
+    defer {
+        forced[i] = null;
+        cached[i] = null;
+    }
+    if (std.c.getenv("GLM53F_KDA_PROMPT_PERCORE") == null) {
+        try t.expect(!explicit(.kda_prompt_percore));
+        try t.expect(on(.kda_prompt_percore));
+        drop(.kda_prompt_percore);
+        try t.expect(!on(.kda_prompt_percore));
+    }
+    cached[i] = null;
+    forced[i] = true;
+    try t.expect(explicit(.kda_prompt_percore));
+    try t.expect(on(.kda_prompt_percore));
 }
 
 test "glm53f options: a value is on unless empty or starting with 0; a forced value wins" {
