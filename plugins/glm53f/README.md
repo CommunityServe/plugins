@@ -233,13 +233,15 @@ prompt, four runs an arm. Decode speed is not compared, because the two arms wri
 
 ### Not measured as of 2026-11-19
 
-- The current default as one configuration, with all five later exact switches on (note 1), and `TRUNK_F16_FREE`
-  and turboexl3_glm53f's `SHARED_HOIST`.
+- The current default's text ID on the standard prompt, with all five later exact switches on (note 1), and
+  `TRUNK_F16_FREE` and turboexl3_glm53f's `SHARED_HOIST`.
 - The stock text with the current switch set. The 2026-11-16 run predates the five later switches.
 - The prefill gain of the three switches together, against all three at 0.
 - The NLL floor test and the per-switch prefill A/Bs on this plugin.
 - Any GPU other than the 40-core M5 Max.
-- The 1K to 256K speed sweep on these two plugins.
+- The 1K to 256K speed sweep on these exact heads. It ran on the same plugin code with two more switches on
+  (`READ_AHEAD3`, whose hook mlx-serve did not merge, and turboexl3_glm53f's `ADOPT_PIECES`, both within noise); its
+  results are on the GLM-5.3-Flash-streaming-repack-exl3 Hugging Face card.
 
 ## Build and test
 
