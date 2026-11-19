@@ -129,6 +129,10 @@ pub const Switches = struct {
     /// wait is pending; nothing a model array reads changes. Its bill term (`glm5n_source.keep_warm_bill_bytes`, 1 MiB) comes
     /// off the bytes the rows are sized from.
     keep_warm: bool = false,
+    /// `TURBOEXL3_GLM53F_SHARED_HOIST=1`: the bank offers the ABI's `rows_hoist`: a decode call takes the trunk's shared
+    /// expert and commits it behind its hit wave when it misses (glm5n_source.zig `rowsHoist`); the same ops and add; no
+    /// row count changes.
+    shared_hoist: bool = false,
 };
 
 /// A switch's value: unset, empty or `0` off; `1` on; anything else refused by name.

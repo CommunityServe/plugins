@@ -23,7 +23,7 @@ the model: its forward, MTP, the prefix cache and the bill. The plugin does only
 
 ## Switches
 
-The plugin reads 23 `TURBOEXL3_GLM53F_*` switches at load (src/options.zig). Set a switch as an environment variable
+The plugin reads 24 `TURBOEXL3_GLM53F_*` switches at load (src/options.zig). Set a switch as an environment variable
 of the mlx-serve process, or on the app's plugin page. A value saved on the plugin page replaces the environment
 variable, so clear or set it on the plugin page too. The kit exports the switches as the plugin's options, and the
 server applies them when it starts, so restart the server after a change. Each default is the value of the served
@@ -31,7 +31,12 @@ configuration.
 
 Write `0` or `1` for an on/off switch. Any other value, such as `off` or `false`, makes the plugin refuse the load.
 This differs from glm53f, which treats such values as on. `PROMPT_KEEP` and `ADOPT_PIECES` need a seam in the kit's
-stream. If the kit has no such seam, they default to off, and the plugin refuses the bank if one is set.
+stream, and `SHARED_HOIST` needs the bank ABI's `rows_hoist`. If the kit has no such seam, they default to off, and
+the plugin refuses the bank if one is set.
+
+`SHARED_HOIST` (on): the trunk's MoE builds a decode call's shared expert before the routed call and hands it to the
+bank, which commits it behind the call's hit wave when the call misses, so the GPU runs it while the misses load. The
+same ops run, and the trunk adds it as before.
 
 The model's own speed changes (the KDA and DSA kernels, the fused router, the split prompt forward and others) are not
 in this plugin. They are `GLM53F_*` switches of the glm53f runner plugin.
@@ -57,7 +62,7 @@ change").
 | Switches (`TURBOEXL3_GLM53F_` + name) | Class | Default | Evidence |
 |---|---|---|---|
 | `PF_ROWS`, `DEC_BF16`, `MOE_COMBINE1`, `ROUTE_VIEW`, `HOST_ZERO` | exact | 1 | Fewer launches or copies for the same values. turboexl3's own tests check `PF_ROWS` and `DEC_BF16` against the path without them. Same greedy text in both arms of each switch's standard A/B |
-| `PF_FEED`, `PF_ALIGN`, `PF_STAGE`, `PF_DRAIN_LAG`, `PF_REUSE` | exact | 1 | Schedules of the same arithmetic. turboexl3's tests check `PF_ALIGN`. Same greedy text in each switch's standard A/B |
+| `PF_FEED`, `PF_ALIGN`, `PF_STAGE`, `PF_DRAIN_LAG`, `PF_REUSE`, `SHARED_HOIST` | exact | 1 (`SHARED_HOIST`: 0 on a kit without `rows_hoist`) | Schedules of the same arithmetic. turboexl3's tests check `PF_ALIGN`. Same greedy text in each switch's standard A/B |
 | `BANKED`, `DEC`, `PF_OPTS`, `PG2` | exact (note 1) | `g4m3.t4.t4`, `g1`, `bk128`, `50115151111` | Schedules or tiles of the same arithmetic. turboexl3's tests check `BANKED` and `DEC`. Same greedy text in each switch's standard A/B |
 | `LAYER_BILL`, `GROW_UNFILLED`, `PROMPT_KEEP`, `SPEC_PICK1`, `ADOPT_PIECES`, `SEED_DECODE`, `KEEP_WARM` | exact | 1 (`PROMPT_KEEP` and `ADOPT_PIECES`: 0 on a kit without their seam) | They change memory, reads and residency, or keep the GPU warm during the stream's waits (`KEEP_WARM`), not the math. Same greedy text in each switch's standard A/B |
 | `DEMAND_HELP` | exact | 0 | Takes 0 or 2. At 2, decode's read pool serves demand reads first, and a waiting demand read helps finish its own record. Only the order of reads changes. Off because its A/B decoded slower (note 2) |

@@ -77,6 +77,10 @@ pub fn setDemandFirst(mode: u32) void {
 pub fn setAdoptPieces(on: bool) void {
     experts.adopt_pieces = on;
 }
+/// turboexl3_glm53f: `TURBOEXL3_GLM53F_SHARED_HOIST` for the next bank (`experts.shared_hoist`).
+pub fn setSharedHoist(on: bool) void {
+    experts.shared_hoist = on;
+}
 /// turboexl3_glm53f: the model layer of the bank's first routed layer, the one READ_AHEAD3 reads ahead (the plugin's line).
 pub const first_moe_layer: u32 = exl3_bank.flash_first_moe_layer;
 /// turboexl3_glm53f: the per-layer prompt and decode rows `Source.open` plans from `slot_rows` (the default split).
@@ -190,6 +194,22 @@ pub const Source = struct {
         const xb = if (g.dtypeOf(x) == .bfloat16) x else try g.astype(x, .bfloat16);
         const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
         return self.inner.forward(layer, xb, idx, w, &.{});
+    }
+
+    /// turboexl3_glm53f: SHARED_HOIST: `rows` with `hoist` (the layer's shared expert over the same rows, which the call
+    /// does not read): a decode-lane call commits it behind its hit wave and ahead of its miss waves when it misses
+    /// (`ExpertsWith.run`); a wide call does not take it. The trunk adds the hoist to the returned sum.
+    pub fn rowsHoist(self: *Source, layer: u32, x: T, idx: T, wts: T, hoist: T) !T {
+        var g = &self.inner.g;
+        const xb = if (g.dtypeOf(x) == .bfloat16) x else try g.astype(x, .bfloat16);
+        const w = if (g.dtypeOf(wts) == .float32) wts else try g.astype(wts, .float32);
+        const nt: u32 = @intCast(g.shapeOf(xb).d[0]);
+        const lane = self.inner.decodeLaneAt(nt);
+        if (lane and !self.hoist_engaged) {
+            self.hoist_engaged = true;
+            sdk.log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_SHARED_HOIST engaged: a decode call of {d} rows (model layer {d}) took its shared expert as its hoist\n", .{ nt, layer });
+        }
+        return self.inner.forward(layer, xb, idx, w, if (lane) &.{hoist} else &.{});
     }
 
     /// A prompt call's predicted routes of `layer` (every row's ids): its experts, hottest first, read while its

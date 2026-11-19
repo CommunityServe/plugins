@@ -123,6 +123,9 @@ pub const seams = struct {
     pub const prompt_keep = @hasField(B.S.Options, "prompt_keep");
     /// `TURBOEXL3_GLM53F_ADOPT_PIECES`: `Lookahead.adopt_pieces` (an adopted range's copy in pieces).
     pub const adopt_pieces = @hasField(B.S.Lookahead, "adopt_pieces");
+    /// `TURBOEXL3_GLM53F_SHARED_HOIST`: the bank ABI's `rows_hoist` (the trunk's MoE hands a decode call its shared
+    /// expert as a hoist, `Routed.source_hoist`).
+    pub const shared_hoist = @hasField(@import("mlx_host").quant_abi.Bank, "rows_hoist");
 };
 
 /// turboexl3_glm53f: the read pool's counters for `[stream-stats]` (`Source.poolCounters`): the demand ranges that
@@ -140,6 +143,7 @@ pub const PoolCounters = struct {
 pub fn missingSeam() ?[]const u8 {
     if (prompt_keep and !seams.prompt_keep) return "TURBOEXL3_GLM53F_PROMPT_KEEP";
     if (adopt_pieces and !seams.adopt_pieces) return "TURBOEXL3_GLM53F_ADOPT_PIECES";
+    if (shared_hoist and !seams.shared_hoist) return "TURBOEXL3_GLM53F_SHARED_HOIST";
     return null;
 }
 
@@ -198,6 +202,10 @@ pub var demand_first: u32 = 0;
 /// into its rows in as many pieces as it has workers (`mimo_stream.io_workers`), the idle workers taking some
 /// (`Lookahead.adopt_pieces`). Only the copy moves: the same bytes into the same rows.
 pub var adopt_pieces: bool = false;
+/// turboexl3_glm53f: `TURBOEXL3_GLM53F_SHARED_HOIST` (off unless the plugin sets it before the bank opens; a hook of the
+/// kit's bank ABI, `seams.shared_hoist`): the bank offers `rows_hoist`, so a decode call commits the trunk's shared
+/// expert behind its hit wave when it misses (`Source.rowsHoist`). Only when the shared expert is committed moves.
+pub var shared_hoist: bool = false;
 comptime {
     // READ_AHEAD3's read-ahead above is the single-bank form (`speculateAhead`): the bank is one bank layer a routed layer
     if (B.S.multi_bank) @compileError("glm5_next: speculateAhead reads one bank layer a routed layer");

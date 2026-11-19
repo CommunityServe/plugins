@@ -283,6 +283,7 @@ fn readSwitches() !bank_rows.Switches {
         .adopt_pieces = try bank_rows.parseSwitch(envSpan("TURBOEXL3_GLM53F_ADOPT_PIECES")),
         .seed_decode = try bank_rows.parseSwitch(envSpan("TURBOEXL3_GLM53F_SEED_DECODE")),
         .keep_warm = try bank_rows.parseSwitch(envSpan("TURBOEXL3_GLM53F_KEEP_WARM")),
+        .shared_hoist = try bank_rows.parseSwitch(envSpan("TURBOEXL3_GLM53F_SHARED_HOIST")),
     };
 }
 
@@ -343,6 +344,7 @@ fn openBank(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.B
     glm5n.setAdoptPieces(sw.adopt_pieces);
     glm5n.setSeedDecode(sw.seed_decode);
     glm5n.setKeepWarm(sw.keep_warm);
+    glm5n.setSharedHoist(sw.shared_hoist);
     if (glm5n.missingSeam()) |name| {
         log.err("[turboexl3_glm53f] {s} is set, but this kit's expert stream (kit.streamed) has no seam for it: the bank is refused (set it to 0)\n", .{name});
         return Verdict.named(.unsupported, "Glm5NextStreamSeam");
@@ -373,6 +375,10 @@ fn openBank(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.B
     // A prompt call's rows each run by themselves (turboexl3's prompt GEMMs reduce a row over its own K only, in an order
     // the call's other rows do not move): a split prompt forward may run two prompt forwards' rows in one call.
     if (comptime @hasField(abi.Bank, "rows_independent")) out.rows_independent = true;
+    // SHARED_HOIST: a decode call takes the trunk's shared expert as its hoist (refused above on a kit without the member)
+    if (comptime glm5n.seams.shared_hoist) {
+        if (sw.shared_hoist) out.rows_hoist = &Bank.rowsHoist;
+    }
     return .ok;
 }
 
@@ -385,6 +391,7 @@ fn engaged(sw: bank_rows.Switches, g: glm5n.Geometry, seed: ?SeedFile) void {
     if (sw.spec_pick1) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_SPEC_PICK1=1: the decode lookahead reads ahead one record a layer call, the most likely of the next layer's non-resident predictions (default {d}); the read pool keeps its {d} speculative slots and threads and its bytes; reads only, no slot or row count changes\n", .{ bank_rows.streamer_spec_budget, 2 * bank_rows.streamer_spec_budget });
     if (sw.demand_first != 0) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_DEMAND_HELP={d}: the read pool puts decode's demand first (the kit stream's demandFirst({d}), set at each decode phase and back to 0 at each prompt phase); the same bytes into the same rows; no slot or row count changes\n", .{ sw.demand_first, sw.demand_first });
     if (sw.adopt_pieces) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_ADOPT_PIECES=1: a demand read served from a lookahead record copies its bytes into its rows in up to {d} pieces (one a read pool worker); the same bytes into the same rows; no slot or row count changes\n", .{bank_rows.streamer_io_workers});
+    if (sw.shared_hoist) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_SHARED_HOIST=1: the bank offers rows_hoist: a decode call takes the trunk's shared expert and commits it behind its hit wave when it misses; the same ops, the trunk's add; no slot or row count changes\n", .{});
     if (sw.keep_warm) log.info("[turboexl3_glm53f] TURBOEXL3_GLM53F_KEEP_WARM=1: the keep-warm engine on the expert stream's waits (gpu_warm at waits, over this plugin's own Metal shim, src/csrc/glm53f_gpu_warm.m); no model array, graph or MLX queue touched; {d} B billed: the slot rows were sized from that much less\n", .{glm5n.keep_warm_bill_bytes});
 }
 
@@ -455,6 +462,11 @@ const Bank = struct {
     }
     fn rows(ctx: ?*anyopaque, layer: u32, x: abi.Array, idx: abi.Array, wts: abi.Array, out: *abi.Array) callconv(.c) Verdict {
         const y = of(ctx).src.rows(layer, arr(x), arr(idx), arr(wts)) catch |e| return Verdict.named(.failed, @errorName(e));
+        out.* = .{ .ctx = y.ctx };
+        return .ok;
+    }
+    fn rowsHoist(ctx: ?*anyopaque, layer: u32, x: abi.Array, idx: abi.Array, wts: abi.Array, hoist: abi.Array, out: *abi.Array) callconv(.c) Verdict {
+        const y = of(ctx).src.rowsHoist(layer, arr(x), arr(idx), arr(wts), arr(hoist)) catch |e| return Verdict.named(.failed, @errorName(e));
         out.* = .{ .ctx = y.ctx };
         return .ok;
     }

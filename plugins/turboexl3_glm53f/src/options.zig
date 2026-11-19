@@ -39,6 +39,7 @@ pub const all = [_]Decl{
     .{ .name = "TURBOEXL3_GLM53F_HOST_ZERO", .kind = .bool, .default = "1", .help = "DEC-ONE's arrival counters made as zeros on the host, not by a launch (the same zeros and bytes)" },
     .{ .name = "TURBOEXL3_GLM53F_MOE_COMBINE1", .kind = .bool, .default = "1", .help = "A decode call's routed join and combine in one launch reading the routed rows in place (the stock chain's bits)" },
     .{ .name = "TURBOEXL3_GLM53F_ROUTE_VIEW", .kind = .bool, .default = "1", .help = "A decode call's route ids as an int32 view of the router's uint32 ids instead of a cast (the same bits)" },
+    .{ .name = "TURBOEXL3_GLM53F_SHARED_HOIST", .kind = .bool, .default = if (seams.shared_hoist) "1" else "0", .help = "A decode call takes the trunk's shared expert and commits it during its read wait (needs the kit's Bank.rows_hoist)" },
     .{ .name = "TURBOEXL3_GLM53F_PF_INT8", .kind = .number, .default = "0", .help = "Not exact: 0 off; 1 the routed prefill's gate|up and down GEMMs on int8, a scale each activation 128-block; 2 one scale a row; 3 1 and the trunk's KDA qkv and o_proj at prefill rows on int8; 4 1 and every trunk linear at prefill rows on int8" },
 };
 
@@ -87,6 +88,7 @@ fn seamOf(name: []const u8) ?bool {
     const list = [_]S{
         .{ .n = "TURBOEXL3_GLM53F_PROMPT_KEEP", .on = seams.prompt_keep },
         .{ .n = "TURBOEXL3_GLM53F_ADOPT_PIECES", .on = seams.adopt_pieces },
+        .{ .n = "TURBOEXL3_GLM53F_SHARED_HOIST", .on = seams.shared_hoist },
     };
     for (list) |x| if (std.mem.eql(u8, x.n, name)) return x.on;
     return null;
@@ -124,7 +126,7 @@ test "turboexl3_glm53f stream options: every default is the frozen exact configu
         }
         try t.expectEqualStrings(d.default, defaultOf(d.name).?);
     }
-    try t.expectEqual(@as(usize, 23), all.len);
+    try t.expectEqual(@as(usize, 24), all.len);
     try t.expectEqualStrings("g4m3.t4.t4", defaultOf("TURBOEXL3_GLM53F_BANKED").?);
     try t.expectEqualStrings("g1", defaultOf("TURBOEXL3_GLM53F_DEC").?);
     try t.expectEqualStrings("bk128", defaultOf("TURBOEXL3_GLM53F_PF_OPTS").?);
